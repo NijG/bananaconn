@@ -57,11 +57,14 @@ pub fn run() {
         .manage(tftpclient::TftpState::default())
         .setup(|app| {
             lock::init(app.handle());
-            // Old-named secrets and scratch folders, off the startup path.
-            std::thread::spawn(|| {
-                legacy::move_vault_entries(vault::SERVICE);
-                legacy::remove_old_temp();
-            });
+            // Old-named secrets and scratch folders, off the startup path
+            // (the released app only, like the data folders).
+            if legacy::is_release(&app.config().identifier) {
+                std::thread::spawn(|| {
+                    legacy::move_vault_entries(vault::SERVICE);
+                    legacy::remove_old_temp();
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

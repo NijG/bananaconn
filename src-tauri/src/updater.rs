@@ -144,6 +144,15 @@ fn source_of(source: &str) -> Result<Source, String> {
     Ok(Source::Folder(PathBuf::from(s)))
 }
 
+/// Test and development builds never update from the public release: what
+/// they find there would depend on what was last published.
+fn released_only(app: &AppHandle, src: Source) -> Result<Source, String> {
+    match src {
+        Source::Web(_) if !crate::legacy::is_release(&app.config().identifier) => Err("공식 빌드가 아니어서 GitHub 업데이트를 건너뜁니다".into()),
+        src => Ok(src),
+    }
+}
+
 /// Largest file fetched from the web (installers are about 10 MB).
 const WEB_LIMIT: usize = 512 * 1024 * 1024;
 
@@ -314,7 +323,7 @@ fn installed_by_msi(exe: &Path) -> bool {
 #[tauri::command]
 pub async fn update_check(app: AppHandle, source: String, credential_id: Option<String>) -> Result<UpdateInfo, String> {
     let current = app.package_info().version.to_string();
-    let src = source_of(&source)?;
+    let src = released_only(&app, source_of(&source)?)?;
     // A network share or the web can be slow to answer; keep it off the async runtime.
     let handle = app.clone();
     let m = tauri::async_runtime::spawn_blocking(move || open_manifest(&handle, &src, credential_id.as_deref())).await.map_err(|e| e.to_string())??;
@@ -327,7 +336,7 @@ pub async fn update_check(app: AppHandle, source: String, credential_id: Option<
 #[tauri::command]
 pub async fn update_install(app: AppHandle, source: String, credential_id: Option<String>) -> Result<(), String> {
     let current = app.package_info().version.to_string();
-    let src = source_of(&source)?;
+    let src = released_only(&app, source_of(&source)?)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let msi = installed_by_msi(&exe);
     let handle = app.clone();
@@ -503,5 +512,17 @@ mod web_tests {
         // Larger than the 1-byte limit: the request itself went through.
         assert!(body.as_deref().is_some_and(|e| e.contains("너무 큽니다")), "{body:?}");
         assert!(super::https_get("https://github.com/this-owner-does-not-exist-bc/x/releases/latest/download/latest.json", 1024).unwrap_err().contains("HTTP 404"));
+    }
+
+    /// Needs internet access: the published release reads and verifies the way the app does it.
+    #[test]
+    #[ignore]
+    fn the_published_release_verifies() {
+        let src = super::source_of("https://github.com/NijG/bananaconn/releases/latest/download/").unwrap();
+        let m = match super::read_manifest(&src) {
+            Ok(m) => m,
+            Err(super::ReadFail::Auth(e) | super::ReadFail::Other(e)) => panic!("{e}"),
+        };
+        assert!(!m.version.is_empty() && !m.notes_i18n.is_empty(), "{m:?}");
     }
 }

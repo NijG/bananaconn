@@ -51,14 +51,10 @@ export interface Settings {
   updateCredentialId?: string | null;
 }
 
-/** Where signed updates are published, checked in this order: the GitHub
- * release download address, then the NAS share (the settings' folder). */
+/** Where signed updates are published (the GitHub release download address).
+ * When it cannot be reached (blocked by security policy), the update folder
+ * from the settings is used: each user's own share; there is no default. */
 export const UPDATE_URL = "https://github.com/NijG/bananaconn/releases/latest/download/";
-/** The NAS share the build machine publishes signed updates to (empty in the public source). */
-export const DEFAULT_UPDATE_FOLDER = "";
-/** The share of versions up to 0.7.28: still checked after the current one
- * while the new share is being set up. */
-export const PREVIOUS_UPDATE_FOLDER = "";
 
 const DEFAULT_SETTINGS: Settings = {
   fontSize: 14,
@@ -75,7 +71,7 @@ const DEFAULT_SETTINGS: Settings = {
   autoLockMinutes: 15,
   sftpWithSsh: false,
   remoteMonitor: true,
-  updateFolder: DEFAULT_UPDATE_FOLDER,
+  updateFolder: "",
   autoUpdate: true,
   logTemplate: "%S_%Y%M%D_%h%m%s.log",
   logMode: "unique",
@@ -129,13 +125,10 @@ function loadFolders(): Set<string> {
   }
 }
 
-/** Saved settings over the defaults. An empty update folder (saved by
- * versions from before the shared folder existed) means the team's folder. */
+/** Saved settings over the defaults. */
 function loadSettings(): Settings {
   const s = readLS<Settings>("bx.settings", DEFAULT_SETTINGS);
-  // The previous default share means the default, which has moved.
-  if (!s.updateFolder?.trim() || (PREVIOUS_UPDATE_FOLDER && s.updateFolder.trim().toLowerCase() === PREVIOUS_UPDATE_FOLDER.toLowerCase()))
-    s.updateFolder = DEFAULT_SETTINGS.updateFolder;
+  s.updateFolder ??= "";
   // 0.7.18 saved "language" with a "ko" default, so only "en" is a real choice.
   const old = s as Settings & { language?: string };
   if (old.language !== undefined) {

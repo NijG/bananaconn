@@ -2,7 +2,7 @@
 
 import { api, revealInExplorer } from "./api";
 import { icon } from "./icons";
-import { DEFAULT_UPDATE_FOLDER, state, updateSettings, type Settings } from "./store";
+import { state, updateSettings, type Settings } from "./store";
 import { appLock, openMasterPassword } from "./lock";
 import { LIGHT_THEMES, TERM_THEMES } from "./themes";
 import { esc, modal, toast } from "./ui";
@@ -107,13 +107,14 @@ export function openSettings(section?: "update") {
         ${check("logPrompt", "툴바의 로그 버튼으로 시작할 때 파일 이름 묻기", "SecureCRT의 Prompt for filename처럼 시작 전에 이름을 확인·수정할 수 있습니다.")}
         <div class="row"><button type="button" class="btn" data-logs>${icon("FolderOpen", 14)}기본 로그 폴더 열기</button></div>
         <h4 data-section="update">업데이트</h4>
-        <label class="field"><span>업데이트 폴더 (빌드 PC가 새 버전을 올리는 공유 폴더, 예: \\\\NAS\\공유\\BananaConn)</span>
+        <p class="muted small">새 버전은 GitHub(github.com/NijG/bananaconn)에서 먼저 확인합니다. 보안 정책으로 GitHub에 접속할 수 없는 PC는 아래에 새 버전을 올려 두는 NAS 폴더를 지정하세요.</p>
+        <label class="field"><span>NAS 업데이트 폴더 (GitHub에 접속할 수 없을 때, 예: \\\\NAS\\공유\\BananaConn)</span>
           <input name="updateFolder" value="${esc(s.updateFolder)}" spellcheck="false" autocomplete="off" placeholder="\\\\서버\\공유\\BananaConn"/></label>
         <label class="field"><span>NAS 계정 (공유 폴더가 Windows 계정을 받아 주지 않을 때 이 계정으로 로그인)</span><select name="updateCredentialId">
             <option value="">사용 안 함 (Windows 계정·저장된 자격 증명)</option>
             ${passwords.map((c) => `<option value="${esc(c.id)}" title="${esc(c.username)}" ${c.id === s.updateCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
           </select>${passwords.length ? "" : `<small class="muted">자격 증명 보관함에 NAS 계정(비밀번호 방식)을 먼저 추가하세요.</small>`}</label>
-        ${check("autoUpdate", "새 버전 자동 확인 (시작할 때와 30분마다)", `새 버전이 있으면 설치할지 묻고, 상태 표시줄에도 업데이트 버튼이 나타납니다. 서명이 맞는 공식 빌드만 설치합니다.${DEFAULT_UPDATE_FOLDER ? ` 폴더를 비워 두면 기본 공유 폴더(${esc(DEFAULT_UPDATE_FOLDER)})를 씁니다.` : ""}`)}
+        ${check("autoUpdate", "새 버전 자동 확인 (시작할 때와 30분마다)", `새 버전이 있으면 설치할지 묻고, 상태 표시줄에도 업데이트 버튼이 나타납니다. 서명이 맞는 공식 빌드만 설치합니다.`)}
         <div class="row"><button type="button" class="btn" data-update-check>${icon("RefreshCw", 14)}지금 확인</button></div>
       </form>`,
     footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-save>${icon("Check", 14)}저장</button>`,

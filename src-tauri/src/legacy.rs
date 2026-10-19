@@ -22,8 +22,14 @@ pub(crate) const OLD_VAULT_SERVICE: &str = "BananaXterm";
 /// Before the app starts (no window, so nothing holds the folders yet).
 /// An error means the old data is still in use by a running older copy: the
 /// app must not start empty, so it says so and quits.
+/// Only the released app takes over the old names; other builds (E2E, development)
+/// share this PC with the user's installed copy and must not touch its data.
+pub fn is_release(identifier: &str) -> bool {
+    identifier == IDENTIFIER
+}
+
 pub fn move_data_dirs(identifier: &str) -> Result<(), String> {
-    if identifier != IDENTIFIER {
+    if !is_release(identifier) {
         return Ok(());
     }
     for base in [dirs::config_dir(), dirs::data_local_dir()].into_iter().flatten() {
@@ -146,6 +152,7 @@ mod tests {
 
     #[test]
     fn other_identifiers_never_move_the_users_data() {
+        assert!(!super::is_release("com.administrator.bananaconn.e2e"));
         assert!(super::move_data_dirs("com.administrator.bananaconn.e2e").is_ok());
     }
 

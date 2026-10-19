@@ -7,7 +7,7 @@
 import { api } from "./api";
 import { icon } from "./icons";
 import { language } from "./i18n";
-import { DEFAULT_UPDATE_FOLDER, PREVIOUS_UPDATE_FOLDER, state, UPDATE_URL } from "./store";
+import { state, UPDATE_URL } from "./store";
 import { choiceDialog, confirmDialog, errorText, esc, toast } from "./ui";
 
 const credential = () => state.settings.updateCredentialId || null;
@@ -98,25 +98,22 @@ export function startAutoUpdate(connections: () => number) {
   window.addEventListener("focus", () => due(CHECK_ON_FOCUS) && checkForUpdate(false));
 }
 
-/** The folder to use: an empty setting means the default share (as the
- * settings hint says), not "no updates". */
+/** The user's own update folder (a NAS share), for when GitHub is blocked. */
 function updateFolder(): string {
-  return state.settings.updateFolder.trim() || DEFAULT_UPDATE_FOLDER;
+  return state.settings.updateFolder.trim();
 }
 
-/** Places to look, in order: GitHub first, the folder from the settings,
- * and while it is the default share also the previous one. A PC without
- * internet access gets its update from the share. */
+/** Places to look, in order: GitHub, then the folder from the settings (a
+ * PC whose security policy blocks GitHub gets its update from the share). */
 function updateSources(): string[] {
-  const folder = updateFolder();
-  const list = [UPDATE_URL, folder, folder === DEFAULT_UPDATE_FOLDER ? PREVIOUS_UPDATE_FOLDER : ""];
-  return [...new Set(list.map((s) => s.trim()).filter(Boolean))];
+  return [...new Set([UPDATE_URL, updateFolder()].map((s) => s.trim()).filter(Boolean))];
 }
 /** The source the available version was found in: installed from there. */
 let foundIn = "";
 
 /** The first source that answers. When none does, the error worth showing
- * is the settings folder's (a refused NAS login has its own guide). */
+ * is the settings folder's (a refused NAS login has its own guide); without a
+ * folder, GitHub's, with the way out. */
 async function checkSources(): Promise<{ source: string; info: Awaited<ReturnType<typeof api.updateCheck>> }> {
   let shown: unknown = null;
   for (const source of updateSources()) {
@@ -126,6 +123,8 @@ async function checkSources(): Promise<{ source: string; info: Awaited<ReturnTyp
       if (shown === null || source === updateFolder()) shown = err;
     }
   }
+  if (!updateFolder())
+    throw new Error(`GitHub에서 업데이트를 확인할 수 없습니다(${errorText(shown)}). 보안 정책으로 GitHub 접속이 막혀 있다면 설정 → 업데이트에서 NAS 업데이트 폴더를 지정하세요.`);
   throw shown;
 }
 

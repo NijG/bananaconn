@@ -217,7 +217,7 @@ BananaConn. checks for a new version at startup, every 30 minutes and whenever y
 (*Settings → Updates → Check now*), and offers to install it. It looks in this order:
 
 1. this repository’s latest release (`https://github.com/NijG/bananaconn/releases/latest/download/`);
-2. the update folder set in Settings — a network share for PCs without internet access.
+2. the NAS update folder set in Settings — for PCs whose security policy blocks GitHub.
 
 Every release carries a `latest.json` manifest signed with an Ed25519 key that exists only on the build machine.
 The app installs a version only when the signature is valid and the installer’s SHA-256 matches the manifest, so a
