@@ -1,7 +1,11 @@
 // Publish the release installers to the update folder with a signed
 // latest.json, so installed apps can update themselves (src-tauri/src/updater.rs).
 //
-//   node scripts/publish-update.mjs <update folder> [notes file]
+//   node scripts/publish-update.mjs <update folder> [notes file] [--installers <dir>]
+//
+// The installers come from this machine's release build, or with
+// --installers from a folder holding both (the CI-built ones that
+// publish-github.mjs downloaded and verified).
 //
 // The signing key never leaves the build machine:
 //   BX_UPDATE_KEY (path of the Ed25519 PEM file).
@@ -14,9 +18,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const [target, notesFile] = process.argv.slice(2);
-if (!target) {
-  console.error("usage: node scripts/publish-update.mjs <update folder> [notes file]");
+const args = process.argv.slice(2);
+const flag = args.indexOf("--installers");
+const installers = flag >= 0 ? args.splice(flag, 2)[1] : undefined;
+const [target, notesFile] = args;
+if (!target || (flag >= 0 && !installers)) {
+  console.error("usage: node scripts/publish-update.mjs <update folder> [notes file] [--installers <dir>]");
   process.exit(2);
 }
 const keyPath = process.env.BX_UPDATE_KEY;
@@ -35,8 +42,8 @@ const notes = notesFile ? fs.readFileSync(notesFile, "utf8").trim() : "";
 fs.mkdirSync(target, { recursive: true });
 const sha = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const copy = (name, dir) => {
-  const src = path.join(bundle, dir, name);
-  if (!fs.existsSync(src)) throw new Error(`missing ${src} — run "npx tauri build" first`);
+  const src = installers ? path.join(installers, name) : path.join(bundle, dir, name);
+  if (!fs.existsSync(src)) throw new Error(`missing ${src}${installers ? "" : ' — run "npx tauri build" first'}`);
   const tmp = path.join(target, `${name}.part`);
   fs.copyFileSync(src, tmp);
   fs.renameSync(tmp, path.join(target, name));

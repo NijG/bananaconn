@@ -1,0 +1,146 @@
+# Builds the Windows installers from this repository on a fresh GitHub runner.
+#
+# - Push a tag v<version> (matching src-tauri/tauri.conf.json): the installers
+#   are built, signed with SignPath when it is configured, given a build
+#   provenance attestation, and attached to a DRAFT release v<version>.
+#   The maintainer then runs scripts/publish-github.mjs locally: it downloads
+#   these installers, verifies their attestations, signs latest.json with the
+#   update key (which never leaves the maintainer's machine) and publishes.
+# - Run it by hand (workflow_dispatch): build and attest only, no release.
+#
+# Anyone can check that a downloaded installer was built here, from this
+# repository:  gh attestation verify <file> -R NijG/bananaconn
+
+name: Release build
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.97.0"
+  NODE_VERSION: "24.21.0"
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: write # the draft release
+      id-token: write # build provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: meta
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $v = $conf.version
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "product=$($conf.productName)" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match tauri.conf.json version $v"
+          }
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --no-self-update
+          rustup default $env:RUST_TOOLCHAIN
+          rustc --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build installers
+        # beforeBuildCommand builds the RDP helper (rdp-helper/) and the frontend.
+        run: npx tauri build
+
+      - name: Collect installers
+        id: files
+        shell: pwsh
+        run: |
+          $b = "src-tauri/target/release/bundle"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "$b/nsis/${{ steps.meta.outputs.product }}_${{ steps.meta.outputs.version }}_x64-setup.exe" out/
+          Copy-Item "$b/msi/${{ steps.meta.outputs.product }}_${{ steps.meta.outputs.version }}_x64_en-US.msi" out/
+          Get-ChildItem out | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLower(), $_.Name }
+
+      # Code signing (SignPath Foundation). Skipped until the repository
+      # variables SIGNPATH_ORGANIZATION_ID / SIGNPATH_PROJECT_SLUG /
+      # SIGNPATH_POLICY_SLUG and the secret SIGNPATH_API_TOKEN are set.
+      - name: Upload unsigned installers
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        id: unsigned
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-installers
+          path: out/
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed/
+
+      - name: Use signed installers
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force out
+          Move-Item signed out
+          Get-ChildItem out | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName).Hash.ToLower(), $_.Name }
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/*.exe
+            out/*.msi
+
+      - name: Keep the installers of a manual run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installers-${{ steps.meta.outputs.version }}
+          path: out/
+          retention-days: 7
+
+      - name: Draft release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $files = Get-ChildItem out | ForEach-Object { $_.FullName }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag @files --repo $env:GITHUB_REPOSITORY --draft --verify-tag --title "${{ steps.meta.outputs.product }}. $tag" --notes "Built by GitHub Actions run $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          }
+          if ($LASTEXITCODE -ne 0) { throw "release upload failed" }

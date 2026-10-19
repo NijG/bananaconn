@@ -78,6 +78,7 @@ command can take a site down:
   - [Built-in servers](#built-in-servers)
   - [Network tools](#network-tools)
 - [Installation](#installation)
+  - [Verifying a download](#verifying-a-download)
 - [Updates](#updates)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Security model](#security-model)
@@ -240,6 +241,19 @@ installed by default on current Windows.
 Installing over an earlier version keeps all sessions, settings and saved passwords. Copies installed under the
 project’s previous names are removed by the installer, and their data is moved over on first start.
 
+### Verifying a download
+
+Release installers are built by GitHub Actions ([`release.yml`](.github/workflows/release.yml)) on a fresh
+GitHub-hosted runner, from the tagged commit of this repository, and carry a signed
+[build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations).
+To check that an installer you downloaded was built that way, from this source:
+
+```bash
+gh attestation verify BananaConn_<version>_x64-setup.exe -R NijG/bananaconn
+```
+
+The output names the workflow run and the commit it was built from; the build log of that run is public.
+
 ## Updates
 
 BananaConn. checks for a new version at startup, every 30 minutes and whenever you ask
@@ -248,7 +262,8 @@ BananaConn. checks for a new version at startup, every 30 minutes and whenever y
 1. this repository’s latest release (`https://github.com/NijG/bananaconn/releases/latest/download/`);
 2. the NAS update folder set in Settings — for PCs whose security policy blocks GitHub.
 
-Every release carries a `latest.json` manifest signed with an Ed25519 key that exists only on the build machine.
+Every release carries a `latest.json` manifest signed with an Ed25519 key that exists only on the maintainer’s
+machine (never in GitHub Actions).
 The app installs a version only when the signature is valid and the installer’s SHA-256 matches the manifest, so a
 file placed in the share or the download location by anyone else is never installed. Downloads go through Windows
 (WinHTTP), so the system proxy and certificate store are used.
@@ -365,17 +380,20 @@ the fixes.
 
 ## Publishing a release
 
-On the build machine, with the update signing key:
+1. Set the version in `src-tauri/tauri.conf.json`, `package.json` and `src-tauri/Cargo.toml`, commit, and push the
+   tag `v<version>`. The **Release build** workflow builds the installers, signs them with SignPath when it is
+   configured, attests their provenance and attaches them to a draft release.
+2. On the maintainer’s machine, with the update signing key:
 
 ```bash
-npx tauri build
-node scripts/publish-github.mjs NijG/bananaconn notes.txt         # GitHub release + signed latest.json
-node scripts/publish-update.mjs \\server\share\updates notes.txt  # optional: the same release to a share
+node scripts/publish-github.mjs NijG/bananaconn notes.txt --nas \\server\share\updates
 ```
 
-`notes.txt` holds the release notes; translations sit next to it as `notes.<language>.txt`, and the GitHub release
-page shows `notes.en.txt`. The signing key is read from the file named by `BX_UPDATE_KEY` and never leaves the build
-machine.
+The script downloads the installers from the draft, refuses them unless their attestation shows they were built by
+`release.yml` of this repository from that tag on a GitHub-hosted runner, signs `latest.json`, publishes the release,
+and copies the same files to the share (`--nas` is optional). `notes.txt` holds the release notes; translations sit
+next to it as `notes.<language>.txt`, and the GitHub release page shows `notes.en.txt`. The signing key is read from
+the file named by `BX_UPDATE_KEY`.
 
 ### Your own builds
 
