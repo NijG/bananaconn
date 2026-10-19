@@ -209,6 +209,7 @@ fn start(
                 break;
             }
             let Some(Ok((mut local, peer))) = accepted else { continue };
+            let _ = local.set_nodelay(true);
             let (handle, target_host, a, t, emit, id) = (handle.clone(), target_host.clone(), a.clone(), t.clone(), emit.clone(), id.clone());
             let relay = tauri::async_runtime::spawn(async move {
                 a.fetch_add(1, Ordering::Relaxed);

@@ -393,6 +393,9 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
     };
     let config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
+        // Keys through a tunnel and short SFTP requests are small writes;
+        // Nagle would hold each one until the previous is acknowledged.
+        nodelay: true,
         ..Default::default()
     });
     let connecting = client::connect(config, (l.host.as_str(), port), handler);
