@@ -1,0 +1,122 @@
+// Network tools dialog: ping, TCP port check and DNS lookup (backend: nettools.rs).
+
+import { api } from "./api";
+import { icon } from "./icons";
+import { errorText, esc, modal } from "./ui";
+
+type Tool = "ping" | "ports" | "dns";
+
+/** "22, 80, 8000-8010" → ports; null if any part is invalid. */
+export function parsePorts(text: string): number[] | null {
+  const out = new Set<number>();
+  for (const part of text.split(/[\s,]+/).filter(Boolean)) {
+    const m = part.match(/^(\d{1,5})(?:-(\d{1,5}))?$/);
+    if (!m) return null;
+    const a = Number(m[1]);
+    const b = m[2] ? Number(m[2]) : a;
+    if (a < 1 || b > 65535 || a > b || b - a > 64) return null;
+    for (let p = a; p <= b; p++) out.add(p);
+  }
+  // The limit is for the whole list ("1-60, 100-160" is 121 ports).
+  return out.size && out.size <= 64 ? [...out] : null;
+}
+
+export function openNetworkTools(initialHost = "") {
+  let tool: Tool = "ping";
+  let busy = false;
+  /** The ping running now, so "Stop" and closing the dialog end ping.exe. */
+  let pingId: string | null = null;
+  const stopPing = () => pingId && api.netPingCancel(pingId).catch(() => {});
+  const m = modal({
+    title: "네트워크 도구",
+    icon: "Activity",
+    width: 640,
+    body: `<div class="nettools">
+        <div class="seg nettools-tabs" role="tablist">
+          <button data-tool="ping" class="on">${icon("Activity", 14)}Ping</button>
+          <button data-tool="ports">${icon("Unplug", 14)}포트 확인</button>
+          <button data-tool="dns">${icon("Globe", 14)}DNS 조회</button>
+        </div>
+        <form class="form nettools-form" autocomplete="off">
+          <div class="inline">
+            <input name="host" placeholder="호스트 또는 IP (예: 192.168.0.1)" spellcheck="false" value="${esc(initialHost)}"/>
+            <input name="extra" class="nettools-extra" spellcheck="false"/>
+            <button type="submit" class="btn btn-primary" data-run>${icon("Play", 14)}실행</button>
+          </div>
+        </form>
+        <div class="nettools-out" role="log"><p class="muted">결과가 여기에 표시됩니다.</p></div>
+      </div>`,
+    footer: `<button class="btn" data-close>닫기</button>`,
+    onClose: () => void stopPing(),
+  });
+  const form = m.root.querySelector<HTMLFormElement>(".nettools-form")!;
+  const host = form.querySelector<HTMLInputElement>("[name=host]")!;
+  const extra = form.querySelector<HTMLInputElement>("[name=extra]")!;
+  const out = m.root.querySelector<HTMLElement>(".nettools-out")!;
+  const run = m.root.querySelector<HTMLButtonElement>("[data-run]")!;
+
+  const setTool = (t: Tool) => {
+    tool = t;
+    m.root.querySelectorAll<HTMLElement>("[data-tool]").forEach((b) => b.classList.toggle("on", b.dataset.tool === t));
+    extra.hidden = t === "dns";
+    if (t === "ping") {
+      extra.type = "number";
+      extra.min = "1";
+      extra.max = "20";
+      extra.value = "4";
+      extra.title = "보낼 횟수";
+    } else if (t === "ports") {
+      extra.type = "text";
+      extra.value = "22, 23, 80, 443, 3389, 5900";
+      extra.title = "포트 (쉼표, 범위 8000-8010)";
+    }
+    host.focus();
+  };
+  // Not while a run is going: its result would land under the other tool.
+  m.root.querySelectorAll<HTMLElement>("[data-tool]").forEach((b) => b.addEventListener("click", () => !busy && setTool(b.dataset.tool as Tool)));
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (busy) return void stopPing();
+    const target = host.value.trim();
+    if (!target) return void host.focus();
+    busy = true;
+    const label = run.innerHTML;
+    if (tool === "ping") run.innerHTML = `${icon("Square", 14)}중지`;
+    else run.disabled = true;
+    out.innerHTML = `<p class="muted"><span class="spinner sm"></span> ${tool === "ping" ? "ping 보내는 중..." : "확인하는 중..."}</p>`;
+    try {
+      if (tool === "ping") {
+        // A whole count the backend takes (1-20): "-3", "2.5" or "1e10" would be refused raw.
+        const count = Math.min(20, Math.max(1, Math.trunc(Number(extra.value)) || 4));
+        pingId = crypto.randomUUID();
+        const text = await api.netPing(pingId, target, count);
+        out.innerHTML = `<pre class="mono">${esc(text)}</pre>`;
+      } else if (tool === "ports") {
+        const ports = parsePorts(extra.value);
+        if (!ports) throw new Error("포트 형식: 22, 80, 8000-8010 (1~65535, 한 번에 64개까지)");
+        const res = await api.netPorts(target, ports);
+        out.innerHTML = `<table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th></tr></thead><tbody>${res
+          .map(
+            (r) => `<tr class="${r.open ? "open" : "closed"}"><td class="mono">${r.port}</td>
+              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td></tr>`,
+          )
+          .join("")}</tbody></table>`;
+      } else {
+        const res = await api.netDns(target);
+        out.innerHTML = res.addresses.length
+          ? `<ul class="nettools-list">${res.addresses.map((a) => `<li class="mono">${esc(a)}</li>`).join("")}</ul><p class="muted small">${res.ms} ms</p>`
+          : `<p class="muted">주소가 없습니다.</p>`;
+      }
+    } catch (err) {
+      const msg = errorText(err);
+      out.innerHTML = msg === "CANCELLED" ? `<p class="muted">중지했습니다.</p>` : `<p class="danger-text">${esc(msg)}</p>`;
+    } finally {
+      busy = false;
+      pingId = null;
+      run.innerHTML = label;
+      run.disabled = false;
+    }
+  });
+  setTool("ping");
+}

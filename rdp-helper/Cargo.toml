@@ -1,0 +1,55 @@
+[package]
+name = "bx-rdp"
+version = "0.3.0"
+description = "BananaConn built-in RDP client process"
+edition = "2024"
+publish = false
+license = "MIT"
+
+# Kept out of the main app's dependency graph on purpose: IronRDP (via picky)
+# pins exact pre-release RustCrypto versions that cannot coexist with russh in
+# one build. Running RDP in its own process also isolates decoder faults from
+# the rest of the app.
+
+[features]
+# Test-only: host "bx-selftest" skips the network and streams a synthetic
+# desktop, so the app's frame/input pipeline can be verified end to end.
+# Never enabled in release builds.
+selftest = []
+
+[dependencies]
+ironrdp = { version = "0.17", features = ["connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "cliprdr"] }
+# Windows clipboard backend for CLIPRDR (text, images and other formats both ways).
+ironrdp-cliprdr-native = "0.7"
+# Clipboard bridge: its window, CF_HDROP for file copy, keyboard description.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+ironrdp-tokio = "0.10"
+ironrdp-tls = { version = "0.2", features = ["native-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+
+# IronRDP 0.17 splits padded bitmaps by the destination width, which skews
+# rows and panics at the image edge; vendor/ironrdp-session crops them first
+# (see fit_to_rect in src/fast_path.rs).
+[patch.crates-io]
+ironrdp-session = { path = "vendor/ironrdp-session" }
+# Adds KeyboardType::Korean (8) so the local keyboard is described like mstsc does.
+ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

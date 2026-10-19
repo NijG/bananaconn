@@ -1,0 +1,28 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+**/target*/
+src-tauri/gen/
+src-tauri/binaries/
+# Published installers and update manifests
+updates/
+*.exe
+*.msi
+*.pdb
+*.dll
+# Keys and secrets
+*.pem
+*.ppk
+*.key
+*.pfx
+.env*
+# Machine-local cargo settings
+.cargo/
+# Logs and editors
+*.log
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.local

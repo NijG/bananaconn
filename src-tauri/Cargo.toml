@@ -1,0 +1,75 @@
+[package]
+name = "bananaconn"
+version = "0.7.29"
+description = "Personal all-in-one remote terminal: SSH, Telnet, SFTP, FTP, FTPS, RDP, VNC"
+authors = ["BananaConn contributors"]
+license = "MIT"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "bananaconn_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+ring = "0.17"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serialport = { version = "4", default-features = false }
+dirs = "5"
+# SSH terminal: the system OpenSSH client inside a ConPTY.
+portable-pty = "0.8"
+# SFTP file browser: pure-Rust SSH (supports ed25519 / OpenSSH-format keys on Windows).
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "3"
+# FTP / FTPS file browser. FTPS uses rustls: one shared ClientConfig gives the
+# TLS session resumption that many FTPS servers require on data connections.
+suppaftp = { version = "6", features = ["rustls", "deprecated"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+# In-process SSH key generation (same version russh already uses) and secure tokens.
+rand = "0.10"
+# Drive enumeration without touching (possibly disconnected) drives.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_Foundation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging"] }
+# Credential vault backed by Windows Credential Manager.
+keyring = { version = "3", features = ["windows-native"] }
+# Built-in FTP server (share a local folder over FTP/FTPS).
+libunftp = { version = "0.23", default-features = false, features = ["ring"] }
+unftp-sbe-fs = "0.4"
+unftp-core = "0.1"
+async-trait = "0.1"
+# Built-in VNC: local WebSocket bridge for the embedded noVNC client.
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "time", "fs", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+# unwind (not abort): a panic in a protocol library ends that one task or
+# connection, which the app reports, instead of closing every open session.
+panic = "unwind"
+strip = true
+
+# suppaftp 6.3.0 with local fixes (see vendor/suppaftp/BANANACONN_PATCH.md):
+# malformed PASV/EPSV/SIZE/MDTM replies returned errors instead of panicking,
+# and a connection closed mid-reply looped forever.
+[patch.crates-io]
+suppaftp = { path = "vendor/suppaftp" }

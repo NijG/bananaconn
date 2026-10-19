@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BananaConn.</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar" data-tauri-drag-region>
+        <button class="icon-btn" id="btn-sidebar" title="사이드바 접기/펴기 (Ctrl+Shift+B)"></button>
+        <div class="brand" data-tauri-drag-region><span class="brand-mark" data-tauri-drag-region><img src="./src/assets/app-icon-24.png" srcset="./src/assets/app-icon-24.png 1x, ./src/assets/app-icon-48.png 2x" width="24" height="24" alt="" draggable="false" data-tauri-drag-region /></span><b class="brand-name" data-tauri-drag-region><span class="brand-y">Banana</span><span class="brand-c">Conn</span><span class="brand-x">.</span></b></div>
+        <form id="quick" autocomplete="off">
+          <select id="quick-proto" title="프로토콜">
+            <option value="ssh">SSH</option>
+            <option value="telnet">Telnet</option>
+            <option value="serial">Serial</option>
+            <option value="sftp">SFTP</option>
+            <option value="ftp">FTP</option>
+            <option value="ftps">FTPS</option>
+            <option value="tftp">TFTP</option>
+            <option value="rdp">RDP</option>
+            <option value="vnc">VNC</option>
+          </select>
+          <input id="quick-target" placeholder="빠른 연결  ·  user@host:port" spellcheck="false" />
+          <button type="submit" class="quick-go" title="연결"></button>
+        </form>
+        <div class="top-tools">
+          <div class="seg layout-seg" role="group" aria-label="화면 분할">
+            <button data-layout="single" title="한 화면"></button>
+            <button data-layout="cols" title="좌우 2분할"></button>
+            <button data-layout="rows" title="상하 2분할"></button>
+            <button data-layout="grid" title="4분할"></button>
+          </div>
+          <button class="tool-toggle" id="btn-broadcast" title="보이는 모든 터미널에 같은 입력 보내기"></button>
+          <span class="top-sep"></span>
+          <button class="icon-btn" id="btn-lock" title="지금 잠그기" hidden></button>
+          <button class="icon-btn" id="btn-tools" title="도구 (SSH 터널, 네트워크 도구)"></button>
+          <button class="icon-btn" id="btn-server" title="파일 서버 (FTP · TFTP · HTTP로 이 PC의 폴더 공유)"></button>
+          <button class="icon-btn" id="btn-vault" title="자격 증명 보관함"></button>
+          <button class="icon-btn" id="btn-help" title="사용법 (F1)"></button>
+          <button class="icon-btn" id="btn-settings" title="설정"></button>
+        </div>
+        <div class="win-controls" hidden>
+          <button data-win="min" title="최소화"></button>
+          <button data-win="max" title="최대화"></button>
+          <button data-win="close" class="win-close" title="닫기"></button>
+        </div>
+      </header>
+      <div id="body">
+        <aside id="sidebar"></aside>
+        <div id="resizer" title="드래그해서 너비 조절"></div>
+        <main id="main">
+          <nav id="tabbar"></nav>
+          <div id="slots" class="slots" hidden></div>
+          <div id="home"></div>
+        </main>
+      </div>
+      <footer id="statusbar"></footer>
+    </div>
+    <div id="view-parking" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
