@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "Atajos de teclado",
     icon: "Keyboard",
     body: `
+      <p>Todos los atajos se pueden ver y cambiar en <b>Configuración → Atajos de teclado</b> (o «Configuración de atajos de teclado» en la pantalla de inicio). Las acciones sin atajo (diseños, n.ª pestaña, registro…) y los fragmentos o macros también pueden recibir uno, y «Predeterminado» en cada acción o «Restablecer todo a los valores predeterminados» deshace los cambios. La tabla muestra los valores predeterminados.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>Esta ayuda (dentro de un terminal se envía al programa remoto)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>Nueva sesión</td></tr>

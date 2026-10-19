@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "Tastenkürzel",
     icon: "Keyboard",
     body: `
+      <p>Alle Tastenkürzel lassen sich unter <b>Einstellungen → Tastenkürzel</b> (oder „Tastenkürzel-Einstellungen“ auf dem Startbildschirm) ansehen und ändern. Auch Aktionen ohne Kürzel (Layouts, n-ter Tab, Protokoll …) sowie Snippets und Makros können eines erhalten; „Standard“ je Aktion oder „Alle auf Standard zurücksetzen“ macht Änderungen rückgängig. Die Tabelle zeigt die Standardwerte.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>Diese Hilfe (in einem Terminal geht die Taste an das entfernte Programm)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>Neue Sitzung</td></tr>

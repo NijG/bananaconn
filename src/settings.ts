@@ -72,6 +72,9 @@ export function openSettings(section?: "update") {
         ${check("highlightKeywords", "출력 키워드 강조", "ERROR·FAIL은 빨강, WARN은 노랑, OK·SUCCESS는 초록으로 표시합니다. 색을 직접 쓰는 프로그램과 vim 같은 전체 화면 프로그램에는 적용하지 않습니다.")}
         ${check("copyOnSelect", "선택하면 바로 복사", "PuTTY처럼 드래그로 선택한 글자를 클립보드에 복사합니다.")}
         ${check("rightClickPaste", "오른쪽 클릭으로 붙여넣기", "터미널에서 오른쪽 버튼을 누르면 클립보드 내용을 붙여넣습니다.")}
+        <h4 data-section="shortcuts">단축키</h4>
+        <div class="row"><button type="button" class="btn" data-shortcuts>${icon("Keyboard", 14)}단축키 보기·바꾸기</button>
+          <span class="muted small">지금 쓰는 모든 단축키를 보고 바꾸거나, 단축키가 없는 동작과 스니펫에 새로 지정합니다.</span></div>
         <h4>보안</h4>
         <div class="grid-2">
           <div class="field"><span>마스터 비밀번호</span>
@@ -120,6 +123,7 @@ export function openSettings(section?: "update") {
     footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-save>${icon("Check", 14)}저장</button>`,
   });
   m.root.querySelector("[data-master]")!.addEventListener("click", () => openMasterPassword());
+  m.root.querySelector("[data-shortcuts]")!.addEventListener("click", () => void import("./shortcuts").then((x) => x.openShortcuts()));
   if (section) m.root.querySelector(`[data-section="${section}"]`)?.scrollIntoView({ block: "start" });
   // Applies at once (and is saved at once): the whole app switches language.
   m.root.querySelector<HTMLSelectElement>("[name=uiLanguage]")!.addEventListener("change", (e) => {

@@ -44,6 +44,8 @@ export interface Settings {
   updateFolder: string;
   /** Look for a new version there when the app starts. */
   autoUpdate: boolean;
+  /** Shortcut changes: action id -> keys (keymap.ts); unset: the defaults. */
+  keybindings?: Record<string, string[]>;
   /** Risky-command rules for snippets and macros (riskRules.ts); unset: the built-in list. */
   riskRules?: RiskRule[];
   /** Vault credential (password) to log in to the update share with when it
@@ -106,9 +108,11 @@ export interface Snippet {
 type Topic = "sessions" | "credentials" | "settings" | "folders" | "snippets";
 const listeners = new Map<Topic, Set<() => void>>();
 
-export function subscribe(topic: Topic, fn: () => void) {
+/** Returns a function that stops the subscription. */
+export function subscribe(topic: Topic, fn: () => void): () => void {
   if (!listeners.has(topic)) listeners.set(topic, new Set());
   listeners.get(topic)!.add(fn);
+  return () => listeners.get(topic)?.delete(fn);
 }
 
 function notify(topic: Topic) {

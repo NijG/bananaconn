@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "Keyboard shortcuts",
     icon: "Keyboard",
     body: `
+      <p>All shortcuts can be viewed and changed in <b>Settings → Keyboard shortcuts</b> (or "Keyboard shortcut settings" on the home screen). Actions without a shortcut (layouts, n-th tab, logging …) and snippets or macros can get one too, and "Default" per action or "Reset all to defaults" undoes the changes. The table below shows the defaults.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>This help (inside a terminal it goes to the remote program)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>New session</td></tr>

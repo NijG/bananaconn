@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "Raccourcis clavier",
     icon: "Keyboard",
     body: `
+      <p>Tous les raccourcis se consultent et se modifient dans <b>Paramètres → Raccourcis clavier</b> (ou « Paramètres des raccourcis clavier » sur l'écran d'accueil). Les actions sans raccourci (dispositions, n-ième onglet, journal…) ainsi que les extraits et macros peuvent aussi en recevoir un, et « Par défaut » sur chaque action ou « Tout rétablir par défaut » annule les changements. Le tableau ci-dessous montre les valeurs par défaut.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>Cette aide (dans un terminal, la touche est transmise au programme distant)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>Nouvelle session</td></tr>

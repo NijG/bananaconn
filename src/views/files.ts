@@ -4,6 +4,7 @@
 import { api, on, openWithDefaultApp, type FileEntry, type TransferProgress } from "../api";
 import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
+import { actionFor } from "../keymap";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession, reloadCredentials } from "../store";
 import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, modal, promptDialog, toast } from "../ui";
@@ -437,18 +438,22 @@ class Pane {
       // Keys on a focused button/field belong to that control, not the selection.
       if ((e.target as HTMLElement).closest("input, textarea, select, button")) return;
       const sel = this.selection();
-      if (e.key === "F5") {
+      // Shortcuts of the file list (keymap.ts; the user can change them).
+      const act = actionFor(e, "files");
+      if (act === "files.refresh") {
         e.preventDefault();
         this.refresh();
-      } else if (e.key === "Backspace") {
+      } else if (act === "files.parent") {
+        e.preventDefault();
         this.load(this.parent(this.path));
-      } else if (e.key === "Delete" && sel.length) {
+      } else if (act === "files.delete" && sel.length) {
         this.remove(sel);
-      } else if (e.key === "F2" && sel.length === 1) {
+      } else if (act === "files.rename" && sel.length === 1) {
+        e.preventDefault();
         this.rename(sel[0]);
-      } else if (e.key === "Enter" && sel.length === 1) {
+      } else if (act === "files.open" && sel.length === 1) {
         this.open(sel[0]);
-      } else if (e.key === "a" && e.ctrlKey) {
+      } else if (act === "files.selectAll") {
         e.preventDefault();
         this.selected = new Set(this.visible().map((x) => x.path));
         this.render();

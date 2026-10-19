@@ -17,6 +17,7 @@ import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands"
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
 import { tr } from "../i18n";
+import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
 
 /** Editing keys in recorded macros, as private-use marks U+E100.. in this
  * order; each tab turns them into its own key mode's bytes. */
@@ -164,6 +165,19 @@ function showTopProcesses(id: string, title: string) {
 
 const allViews = new Set<TerminalView>();
 subscribe("settings", () => allViews.forEach((v) => v.applySettings()));
+
+/** Terminal shortcut -> the toolbar button it presses. */
+const TOOLBAR_KEYS: Record<string, string> = {
+  "term.clear": "clear",
+  "term.log": "log",
+  "term.save": "save",
+  "term.zoomIn": "zoomin",
+  "term.zoomOut": "zoomout",
+  "term.sftp": "sftp",
+  "term.snippets": "snippet",
+  "term.record": "record",
+  "term.break": "break",
+};
 
 export class TerminalView implements View {
   el: HTMLElement;
@@ -1227,7 +1241,6 @@ export class TerminalView implements View {
 
   private handleKey(e: KeyboardEvent): boolean {
     if (e.type !== "keydown") return true;
-    const key = e.key.toLowerCase();
     // Network gear (Cisco IOS & co.) does not understand ESC [ 3 ~ and prints
     // the "~"; it edits lines with Emacs-style control keys instead.
     // Delete/Home/End are sent here in both key modes, and broadcast as the key
@@ -1246,32 +1259,49 @@ export class TerminalView implements View {
       }
       return false;
     }
-    if (e.ctrlKey && e.shiftKey && key === "c") {
-      if (this.term.hasSelection()) writeClipboard(this.term.getSelection());
-      return false;
+    // Terminal shortcuts (keymap.ts; the user can change them).
+    const act = actionFor(e, "terminal");
+    if (act?.startsWith(SNIPPET_PREFIX)) {
+      const snippet = state.snippets.find((x) => SNIPPET_PREFIX + x.id === act);
+      if (snippet) {
+        e.preventDefault();
+        void this.sendSnippet(snippet);
+        return false;
+      }
     }
-    if (e.ctrlKey && e.shiftKey && key === "v") {
-      e.preventDefault(); // otherwise WebView2 also fires a native paste into xterm
-      this.paste();
-      return false;
+    switch (act) {
+      case "term.copy":
+        if (this.term.hasSelection()) writeClipboard(this.term.getSelection());
+        return false;
+      // Copies when there is a selection; otherwise the key goes to the remote (Ctrl+C is ^C).
+      case "term.copySelection":
+        if (!this.term.hasSelection()) break;
+        writeClipboard(this.term.getSelection());
+        this.term.clearSelection();
+        return false;
+      case "term.paste":
+        e.preventDefault(); // otherwise WebView2 also fires a native paste into xterm
+        this.paste();
+        return false;
+      case "term.find":
+        this.toggleFind(true);
+        return false;
+      case "term.selectAll":
+        this.term.selectAll();
+        return false;
+      default: {
+        // The rest do what their toolbar button does (hidden buttons do not apply here).
+        const button = act && TOOLBAR_KEYS[act];
+        const el = button ? this.el.querySelector<HTMLElement>(`.view-actions [data-act="${button}"]`) : null;
+        if (el && !el.hidden && !(el as HTMLButtonElement).disabled) {
+          e.preventDefault();
+          el.click();
+          return false;
+        }
+      }
     }
-    if (e.ctrlKey && e.shiftKey && key === "f") {
-      this.toggleFind(true);
-      return false;
-    }
-    // Ctrl+C copies when there is a selection, otherwise it is sent as ^C.
-    if (e.ctrlKey && !e.shiftKey && key === "c" && this.term.hasSelection()) {
-      writeClipboard(this.term.getSelection());
-      this.term.clearSelection();
-      return false;
-    }
-    if (e.ctrlKey && !e.shiftKey && key === "v") {
-      e.preventDefault();
-      this.paste();
-      return false;
-    }
-    // Let app-level shortcuts (Ctrl+Shift+W/T/N, Ctrl+Tab, Ctrl+F4) bubble up.
-    if (e.ctrlKey && (e.key === "Tab" || e.key === "F4" || (e.shiftKey && ["w", "t", "n", "k", "b"].includes(key)))) return false;
+    // App-wide shortcuts (new tab, close tab, Ctrl+Tab …) go to the app, not the remote.
+    if (appTakesInTerminal(e)) return false;
     return true;
   }
 

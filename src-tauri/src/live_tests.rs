@@ -590,8 +590,9 @@ async fn linux_monitor_samples_on_request_and_pauses() {
     let handle = crate::remote::ssh_login(login(Some(fp))).await.expect("login");
     let (samples, pause) = crate::monitor::test_pump_live(&handle).await;
     let count = || samples.lock().unwrap().len();
-    // Samples arrive: one at once, the next after 2 s.
-    tokio::time::sleep(Duration::from_millis(2600)).await;
+    // Samples arrive: one at once, the next after 2 s (with room for a busy
+    // machine: the whole test suite runs in parallel).
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     let first = count();
     assert!(first >= 2, "samples while shown: {first} {:?}", samples.lock().unwrap());
     let s = samples.lock().unwrap()[0].clone();

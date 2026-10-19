@@ -5,7 +5,11 @@ import icon48 from "./assets/app-icon-48.png";
 import icon96 from "./assets/app-icon-96.png";
 import { icon } from "./icons";
 import { endpoint, PROTOCOL_ORDER, PROTOCOLS, type Protocol, type Session } from "./model";
+import { ACTIONS, bindings } from "./keymap";
 import { state, subscribe } from "./store";
+
+/** The shortcuts the home screen lists (their current keys). */
+const HOME_KEYS = ["app.newSession", "app.quickConnect", "tab.next", "tab.close", "term.find", "app.toggleSidebar"];
 import { esc, relativeTime } from "./ui";
 
 export function mountHome(
@@ -49,15 +53,13 @@ export function mountHome(
           </section>
           <section>
             <h3>단축키</h3>
-            <dl class="keys">
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd></dt><dd>새 세션</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></dt><dd>빠른 연결</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Tab</kbd></dt><dd>다음 탭</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>F4</kbd></dt><dd>탭 닫기 (Ctrl+Shift+W도 가능)</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd></dt><dd>터미널에서 찾기</dd>
-              <dt><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd></dt><dd>사이드바 접기</dd>
-            </dl>
-            <button class="btn" data-vault>${icon("KeyRound", 14)}자격 증명 보관함</button>
+            <dl class="keys">${HOME_KEYS.map((id) => {
+              const keys = bindings(id);
+              const label = ACTIONS.find((a) => a.id === id)?.label ?? id;
+              return keys.length ? `<dt>${keys.map((k) => k.split("+").map((p) => `<kbd>${esc(p)}</kbd>`).join("+")).join(" · ")}</dt><dd>${esc(label)}</dd>` : "";
+            }).join("")}</dl>
+            <div class="row"><button class="btn" data-shortcuts>${icon("Keyboard", 14)}단축키 설정</button>
+              <button class="btn" data-vault>${icon("KeyRound", 14)}자격 증명 보관함</button></div>
           </section>
         </div>
       </div>`;
@@ -71,8 +73,11 @@ export function mountHome(
       }),
     );
     root.querySelector("[data-vault]")!.addEventListener("click", () => actions.vault());
+    root.querySelector("[data-shortcuts]")!.addEventListener("click", () => void import("./shortcuts").then((m) => m.openShortcuts()));
   };
   subscribe("sessions", render);
+  // The shortcut list follows the user's keys.
+  subscribe("settings", render);
   // Shown again after the last tab closed: "방금 전" from an hour ago must be
   // recomputed. The workspace shows it by clearing `hidden`.
   new MutationObserver(() => {

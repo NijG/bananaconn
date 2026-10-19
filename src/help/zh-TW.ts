@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "快速鍵",
     icon: "Keyboard",
     body: `
+      <p>所有快速鍵都可以在<b>設定 → 快速鍵</b>（或首頁上的「快速鍵設定」）中檢視和變更。沒有快速鍵的動作（分割畫面、第 n 個分頁、開啟記錄等）以及程式碼片段和巨集也可以新指定快速鍵；用每個動作的「預設值」或「全部還原為預設值」即可還原。下表為預設值。</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>本使用說明 (在終端機內會傳給遠端程式)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>新增工作階段</td></tr>

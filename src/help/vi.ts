@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "Phím tắt",
     icon: "Keyboard",
     body: `
+      <p>Có thể xem và thay đổi mọi phím tắt trong <b>Cài đặt → Phím tắt</b> (hoặc "Cài đặt phím tắt" trên màn hình chính). Các thao tác chưa có phím tắt (chia màn hình, tab thứ n, bật nhật ký…) cùng đoạn lệnh và macro cũng có thể được gán phím tắt mới; nút "Mặc định" của từng thao tác hoặc "Đặt lại tất cả về mặc định" sẽ hoàn tác. Bảng dưới đây là giá trị mặc định.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>Hướng dẫn này (bên trong terminal, phím được gửi tới chương trình từ xa)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>Phiên mới</td></tr>

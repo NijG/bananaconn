@@ -1,6 +1,7 @@
 // Session sidebar: searchable folder tree with drag-and-drop between folders.
 
 import { icon } from "./icons";
+import { actionFor } from "./keymap";
 
 /** Row heights (.folder-row, .session-row) and when to draw only the rows in view. */
 const FOLDER_H = 30;
@@ -667,9 +668,8 @@ export class Sidebar {
     if (e.target !== this.tree) return;
     const s = this.selected ? this.session(this.selected) : undefined;
     const ids = this.visibleIds();
-    const mod = e.ctrlKey || e.metaKey;
-    // `code` survives the Korean IME (key becomes "ㅊ"); `key` covers synthetic events without a code.
-    const letter = (l: string) => e.code === `Key${l.toUpperCase()}` || e.key.toLowerCase() === l;
+    // Shortcuts of the tree (keymap.ts; the user can change them). Arrows and Esc are fixed.
+    const act = actionFor(e, "tree");
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const i = this.selected ? ids.indexOf(this.selected) : -1;
@@ -685,28 +685,28 @@ export class Sidebar {
       this.reveal(next);
       return;
     }
-    if (mod && !e.shiftKey && !e.altKey && letter("a")) {
+    if (act === "tree.selectAll") {
       e.preventDefault();
       return this.select(ids, this.selected ?? ids[0] ?? null);
     }
     if (e.key === "Escape" && this.picked.size > 1) return this.select(this.selected ? [this.selected] : [], this.selected);
     if (this.picked.size > 1) {
       const list = this.pickedSessions();
-      if (e.key === "Delete") return void this.bulkDelete(list);
-      if (e.key === "F2") return this.bulkEdit(list);
-      if (e.key === "Enter") return list.forEach((x) => this.actions.connect(x));
+      if (act === "tree.delete") return void this.bulkDelete(list);
+      if (act === "tree.edit") return this.bulkEdit(list);
+      if (act === "tree.connect") return list.forEach((x) => this.actions.connect(x));
     }
-    if (mod && !e.shiftKey && !e.altKey && letter("v") && this.clip) {
+    if (act === "tree.paste" && this.clip) {
       e.preventDefault();
       return void this.pasteSession(s ? s.folder : this.clip.folder);
     }
     if (!s) return;
-    if (mod && !e.shiftKey && !e.altKey && letter("c")) {
+    if (act === "tree.copy") {
       e.preventDefault();
       return this.copySession(s);
     }
-    if (e.key === "Enter") this.actions.connect(s);
-    if (e.key === "F2") this.actions.edit(s);
-    if (e.key === "Delete") this.deleteSession(s);
+    if (act === "tree.connect") this.actions.connect(s);
+    if (act === "tree.edit") this.actions.edit(s);
+    if (act === "tree.delete") this.deleteSession(s);
   }
 }

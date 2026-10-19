@@ -19,7 +19,8 @@ import { confirmDialog, contextMenu, errorText, esc, toast } from "./ui";
 import { openVault } from "./vault";
 
 import { Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
-import { installUpdate, loadVersion, onUpdateChange, startAutoUpdate, updateBadge } from "./updates";
+import { checkForUpdate, installUpdate, loadVersion, onUpdateChange, startAutoUpdate, updateBadge } from "./updates";
+import { ACTIONS, actionFor } from "./keymap";
 // Loaded on first use: noVNC probes the video decoder when imported, and
 // help, the editor and the importers are big; none of it is needed at startup.
 const openHelp = (section?: string) =>
@@ -400,34 +401,66 @@ $("#statusbar").addEventListener("click", (e) => {
   if (kind === "tftp" || kind === "http") openFileServer(kind);
 });
 
-// ---- keyboard shortcuts ------------------------------------------------------------
-window.addEventListener("keydown", (e) => {
-  if (document.querySelector(".modal-backdrop") || appLock.locked) return;
-  const k = e.key.toLowerCase();
-  if (e.ctrlKey && e.key === "Tab") {
-    e.preventDefault();
-    ws.cycle(e.shiftKey ? -1 : 1);
-  } else if (e.key === "F1" && !e.ctrlKey && !e.altKey && !e.shiftKey && !(e.target as Element | null)?.closest?.(".xterm")) {
-    // In a terminal F1 belongs to the remote program (htop, mc); help is F1 elsewhere.
-    e.preventDefault();
-    openHelp();
-  } else if (e.ctrlKey && e.shiftKey && k === "n") {
-    e.preventDefault();
-    edit(null);
-  } else if ((e.ctrlKey && e.shiftKey && k === "w") || (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "F4")) {
-    e.preventDefault();
+// ---- keyboard shortcuts (keymap.ts; the user can change them) ----------------------
+/** What each app-wide action does; false: not applicable now (the key goes on). */
+const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
+  "app.help": () => void openHelp(),
+  "app.newSession": () => void edit(null),
+  "app.quickConnect": () => quickTarget.focus(),
+  "app.toggleSidebar": () => toggleSidebar(),
+  "app.searchSessions": () => (ws.activeTab ? false : sidebar.focusSearch()),
+  "app.settings": () => void openSettings(),
+  "app.shortcuts": () => void import("./shortcuts").then((m) => m.openShortcuts()),
+  "app.vault": () => void openVault(),
+  "app.tunnels": () => openTunnelManager(),
+  "app.netTools": () => openNetworkTools(),
+  "app.lock": () => (appLock.enabled ? void lockNow() : false),
+  "app.checkUpdate": () => void checkForUpdate(true),
+  "tab.next": () => ws.cycle(1),
+  "tab.prev": () => ws.cycle(-1),
+  "tab.close": () => {
     const t = ws.activeTab;
     if (t) ws.close(t.id);
-  } else if (e.ctrlKey && e.shiftKey && k === "k") {
-    e.preventDefault();
-    quickTarget.focus();
-  } else if (e.ctrlKey && e.shiftKey && k === "b") {
-    e.preventDefault();
-    toggleSidebar();
-  } else if (e.ctrlKey && !e.shiftKey && k === "f" && !ws.activeTab) {
-    e.preventDefault();
-    sidebar.focusSearch();
-  }
+  },
+  "tab.closeOthers": () => {
+    const t = ws.activeTab;
+    if (t) void ws.closeOthers(t.id);
+  },
+  "tab.duplicate": () => {
+    const t = ws.activeTab;
+    if (t) ws.duplicateHandler?.(t.session);
+  },
+  "tab.reconnect": () => {
+    const v = ws.activeTab?.view;
+    if (!v?.reconnect) return false;
+    v.reconnect();
+  },
+  ...Object.fromEntries(
+    Array.from({ length: 9 }, (_, i) => [
+      `tab.go${i + 1}`,
+      () => {
+        const t = ws.tabs[i];
+        if (t) ws.activate(t.id);
+      },
+    ]),
+  ),
+  "pane.next": () => ws.focusSlot((ws.focused + 1) % ws.slots.length),
+  "layout.single": () => ws.setLayout("single"),
+  "layout.cols": () => ws.setLayout("cols"),
+  "layout.rows": () => ws.setLayout("rows"),
+  "layout.grid": () => ws.setLayout("grid"),
+  "broadcast.toggle": () => $("#btn-broadcast").click(),
+};
+window.addEventListener("keydown", (e) => {
+  if (document.querySelector(".modal-backdrop") || appLock.locked) return;
+  const id = actionFor(e, "global");
+  const run = id && GLOBAL_ACTIONS[id];
+  if (!run) return;
+  // Some keys belong to the program in a terminal (F1 for htop, Ctrl+F for less).
+  const inTerminal = !!(e.target as Element | null)?.closest?.(".xterm");
+  if (inTerminal && ACTIONS.find((a) => a.id === id)?.terminalKeeps) return;
+  if (run() === false) return;
+  e.preventDefault();
 });
 // Block the browser's own context menu outside places that provide one.
 window.addEventListener("contextmenu", (e) => {

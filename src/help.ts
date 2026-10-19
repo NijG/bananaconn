@@ -239,6 +239,7 @@ const KO_SECTIONS: HelpSection[] = [
     title: "단축키",
     icon: "Keyboard",
     body: `
+      <p>단축키는 <b>설정 → 단축키</b>(또는 홈 화면의 "단축키 설정")에서 모두 보고 바꿀 수 있습니다. 단축키가 없는 동작(화면 나누기, n번째 탭, 로그 켜기 등)과 스니펫·매크로에도 새로 지정할 수 있고, 동작별 "기본값" 또는 "모두 기본값으로"로 되돌립니다. 아래 표는 기본값입니다.</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>이 도움말 (터미널 안에서는 원격 프로그램으로 감)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>새 세션</td></tr>

@@ -226,6 +226,11 @@ file placed in the share or the download location by anyone else is never instal
 
 ## Keyboard shortcuts
 
+Every shortcut can be changed in **Settings → Keyboard shortcuts**: change, add or remove keys, give a key to actions
+that have none (layouts, n-th tab, duplicate tab, reconnect, logging, clear screen, font size …) or to any snippet or
+macro, and restore the defaults per action or all at once. A key already in use is reported before it is moved, and
+shortcuts match the physical key, so they also work with an input method such as Korean switched on. The defaults:
+
 | Keys | Action |
 | --- | --- |
 | `Ctrl+Shift+N` | New session |

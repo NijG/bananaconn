@@ -230,6 +230,7 @@ export const SECTIONS: HelpSection[] = [
     title: "键盘快捷键",
     icon: "Keyboard",
     body: `
+      <p>所有快捷键都可以在<b>设置 → 键盘快捷键</b>（或主页上的“键盘快捷键设置”）中查看和修改。没有快捷键的操作（分屏、第 n 个标签页、开启日志等）以及代码片段和宏也可以新指定快捷键；用每个操作的“默认值”或“全部恢复默认值”即可还原。下表为默认值。</p>
       <table class="help-table">
         <tr><td>${kbd("F1")}</td><td>本帮助 (在终端内会发送给远程程序)</td></tr>
         <tr><td>${kbd("Ctrl+Shift+N")}</td><td>新建会话</td></tr>
