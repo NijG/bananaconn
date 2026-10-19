@@ -82,6 +82,8 @@ command can take a site down:
 - [Updates](#updates)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Security model](#security-model)
+- [Privacy](#privacy)
+- [Code signing policy](#code-signing-policy)
 - [Where data is stored](#where-data-is-stored)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
@@ -307,6 +309,32 @@ shortcuts match the physical key, so they also work with an input method such as
 - **Signed updates.** See [Updates](#updates).
 - **Local only.** BananaConn. has no account, no telemetry and no cloud service. It connects only to the hosts you
   choose and to the update locations above.
+
+## Privacy
+
+BananaConn. collects no personal data and sends nothing about you or your sessions anywhere. The only connection it
+makes on its own is the update check: it downloads `latest.json` from this repository’s releases (or from the NAS
+folder you set), at startup and every 30 minutes. GitHub sees that request like any download. Turn it off with
+*Settings → Updates → Check for updates automatically*; you can still check by hand. Every other connection is
+one you open.
+
+## Code signing policy
+
+Free code signing on Windows provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/) — *application pending; until it is approved, the installers are
+unsigned.*
+
+Installers are built only by the [Release build](.github/workflows/release.yml) workflow from this repository and
+carry a build provenance attestation (see [Verifying a download](#verifying-a-download)). Each release is signed
+only after a manual approval.
+
+| Role | Members |
+| --- | --- |
+| Committers and reviewers | [NijG](https://github.com/NijG) |
+| Approvers | [NijG](https://github.com/NijG) |
+
+The installer adds an uninstaller to *Settings → Apps → Installed apps*; see
+[Where data is stored](#where-data-is-stored) for what stays after uninstalling.
 
 ## Where data is stored
 
