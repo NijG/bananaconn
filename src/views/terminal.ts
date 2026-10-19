@@ -805,7 +805,7 @@ export class TerminalView implements View {
           },
         );
       // User data (commands, names) is shown as is, never run through translation.
-      const item = (h: (typeof hits)[number]) => `<li><code data-i18n-skip>${esc(h.line)}</code> — ${esc(h.rule.note)}</li>`;
+      const item = (h: (typeof hits)[number]) => `<li><code data-i18n-skip>${esc(h.line)}</code> — <span>${esc(h.rule.note)}</span></li>`;
       const blocked = hits.filter((h) => h.rule.action === "block");
       if (blocked.length) {
         await audit("BLOCKED");

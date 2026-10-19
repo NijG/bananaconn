@@ -5,12 +5,20 @@
 <h1 align="center">BananaConn.</h1>
 
 <p align="center">
-  <b>An all-in-one remote access workspace for Windows.</b><br>
-  SSH · Telnet · Serial · SFTP · FTP · FTPS · TFTP · RDP · VNC — in tabs and split panes, in one window.
+  <b>The safe remote workspace for network and server operators on Windows.</b><br>
+  SSH · Telnet · Serial · SFTP · FTP · FTPS · TFTP · RDP · VNC — in tabs and split panes, in one 8 MB app.
+</p>
+
+<p align="center">
+  <a href="https://github.com/NijG/bananaconn/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/NijG/bananaconn?label=release&color=f5c518"></a>
+  <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0b0d12">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-cb8944">
+  <img alt="9 languages" src="https://img.shields.io/badge/languages-9-e8302c">
 </p>
 
 <p align="center">
   <a href="https://github.com/NijG/bananaconn/releases/latest">Download the latest release</a> ·
+  <a href="#why-bananaconn">Why BananaConn.</a> ·
   <a href="#features">Features</a> ·
   <a href="#installation">Installation</a> ·
   <a href="#building-from-source">Building from source</a> ·
@@ -34,10 +42,30 @@ It is written from scratch on public protocols and open-source libraries: a Rust
   (follows the Windows display language, can be changed in Settings)
 - **License:** MIT
 
-![BananaConn. home screen](docs/screenshot-home.png)
+![BananaConn. in action: split panes, broadcast input, a blocked risky command and device monitoring](docs/demo.gif)
+
+## Why BananaConn.
+
+There are many terminals. BananaConn. is built for the people who run networks and servers, where one wrong
+command can take a site down:
+
+- **Snippets and macros that cannot hurt you.** Saved commands and recorded macros — sent to one tab or to every
+  tab at once — never change the clock or time synchronisation; reloads, `write erase`, `rm -rf`, reboots and
+  similar ask first and are written to an audit log, also when they hide inside `sudo`, `bash -c` or chained commands.
+- **A terminal that knows the device.** Cisco IOS/IOS-XE/NX-OS/ASA, Juniper, Huawei, FortiGate, Aruba, Linux, AIX,
+  HP-UX and Solaris are recognised automatically: CPU and memory in the status bar, top processes, device-specific
+  show commands and configuration backups that refuse truncated output.
+- **The field toolkit in one place.** Built-in TFTP, FTP and HTTP servers for firmware and backups, a TFTP client,
+  ping/port/DNS tools, a serial console with paste pacing and Break.
+- **Move in without retyping.** Import sessions from SecureCRT, PuTTY, KiTTY, WinSCP, Xshell, mRemoteNG, RDCMan,
+  `.rdp` files and CSV — including SecureCRT log settings.
+- **Small, private and closed-network friendly.** An 8 MB installer, no account and no telemetry, passwords in the
+  Windows Credential Manager, and signed updates from GitHub or from your own NAS when the internet is blocked.
+- **Yours to shape.** Every keyboard shortcut can be changed or added, including one-key snippets and macros.
 
 ## Contents
 
+- [Why BananaConn.](#why-bananaconn)
 - [Features](#features)
   - [Protocols](#protocols)
   - [Workspace](#workspace)
@@ -119,8 +147,9 @@ It is written from scratch on public protocols and open-source libraries: a Rust
 
 ### Risky command protection
 
-Every line sent to a terminal — typed, pasted, sent from a snippet, a macro or broadcast input — is checked
-against a list of rules before it leaves the app. Rules see through `sudo`/`doas`/`su -c`/`sh -c`/`eval`,
+Every line sent from a snippet or a macro — to one tab, or to every connected tab when broadcast input is on — is
+checked against a list of rules before it leaves the app. (Keys typed one by one go to the remote shell as they are:
+with line editing and history the final command cannot be known reliably.) Rules see through `sudo`/`doas`/`su -c`/`sh -c`/`eval`,
 `env VAR=…`, chained commands (`;`, `&&`, `||`, `|`, `$( )`), absolute paths and line continuations, and they
 apply the effect of Backspace and Ctrl-U before matching.
 

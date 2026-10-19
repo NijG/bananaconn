@@ -49,6 +49,8 @@
       "wix": {
         "upgradeCode": "{5DA65EA0-0D11-5EB4-9E69-A3C32182D9C2}"
       }
-    }
+    },
+    "publisher": "NijG",
+    "copyright": "Copyright (c) 2026 BananaConn contributors"
   }
 }
