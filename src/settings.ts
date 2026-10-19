@@ -35,8 +35,79 @@ function themeOptions(light: boolean, current: string): string {
     .join("");
 }
 
-/** `section`: scroll to it (e.g. "update" from the update login guide). */
-export function openSettings(section?: "update") {
+/** Settings pages, in menu order: the section id, its menu label and icon. */
+const PAGES: { id: string; label: string; icon: string }[] = [
+  { id: "general", label: "일반", icon: "Globe" },
+  { id: "terminal", label: "터미널", icon: "SquareTerminal" },
+  { id: "shortcuts", label: "단축키", icon: "Keyboard" },
+  { id: "security", label: "보안", icon: "LockKeyhole" },
+  { id: "session", label: "세션", icon: "Server" },
+  { id: "risk", label: "위험 명령", icon: "ShieldAlert" },
+  { id: "log", label: "로그", icon: "ScrollText" },
+  { id: "update", label: "업데이트", icon: "RefreshCw" },
+];
+
+/** Split the settings form into pages at its section headings, with a menu
+ * on the left; the fields stay in the one form, so saving is unchanged. */
+function paginate(form: HTMLFormElement, start: string | undefined) {
+  const pages = new Map<string, HTMLElement>();
+  let current = document.createElement("div");
+  current.className = "settings-page";
+  current.dataset.page = "general";
+  pages.set("general", current);
+  for (const node of [...form.childNodes]) {
+    const id = node instanceof HTMLElement && node.tagName === "H4" ? node.dataset.section : undefined;
+    if (id) {
+      current = document.createElement("div");
+      current.className = "settings-page";
+      current.dataset.page = id;
+      pages.set(id, current);
+    }
+    current.append(node);
+  }
+  const nav = document.createElement("nav");
+  nav.className = "settings-nav";
+  nav.setAttribute("aria-label", "설정 항목");
+  nav.innerHTML = PAGES.filter((p) => pages.has(p.id))
+    .map((p) => `<button type="button" data-page="${p.id}">${icon(p.icon, 15)}<span>${p.label}</span></button>`)
+    .join("");
+  const body = document.createElement("div");
+  body.className = "settings-pages";
+  body.append(...pages.values());
+  form.replaceChildren(nav, body);
+  form.classList.add("paged");
+  const show = (id: string) => {
+    if (!pages.has(id)) id = "general";
+    pages.forEach((el, key) => (el.hidden = key !== id));
+    nav.querySelectorAll<HTMLElement>("[data-page]").forEach((b) => b.classList.toggle("on", b.dataset.page === id));
+    body.scrollTop = 0;
+    try {
+      localStorage.setItem("bx.settingsPage", id);
+    } catch {
+      /* storage blocked: the menu still works */
+    }
+  };
+  nav.addEventListener("click", (e) => {
+    const id = (e.target as HTMLElement).closest<HTMLElement>("[data-page]")?.dataset.page;
+    if (id) show(id);
+  });
+  let remembered: string | null = null;
+  try {
+    remembered = localStorage.getItem("bx.settingsPage");
+  } catch {
+    /* ignore */
+  }
+  show(start ?? remembered ?? "general");
+}
+
+/** Show the settings page holding this field (a refused save points at it). */
+function revealPage(el: Element | null | undefined) {
+  const page = el?.closest<HTMLElement>(".settings-page")?.dataset.page;
+  if (page) el!.closest("form")?.querySelector<HTMLElement>(`.settings-nav [data-page="${page}"]`)?.click();
+}
+
+/** `section`: open at that page (e.g. "update" from the update login guide). */
+export function openSettings(section?: "update" | "risk" | "shortcuts") {
   const s = state.settings;
   const passwords = state.credentials.filter((c) => c.kind === "password");
   const check = (name: keyof Settings, label: string, hint: string) =>
@@ -45,13 +116,13 @@ export function openSettings(section?: "update") {
   const m = modal({
     title: "설정",
     icon: "Settings",
-    width: 680,
+    width: 860,
     body: `<form class="form settings">
         <div class="lang-row"><span>화면 언어 <span data-i18n-skip>(LANGUAGE)</span><small>고르기 전에는 Windows 표시 언어를 따릅니다</small></span>
           <select class="lang-select" name="uiLanguage" aria-label="화면 언어" data-i18n-skip>
             ${LANGUAGES.map(([code, name]) => `<option value="${code}" ${code === shownLanguage() ? "selected" : ""}>${name}</option>`).join("")}
           </select></div>
-        <h4>터미널</h4>
+        <h4 data-section="terminal">터미널</h4>
         <div class="field"><span>색 테마 — 어두운 배경</span>
           <div class="theme-pick">${themeOptions(false, s.terminalTheme)}</div></div>
         <div class="field"><span>색 테마 — 밝은 배경</span>
@@ -75,13 +146,13 @@ export function openSettings(section?: "update") {
         <h4 data-section="shortcuts">단축키</h4>
         <div class="row"><button type="button" class="btn" data-shortcuts>${icon("Keyboard", 14)}단축키 보기·바꾸기</button>
           <span class="muted small">지금 쓰는 모든 단축키를 보고 바꾸거나, 단축키가 없는 동작과 스니펫에 새로 지정합니다.</span></div>
-        <h4>보안</h4>
+        <h4 data-section="security">보안</h4>
         <div class="grid-2">
           <div class="field"><span>마스터 비밀번호</span>
             <button type="button" class="btn" data-master>${icon("LockKeyhole", 14)}${appLock.enabled ? "바꾸기·해제" : "설정"}</button></div>
           <label class="field"><span>자리 비움 자동 잠금 (분, 0 = 사용 안 함)</span><input name="autoLockMinutes" type="number" min="0" max="1440" value="${s.autoLockMinutes}"/></label>
         </div>
-        <h4>세션</h4>
+        <h4 data-section="session">세션</h4>
         ${check("sftpWithSsh", "SSH 연결 시 SFTP 파일 창을 옆에 함께 열기", "SSH 터미널 옆 칸에 같은 서버의 파일 브라우저를 엽니다. 터미널 툴바의 \"파일\" 버튼으로도 열 수 있습니다.")}
         ${check("remoteMonitor", "SSH·Telnet 접속 대상의 CPU·메모리를 상태 표시줄에 표시", "탭마다 연결을 하나 더 열어 읽기 전용 명령으로 확인합니다. 리눅스는 2초, 네트워크 장비는 15초, AIX·HP-UX는 10초마다 읽고, 그 장비의 탭이 화면에 없으면 멈춥니다. 터미널 화면에는 아무것도 입력하지 않습니다.")}
         ${check("confirmClose", "연결된 탭을 닫을 때 확인", "실수로 연결을 끊지 않도록 묻습니다.")}
@@ -93,7 +164,7 @@ export function openSettings(section?: "update") {
           <button type="button" class="btn btn-sm" data-risk-reset>${icon("RefreshCw", 14)}기본 규칙으로</button>
           <button type="button" class="btn btn-sm" data-risk-log>${icon("FolderOpen", 14)}위험 명령 기록 보기</button>
         </div>
-        <h4>로그 (기본값 · 세션마다 따로 정할 수도 있습니다)</h4>
+        <h4 data-section="log">로그 (기본값 · 세션마다 따로 정할 수도 있습니다)</h4>
         ${logFields(
           {
             path: s.logTemplate,
@@ -124,7 +195,7 @@ export function openSettings(section?: "update") {
   });
   m.root.querySelector("[data-master]")!.addEventListener("click", () => openMasterPassword());
   m.root.querySelector("[data-shortcuts]")!.addEventListener("click", () => void import("./shortcuts").then((x) => x.openShortcuts()));
-  if (section) m.root.querySelector(`[data-section="${section}"]`)?.scrollIntoView({ block: "start" });
+  paginate(m.root.querySelector<HTMLFormElement>("form.settings")!, section);
   // Applies at once (and is saved at once): the whole app switches language.
   m.root.querySelector<HTMLSelectElement>("[name=uiLanguage]")!.addEventListener("change", (e) => {
     const value = (e.target as HTMLSelectElement).value;
@@ -206,11 +277,13 @@ export function openSettings(section?: "update") {
     if (broken >= 0) {
       const input = rulesEl.querySelector<HTMLInputElement>(`[data-i="${broken}"] [data-k=pattern]`);
       input?.classList.add("invalid");
+      revealPage(input);
       input?.scrollIntoView({ block: "center" });
       input?.focus();
       return toast("정규식이 잘못된 위험 명령 규칙이 있어 저장하지 않았습니다. 빨간 칸을 고치거나 지우세요", "error");
     }
     if (runnableLogName(val("log.path").value)) {
+      revealPage(val("log.path"));
       val("log.path").focus();
       return toast("로그 파일 이름에 실행되는 확장자(.bat, .exe 등)는 쓸 수 없습니다", "error");
     }

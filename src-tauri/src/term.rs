@@ -424,6 +424,9 @@ fn valid_com_name(name: &str) -> bool {
     upper.strip_prefix("COM").and_then(|n| n.parse::<u16>().ok()).is_some_and(|n| (1..=256).contains(&n))
 }
 
+/// Read/write timeout of a COM port (see open_serial).
+const SERIAL_POLL: Duration = Duration::from_millis(5);
+
 fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutPump>) -> Result<Arc<Session>, String> {
     use serialport::{DataBits, FlowControl, Parity, StopBits};
     let name = port_name.trim().to_ascii_uppercase();
@@ -458,7 +461,11 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
         .parity(parity)
         .stop_bits(stop_bits)
         .flow_control(flow)
-        .timeout(Duration::from_millis(100))
+        // The port is opened for synchronous I/O and the reader and writer
+        // share it, so Windows runs their calls one after another: a write
+        // (a keystroke) waits until the idle read times out. A short timeout
+        // keeps typing immediate; a read still returns as soon as bytes arrive.
+        .timeout(SERIAL_POLL)
         .open()
         .map_err(|e| match e.kind() {
             serialport::ErrorKind::NoDevice | serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => format!("{name} 포트를 찾을 수 없습니다. 케이블 연결과 포트 번호를 확인하세요."),
@@ -507,7 +514,7 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
 }
 
 /// Serial writer: a device pausing us (XOFF, CTS low) makes writes time out
-/// after 100 ms; that is a pause, not an error, so the write is retried until
+/// after SERIAL_POLL; that is a pause, not an error, so the write is retried until
 /// it completes or the session is closed. No flush: FlushFileBuffers would wait
 /// for the device without a timeout.
 fn spawn_serial_writer(
@@ -1037,8 +1044,8 @@ pub async fn term_close(state: State<'_, TermState>, id: String) -> Result<(), S
             closed.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = control.shutdown(std::net::Shutdown::Both);
         }
-        // Wait until the port is really released (threads stop within their
-        // 100 ms poll), so an immediate reconnect can open it.
+        // Wait until the port is really released (the reader stops within its
+        // poll, the writer within 100 ms), so an immediate reconnect can open it.
         Backend::Serial { closed, control, threads } => {
             closed.store(true, std::sync::atomic::Ordering::Relaxed);
             let handles = std::mem::take(&mut *threads.lock().unwrap());
