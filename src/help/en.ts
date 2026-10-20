@@ -31,6 +31,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Folders</b>: In the session editor, write the folder with slashes, like <code>Prod/Web servers</code>, to create subfolders. You can also drag a session onto a folder to move it.</li>
+        <li><b>Sorting and order</b>: The sort button above the session list chooses by name (AP2 before AP10), by address (IPs compared as numbers), recently connected, or custom. Drag a session above or below another to put it there; folders are reordered, or moved into another folder, the same way. Reordering switches to the custom order, which is kept. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} move the selected session one place, and "Sort this folder by name/address" in a folder's menu tidies it in one go.</li>
         <li><b>Search</b>: Type part of a name, host, user or note into the search box at the top.</li>
         <li><b>Multi-select</b>: ${kbd("Ctrl")}+click to pick one at a time, ${kbd("Shift")}+click to pick a range. ${kbd("Shift+↑/↓")} and ${kbd("Ctrl+A")} also work. ${kbd("Esc")} clears the selection.</li>
         <li><b>Bulk actions</b>: With several selected, right-click → Bulk edit (${kbd("F2")}: user, port, credential, folder, key mode), Move to folder, Delete (${kbd("Del")}), Connect all (${kbd("Enter")}).</li>

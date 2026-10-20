@@ -632,6 +632,13 @@ kbd.word {
 .session-row.selected .row-go {
   opacity: 1;
 }
+/* Where a dragged row lands: a line above or below the row. */
+.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
 .drop-target {
   outline: 2px dashed var(--accent);
   outline-offset: -2px;

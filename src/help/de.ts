@@ -31,6 +31,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Ordner</b>: Schreiben Sie im Sitzungseditor den Ordner mit Schrägstrichen, etwa <code>Prod/Web servers</code>, um Unterordner anzulegen. Sie können eine Sitzung auch auf einen Ordner ziehen, um sie zu verschieben.</li>
+        <li><b>Sortierung und Reihenfolge</b>: Die Sortierschaltfläche über der Sitzungsliste wählt nach Namen (AP2 vor AP10), nach Adresse (IPs als Zahlen verglichen), zuletzt verbunden oder benutzerdefiniert. Ziehen Sie eine Sitzung über oder unter eine andere, um sie dort einzuordnen; Ordner werden genauso umgeordnet oder in einen anderen Ordner verschoben. Umordnen schaltet auf die benutzerdefinierte Reihenfolge um, die erhalten bleibt. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} verschieben die gewählte Sitzung um eine Stelle, und „Diesen Ordner nach Namen/Adresse sortieren“ im Ordnermenü räumt ihn auf einmal auf.</li>
         <li><b>Suche</b>: Geben Sie einen Teil eines Namens, Hosts, Benutzers oder einer Notiz in das Suchfeld oben ein.</li>
         <li><b>Mehrfachauswahl</b>: ${kbd("Ctrl")}+Klick wählt einzeln aus, ${kbd("Shift")}+Klick einen Bereich. ${kbd("Shift+↑/↓")} und ${kbd("Ctrl+A")} funktionieren ebenfalls. ${kbd("Esc")} hebt die Auswahl auf.</li>
         <li><b>Sammelaktionen</b>: Bei mehreren ausgewählten Sitzungen Rechtsklick → Gemeinsam bearbeiten (${kbd("F2")}: Benutzer, Port, Anmeldedaten, Ordner, Tastaturmodus), In Ordner verschieben, Löschen (${kbd("Del")}), Alle verbinden (${kbd("Enter")}).</li>

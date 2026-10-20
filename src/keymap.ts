@@ -84,6 +84,8 @@ export const ACTIONS: ActionDef[] = [
   { id: "tree.selectAll", label: "모두 선택", scope: "tree", keys: ["Ctrl+A"] },
   { id: "tree.copy", label: "세션 복사", scope: "tree", keys: ["Ctrl+C"] },
   { id: "tree.paste", label: "세션 붙여넣기", scope: "tree", keys: ["Ctrl+V"] },
+  { id: "tree.moveUp", label: "세션을 위로 옮기기", scope: "tree", keys: ["Alt+Up"] },
+  { id: "tree.moveDown", label: "세션을 아래로 옮기기", scope: "tree", keys: ["Alt+Down"] },
   // File browser
   { id: "files.refresh", label: "새로 고침", scope: "files", keys: ["F5"] },
   { id: "files.open", label: "열기", scope: "files", keys: ["Enter"] },

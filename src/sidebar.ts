@@ -1,4 +1,5 @@
-// Session sidebar: searchable folder tree with drag-and-drop between folders.
+// Session sidebar: searchable folder tree. Sessions and folders are dragged
+// into folders and, in the manual order, to any place among their siblings.
 
 import { icon } from "./icons";
 import { actionFor } from "./keymap";
@@ -10,11 +11,19 @@ const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
 import { endpoint, PROTOCOLS, type Session } from "./model";
+import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
+  adoptManualOrder,
   addFolder,
   allFolders,
   deleteFolder,
   moveSessions,
+  placeFolder,
+  placeSessions,
+  sessionPositions,
+  sortFolder,
+  startManualOrder,
+  updateSettings,
   removeSession,
   removeSessions,
   renameFolder,
@@ -41,8 +50,12 @@ interface FolderNode {
 const collapsed = new Set<string>(JSON.parse(localStorage.getItem("bx.collapsed") ?? "[]") as string[]);
 const saveCollapsed = () => localStorage.setItem("bx.collapsed", JSON.stringify([...collapsed]));
 
-/** One collator for every sort (localeCompare with a locale builds one per call). */
-const byName = new Intl.Collator("ko");
+/** Where a dragged row would land: before/after a row, into a folder, or (no
+ * row) at the top level. */
+interface DropAt {
+  row: HTMLElement | null;
+  where: "before" | "after" | "into";
+}
 
 export class Sidebar {
   private tree: HTMLElement;
@@ -58,6 +71,10 @@ export class Sidebar {
   private anchor: string | null = null;
   /** Sessions being dragged: the whole selection when the dragged row is part of it. */
   private dragIds: string[] | null = null;
+  /** The folder being dragged. */
+  private dragFolder: string | null = null;
+  /** The row showing where a drop would land. */
+  private dropMark: HTMLElement | null = null;
 
   constructor(
     private root: HTMLElement,
@@ -67,6 +84,7 @@ export class Sidebar {
       <div class="side-head">
         <span>세션</span>
         <div class="side-tools">
+          <button class="icon-btn" data-a="sort" title="정렬">${icon("ArrowUpDown", 16)}</button>
           <button class="icon-btn" data-a="more" title="가져오기·내보내기">${icon("Download", 16)}</button>
           <button class="icon-btn" data-a="folder" title="새 폴더">${icon("FolderPlus", 16)}</button>
           <button class="icon-btn" data-a="new" title="새 세션 (Ctrl+Shift+N)">${icon("Plus", 16)}</button>
@@ -77,6 +95,10 @@ export class Sidebar {
     this.tree = root.querySelector(".tree")!;
     root.querySelector('[data-a="new"]')!.addEventListener("click", () => actions.edit(null));
     root.querySelector('[data-a="folder"]')!.addEventListener("click", () => this.newFolder(""));
+    root.querySelector('[data-a="sort"]')!.addEventListener("click", (e) => {
+      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      this.sortMenu(r.left, r.bottom + 4);
+    });
     root.querySelector('[data-a="more"]')!.addEventListener("click", async (e) => {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const mod = await import("./importExport").catch((err) => void toast(errorText(err), "error"));
@@ -118,29 +140,36 @@ export class Sidebar {
       contextMenu(e.clientX, e.clientY, [
         { label: "새 세션", icon: "Plus", action: () => this.actions.edit(null) },
         { label: "맨 위에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession("") },
+        "-",
+        { label: "맨 위 단계를 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce("", "name") },
+        { label: "맨 위 단계를 주소순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce("", "address") },
       ]);
     });
-    // Dropping on empty tree space moves a session to the top level; on a
-    // session row, into that session's folder (a short drag released on the
-    // dragged row itself changes nothing).
+    // Drops are handled here for every row (rows are redrawn, and only the
+    // rows in view exist when there are many).
     this.tree.addEventListener("dragover", (e) => {
-      if (this.dragIds) e.preventDefault();
+      if (!this.dragIds && !this.dragFolder) return;
+      const at = this.dropAt(e);
+      this.markDrop(at);
+      if (at) e.preventDefault();
+    });
+    this.tree.addEventListener("dragleave", (e) => {
+      if (!this.tree.contains(e.relatedTarget as Node | null)) this.markDrop(null);
     });
     this.tree.addEventListener("drop", (e) => {
-      const target = e.target as HTMLElement;
-      if (!this.dragIds || target.closest(".folder-row")) return;
+      const at = this.dropAt(e);
+      const [folder, ids] = [this.dragFolder, this.dragIds];
+      // The drag ends here: the redraw below can remove the dragged row, and
+      // a detached row's dragend reaches no listener.
+      this.endDrag();
+      if (!at) return;
       e.preventDefault();
-      const row = target.closest<HTMLElement>(".session-row");
-      if (row) {
-        const id = row.dataset.session!;
-        if (this.dragIds.includes(id)) return;
-        const folder = state.sessions.find((s) => s.id === id)?.folder ?? "";
-        return moveSessions(this.dragIds, folder);
-      }
-      moveSessions(this.dragIds, "");
+      if (folder) void this.dropFolder(folder, at);
+      else if (ids) void this.dropSessions(ids, at);
     });
     subscribe("sessions", () => this.render());
     subscribe("folders", () => this.render());
+    subscribe("settings", () => this.render());
     this.render();
   }
 
@@ -191,18 +220,21 @@ export class Sidebar {
     const html: string[] = [];
     const heights: number[] = [];
     const order: string[] = [];
+    const mode = state.settings.sessionSort;
+    const bySession = sessionCompare(mode, mode === "manual" ? sessionPositions() : new Map());
+    const byFolder = folderCompare(mode, state.settings.folderOrder);
     const walk = (node: FolderNode, depth: number) => {
-      const folders = [...node.children.values()].sort((a, b) => byName.compare(a.name, b.name));
+      const folders = [...node.children.values()].sort((a, b) => byFolder(a.path, b.path));
       for (const f of folders) {
         const open = this.query ? true : !collapsed.has(f.path);
-        html.push(`<div class="folder-row" data-folder="${esc(f.path)}" style="--depth:${depth}">
+        html.push(`<div class="folder-row" data-folder="${esc(f.path)}" draggable="true" style="--depth:${depth}">
             <span class="chev">${icon(open ? "ChevronDown" : "ChevronRight", 14)}</span>
             ${icon(open ? "FolderOpen" : "Folder", 15, "folder-ico")}
             <span class="fname">${esc(f.name)}</span><span class="count">${this.count(f)}</span></div>`);
         heights.push(FOLDER_H);
         if (open) walk(f, depth + 1);
       }
-      const sessions = [...node.sessions].sort((a, b) => byName.compare(a.name, b.name));
+      const sessions = [...node.sessions].sort(bySession);
       for (const s of sessions) {
         const p = PROTOCOLS[s.protocol];
         html.push(`<div class="session-row${this.picked.has(s.id) ? " selected" : ""}" data-session="${s.id}" draggable="true"
@@ -380,23 +412,12 @@ export class Sidebar {
           { label: "이 폴더에 새 세션", icon: "Plus", action: () => this.actions.edit(null, { folder: path }) },
           { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession(path) },
           { label: "하위 폴더 만들기", icon: "FolderPlus", action: () => this.newFolder(path) },
+          { label: "이 폴더 안을 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "name") },
+          { label: "이 폴더 안을 주소순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "address") },
           { label: "이름 바꾸기", icon: "Pencil", action: () => this.renameFolder(path) },
           "-",
           { label: "폴더 삭제", icon: "Trash2", danger: true, action: () => this.deleteFolder(path) },
         ]);
-      });
-      row.addEventListener("dragover", (e) => {
-        if (!this.dragIds) return;
-        e.preventDefault();
-        row.classList.add("drop-target");
-      });
-      row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
-      row.addEventListener("drop", (e) => {
-        row.classList.remove("drop-target");
-        if (!this.dragIds) return;
-        e.preventDefault();
-        e.stopPropagation();
-        this.moveTo(this.dragIds, path);
       });
     });
 
@@ -428,6 +449,16 @@ export class Sidebar {
       this.sessionMenu(s, e.clientX, e.clientY);
     });
     this.tree.addEventListener("dragstart", (e) => {
+      // A drag whose end was never reported (its row was redrawn) is over.
+      this.endDrag();
+      const folderRow = (e.target as HTMLElement).closest<HTMLElement>(".folder-row");
+      if (folderRow) {
+        this.dragFolder = folderRow.dataset.folder!;
+        e.dataTransfer!.effectAllowed = "move";
+        e.dataTransfer!.setData("text/plain", this.dragFolder);
+        folderRow.classList.add("dragging");
+        return;
+      }
       const s = rowSession(e);
       if (!s) return;
       if (!this.picked.has(s.id)) this.select([s.id], s.id);
@@ -438,11 +469,7 @@ export class Sidebar {
     });
     // On the document: the dragged row may have been replaced by a redraw
     // (a save mid-drag), and then its dragend never reaches the tree.
-    document.addEventListener("dragend", () => {
-      if (!this.dragIds) return;
-      this.dragIds = null;
-      this.tree.querySelectorAll(".session-row.dragging").forEach((r) => r.classList.remove("dragging"));
-    });
+    document.addEventListener("dragend", () => this.endDrag());
   }
 
   private sessionMenu(s: Session, x: number, y: number) {
@@ -470,6 +497,107 @@ export class Sidebar {
       "-",
       { label: `${list.length}개 삭제`, icon: "Trash2", hint: "Del", danger: true, action: () => this.bulkDelete(list) },
     ]);
+  }
+
+  private endDrag() {
+    if (!this.dragIds && !this.dragFolder) return;
+    this.dragIds = null;
+    this.dragFolder = null;
+    this.markDrop(null);
+    this.tree.querySelectorAll(".dragging").forEach((r) => r.classList.remove("dragging"));
+  }
+
+  private sortMenu(x: number, y: number) {
+    const mode = state.settings.sessionSort;
+    const item = (m: SessionSort, label: string, action: () => unknown) => ({ label, icon: mode === m ? "Check" : "Circle", action });
+    contextMenu(x, y, [
+      item("name", "이름순 (AP2가 AP10보다 먼저)", () => updateSettings({ sessionSort: "name" })),
+      item("address", "주소순 (IP를 숫자로)", () => updateSettings({ sessionSort: "address" })),
+      item("recent", "최근 연결순", () => updateSettings({ sessionSort: "recent" })),
+      item("manual", "사용자 지정 (끌어서 순서 바꾸기)", () => startManualOrder()),
+    ]);
+  }
+
+  /** Sort what a folder holds once (the manual order keeps it). */
+  private async sortOnce(folder: string, by: "name" | "address") {
+    const wasManual = state.settings.sessionSort === "manual";
+    await sortFolder(folder, by);
+    if (!wasManual) toast("정렬을 '사용자 지정'으로 바꿨습니다. 이제 끌어서 순서를 바꿀 수 있습니다", "info", 4000);
+  }
+
+  /** Where the dragged rows would land at this point, or null where they
+   * cannot go. Sessions: before/after a session (upper/lower half), into a
+   * folder, or the top level. Folders: before/after a folder (its upper or
+   * lower quarter), into it (the middle), or the top level. */
+  private dropAt(e: DragEvent): DropAt | null {
+    const row = (e.target as HTMLElement).closest<HTMLElement>(".session-row, .folder-row");
+    if (!row) return { row: null, where: "into" };
+    const r = row.getBoundingClientRect();
+    const y = (e.clientY - r.top) / Math.max(1, r.height);
+    if (row.classList.contains("folder-row")) {
+      if (this.dragIds) return { row, where: "into" };
+      const path = row.dataset.folder!;
+      if (this.dragFolder && (path === this.dragFolder || path.startsWith(this.dragFolder + "/"))) return null;
+      return { row, where: y < 0.25 ? "before" : y > 0.75 ? "after" : "into" };
+    }
+    if (this.dragFolder) return null;
+    if (this.dragIds?.includes(row.dataset.session!)) return null;
+    return { row, where: y < 0.5 ? "before" : "after" };
+  }
+
+  private markDrop(at: DropAt | null) {
+    const el = at?.row ?? null;
+    const cls = at ? (at.where === "into" ? "drop-target" : `drop-${at.where}`) : "";
+    if (this.dropMark && (this.dropMark !== el || !this.dropMark.classList.contains(cls))) {
+      this.dropMark.classList.remove("drop-target", "drop-before", "drop-after");
+    }
+    this.dropMark = el;
+    if (el && cls) el.classList.add(cls);
+  }
+
+  private async dropSessions(ids: string[], at: DropAt) {
+    // Dragged in the order they are shown.
+    const shown = new Map(this.order.map((id, i) => [id, i]));
+    const list = [...ids].sort((a, b) => (shown.get(a) ?? 0) - (shown.get(b) ?? 0));
+    if (!at.row) return this.moveTo(list, "");
+    if (at.row.classList.contains("folder-row")) return this.moveTo(list, at.row.dataset.folder!);
+    const target = this.session(at.row.dataset.session!);
+    if (!target) return;
+    // Onto a row of another folder in an automatic order: only the folder
+    // changes. Among its own folder (or in the manual order) it is a reorder.
+    const sameFolder = list.every((id) => this.session(id)?.folder === target.folder);
+    if (state.settings.sessionSort !== "manual" && !sameFolder) return this.moveTo(list, target.folder);
+    const switched = adoptManualOrder();
+    await placeSessions(list, target.folder, target.id, at.where === "before" ? "before" : "after");
+    if (switched) toast("정렬을 '사용자 지정'으로 바꿨습니다. 끌어서 놓은 순서가 그대로 유지됩니다", "info", 4000);
+    this.refocus();
+  }
+
+  private async dropFolder(path: string, at: DropAt) {
+    const anchor = at.row?.dataset.folder ?? "";
+    // Before/after another folder sets the manual order; into one does not.
+    const switched = at.where !== "into" && adoptManualOrder();
+    const err = await placeFolder(path, anchor, at.where);
+    if (err) return void toast(err, "warn");
+    if (at.where === "into" && anchor) {
+      collapsed.delete(anchor);
+      saveCollapsed();
+    }
+    if (switched) toast("정렬을 '사용자 지정'으로 바꿨습니다. 끌어서 놓은 순서가 그대로 유지됩니다", "info", 4000);
+    this.render();
+  }
+
+  /** Alt+Up / Alt+Down: move the selected session one place within its folder. */
+  private async nudge(step: -1 | 1) {
+    const s = this.selected && this.picked.size <= 1 ? this.session(this.selected) : undefined;
+    if (!s) return;
+    const siblings = this.order.filter((id) => this.session(id)?.folder === s.folder);
+    const next = siblings[siblings.indexOf(s.id) + step];
+    if (!next) return;
+    const switched = adoptManualOrder();
+    await placeSessions([s.id], s.folder, next, step < 0 ? "before" : "after");
+    if (switched) toast("정렬을 '사용자 지정'으로 바꿨습니다", "info", 3000);
+    this.reveal(s.id);
   }
 
   private async moveTo(ids: string[], folder: string) {
@@ -670,6 +798,10 @@ export class Sidebar {
     const ids = this.visibleIds();
     // Shortcuts of the tree (keymap.ts; the user can change them). Arrows and Esc are fixed.
     const act = actionFor(e, "tree");
+    if (act === "tree.moveUp" || act === "tree.moveDown") {
+      e.preventDefault();
+      return void this.nudge(act === "tree.moveUp" ? -1 : 1);
+    }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const i = this.selected ? ids.indexOf(this.selected) : -1;

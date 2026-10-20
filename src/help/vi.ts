@@ -31,6 +31,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Thư mục</b>: Trong trình sửa phiên, ghi thư mục bằng dấu gạch chéo, như <code>Prod/Web servers</code>, để tạo thư mục con. Bạn cũng có thể kéo phiên thả vào thư mục để di chuyển.</li>
+        <li><b>Sắp xếp và thứ tự</b>: Nút sắp xếp phía trên danh sách phiên cho phép chọn theo tên (AP2 trước AP10), theo địa chỉ (so sánh IP theo số), kết nối gần đây hoặc tùy chỉnh. Kéo một phiên lên trên hoặc xuống dưới phiên khác để đặt nó vào đó; thư mục cũng được đổi thứ tự, hoặc chuyển vào thư mục khác, theo cách tương tự. Đổi thứ tự sẽ chuyển sang thứ tự tùy chỉnh và giữ nguyên thứ tự đó. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} chuyển phiên đang chọn lên hoặc xuống một vị trí, và "Sắp xếp thư mục này theo tên/địa chỉ" trong menu thư mục sắp xếp lại một lần.</li>
         <li><b>Tìm kiếm</b>: Nhập một phần tên, máy chủ, người dùng hoặc ghi chú vào ô tìm kiếm ở trên cùng.</li>
         <li><b>Chọn nhiều</b>: ${kbd("Ctrl")}+nhấp để chọn từng mục, ${kbd("Shift")}+nhấp để chọn một dải. ${kbd("Shift+↑/↓")} và ${kbd("Ctrl+A")} cũng dùng được. ${kbd("Esc")} bỏ chọn.</li>
         <li><b>Thao tác hàng loạt</b>: Khi chọn nhiều mục, nhấp chuột phải → Sửa hàng loạt (${kbd("F2")}: người dùng, cổng, thông tin đăng nhập, thư mục, chế độ phím), Di chuyển vào thư mục, Xóa (${kbd("Del")}), Kết nối tất cả (${kbd("Enter")}).</li>

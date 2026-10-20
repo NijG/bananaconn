@@ -31,6 +31,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Dossiers</b> : dans l'éditeur de session, écrivez le dossier avec des barres obliques, comme <code>Prod/Serveurs web</code>, pour créer des sous-dossiers. Vous pouvez aussi faire glisser une session sur un dossier pour l'y déplacer.</li>
+        <li><b>Tri et ordre</b> : le bouton de tri au-dessus de la liste des sessions choisit par nom (AP2 avant AP10), par adresse (IP comparées comme des nombres), connectées récemment ou personnalisé. Faites glisser une session au-dessus ou au-dessous d'une autre pour l'y placer ; les dossiers se réordonnent, ou se déplacent dans un autre dossier, de la même façon. Réordonner passe à l'ordre personnalisé, qui est conservé. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} déplacent la session sélectionnée d'un cran, et « Trier ce dossier par nom/adresse » dans le menu d'un dossier le range d'un coup.</li>
         <li><b>Recherche</b> : saisissez une partie d'un nom, d'un hôte, d'un utilisateur ou d'une note dans la zone de recherche en haut.</li>
         <li><b>Sélection multiple</b> : ${kbd("Ctrl")}+clic pour choisir un à un, ${kbd("Shift")}+clic pour choisir une plage. ${kbd("Shift+↑/↓")} et ${kbd("Ctrl+A")} fonctionnent aussi. ${kbd("Esc")} efface la sélection.</li>
         <li><b>Actions groupées</b> : avec plusieurs éléments sélectionnés, clic droit → Modification groupée (${kbd("F2")} : utilisateur, port, identifiant, dossier, mode clavier), Déplacer vers un dossier, Supprimer (${kbd("Del")}), Tout connecter (${kbd("Enter")}).</li>

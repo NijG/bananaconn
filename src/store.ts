@@ -1,6 +1,7 @@
 // Application state: saved sessions, credentials, folders and user settings,
 // with a tiny change-notification bus.
 
+import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import { api, type Credential } from "./api";
 import type { Language } from "./i18n";
 import type { RiskRule } from "./riskRules";
@@ -60,6 +61,10 @@ export interface Settings {
   autoUpdate: boolean;
   /** Shortcut changes: action id -> keys (keymap.ts); unset: the defaults. */
   keybindings?: Record<string, string[]>;
+  /** Order of the session tree (sessionOrder.ts). */
+  sessionSort: SessionSort;
+  /** Folder paths in the manual order (siblings compare by their index). */
+  folderOrder: string[];
   /** Risky-command rules for snippets and macros (riskRules.ts); unset: the built-in list. */
   riskRules?: RiskRule[];
   /** Vault credential (password) to log in to the update share with when it
@@ -86,6 +91,8 @@ const DEFAULT_SETTINGS: Settings = {
   pasteCharDelay: 0,
   serialIo: "fast",
   serialAutoReconnect: true,
+  sessionSort: "name",
+  folderOrder: [],
   autoLog: false,
   confirmClose: true,
   terminalTheme: "banana",
@@ -153,6 +160,8 @@ function loadFolders(): Set<string> {
 function loadSettings(): Settings {
   const s = readLS<Settings>("bx.settings", DEFAULT_SETTINGS);
   s.updateFolder ??= "";
+  if (!["name", "address", "recent", "manual"].includes(s.sessionSort)) s.sessionSort = "name";
+  if (!Array.isArray(s.folderOrder) || s.folderOrder.some((f) => typeof f !== "string")) s.folderOrder = [];
   // 0.7.18 saved "language" with a "ko" default, so only "en" is a real choice.
   const old = s as Settings & { language?: string };
   if (old.language !== undefined) {
@@ -410,6 +419,7 @@ export async function renameFolder(from: string, to: string) {
   const remap = (f: string) => (f === from ? clean : f.startsWith(from + "/") ? clean + f.slice(from.length) : f);
   state.sessions.forEach((s) => (s.folder = remap(s.folder)));
   state.extraFolders = new Set([...state.extraFolders].map(remap));
+  if (state.settings.folderOrder.length) updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.map(remap))] });
   saveFolders();
   await persistSessions();
 }
@@ -423,7 +433,95 @@ export async function deleteFolder(path: string) {
   state.extraFolders = new Set(
     [...state.extraFolders].filter((f) => f !== path).map((f) => remap(f).replace(/^\//, "")).filter(Boolean),
   );
+  if (state.settings.folderOrder.length) {
+    updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.filter((f) => f !== path).map((f) => remap(f).replace(/^\//, "")).filter(Boolean))] });
+  }
   saveFolders();
+  await persistSessions();
+}
+
+// ---- manual order ------------------------------------------------------------------------------
+
+const parentOf = (p: string) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
+
+/** Each session's index in the stored list: the manual order. */
+export function sessionPositions(): Map<string, number> {
+  return new Map(state.sessions.map((s, i) => [s.id, i]));
+}
+
+/** Every folder in the manual order: the saved order (folders that no longer
+ * exist left out), then the folders it does not list yet, by name. */
+function fullFolderOrder(): string[] {
+  const all = allFolders();
+  const exists = new Set(all);
+  const known = state.settings.folderOrder.filter((f) => exists.has(f));
+  const listed = new Set(known);
+  return [...known, ...all.filter((f) => !listed.has(f)).sort(folderCompare("name", []))];
+}
+
+/** Switch to the manual order starting from the order on screen: the stored
+ * list is sorted the way the tree shows it, folders likewise. Not saved
+ * here: the caller's change saves it. False when already manual. */
+export function adoptManualOrder(): boolean {
+  const mode = state.settings.sessionSort;
+  if (mode === "manual") return false;
+  state.sessions.sort(sessionCompare(mode, sessionPositions()));
+  updateSettings({ sessionSort: "manual", folderOrder: allFolders().sort(folderCompare(mode, [])) });
+  return true;
+}
+
+/** The sort menu's "manual": keep the order on screen from now on. */
+export async function startManualOrder() {
+  if (adoptManualOrder()) await persistSessions();
+}
+
+/** Put sessions `ids` (in this order) into `folder`, just before or after
+ * session `anchor`, or at the end when there is no anchor. */
+export async function placeSessions(ids: string[], folder: string, anchor: string | null, where: "before" | "after") {
+  const moving = new Set(ids);
+  const list = ids.map((id) => state.sessions.find((s) => s.id === id)).filter((s): s is Session => !!s);
+  if (!list.length) return;
+  const rest = state.sessions.filter((s) => !moving.has(s.id));
+  list.forEach((s) => (s.folder = folder));
+  const i = anchor ? rest.findIndex((s) => s.id === anchor) : -1;
+  rest.splice(i < 0 ? rest.length : where === "before" ? i : i + 1, 0, ...list);
+  state.sessions = rest;
+  await persistSessions();
+}
+
+/** Move folder `path` next to folder `anchor` (before or after it, among
+ * its siblings) or into it. A folder that changes parent is renamed, so its
+ * sessions and subfolders go with it. Returns an error text when refused. */
+export async function placeFolder(path: string, anchor: string, where: "before" | "after" | "into"): Promise<string | null> {
+  if (anchor === path || anchor.startsWith(path + "/")) return "폴더를 자기 자신이나 그 안의 폴더로 옮길 수 없습니다";
+  const parent = where === "into" ? anchor : parentOf(anchor);
+  const name = path.split("/").pop()!;
+  const target = parent ? `${parent}/${name}` : name;
+  if (target !== path) {
+    if (allFolders().includes(target)) return `같은 이름의 폴더가 이미 있습니다: ${target}`;
+    await renameFolder(path, target);
+  }
+  if (where !== "into") {
+    const order = fullFolderOrder().filter((f) => f !== target);
+    const at = order.indexOf(anchor);
+    order.splice(at < 0 ? order.length : where === "before" ? at : at + 1, 0, target);
+    updateSettings({ folderOrder: order });
+  }
+  return null;
+}
+
+/** Sort what a folder holds directly (its sessions, its subfolders by name)
+ * once; the manual order keeps it until the next change. */
+export async function sortFolder(path: string, by: "name" | "address") {
+  adoptManualOrder();
+  const slots = state.sessions.flatMap((s, i) => (s.folder === path ? [i] : []));
+  const sorted = slots.map((i) => state.sessions[i]).sort(sessionCompare(by, new Map()));
+  slots.forEach((i, k) => (state.sessions[i] = sorted[k]));
+  const order = fullFolderOrder();
+  const kids = order.flatMap((f, i) => (parentOf(f) === path ? [i] : []));
+  const names = kids.map((i) => order[i]).sort(folderCompare("name", []));
+  kids.forEach((i, k) => (order[i] = names[k]));
+  updateSettings({ folderOrder: order });
   await persistSessions();
 }
 

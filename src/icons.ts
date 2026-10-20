@@ -4,6 +4,7 @@
 import {
   AppWindow,
   ArrowUp,
+  ArrowUpDown,
   Cable,
   Check,
   ChevronDown,
@@ -88,7 +89,7 @@ const ICONS: Record<string, IconNode> = {
   CircleHelp,
   ClipboardPaste,
   CopyPlus,
-  AppWindow, ArrowUp, Cable, Check, ChevronDown, ChevronRight, ClipboardType, Columns2, Copy, CornerDownLeft, Download,
+  AppWindow, ArrowUp, ArrowUpDown, Cable, Check, ChevronDown, ChevronRight, ClipboardType, Columns2, Copy, CornerDownLeft, Download,
   Eraser, ExternalLink, Eye, File, Folder, FolderKey, FolderLock, FolderOpen, FolderPlus, FolderSync, HardDrive, House, Info, Key, Keyboard, KeyRound,
   LayoutGrid, Lock, Maximize2, Minus, Monitor, PanelLeft, Pencil, Play, Plus, Radio, RefreshCw, RotateCcw, RotateCw, Rows2, Save,
   ScreenShare, ScrollText, Search, Server, Settings, ShieldAlert, ShieldCheck, Sparkles, Square, SquareTerminal,

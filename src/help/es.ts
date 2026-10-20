@@ -31,6 +31,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Carpetas</b>: en el editor de sesiones, escriba la carpeta con barras, como <code>Prod/Web servers</code>, para crear subcarpetas. También puede arrastrar una sesión sobre una carpeta para moverla.</li>
+        <li><b>Orden</b>: el botón de ordenar sobre la lista de sesiones elige por nombre (AP2 antes que AP10), por dirección (IP comparadas como números), conectadas recientemente o personalizado. Arrastre una sesión encima o debajo de otra para colocarla ahí; las carpetas se reordenan, o se mueven a otra carpeta, del mismo modo. Reordenar cambia al orden personalizado, que se conserva. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} mueven la sesión seleccionada un puesto, y «Ordenar esta carpeta por nombre/dirección» en el menú de una carpeta la ordena de una vez.</li>
         <li><b>Búsqueda</b>: escriba parte de un nombre, host, usuario o nota en el cuadro de búsqueda de la parte superior.</li>
         <li><b>Selección múltiple</b>: ${kbd("Ctrl")}+clic para elegir de una en una, ${kbd("Shift")}+clic para elegir un rango. ${kbd("Shift+↑/↓")} y ${kbd("Ctrl+A")} también funcionan. ${kbd("Esc")} borra la selección.</li>
         <li><b>Acciones masivas</b>: con varias seleccionadas, clic derecho → Edición masiva (${kbd("F2")}: usuario, puerto, credencial, carpeta, modo de teclas), Mover a carpeta, Eliminar (${kbd("Del")}), Conectar todas (${kbd("Enter")}).</li>
