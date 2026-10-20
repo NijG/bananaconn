@@ -5,6 +5,7 @@
 // noVNC over the loopback bridge in vnc.rs. Credentials live in vault.rs.
 
 mod childjob;
+mod comport;
 mod fileservers;
 mod ftpserver;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod lock;
 mod monitor;
 mod devmon;
 mod nettools;
+mod paste;
 mod rdp;
 mod remote;
 mod store;
@@ -83,6 +85,8 @@ pub fn run() {
             term::term_close,
             term::serial_ports,
             term::term_break,
+            term::term_paste,
+            term::term_paste_stop,
             term::term_set_logging,
             term::logs_folder,
             term::save_text_file,

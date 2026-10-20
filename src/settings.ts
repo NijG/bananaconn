@@ -143,6 +143,19 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
         ${check("highlightKeywords", "출력 키워드 강조", "ERROR·FAIL은 빨강, WARN은 노랑, OK·SUCCESS는 초록으로 표시합니다. 색을 직접 쓰는 프로그램과 vim 같은 전체 화면 프로그램에는 적용하지 않습니다.")}
         ${check("copyOnSelect", "선택하면 바로 복사", "PuTTY처럼 드래그로 선택한 글자를 클립보드에 복사합니다.")}
         ${check("rightClickPaste", "오른쪽 클릭으로 붙여넣기", "터미널에서 오른쪽 버튼을 누르면 클립보드 내용을 붙여넣습니다.")}
+        ${check("confirmMultiPaste", "여러 줄을 붙여넣기 전에 확인", "두 줄 이상을 붙여넣거나 텍스트 파일을 보낼 때 내용을 미리 보여 주고 보낼지 묻습니다.")}
+        <div class="grid-2">
+          <label class="field span-2"><span>장비 콘솔에 여러 줄 보내기 (시리얼 · 콘솔 서버 텔넷)</span><select name="pasteMode">
+            ${[["echo", "장비가 줄을 받아들이는 대로 (권장)"], ["fixed", "정해진 지연으로"]].map(([v, l]) => `<option value="${v}" ${v === s.pasteMode ? "selected" : ""}>${l}</option>`).join("")}
+          </select></label>
+          <label class="field"><span>줄 지연 (ms)</span><input name="pasteLineDelay" type="number" min="0" max="5000" value="${s.pasteLineDelay}"/></label>
+          <label class="field"><span>글자 지연 (ms)</span><input name="pasteCharDelay" type="number" min="0" max="200" value="${s.pasteCharDelay}"/></label>
+        </div>
+        <p class="muted small">권장 방식은 한 줄을 보낸 뒤 장비가 그 줄을 되돌려 보내고 프롬프트를 다시 띄우면 바로 다음 줄을 보냅니다. 빠른 장비에는 빠르게, 느린 장비에는 기다렸다가 보내므로 글자가 빠지지 않습니다. 줄 지연과 글자 지연은 "정해진 지연으로"를 고를 때 쓰입니다 (입력을 되돌려 보내지 않는 장비용).</p>
+        ${check("serialAutoReconnect", "시리얼 포트가 빠지면 다시 꽂힐 때까지 기다렸다가 자동으로 연결", "USB 시리얼 어댑터를 뽑았다 꽂거나, 연결할 때 아직 꽂혀 있지 않으면 포트가 나타나는 대로 연결합니다.")}
+        <label class="field"><span>시리얼 포트 입출력</span><select name="serialIo">
+          ${[["fast", "빠르게 (권장) — 키 입력이 읽기 대기에 막히지 않음"], ["compat", "호환 모드 — 이전 방식 (드라이버에 문제가 있을 때)"]].map(([v, l]) => `<option value="${v}" ${v === s.serialIo ? "selected" : ""}>${l}</option>`).join("")}
+        </select></label>
         <h4 data-section="shortcuts">단축키</h4>
         <div class="row"><button type="button" class="btn" data-shortcuts>${icon("Keyboard", 14)}단축키 보기·바꾸기</button>
           <span class="muted small">지금 쓰는 모든 단축키를 보고 바꾸거나, 단축키가 없는 동작과 스니펫에 새로 지정합니다.</span></div>
@@ -295,6 +308,12 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
       renderer: val("renderer").value as Settings["renderer"],
       copyOnSelect: bool("copyOnSelect"),
       rightClickPaste: bool("rightClickPaste"),
+      confirmMultiPaste: bool("confirmMultiPaste"),
+      pasteMode: val("pasteMode").value === "fixed" ? "fixed" : "echo",
+      pasteLineDelay: Math.max(0, Math.min(5000, Math.trunc(Number(val("pasteLineDelay").value)) || 0)),
+      pasteCharDelay: Math.max(0, Math.min(200, Math.trunc(Number(val("pasteCharDelay").value)) || 0)),
+      serialAutoReconnect: bool("serialAutoReconnect"),
+      serialIo: val("serialIo").value === "compat" ? "compat" : "fast",
       autoLog: bool("log.auto"),
       logTemplate: val("log.path").value.trim() || "%S_%Y%M%D_%h%m%s.log",
       logMode: val("log.mode").value as Settings["logMode"],

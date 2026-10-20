@@ -88,7 +88,9 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
         </select></label>
         ${gatewayField(o.gateway)}`;
     case "telnet":
-      return `${keyModeField(o.keyMode, o.backspace)}${gatewayField(o.gateway)}`;
+      return `${keyModeField(o.keyMode, o.backspace)}
+        ${check("pacedPaste", "콘솔 서버 연결 (여러 줄을 장비가 받아들이는 대로 한 줄씩 보냄)", !!o.pacedPaste)}
+        ${gatewayField(o.gateway)}`;
     case "tftp":
       return `<p class="muted small">TFTP는 로그인과 폴더 목록이 없습니다. 탭에서 서버의 파일 이름을 적어 받거나 보냅니다. 사용자 이름은 쓰지 않습니다.</p>`;
     case "serial": {

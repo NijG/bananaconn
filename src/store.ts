@@ -20,6 +20,20 @@ export interface Settings {
   uiLanguage?: Language;
   copyOnSelect: boolean;
   rightClickPaste: boolean;
+  /** Ask before pasting more than one line into a terminal. */
+  confirmMultiPaste: boolean;
+  /** How multi-line pastes reach device consoles (serial, console-server
+   * Telnet): when the device has taken each line ("echo"), or after fixed
+   * delays. */
+  pasteMode: "echo" | "fixed";
+  pasteLineDelay: number;
+  pasteCharDelay: number;
+  /** COM ports: overlapped I/O ("fast"), or the previous synchronous I/O
+   * ("compat") should a driver misbehave. */
+  serialIo: "fast" | "compat";
+  /** Wait for a serial port that went away (USB adapter unplugged) or is not
+   * there yet, and connect when it shows up. */
+  serialAutoReconnect: boolean;
   autoLog: boolean;
   confirmClose: boolean;
   terminalTheme: string;
@@ -66,6 +80,12 @@ const DEFAULT_SETTINGS: Settings = {
   renderer: "auto",
   copyOnSelect: true,
   rightClickPaste: true,
+  confirmMultiPaste: true,
+  pasteMode: "echo",
+  pasteLineDelay: 100,
+  pasteCharDelay: 0,
+  serialIo: "fast",
+  serialAutoReconnect: true,
   autoLog: false,
   confirmClose: true,
   terminalTheme: "banana",

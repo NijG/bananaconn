@@ -37,6 +37,16 @@ export interface TransferProgress {
 type Listener = (payload: any) => void;
 const mockListeners = new Map<string, Set<Listener>>();
 
+export type PasteMode = { kind: "echo" } | { kind: "fixed"; lineMs: number; charMs: number };
+
+/** Progress of a paced paste (term::PasteProgress). */
+export interface PasteEvent {
+  id: string;
+  sent: number;
+  total: number;
+  state: "running" | "done" | "stopped" | "failed";
+}
+
 export function mockEmit(event: string, payload: unknown) {
   mockListeners.get(event)?.forEach((l) => l(payload));
 }
@@ -69,7 +79,7 @@ export interface TermOpen {
   agentForward?: boolean;
   rows: number;
   cols: number;
-  serial?: { baud: number; dataBits: number; parity: string; stopBits: number; flow: string } | null;
+  serial?: { baud: number; dataBits: number; parity: string; stopBits: number; flow: string; io?: "fast" | "compat" } | null;
 }
 
 export interface RemoteConnect {
@@ -264,6 +274,9 @@ export const api = {
   termResize: (id: string, rows: number, cols: number) => call<void>("term_resize", { id, rows, cols }),
   termClose: (id: string) => call<void>("term_close", { id }),
   termBreak: (id: string) => call<void>("term_break", { id }),
+  /** Paste to a device console line by line (paste.rs); progress comes as "term-paste" events. */
+  termPaste: (id: string, text: string, mode: PasteMode) => call<void>("term_paste", { id, text, mode }),
+  termPasteStop: (id: string) => call<void>("term_paste_stop", { id }),
   monitorStart: (req: {
     id: string;
     protocol: "ssh" | "telnet";

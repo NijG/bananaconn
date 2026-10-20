@@ -1,6 +1,6 @@
 [package]
 name = "bananaconn"
-version = "0.7.34"
+version = "0.7.35"
 description = "Personal all-in-one remote terminal: SSH, Telnet, SFTP, FTP, FTPS, RDP, VNC"
 authors = ["BananaConn contributors"]
 license = "MIT"
@@ -44,7 +44,7 @@ rustls-native-certs = "0.8"
 # In-process SSH key generation (same version russh already uses) and secure tokens.
 rand = "0.10"
 # Drive enumeration without touching (possibly disconnected) drives.
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_Foundation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_Foundation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging", "Win32_Devices_Communication", "Win32_System_IO", "Win32_System_Pipes"] }
 # Credential vault backed by Windows Credential Manager.
 keyring = { version = "3", features = ["windows-native"] }
 # Built-in FTP server (share a local folder over FTP/FTPS).

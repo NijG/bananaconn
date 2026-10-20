@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
+use crate::paste;
 use crate::telnet;
 use crate::termout::OutPump;
 use crate::vault;
@@ -55,10 +56,35 @@ enum Backend {
     /// (exclusive) port is gone when term_close returns and a reconnect can
     /// open it again at once.
     Serial {
-        control: Mutex<Option<Box<dyn serialport::SerialPort>>>,
+        control: Mutex<Option<SerialControl>>,
         closed: Arc<std::sync::atomic::AtomicBool>,
         threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     },
+}
+
+/// The port handle the session keeps for Break and for closing.
+enum SerialControl {
+    /// Compatibility mode: synchronous I/O through the serialport crate.
+    Sync(Box<dyn serialport::SerialPort>),
+    /// Overlapped I/O (comport.rs), shared with the reader and writer.
+    Async(Arc<crate::comport::ComPort>),
+}
+
+impl SerialControl {
+    fn set_break(&self, on: bool) -> Result<(), String> {
+        match self {
+            Self::Sync(p) => if on { p.set_break() } else { p.clear_break() }.map_err(|e| e.to_string()),
+            Self::Async(p) => p.set_break(on).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Make pending reads and writes end now (the synchronous ones end
+    /// within their poll anyway).
+    fn cancel_io(&self) {
+        if let Self::Async(p) = self {
+            p.close();
+        }
+    }
 }
 
 struct AutofillRule {
@@ -79,6 +105,10 @@ struct Session {
     tail: Mutex<String>,
     started: Instant,
     out: Arc<OutPump>,
+    /// A paced multi-line paste in progress (see paste.rs).
+    paste: Mutex<Option<Arc<paste::Job>>>,
+    /// Time one character takes on the wire (serial; zero otherwise).
+    char_time: Duration,
 }
 
 /// Run blocking writes on their own thread; the session keeps the sender.
@@ -110,7 +140,14 @@ impl Session {
             tail: Mutex::new(String::new()),
             started: Instant::now(),
             out,
+            paste: Mutex::new(None),
+            char_time: Duration::ZERO,
         }
+    }
+
+    fn with_char_time(mut self, char_time: Duration) -> Self {
+        self.char_time = char_time;
+        self
     }
 
     /// Never blocks (callers include the UI thread): a full queue means the
@@ -143,6 +180,10 @@ impl Session {
     fn deliver(&self, bytes: &[u8], idle: bool) {
         if bytes.is_empty() {
             return;
+        }
+        // A paced paste waits for exactly this (the echo, the prompt).
+        if let Some(job) = self.paste.lock().unwrap().as_ref() {
+            job.observe(bytes);
         }
         // The screen first: a log on a slow share must not delay the echo.
         self.out.push(bytes);
@@ -342,6 +383,10 @@ pub struct SerialSettings {
     /// "none", "hardware" (RTS/CTS) or "software" (XON/XOFF)
     #[serde(default)]
     pub flow: String,
+    /// "compat": synchronous I/O (the serialport crate, polling); anything
+    /// else: overlapped I/O (comport.rs).
+    #[serde(default)]
+    pub io: String,
 }
 
 fn eight() -> u8 {
@@ -433,9 +478,15 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
     if !valid_com_name(&name) {
         return Err(format!("COM 포트 이름이 올바르지 않습니다: {port_name} (예: COM3)"));
     }
-    let s = settings.clone().unwrap_or(SerialSettings { baud: 9600, data_bits: 8, parity: String::new(), stop_bits: 1, flow: String::new() });
+    let s = settings.clone().unwrap_or(SerialSettings { baud: 9600, data_bits: 8, parity: String::new(), stop_bits: 1, flow: String::new(), io: String::new() });
     if !(50..=4_000_000).contains(&s.baud) {
         return Err(format!("통신 속도가 올바르지 않습니다: {}", s.baud));
+    }
+    // Start bit, data bits, parity bit, stop bits.
+    let bits = 1 + u32::from(s.data_bits.clamp(5, 8)) + u32::from(matches!(s.parity.as_str(), "odd" | "even")) + u32::from(s.stop_bits.clamp(1, 2));
+    let char_time = Duration::from_secs_f64(f64::from(bits) / f64::from(s.baud));
+    if s.io != "compat" {
+        return open_serial_async(&name, &s, char_time, out);
     }
     let data_bits = match s.data_bits {
         5 => DataBits::Five,
@@ -468,22 +519,23 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
         .timeout(SERIAL_POLL)
         .open()
         .map_err(|e| match e.kind() {
-            serialport::ErrorKind::NoDevice | serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => format!("{name} 포트를 찾을 수 없습니다. 케이블 연결과 포트 번호를 확인하세요."),
-            serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => {
-                format!("{name} 포트를 다른 프로그램이 쓰고 있습니다. 그 프로그램을 닫은 다음 다시 연결하세요.")
-            }
-            _ => format!("{name} 포트를 열 수 없습니다: {e}"),
+            serialport::ErrorKind::NoDevice => port_error(&name, std::io::ErrorKind::NotFound, &e),
+            serialport::ErrorKind::Io(kind) => port_error(&name, kind, &e),
+            _ => port_error(&name, std::io::ErrorKind::Other, &e),
         })?;
     let mut reader = port.try_clone().map_err(|e| format!("{name} 포트를 열 수 없습니다: {e}"))?;
     let control = port.try_clone().map_err(|e| format!("{name} 포트를 열 수 없습니다: {e}"))?;
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (input, writer) = spawn_serial_writer(port, closed.clone());
-    let session = Arc::new(Session::new(
-        Backend::Serial { control: Mutex::new(Some(control)), closed: closed.clone(), threads: Mutex::new(vec![writer]) },
-        input,
-        Vec::new(),
-        out,
-    ));
+    let session = Arc::new(
+        Session::new(
+            Backend::Serial { control: Mutex::new(Some(SerialControl::Sync(control))), closed: closed.clone(), threads: Mutex::new(vec![writer]) },
+            input,
+            Vec::new(),
+            out,
+        )
+        .with_char_time(char_time),
+    );
 
     let rs = session.clone();
     let reader_thread = std::thread::spawn(move || {
@@ -509,6 +561,86 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
     });
     if let Backend::Serial { threads, .. } = &session.backend {
         threads.lock().unwrap().push(reader_thread);
+    }
+    Ok(session)
+}
+
+/// Why a COM port could not be opened, in words a user can act on.
+fn port_error(name: &str, kind: std::io::ErrorKind, e: &dyn std::fmt::Display) -> String {
+    match kind {
+        std::io::ErrorKind::NotFound => format!("{name} 포트를 찾을 수 없습니다. 케이블 연결과 포트 번호를 확인하세요."),
+        std::io::ErrorKind::PermissionDenied => format!("{name} 포트를 다른 프로그램이 쓰고 있습니다. 그 프로그램을 닫은 다음 다시 연결하세요."),
+        _ => format!("{name} 포트를 열 수 없습니다: {e}"),
+    }
+}
+
+/// A COM port with overlapped I/O (comport.rs): the reader waits for bytes
+/// without polling and a keystroke never waits for it. Closing cancels both.
+fn open_serial_async(name: &str, s: &SerialSettings, char_time: Duration, out: Arc<OutPump>) -> Result<Arc<Session>, String> {
+    use std::sync::atomic::Ordering;
+    let line = crate::comport::Line { baud: s.baud, data_bits: s.data_bits, parity: s.parity.clone(), stop_bits: s.stop_bits, flow: s.flow.clone() };
+    let port = Arc::new(crate::comport::ComPort::open(name, &line).map_err(|e| port_error(name, e.kind(), &e))?);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
+    let writer = {
+        let (port, closed) = (port.clone(), closed.clone());
+        std::thread::spawn(move || {
+            while !closed.load(Ordering::Relaxed) {
+                let chunk = match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(c) => c,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                match port.write_all(&chunk) {
+                    Ok(()) => {}
+                    // Closed meanwhile.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                    // The port is gone (USB adapter unplugged): end the session.
+                    Err(_) => {
+                        closed.store(true, Ordering::Relaxed);
+                        port.close();
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    let session = Arc::new(
+        Session::new(
+            Backend::Serial { control: Mutex::new(Some(SerialControl::Async(port.clone()))), closed: closed.clone(), threads: Mutex::new(vec![writer]) },
+            tx,
+            Vec::new(),
+            out,
+        )
+        .with_char_time(char_time),
+    );
+    let rs = session.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut code = 0;
+        loop {
+            match port.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => rs.deliver(&buf[..n], n < buf.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                // Unplugged USB adapter, driver error: the session ends.
+                Err(e) => {
+                    rs.deliver_line(format!("\r\n[{e}]\r\n").as_bytes());
+                    code = 1;
+                    closed.store(true, Ordering::Relaxed);
+                    port.close();
+                    break;
+                }
+            }
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        rs.out.finish(code);
+    });
+    if let Backend::Serial { threads, .. } = &session.backend {
+        threads.lock().unwrap().push(reader);
     }
     Ok(session)
 }
@@ -585,6 +717,68 @@ pub async fn serial_ports() -> Result<Vec<SerialPortInfo>, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasteProgress {
+    id: String,
+    sent: usize,
+    total: usize,
+    /// "running", "done", "stopped" or "failed".
+    state: &'static str,
+}
+
+/// Paste text to a device console one line at a time (paste.rs). Text pasted
+/// while a paste is running is queued behind it. Progress and the end are
+/// reported with the "term-paste" event.
+#[tauri::command]
+pub fn term_paste(app: AppHandle, state: State<TermState>, id: String, text: String, mode: paste::Mode) -> Result<(), String> {
+    let session = get(&state, &id)?;
+    let mut current = session.paste.lock().unwrap();
+    if let Some(job) = current.as_ref().filter(|j| !j.stopped()) {
+        job.add(text.as_bytes());
+        return Ok(());
+    }
+    let job = Arc::new(paste::Job::new());
+    job.add(text.as_bytes());
+    *current = Some(job.clone());
+    drop(current);
+    let rs = session.clone();
+    std::thread::Builder::new()
+        .name("term-paste".into())
+        .spawn(move || {
+            let report = |state: &'static str| {
+                let (sent, total) = job.progress();
+                let _ = app.emit("term-paste", PasteProgress { id: id.clone(), sent, total, state });
+            };
+            report("running");
+            let end = job.run(mode, rs.char_time, |line| rs.send_input(line), || report("running"));
+            // A newer paste may have replaced this one meanwhile.
+            {
+                let mut current = rs.paste.lock().unwrap();
+                if current.as_ref().is_some_and(|j| Arc::ptr_eq(j, &job)) {
+                    *current = None;
+                }
+            }
+            report(match end {
+                paste::End::Done => "done",
+                paste::End::Stopped => "stopped",
+                paste::End::Failed => "failed",
+            });
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Stop the paste in progress; lines not yet sent are dropped.
+#[tauri::command]
+pub fn term_paste_stop(state: State<TermState>, id: String) {
+    if let Ok(session) = get(&state, &id)
+        && let Some(job) = session.paste.lock().unwrap().as_ref()
+    {
+        job.stop();
+    }
+}
+
 /// Send a serial Break (e.g. Cisco ROMMON / password recovery).
 #[tauri::command]
 pub async fn term_break(state: State<'_, TermState>, id: String) -> Result<(), String> {
@@ -593,9 +787,9 @@ pub async fn term_break(state: State<'_, TermState>, id: String) -> Result<(), S
         Backend::Serial { control, .. } => {
             let guard = control.lock().unwrap();
             let port = guard.as_ref().ok_or("세션이 종료되었습니다")?;
-            port.set_break().map_err(|e| format!("Break 신호를 보낼 수 없습니다: {e}"))?;
+            port.set_break(true).map_err(|e| format!("Break 신호를 보낼 수 없습니다: {e}"))?;
             std::thread::sleep(Duration::from_millis(500));
-            port.clear_break().map_err(|e| format!("Break 신호를 끝낼 수 없습니다: {e}"))
+            port.set_break(false).map_err(|e| format!("Break 신호를 끝낼 수 없습니다: {e}"))
         }
         _ => Err("Break 신호는 시리얼 연결에서만 보낼 수 있습니다".into()),
     })
@@ -1034,6 +1228,9 @@ pub fn end_all_logs(state: &TermState) {
 #[tauri::command]
 pub async fn term_close(state: State<'_, TermState>, id: String) -> Result<(), String> {
     let Some(session) = state.sessions.lock().unwrap().remove(&id) else { return Ok(()) };
+    if let Some(job) = session.paste.lock().unwrap().take() {
+        job.stop();
+    }
     session.out.close();
     match &session.backend {
         Backend::Pty { killer, .. } => {
@@ -1044,10 +1241,14 @@ pub async fn term_close(state: State<'_, TermState>, id: String) -> Result<(), S
             closed.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = control.shutdown(std::net::Shutdown::Both);
         }
-        // Wait until the port is really released (the reader stops within its
-        // poll, the writer within 100 ms), so an immediate reconnect can open it.
+        // Wait until the port is really released (pending overlapped I/O is
+        // cancelled; a synchronous reader stops within its poll, the writer
+        // within 100 ms), so an immediate reconnect can open it.
         Backend::Serial { closed, control, threads } => {
             closed.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(c) = control.lock().unwrap().as_ref() {
+                c.cancel_io();
+            }
             let handles = std::mem::take(&mut *threads.lock().unwrap());
             let _ = tauri::async_runtime::spawn_blocking(move || {
                 for h in handles {

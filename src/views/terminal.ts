@@ -4,13 +4,14 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { api, on, openExternal, pickSavePath, revealInExplorer } from "../api";
+import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } from "../api";
+import type { PasteEvent } from "../api";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
 import { addMacro, snippetMenu } from "../snippets";
 import { findRisks } from "../riskRules";
-import { patchSession, state, subscribe, type Snippet } from "../store";
+import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
 import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands";
@@ -23,9 +24,6 @@ import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
  * order; each tab turns them into its own key mode's bytes. */
 const MARKED_KEYS: EditKey[] = ["Delete", "Home", "End", "Backspace"];
 
-/** Gap between pasted lines on a serial console: long enough for a device
- * to take in and apply a configuration line at 9600 baud. */
-const SERIAL_LINE_GAP = 100;
 import { confirmDialog, contextMenu, errorText, esc, h, modal, promptDialog, timestamp, toast } from "../ui";
 import type { BroadcastInput, EditKey, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
 
@@ -54,6 +52,7 @@ function ensureRouting() {
     }
     setMonitorInfo(m, nextMonitorInfo(m.info, e));
   });
+  on<PasteEvent>("term-paste", (e) => allViews.forEach((v) => v.pasteProgress(e)));
 }
 
 // ---- shared resource monitors ----------------------------------------------------------
@@ -238,6 +237,7 @@ export class TerminalView implements View {
            <button class="tool" data-act="snippet" title="명령 스니펫·매크로 보내기">${icon("ClipboardType", 15)}<span>스니펫</span></button>
            <button class="tool device-tool" data-act="device" title="자동으로 인식한 장비: 자주 쓰는 명령, 설정 백업, 상위 프로세스" hidden>${icon("Server", 15)}<span data-device-label></span></button>
            <button class="tool" data-act="keys" title="Delete·Home·End 키를 보내는 방식 (네트워크 장비는 Ctrl-D·Ctrl-A·Ctrl-E)">${icon("Keyboard", 15)}<span data-keys-label></span></button>
+           <button class="tool" data-act="sendfile" title="텍스트 파일 보내기 (설정 파일을 붙여넣듯이)">${icon("FileText", 15)}</button>
            ${session.protocol === "serial" ? `<button class="tool" data-act="break" title="Break 신호 보내기 (장비 ROMMON 진입 등)">${icon("Zap", 15)}<span>Break</span></button>` : ""}
            <button class="tool" data-act="record" title="매크로 기록 시작/끝">${icon("Circle", 15)}<span>기록</span></button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
@@ -685,43 +685,97 @@ export class TerminalView implements View {
       if (this.early.length < 1000) this.early.push(data);
       return;
     }
-    if (this.pasting && this.session.protocol === "serial" && /\r[^]/.test(data)) return this.pacePaste(data);
-    if (this.pasteQueue.length && data.includes("\x03")) this.stopPaste();
+    if (this.pasting && this.paced && /\r[^]/.test(data)) return this.pacePaste(data);
+    if (this.pasteActive && data.includes("\x03")) this.stopPaste();
     api.termWrite(this.runtimeId, data).catch((err) => this.inputRefused(err));
   }
 
-  /** Lines of a serial paste still to send, one every SERIAL_LINE_GAP ms. */
-  private pasteQueue: string[] = [];
-  private pasteTimer = 0;
-  /** The connection the queued lines belong to: never the next one. */
-  private pasteRid = "";
-
-  private pacePaste(data: string) {
-    const lines = data.split(/(?<=\r)/);
-    if (!this.pasteQueue.length && lines.length > 20) toast(`${lines.length}줄을 한 줄씩 보냅니다. Ctrl+C를 누르면 멈춥니다`, "info");
-    if (this.pasteRid !== this.runtimeId) this.pasteQueue = [];
-    this.pasteRid = this.runtimeId;
-    this.pasteQueue.push(...lines);
-    if (!this.pasteTimer) this.sendPasteLine();
+  /** Multi-line input reaches a device console one line at a time, as fast
+   * as the device takes it (paste.rs): serial ports, and Telnet sessions
+   * marked as console-server connections. */
+  private get paced(): boolean {
+    return this.session.protocol === "serial" || (this.session.protocol === "telnet" && !!this.session.options.pacedPaste);
   }
 
-  private sendPasteLine = () => {
-    if (this.runtimeId !== this.pasteRid) this.pasteQueue = [];
-    const line = this.pasteQueue.shift();
-    if (line === undefined || this.disposed) {
-      this.pasteTimer = 0;
+  /** A paced paste is running on this connection. */
+  private pasteActive = false;
+  private pasteStarted = 0;
+
+  private pacePaste(data: string) {
+    const s = state.settings;
+    const mode = s.pasteMode === "fixed" ? { kind: "fixed" as const, lineMs: s.pasteLineDelay, charMs: s.pasteCharDelay } : { kind: "echo" as const };
+    if (!this.pasteActive) this.pasteStarted = Date.now();
+    this.pasteActive = true;
+    api.termPaste(this.runtimeId, data, mode).catch((err) => {
+      this.pasteActive = false;
+      this.inputRefused(err);
+    });
+  }
+
+  /** Stop the paced paste; `quiet`: the connection is going away anyway. */
+  private stopPaste(quiet = false) {
+    if (!this.pasteActive) return;
+    api.termPasteStop(this.runtimeId).catch(() => {});
+    if (quiet) {
+      this.pasteActive = false;
+      this.renderPasteProgress(null);
+    }
+  }
+
+  pasteProgress(e: PasteEvent) {
+    if (e.id !== this.runtimeId || this.disposed) return;
+    if (e.state === "running") {
+      this.pasteActive = true;
+      this.renderPasteProgress(e);
       return;
     }
-    api.termWrite(this.runtimeId, line).catch((err) => this.inputRefused(err));
-    this.pasteTimer = window.setTimeout(this.sendPasteLine, SERIAL_LINE_GAP);
-  };
+    this.pasteActive = false;
+    this.renderPasteProgress(null);
+    const left = e.total - e.sent;
+    const secs = Math.max(1, Math.round((Date.now() - this.pasteStarted) / 1000));
+    if (e.state === "stopped" && left) toast(`붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음)`, "warn");
+    else if (e.state === "failed") toast(`연결이 끊어져 붙여넣기를 마치지 못했습니다 (${left}줄은 보내지 않음)`, "error", 6000);
+    else if (e.state === "done" && e.total >= 20) toast(`${e.total}줄을 보냈습니다 (${secs}초)`, "success", 3000);
+  }
 
-  private stopPaste(quiet = false) {
-    const left = quiet ? 0 : this.pasteQueue.length;
-    this.pasteQueue = [];
-    clearTimeout(this.pasteTimer);
-    this.pasteTimer = 0;
-    if (left) toast(`붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음)`, "warn");
+  /** Lines sent, time left and a stop button over the terminal while a
+   * paced paste of more than a few lines runs; null removes it. */
+  private renderPasteProgress(e: PasteEvent | null) {
+    let box = this.el.querySelector<HTMLElement>(".paste-progress");
+    if (!e || e.total < 5) {
+      box?.remove();
+      return;
+    }
+    if (!box) {
+      box = h("div", { class: "paste-progress", role: "status" });
+      box.innerHTML = `<div class="pp-row"><span>붙여넣는 중</span><b data-pp-count></b><span class="muted" data-pp-eta></span>
+          <button type="button" class="btn sm" data-pp-stop title="남은 줄을 보내지 않습니다 (Ctrl+C)">${icon("CircleStop", 13)}<span>중지</span></button></div>
+        <div class="pp-bar"><i></i></div>`;
+      box.querySelector("[data-pp-stop]")!.addEventListener("click", () => {
+        this.stopPaste();
+        this.term.focus();
+      });
+      this.host.parentElement!.appendChild(box);
+    }
+    box.querySelector<HTMLElement>("[data-pp-count]")!.textContent = `${e.sent} / ${e.total}`;
+    box.querySelector<HTMLElement>(".pp-bar i")!.style.width = `${(100 * e.sent) / e.total}%`;
+    const elapsed = (Date.now() - this.pasteStarted) / 1000;
+    const eta = e.sent > 2 && elapsed > 0.5 ? Math.ceil(((e.total - e.sent) * elapsed) / e.sent) : 0;
+    box.querySelector<HTMLElement>("[data-pp-eta]")!.textContent = eta ? tr(`약 ${eta}초 남음`) : "";
+  }
+
+  /** Send a text file (a configuration) as if it were pasted. */
+  private async sendFile() {
+    if (this.state !== "connected") return toast("연결된 다음에 보낼 수 있습니다", "warn");
+    const path = await pickOpenFile("보낼 텍스트 파일");
+    if (!path) return;
+    try {
+      const text = await api.readTextFile(path);
+      if (!text) return toast("빈 파일입니다", "warn");
+      this.pasteFromUser(text, path.split(/[\\/]/).pop());
+    } catch (err) {
+      toast(errorText(err), "error", 6000);
+    }
   }
   /** The runtime id whose backend session exists (termOpen returned). */
   private opened = "";
@@ -941,7 +995,7 @@ export class TerminalView implements View {
         agentForward: !!this.session.options.agentForward,
         rows: this.term.rows,
         cols: this.term.cols,
-        serial: p === "serial" ? serialSettings(this.session.options) : null,
+        serial: p === "serial" ? { ...serialSettings(this.session.options), io: state.settings.serialIo } : null,
         },
         (bytes) => this.receive(rid, bytes),
         (code) => this.exited(rid, code),
@@ -970,11 +1024,15 @@ export class TerminalView implements View {
       if (this.disposed || rid !== this.runtimeId) return;
       this.setState("error");
       this.term.write(`\r\n\x1b[31m${tr(`연결 실패: ${errorText(err)}`)}\x1b[0m\r\n`);
+      // A COM port that is not plugged in (yet): connect when it appears.
+      if (/찾을 수 없습니다/.test(errorText(err)) && this.waitForPort(errorText(err))) return;
       this.showOverlay("연결하지 못했습니다", errorText(err));
     }
   }
 
   async reconnect() {
+    this.stopPortWait();
+    this.portWaitDeclined = false;
     this.stopPaste(true);
     this.stopMonitor();
     if (this.runtimeId) {
@@ -1031,7 +1089,45 @@ export class TerminalView implements View {
     this.stopMonitor();
     this.setState("closed");
     this.term.write(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
+    // A serial line ends with an error only when the port went away.
+    if (code && this.waitForPort("연결이 끊어졌습니다.")) return;
     this.showOverlay("연결이 종료되었습니다", "다시 연결하거나 탭을 닫을 수 있습니다.");
+  }
+
+  /** Timer of the wait for a serial port to come back (0: not waiting). */
+  private portWait = 0;
+  /** "Stop waiting" was chosen: an attempt still under way must not start
+   * the wait again; the next reconnect by the user allows it again. */
+  private portWaitDeclined = false;
+
+  /** A COM port that went away (USB adapter unplugged) or is not there yet:
+   * check every second and reconnect once it shows up. False when this tab
+   * does not wait (not serial, or turned off in Settings). */
+  private waitForPort(reason: string): boolean {
+    if (this.session.protocol !== "serial" || !state.settings.serialAutoReconnect || this.portWaitDeclined || this.disposed) return false;
+    const name = this.session.host.trim().toUpperCase();
+    this.stopPortWait();
+    this.showOverlay(`${name} 포트를 기다리는 중`, reason, true);
+    const rid = this.runtimeId;
+    const tick = async () => {
+      if (!this.portWait || this.disposed || rid !== this.runtimeId) return;
+      const ports = await api.serialPorts().catch(() => []);
+      if (!this.portWait) return;
+      if (ports.some((p) => p.name === name)) {
+        this.stopPortWait();
+        // Give the driver a moment to finish setting the port up.
+        window.setTimeout(() => !this.disposed && rid === this.runtimeId && this.reconnect(), 500);
+        return;
+      }
+      this.portWait = window.setTimeout(tick, 1000);
+    };
+    this.portWait = window.setTimeout(tick, 1000);
+    return true;
+  }
+
+  private stopPortWait() {
+    clearTimeout(this.portWait);
+    this.portWait = 0;
   }
 
   private setState(s: ViewState) {
@@ -1055,15 +1151,28 @@ export class TerminalView implements View {
     this.ws.changed();
   }
 
-  private showOverlay(title: string, detail: string) {
+  /** `waiting`: waiting for a COM port to come back (waitForPort). */
+  private showOverlay(title: string, detail: string, waiting = false) {
     this.overlay.hidden = false;
-    this.overlay.innerHTML = `<div class="overlay-card">
+    this.overlay.innerHTML = waiting
+      ? `<div class="overlay-card port-wait">
+        ${icon("Usb", 26)}
+        <h3>${esc(title)}</h3><p>${esc(detail)}</p>
+        <p class="muted small">케이블(USB 어댑터)을 다시 연결하면 자동으로 연결합니다.</p>
+        <div class="row"><button class="btn btn-primary" data-o="re">${icon("RotateCw", 15)}지금 다시 연결</button>
+        <button class="btn" data-o="stop">기다리지 않기</button></div></div>`
+      : `<div class="overlay-card">
         ${icon(this.state === "error" ? "WifiOff" : "Unlink", 26)}
         <h3>${esc(title)}</h3><p>${esc(detail)}</p>
         <div class="row"><button class="btn btn-primary" data-o="re">${icon("RotateCw", 15)}다시 연결</button>
         <button class="btn" data-o="hide">닫기</button></div></div>`;
     this.overlay.querySelector('[data-o="re"]')!.addEventListener("click", () => this.reconnect());
-    this.overlay.querySelector('[data-o="hide"]')!.addEventListener("click", () => (this.overlay.hidden = true));
+    this.overlay.querySelector('[data-o="hide"]')?.addEventListener("click", () => (this.overlay.hidden = true));
+    this.overlay.querySelector('[data-o="stop"]')?.addEventListener("click", () => {
+      this.stopPortWait();
+      this.portWaitDeclined = true;
+      this.showOverlay("연결이 종료되었습니다", detail);
+    });
   }
 
   // ---- toolbar ---------------------------------------------------------------
@@ -1092,6 +1201,8 @@ export class TerminalView implements View {
           return this.deviceMenu();
         case "keys":
           return this.keysMenu();
+        case "sendfile":
+          return void this.sendFile();
         case "break":
           this.stopPaste();
           return void api.termBreak(this.runtimeId).then(
@@ -1201,7 +1312,31 @@ export class TerminalView implements View {
     if (text) this.pasteFromUser(text);
   }
 
-  private pasteFromUser(text: string) {
+  /** `file`: the name of the file being sent (the confirmation names it). */
+  private async pasteFromUser(text: string, file?: string) {
+    const lines = text.replace(/\r?\n$/, "").split(/\r?\n|\r/);
+    if (lines.length > 1 && state.settings.confirmMultiPaste) {
+      const preview = lines.slice(0, 6).map((l) => esc(l.length > 120 ? `${l.slice(0, 120)}…` : l)).join("\n");
+      const how = this.paced
+        ? state.settings.pasteMode === "fixed"
+          ? "장비 콘솔이라 정해진 지연을 두고 한 줄씩 보냅니다. 보내는 중에 Ctrl+C를 누르면 멈춥니다."
+          : "장비 콘솔이라 장비가 각 줄을 받아들이는 대로 한 줄씩 보냅니다. 보내는 중에 Ctrl+C를 누르면 멈춥니다."
+        : "";
+      // One text node per sentence, so each is translated whole; the preview
+      // is the user's own text and is never translated.
+      const ok = await confirmDialog({
+        title: file ? "텍스트 파일 보내기" : "여러 줄 붙여넣기",
+        icon: "ClipboardPaste",
+        message: `<p><b>${esc(`${lines.length}줄을 보냅니다: ${this.title()}`)}</b></p>
+          ${file ? `<p class="muted small">${esc(`파일: ${file}`)}</p>` : ""}
+          <pre class="paste-preview" data-i18n-skip>${preview}${lines.length > 6 ? "\n…" : ""}</pre>
+          ${how ? `<p class="muted small">${how}</p>` : ""}`,
+        confirm: "보내기",
+        dontAsk: () => updateSettings({ confirmMultiPaste: false }),
+      });
+      this.term.focus();
+      if (!ok) return;
+    }
     this.pasteText(text);
     this.ws.mirrorInput(this, { paste: text });
     this.recording?.push(text.replace(/\r?\n/g, "\r"));
@@ -1309,7 +1444,7 @@ export class TerminalView implements View {
 
   dispose() {
     this.disposed = true;
-    clearTimeout(this.pasteTimer);
+    this.stopPortWait();
     this.resizer.disconnect();
     clearInterval(this.blinkTimer);
     clearTimeout(this.resizeTimer);
