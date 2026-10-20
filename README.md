@@ -83,7 +83,7 @@ command can take a site down:
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Security model](#security-model)
 - [Privacy](#privacy)
-- [Code signing policy](#code-signing-policy)
+- [Code signing](#code-signing)
 - [Where data is stored](#where-data-is-stored)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
@@ -318,20 +318,18 @@ folder you set), at startup and every 30 minutes. GitHub sees that request like 
 *Settings → Updates → Check for updates automatically*; you can still check by hand. Every other connection is
 one you open.
 
-## Code signing policy
+## Code signing
 
-Free code signing on Windows provided by [SignPath.io](https://about.signpath.io/), certificate by
-[SignPath Foundation](https://signpath.org/) — *application pending; until it is approved, the installers are
-unsigned.*
+The installers are not code-signed yet, so Windows SmartScreen may warn the first time you run one (see
+[Installation](#installation)). What you can check instead:
 
-Installers are built only by the [Release build](.github/workflows/release.yml) workflow from this repository and
-carry a build provenance attestation (see [Verifying a download](#verifying-a-download)). Each release is signed
-only after a manual approval.
+- every installer is built only by the [Release build](.github/workflows/release.yml) workflow, on a GitHub-hosted
+  runner, from the tagged commit of this repository, and carries a build provenance attestation
+  ([Verifying a download](#verifying-a-download));
+- updates are installed only when `latest.json` carries a valid Ed25519 signature and the installer matches its
+  SHA-256 ([Updates](#updates)).
 
-| Role | Members |
-| --- | --- |
-| Committers and reviewers | [NijG](https://github.com/NijG) |
-| Approvers | [NijG](https://github.com/NijG) |
+A code signing certificate will be added once the project qualifies for one.
 
 The installer adds an uninstaller to *Settings → Apps → Installed apps*; see
 [Where data is stored](#where-data-is-stored) for what stays after uninstalling.

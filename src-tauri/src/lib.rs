@@ -33,6 +33,25 @@ mod vault;
 mod vnc;
 mod wsutil;
 
+/// Test runs: the main window (created hidden by the E2E configuration)
+/// goes far off screen with no taskbar button, then is shown without being
+/// activated.
+fn show_off_screen(app: &tauri::App) {
+    use tauri::Manager;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW};
+    let Some(window) = app.get_webview_window("main") else { return };
+    let _ = window.set_position(tauri::PhysicalPosition::new(-20000, -20000));
+    if let Ok(hwnd) = window.hwnd() {
+        // SAFETY: a valid window handle of this process. A tool window has no
+        // taskbar button and is left out of Alt+Tab.
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd.0, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd.0, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize));
+            ShowWindow(hwnd.0, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
@@ -41,12 +60,18 @@ pub fn run() {
         legacy::fatal(&e);
         return;
     }
-    tauri::Builder::default()
+    // Test runs (a non-release build started with BX_E2E_OFFSCREEN set) keep
+    // their window off screen, without a taskbar button or the focus, so a
+    // test run does not take over the screen of whoever works on this PC.
+    let offscreen = !legacy::is_release(&context.config().identifier) && std::env::var_os("BX_E2E_OFFSCREEN").is_some();
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
-        // Restore the window's size and position from the last run.
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_clipboard_manager::init());
+    // Restore the window's size and position from the last run (it also
+    // shows and focuses the window, so not in test runs).
+    let builder = if offscreen { builder } else { builder.plugin(tauri_plugin_window_state::Builder::default().build()) };
+    builder
         .manage(term::TermState::default())
         .manage(remote::RemoteState::default())
         .manage(vnc::VncState::default())
@@ -57,7 +82,10 @@ pub fn run() {
         .manage(lock::LockState::default())
         .manage(monitor::MonitorState::default())
         .manage(tftpclient::TftpState::default())
-        .setup(|app| {
+        .setup(move |app| {
+            if offscreen {
+                show_off_screen(app);
+            }
             lock::init(app.handle());
             // Old-named secrets and scratch folders, off the startup path
             // (the released app only, like the data folders).
