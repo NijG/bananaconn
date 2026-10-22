@@ -122,6 +122,9 @@ export type RdpEvent =
   | { type: "resizeUnsupported" }
   /** Files copied on the remote, downloaded for a local paste. */
   | { type: "clipFiles"; state: "downloading" | "ready" | "failed"; done?: number; total?: number; files?: number; message?: string }
+  /** A step of the clipboard channel (capabilities, monitorReady, held,
+   * ready, rejected, pasteRequest, pasteData, error, unavailable). */
+  | { type: "clipboard"; state: string; detail: string }
   | { type: "pointer"; kind: "default" | "hidden" }
   | { type: "pointerBitmap"; width: number; height: number; hotX: number; hotY: number; rgba: string }
   | { type: "error"; kind: string; message: string }

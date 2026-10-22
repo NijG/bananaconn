@@ -138,6 +138,7 @@ fn start_clipboard(out: &Out) -> Option<Clipboard> {
             }
             Err(e) => {
                 eprintln!("clipboard unavailable: {e}");
+                thread_files.trace("unavailable", format!("the local clipboard cannot be used: {e}"));
                 let _ = ready_tx.send(None);
             }
         }
@@ -168,6 +169,13 @@ fn clipboard_frame(
     use ironrdp::cliprdr::CliprdrClient;
     let Some(cliprdr) = stage.get_svc_processor_mut::<CliprdrClient>() else { return Ok(None) };
     let result = match message {
+        // Copied locally before Monitor Ready (while logging on): the server's
+        // clipboard program may not listen yet. Monitor Ready makes the native
+        // backend announce the clipboard as it is then.
+        ClipboardMessage::SendInitiateCopy(_) if !files.server_ready_for_copies() => {
+            files.trace("held", "a local copy before the server was ready: announced at Monitor Ready");
+            return Ok(None);
+        }
         // The remote's own files, offered on our clipboard: nothing new to announce.
         ClipboardMessage::SendInitiateCopy(_) if files.is_own_clipboard() => return Ok(None),
         // Files copied in Explorer: announce them as a file list (FileGroupDescriptorW).
@@ -186,7 +194,13 @@ fn clipboard_frame(
                 cliprdr.initiate_copy(&transferable(formats))
             }
         },
-        ClipboardMessage::SendFormatData(response) => cliprdr.submit_format_data(response),
+        ClipboardMessage::SendFormatData(response) => {
+            files.trace(
+                "pasteData",
+                if response.is_error() { "no data in that format on the local clipboard".to_string() } else { format!("sent {} bytes", response.data().len()) },
+            );
+            cliprdr.submit_format_data(response)
+        }
         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
         ClipboardMessage::SendInitiateFileCopy(list) => match cliprdr.initiate_file_copy(list.clone()) {
             Err(e) if not_ready(&e) => {
@@ -199,6 +213,7 @@ fn clipboard_frame(
         ClipboardMessage::SendFileContentsResponse(response) => cliprdr.submit_file_contents(response),
         ClipboardMessage::Error(e) => {
             eprintln!("clipboard: {e}");
+            files.trace("error", e.to_string());
             return Ok(None);
         }
     };
@@ -206,6 +221,7 @@ fn clipboard_frame(
         Ok(messages) => messages,
         Err(e) => {
             eprintln!("clipboard: {e}");
+            files.trace("error", e.to_string());
             return Ok(None);
         }
     };

@@ -3,13 +3,14 @@
 // wheel input go back the same way.
 
 import { api, rdpOpen, type RdpEvent, type RdpFrames } from "../api";
-import { readClipboard } from "../clipboard";
+import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession, reloadCredentials } from "../store";
 import { confirmDialog, errorText, esc, h, modal, toast } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import { GatewayLink } from "../tunnels";
+import { tr } from "../i18n";
 import { KEY, MODIFIER_CODES, namedKeyFor, scancodeFor } from "./rdpKeys";
 
 type Op =
@@ -71,6 +72,7 @@ export class RdpView implements View {
            <button class="tool" data-act="cad" title="Ctrl+Alt+Del 보내기">${icon("Keyboard", 15)}<span>Ctrl+Alt+Del</span></button>
            <button class="tool" data-act="win" title="Windows 키 보내기">${icon("AppWindow", 15)}<span>Win</span></button>
            <button class="tool" data-act="type" title="내 클립보드의 텍스트를 원격에 입력">${icon("ClipboardType", 15)}<span>클립보드 입력</span></button>
+           <button class="tool clip-state" data-act="clipdiag" title="클립보드 공유 상태 (누르면 진단 기록)">${icon("ClipboardPaste", 15)}<span data-clip-label>클립보드: 준비 중</span></button>
            <button class="tool" data-act="keytest" title="누른 키가 원격에 어떻게 전달되는지 보기 (문제 확인용)">${icon("Keyboard", 15)}<span>키 확인</span></button>
            <span class="tool-sep"></span>
            <button class="tool" data-act="fit" title="창에 맞추기 / 실제 크기">${icon("Maximize2", 15)}<span>맞춤</span></button>
@@ -147,6 +149,7 @@ export class RdpView implements View {
     this.showOverlay("progress", STAGE_TEXT.tcp);
     this.id = crypto.randomUUID();
     const id = this.id;
+    this.resetClipboard();
     try {
       const tunnelPort = await this.gateway.port();
       if (id !== this.id) return;
@@ -211,6 +214,7 @@ export class RdpView implements View {
           this.setState("connected");
           this.lockFlags = -1;
           this.canvas.focus();
+          this.watchClipboard();
           // Connected while in the background: no screen updates until shown.
           if (!this.onScreen) api.rdpVisible(this.id, false).catch(() => {});
           // The tab changed size while connecting (window maximized, sidebar
@@ -226,6 +230,9 @@ export class RdpView implements View {
         break;
       case "clipFiles":
         this.clipFiles(e);
+        break;
+      case "clipboard":
+        this.clipboardStep(e.state, e.detail);
         break;
       case "error":
         if (e.kind === "auth") return this.askCredentials(true, e.message);
@@ -636,6 +643,82 @@ export class RdpView implements View {
     toast(`${[...text].length}자를 원격에 입력했습니다`, "success");
   }
 
+  // ---- clipboard sharing status ----------------------------------------------------------
+
+  /** Steps of this connection's clipboard channel, for the diagnostic log. */
+  private clipLog: { at: number; state: string; detail: string }[] = [];
+  private clipState: "starting" | "ready" | "noResponse" | "error" | "unavailable" = "starting";
+  private clipTimer = 0;
+
+  private resetClipboard() {
+    clearTimeout(this.clipTimer);
+    this.clipLog = [];
+    this.clipState = "starting";
+    this.renderClipboard();
+  }
+
+  private clipboardStep(state: string, detail: string) {
+    this.clipLog.push({ at: Date.now(), state, detail });
+    if (this.clipLog.length > 200) this.clipLog.splice(0, this.clipLog.length - 200);
+    if (state === "ready") this.clipState = "ready";
+    else if (state === "rejected") this.clipState = "error";
+    else if (state === "unavailable") this.clipState = "unavailable";
+    this.renderClipboard();
+  }
+
+  /** The server's clipboard program announces itself within seconds of the
+   * desktop; without it nothing can be pasted either way. Said once. */
+  private watchClipboard() {
+    clearTimeout(this.clipTimer);
+    const id = this.id;
+    this.clipTimer = window.setTimeout(() => {
+      if (id !== this.id || this.clipState !== "starting") return;
+      this.clipState = "noResponse";
+      this.clipLog.push({ at: Date.now(), state: "noResponse", detail: "no Monitor Ready from the server within 20 s" });
+      this.renderClipboard();
+      toast("원격 PC의 클립보드가 응답하지 않아 복사·붙여넣기를 할 수 없습니다. 툴바의 클립보드 상태를 눌러 해결 방법을 확인하세요.", "warn", 8000);
+    }, 20000);
+  }
+
+  private renderClipboard() {
+    const label = this.el.querySelector<HTMLElement>("[data-clip-label]");
+    const button = this.el.querySelector<HTMLElement>('[data-act="clipdiag"]');
+    if (!label || !button) return;
+    const text = {
+      starting: "클립보드: 준비 중",
+      ready: "클립보드: 연결됨",
+      noResponse: "클립보드: 응답 없음",
+      error: "클립보드: 오류",
+      unavailable: "클립보드: 사용 불가",
+    }[this.clipState];
+    // An icon and a coloured dot in the toolbar; the words in the tooltip.
+    label.textContent = text;
+    button.title = tr(`${text} · 누르면 진단 기록`);
+    button.classList.toggle("warn", this.clipState === "noResponse" || this.clipState === "error" || this.clipState === "unavailable");
+    button.classList.toggle("ok", this.clipState === "ready");
+  }
+
+  private showClipboardLog() {
+    const time = (t: number) => new Date(t).toTimeString().slice(0, 8);
+    const text = this.clipLog.map((l) => `${time(l.at)}  ${l.state.padEnd(13)} ${l.detail}`).join("\n") || tr("(기록 없음: 서버가 클립보드 채널을 열지 않았습니다)");
+    const hint =
+      this.clipState === "ready"
+        ? "클립보드가 연결되어 있습니다. 붙여넣기가 안 되면 원격에서 붙여넣을 때 기록에 pasteRequest가 생기는지 확인하세요."
+        : "원격 PC의 클립보드 프로그램(rdpclip.exe)이 응답하지 않거나, 원격 PC가 클립보드 공유를 막고 있습니다. 원격에서 작업 관리자로 rdpclip.exe를 끝낸 다음 Win+R에 rdpclip을 입력해 다시 실행하면 대부분 해결됩니다. mstsc로 열어도 안 되면 원격 PC의 정책(클립보드 리디렉션)을 확인하세요.";
+    const m = modal({
+      title: "클립보드 공유 상태",
+      icon: "ClipboardPaste",
+      width: 640,
+      body: `<p class="modal-text">${esc(hint)}</p>
+        <pre class="clip-log" data-i18n-skip>${esc(text)}</pre>`,
+      footer: `<button class="btn" data-copy>${icon("Copy", 14)}기록 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
+    });
+    m.root.querySelector("[data-copy]")!.addEventListener("click", async () => {
+      await writeClipboard(`BananaConn RDP clipboard log · ${this.session.host}\n${text}`);
+      toast("기록을 복사했습니다", "success", 2000);
+    });
+  }
+
   /** Key check: the last keys pressed on the remote screen and what was sent
    * for them (to see, for example, whether Right Shift arrives at all). */
   private keyLog: HTMLElement | null = null;
@@ -666,6 +749,7 @@ export class RdpView implements View {
       if (act === "win") this.keyCombo(KEY.win);
       if (act === "type") this.typeClipboard();
       if (act === "keytest") this.toggleKeyTest();
+      if (act === "clipdiag") this.showClipboardLog();
       if (act === "fit") {
         this.fit = !this.fit;
         this.syncFit();
@@ -689,6 +773,7 @@ export class RdpView implements View {
   }
 
   private cleanup() {
+    clearTimeout(this.clipTimer);
     this.frames?.close();
     this.frames = null;
     if (this.id) api.rdpClose(this.id).catch(() => {});

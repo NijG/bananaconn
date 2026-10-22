@@ -105,7 +105,18 @@ pub struct Shared {
     sta_thread: AtomicU32,
     /// Generation whose files should go on the clipboard next (clipboard thread).
     offer: AtomicUsize,
+    /// How far the channel start-up got (CLIP_* below).
+    stage: AtomicU32,
 }
+
+/// Clipboard channel start-up ([MS-RDPECLIP] 1.3.2.1): the server sends its
+/// capabilities, then Monitor Ready once its clipboard program (rdpclip.exe)
+/// runs; the client answers with its capabilities and format list, and the
+/// server's Format List Response makes the channel ready.
+const CLIP_WAITING: u32 = 0;
+const CLIP_CAPABILITIES: u32 = 1;
+const CLIP_MONITOR_READY: u32 = 2;
+const CLIP_READY: u32 = 3;
 
 impl core::fmt::Debug for Shared {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -129,7 +140,25 @@ impl Shared {
             own_sequence: AtomicU32::new(0),
             sta_thread: AtomicU32::new(0),
             offer: AtomicUsize::new(0),
+            stage: AtomicU32::new(CLIP_WAITING),
         })
+    }
+
+    /// One step of the clipboard channel, for the app's clipboard status and
+    /// its diagnostic log.
+    pub fn trace(&self, state: &str, detail: impl Into<String>) {
+        self.report(json!({ "type": "clipboard", "state": state, "detail": detail.into() }));
+    }
+
+    /// The server sent Monitor Ready: a format list may go out now. Before
+    /// that its clipboard program may not even run yet (Windows 7 starts it a
+    /// few seconds after the logon) and would never see it.
+    pub fn server_ready_for_copies(&self) -> bool {
+        self.stage.load(Ordering::SeqCst) >= CLIP_MONITOR_READY
+    }
+
+    fn advance(&self, stage: u32) {
+        self.stage.fetch_max(stage, Ordering::SeqCst);
     }
 
     fn send(&self, message: ClipboardMessage) -> bool {
@@ -514,18 +543,29 @@ impl CliprdrBackend for FileClipBackend {
     }
 
     fn on_ready(&mut self) {
+        self.shared.advance(CLIP_READY);
+        self.shared.trace("ready", "the server accepted our format list");
         self.inner.on_ready()
     }
 
     fn on_request_format_list(&mut self) {
+        // Monitor Ready: the local clipboard is announced now (the native
+        // backend answers with the current formats).
+        self.shared.advance(CLIP_MONITOR_READY);
+        self.shared.trace("monitorReady", "the server's clipboard program is running");
         self.inner.on_request_format_list()
     }
 
     fn on_format_list_response(&mut self, ok: bool) {
+        if !ok {
+            self.shared.trace("rejected", "the server refused our format list");
+        }
         self.inner.on_format_list_response(ok)
     }
 
     fn on_process_negotiated_capabilities(&mut self, capabilities: ClipboardGeneralCapabilityFlags) {
+        self.shared.advance(CLIP_CAPABILITIES);
+        self.shared.trace("capabilities", format!("negotiated {capabilities:?}"));
         self.inner.on_process_negotiated_capabilities(capabilities)
     }
 
@@ -540,6 +580,7 @@ impl CliprdrBackend for FileClipBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        self.shared.trace("pasteRequest", format!("the remote asks for format {}", request.format.value()));
         self.inner.on_format_data_request(request)
     }
 
@@ -792,6 +833,28 @@ mod tests {
         let err = client.initiate_file_copy(files).err().expect("a file list is refused before start-up");
         assert!(crate::not_ready(&err), "{err}");
         assert!(client.initiate_copy(&[]).is_ok(), "the start-up copy goes out");
+    }
+
+    /// The start-up as a server runs it: capabilities, then Monitor Ready once
+    /// its clipboard program runs (Windows 7: seconds after the logon), then
+    /// the Format List Response. Local copies may go out only from Monitor
+    /// Ready on, and every step reaches the app's clipboard status.
+    #[test]
+    fn local_copies_wait_for_monitor_ready() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events) = mpsc::unbounded_channel::<Value>();
+        let shared = Shared::new(tx, events_tx);
+        let mut backend = FileClipBackend { inner: Box::new(Noop), shared: shared.clone() };
+        assert!(!shared.server_ready_for_copies(), "nothing from the server yet");
+        backend.on_process_negotiated_capabilities(ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES);
+        assert!(!shared.server_ready_for_copies(), "capabilities alone: the clipboard program may not run yet");
+        backend.on_request_format_list();
+        assert!(shared.server_ready_for_copies(), "Monitor Ready");
+        backend.on_format_list_response(true);
+        backend.on_ready();
+        backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+        let states: Vec<String> = std::iter::from_fn(|| events.try_recv().ok()).map(|e| e["state"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(states, ["capabilities", "monitorReady", "ready", "pasteRequest"]);
     }
 
     fn powershell(script: &str) -> String {
