@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH gateway</b>: In the RDP, VNC or Telnet session editor, choose a saved SSH session as the gateway to reach devices behind a firewall through that server.</li>
+        <li><b>Proxy</b>: Under "Proxy" in the session editor, choose SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (connect with a command) or a local command, as in PuTTY's Connection → Proxy. SSH, SFTP, Telnet, FTP/FTPS, RDP and VNC, and the session's resource monitor, all go through it. Pick the proxy login from the credential vault, and set the hosts that skip the proxy (*.corp.local, 10.0.0.0/8), where names are looked up, and whether diagnostics are shown. FTP uses passive mode through a proxy. Sessions imported from PuTTY or KiTTY bring their proxy settings along (without the password).</li>
         <li><b>SSH tunnels</b>: Tools at the top → SSH tunnels. Save forwardings of local port → SSH server → target address and turn them on and off.</li>
         <li><b>Network tools</b>: ping, TCP port check (multiple ports and ranges), DNS lookup.</li>
         <li><b>File servers</b>: The file server button at the top temporarily shares a folder on this PC over FTP, TFTP or HTTP (e.g. for uploading device OS images).</li>

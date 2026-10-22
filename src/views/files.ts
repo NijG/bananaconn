@@ -2,6 +2,7 @@
 // remote server on the right, with a transfer queue at the bottom.
 
 import { api, on, openWithDefaultApp, type FileEntry, type TransferProgress } from "../api";
+import { proxyOf } from "../proxy";
 import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { actionFor } from "../keymap";
@@ -888,6 +889,7 @@ export class FilesView implements View, EditorHost {
         activeMode: !!this.session.options.activeMode,
         ftpsMode: this.session.options.ftpsMode === "implicit" ? "implicit" : "explicit",
         allowInvalidCert: !!this.session.options.allowInvalidCert,
+        proxy: proxyOf(this.session),
         ...extra,
       });
       // Closed or reconnected while connecting: drop the orphaned connection.

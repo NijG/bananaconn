@@ -211,6 +211,10 @@ one-time-code and yes/no prompts instead of answering them, and pauses while non
   The forwarding happens inside the app; `ssh.exe` is not involved.
 - **SSH tunnel manager:** save local-port → SSH server → target forwardings and switch them on and off.
 - Host keys are checked like everywhere else; an unknown key shows its fingerprint and must be confirmed.
+- **Proxy:** SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (connect with a command) or a local command, with the
+  same settings as PuTTY's Connection → Proxy: excluded hosts (wildcards, IPv4 CIDR), where names are looked up
+  and diagnostics. SSH, SFTP, Telnet, FTP/FTPS, RDP, VNC and the resource monitor all go through it. The proxy
+  password stays in the credential vault; PuTTY and KiTTY imports bring the proxy settings (not the password).
 
 ### Built-in servers
 
@@ -393,6 +397,7 @@ src-tauri/src/           Rust backend (Tauri v2)
   remote.rs              SFTP, FTP, FTPS, local files, transfers
   devmon.rs, monitor.rs  resource monitor and device recognition
   tunnel.rs              SSH gateways and port forwarding
+  proxy.rs               SOCKS, HTTP, Telnet and local-command proxies
   ftpserver.rs, fileservers.rs   built-in FTP, TFTP and HTTP servers
   vault.rs, lock.rs      Credential Manager storage, master password
   updater.rs             signed updates from GitHub Releases or a share

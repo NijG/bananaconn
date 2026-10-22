@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH gateway</b>: Trong trình sửa phiên RDP, VNC hoặc Telnet, chọn một phiên SSH đã lưu làm gateway để truy cập thiết bị nằm sau tường lửa thông qua máy chủ đó.</li>
+        <li><b>Proxy</b>: Trong mục "Proxy" của trình sửa phiên, chọn SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (kết nối bằng lệnh) hoặc lệnh cục bộ, giống Connection → Proxy của PuTTY. SSH, SFTP, Telnet, FTP/FTPS, RDP, VNC và trình giám sát tài nguyên của phiên đều đi qua proxy. Chọn thông tin đăng nhập proxy từ kho thông tin xác thực, và đặt các máy chủ không qua proxy (*.corp.local, 10.0.0.0/8), nơi tra cứu tên DNS và việc hiện thông báo chẩn đoán. FTP dùng chế độ thụ động (PASV) khi qua proxy. Phiên nhập từ PuTTY hoặc KiTTY giữ nguyên cài đặt proxy (trừ mật khẩu).</li>
         <li><b>Đường hầm SSH</b>: Công cụ ở trên cùng → Đường hầm SSH. Lưu các chuyển tiếp cổng cục bộ → máy chủ SSH → địa chỉ đích và bật/tắt chúng.</li>
         <li><b>Công cụ mạng</b>: ping, kiểm tra cổng TCP (nhiều cổng và dải cổng), tra cứu DNS.</li>
         <li><b>Máy chủ tệp</b>: Nút máy chủ tệp ở trên cùng tạm thời chia sẻ một thư mục trên PC này qua FTP, TFTP hoặc HTTP (VD để tải image OS lên thiết bị).</li>

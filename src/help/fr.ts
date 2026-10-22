@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Passerelle SSH</b> : dans l'éditeur de session RDP, VNC ou Telnet, choisissez une session SSH enregistrée comme passerelle pour atteindre, via ce serveur, des équipements situés derrière un pare-feu.</li>
+        <li><b>Proxy</b> : dans « Proxy » de l'éditeur de session, choisissez comme dans Connection → Proxy de PuTTY SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (connexion par une commande) ou une commande locale. SSH, SFTP, Telnet, FTP/FTPS, RDP et VNC, ainsi que le moniteur de ressources de la session, passent par lui. Choisissez la connexion au proxy dans le coffre d'identifiants, puis les hôtes qui ne passent pas par le proxy (*.corp.local, 10.0.0.0/8), le lieu de la résolution DNS et l'affichage du diagnostic. FTP utilise le mode passif derrière un proxy. Les sessions importées de PuTTY ou KiTTY gardent leur proxy (sans le mot de passe).</li>
         <li><b>Tunnels SSH</b> : Outils en haut → Tunnels SSH. Enregistrez des redirections port local → serveur SSH → adresse cible et activez-les ou désactivez-les.</li>
         <li><b>Outils réseau</b> : ping, vérification de ports TCP (plusieurs ports et plages), recherche DNS.</li>
         <li><b>Serveurs de fichiers</b> : le bouton de serveur de fichiers en haut partage temporairement un dossier de ce PC via FTP, TFTP ou HTTP (par ex. pour envoyer des images d'OS d'équipements).</li>

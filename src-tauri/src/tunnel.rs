@@ -41,6 +41,9 @@ pub struct TunnelRequest {
     pub password: Option<String>,
     #[serde(default)]
     pub trusted_fingerprint: Option<String>,
+    /// The gateway session's proxy (proxy.rs).
+    #[serde(default)]
+    pub gateway_proxy: Option<crate::proxy::ProxyConfig>,
     /// Where connections are forwarded to, as seen from the gateway.
     pub target_host: String,
     pub target_port: u16,
@@ -149,6 +152,7 @@ pub async fn tunnel_open(app: AppHandle, state: State<'_, TunnelState>, req: Tun
     })?;
     let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
+    let proxy_auth = crate::proxy::auth_for(&app, req.gateway_proxy.as_ref())?;
     let handle = ssh_login(SshLogin {
         host: req.gateway_host.clone(),
         port: gw_port,
@@ -157,6 +161,8 @@ pub async fn tunnel_open(app: AppHandle, state: State<'_, TunnelState>, req: Tun
         cred,
         trusted_fingerprint: req.trusted_fingerprint.clone(),
         known_hosts: known_hosts_path(),
+        proxy: req.gateway_proxy.clone(),
+        proxy_auth,
     })
     .await?;
     let info = TunnelInfo {

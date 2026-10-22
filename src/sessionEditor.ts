@@ -1,6 +1,7 @@
 // Create / edit session dialog.
 
 import { icon } from "./icons";
+import { proxyFields, proxyOptions, proxyProblem } from "./proxy";
 import { BAUD_RATES, defaultPort, newSession, normalizeFolder, PROTOCOL_ORDER, PROTOCOLS, serialSettings, type Protocol, type Session } from "./model";
 import { allFolders, state, upsertSession } from "./store";
 import { api } from "./api";
@@ -234,6 +235,7 @@ export function editSession(
             <datalist id="folder-list">${allFolders().map((f) => `<option value="${esc(f)}">`).join("")}</datalist></label>
         </div>
         <details class="advanced" open><summary>${info.label} 옵션</summary>${optionsFields(s.protocol, s.options)}</details>
+        ${proxyFields(s)}
         ${logSection(s)}
         <label class="field"><span>메모</span><textarea name="notes" rows="2" placeholder="이 서버에 대한 메모">${esc(s.notes)}</textarea></label>`;
       wireLogBrowse(form, logName);
@@ -319,7 +321,8 @@ export function editSession(
         const next = b.dataset.proto as Protocol;
         // Swap a default port (including FTPS implicit 990) for the new protocol's default.
         if (s.port === defaultPort(s.protocol, s.options)) s.port = PROTOCOLS[next].port;
-        if (next !== s.protocol) s.options = {};
+        // The proxy is not tied to the protocol: it stays.
+        if (next !== s.protocol) s.options = proxyOptions(s.options);
         s.protocol = next;
         render();
       }),
@@ -330,6 +333,12 @@ export function editSession(
       if (badPort) {
         toast("포트는 1부터 65535 사이의 정수여야 합니다", "warn");
         form.querySelector<HTMLInputElement>("[name=port]")?.focus();
+        return;
+      }
+      const proxyIssue = proxyProblem(s);
+      if (proxyIssue) {
+        toast(proxyIssue, "warn");
+        form.querySelector<HTMLInputElement>("[name='opt.proxyHost'], [name='opt.proxyLocalCommand']")?.focus();
         return;
       }
       if (s.protocol === "serial") {

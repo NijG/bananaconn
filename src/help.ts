@@ -210,6 +210,7 @@ const KO_SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH 게이트웨이</b>: RDP·VNC·Telnet 세션 편집에서 저장된 SSH 세션을 게이트웨이로 고르면 그 서버를 거쳐 방화벽 안쪽 장비에 접속합니다.</li>
+        <li><b>프록시</b>: 세션 편집의 "프록시"에서 PuTTY의 Connection → Proxy처럼 SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet(명령으로 연결), 로컬 명령을 고릅니다. SSH, SFTP, Telnet, FTP/FTPS, RDP, VNC와 그 세션의 리소스 모니터가 모두 프록시를 거칩니다. 프록시 로그인은 자격 증명 보관함에서 고르고, 프록시를 거치지 않을 호스트(*.corp.local, 10.0.0.0/8), DNS 조회 위치, 진단 메시지 표시를 정할 수 있습니다. FTP는 프록시를 거칠 때 수동(PASV) 모드로 연결합니다. PuTTY·KiTTY에서 세션을 가져오면 프록시 설정도 함께 가져옵니다(비밀번호는 제외).</li>
         <li><b>SSH 터널</b>: 상단 도구 → SSH 터널. 내 PC 포트 → SSH 서버 → 대상 주소 포워딩을 저장해 두고 켜고 끕니다.</li>
         <li><b>네트워크 도구</b>: ping, TCP 포트 확인(여러 포트·범위), DNS 조회.</li>
         <li><b>파일 서버</b>: 상단 파일 서버 버튼으로 이 PC의 폴더를 FTP·TFTP·HTTP로 잠깐 공유합니다(장비 OS 업로드 등).</li>

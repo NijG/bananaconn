@@ -2,6 +2,7 @@
 // are routed to an in-memory mock so the UI can be developed and inspected.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { ProxyConfig } from "./proxy";
 import { listen } from "@tauri-apps/api/event";
 import { tr } from "./i18n";
 
@@ -64,6 +65,13 @@ export async function on<T>(event: string, handler: (payload: T) => void): Promi
   return () => mockListeners.get(event)?.delete(handler);
 }
 
+/** One step of a proxy forward (proxy.rs): diagnostics, or why it failed. */
+export interface ProxyLogEvent {
+  id: string;
+  line: string;
+  error: boolean;
+}
+
 export interface TermOpen {
   id: string;
   protocol: "ssh" | "telnet" | "serial";
@@ -80,6 +88,7 @@ export interface TermOpen {
   rows: number;
   cols: number;
   serial?: { baud: number; dataBits: number; parity: string; stopBits: number; flow: string; io?: "fast" | "compat" } | null;
+  proxy?: ProxyConfig | null;
 }
 
 export interface RemoteConnect {
@@ -95,6 +104,7 @@ export interface RemoteConnect {
   activeMode?: boolean;
   ftpsMode?: "explicit" | "implicit";
   allowInvalidCert?: boolean;
+  proxy?: ProxyConfig | null;
 }
 
 export interface RdpOpen {
@@ -218,6 +228,8 @@ export interface TunnelRequest {
   targetHost: string;
   targetPort: number;
   localPort: number;
+  /** The gateway session's own proxy. */
+  gatewayProxy?: ProxyConfig | null;
 }
 
 export type FileServerKind = "tftp" | "http";
@@ -290,6 +302,7 @@ export const api = {
     password?: string;
     trustedFingerprint?: string;
     noPassword?: boolean;
+    proxy?: ProxyConfig | null;
   }) => call<void>("monitor_start", { req }),
   monitorStop: (id: string) => call<void>("monitor_stop", { id }),
   /** No tab of this monitor on screen: pause sampling (or resume). */
@@ -372,6 +385,9 @@ export const api = {
   lockSet: (current: string | null, next: string | null) => call<void>("lock_set", { current, new: next }),
 
   tunnelOpen: (req: TunnelRequest) => call<TunnelInfo>("tunnel_open", { req }),
+  /** A local port reaching host:port through the proxy (RDP, VNC). */
+  proxyForwardOpen: (id: string, host: string, port: number, proxy: ProxyConfig) => call<number>("proxy_forward_open", { id, host, port, proxy }),
+  proxyForwardClose: (id: string) => call<void>("proxy_forward_close", { id }),
   tunnelClose: (id: string) => call<void>("tunnel_close", { id }),
   tunnelList: () => call<TunnelInfo[]>("tunnel_list"),
 

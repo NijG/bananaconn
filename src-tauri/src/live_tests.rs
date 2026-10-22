@@ -21,6 +21,7 @@ fn rebex(protocol: &str, port: u16) -> ConnectRequest {
         active_mode: false,
         ftps_mode: None,
         allow_invalid_cert: false,
+        proxy: None,
     }
 }
 
@@ -429,6 +430,8 @@ async fn ssh_gateway_tunnel_forwards_after_host_key_approval() {
         cred: None,
         trusted_fingerprint: fp,
         known_hosts: kh.clone(),
+        proxy: None,
+        proxy_auth: Default::default(),
     };
 
     // Unknown host key is reported, never silently trusted.
@@ -582,6 +585,8 @@ async fn linux_monitor_samples_on_request_and_pauses() {
         cred: None,
         trusted_fingerprint: fp,
         known_hosts: kh.clone(),
+        proxy: None,
+        proxy_auth: Default::default(),
     };
     let fp = match crate::remote::ssh_login(login(None)).await {
         Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),

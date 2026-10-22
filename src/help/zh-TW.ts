@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH 閘道</b>：在 RDP、VNC 或 Telnet 的編輯工作階段中，選擇已儲存的 SSH 工作階段作為閘道，即可經由該伺服器連到防火牆後方的設備。</li>
+        <li><b>Proxy</b>：在編輯工作階段的「Proxy」中，可像 PuTTY 的 Connection → Proxy 一樣選擇 SOCKS 4/4a、SOCKS 5、HTTP CONNECT、Telnet（用指令連線）或本機指令。SSH、SFTP、Telnet、FTP/FTPS、RDP、VNC 以及該工作階段的資源監視器都會經過 Proxy。Proxy 登入從認證保管庫中選擇，還可設定不經過 Proxy 的主機（*.corp.local、10.0.0.0/8）、DNS 查詢位置以及是否顯示診斷訊息。經 Proxy 連線時 FTP 使用被動 (PASV) 模式。從 PuTTY、KiTTY 匯入的工作階段會一併匯入 Proxy 設定（不含密碼）。</li>
         <li><b>SSH 通道</b>：上方的工具 → SSH 通道。儲存 本機連接埠 → SSH 伺服器 → 目標位址 的轉送，並可開啟與關閉。</li>
         <li><b>網路工具</b>：ping、TCP 連接埠檢查 (多個連接埠與範圍)、DNS 查詢。</li>
         <li><b>檔案伺服器</b>：上方的檔案伺服器按鈕可透過 FTP、TFTP 或 HTTP 暫時共用這台電腦上的資料夾 (例如上傳設備的 OS 映像檔)。</li>

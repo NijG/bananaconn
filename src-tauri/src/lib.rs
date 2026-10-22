@@ -19,6 +19,7 @@ mod monitor;
 mod devmon;
 mod nettools;
 mod paste;
+pub mod proxy;
 mod rdp;
 mod remote;
 mod store;
@@ -73,6 +74,7 @@ pub fn run() {
     let builder = if offscreen { builder } else { builder.plugin(tauri_plugin_window_state::Builder::default().build()) };
     builder
         .manage(term::TermState::default())
+        .manage(proxy::ProxyState::default())
         .manage(remote::RemoteState::default())
         .manage(vnc::VncState::default())
         .manage(rdp::RdpState::default())
@@ -114,6 +116,8 @@ pub fn run() {
             term::serial_ports,
             term::term_break,
             term::term_paste,
+            proxy::proxy_forward_open,
+            proxy::proxy_forward_close,
             term::term_paste_stop,
             term::term_set_logging,
             term::logs_folder,

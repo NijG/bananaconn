@@ -163,6 +163,7 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
       logOnConnect: "로그 파일 위치·자동 기록",
       logOnDisconnect: "로그 파일 위치·자동 기록",
       logLinePrefix: "로그 파일 위치·자동 기록",
+      proxyLocalCommand: "로컬 프록시 명령 (이 PC에서 명령 실행)",
     };
     const sensitiveOf = (s: Session) =>
       SENSITIVE_OPTIONS.filter((k) => {

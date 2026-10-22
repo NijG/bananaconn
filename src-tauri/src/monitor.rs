@@ -102,6 +102,9 @@ pub struct MonitorRequest {
     /// alone is sent (otherwise the login stops before it).
     #[serde(default)]
     pub no_password: bool,
+    /// The session's proxy (proxy.rs): the monitor's own login goes through it too.
+    #[serde(default)]
+    pub proxy: Option<crate::proxy::ProxyConfig>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
@@ -200,19 +203,21 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
         Some(id) => Some(vault::resolve(&app, id)?),
         None => None,
     };
+    let proxy_auth = crate::proxy::auth_for(&app, req.proxy.as_ref())?;
     if req.protocol == "telnet" {
         // Its own Telnet login; problems (password needed, unsupported device)
         // arrive as events because they show up only after connecting.
         let username = if req.username.is_empty() { cred.as_ref().map(|c| c.username.clone()).unwrap_or_default() } else { req.username.clone() };
         let password = req.password.clone().filter(|p| !p.is_empty()).or_else(|| cred.and_then(|c| c.password));
         let (id, host, port, no_password) = (req.id.clone(), req.host.clone(), req.port.unwrap_or(23), req.no_password);
+        let route = req.proxy.clone().map(|p| (p, proxy_auth.clone()));
         let (query_tx, queries) = mpsc::channel(2);
         let task = tauri::async_runtime::spawn(async move {
             let emit = |mut event: serde_json::Value| {
                 event["id"] = json!(id);
                 let _ = app.emit("monitor-stats", event);
             };
-            match crate::devmon::run_telnet(&host, port, &username, password.as_deref(), no_password, emit, queries).await {
+            match crate::devmon::run_telnet(&host, port, &username, password.as_deref(), no_password, emit, queries, route).await {
                 Ok(()) => {}
                 Err(e) => {
                     let _ = app.emit("monitor-stats", json!({ "id": id, "error": e }));
@@ -244,6 +249,8 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
         cred,
         trusted_fingerprint: req.trusted_fingerprint.clone(),
         known_hosts: known_hosts_path(),
+        proxy: req.proxy.clone(),
+        proxy_auth: proxy_auth.clone(),
     };
 
     // Vault credential or typed password first; otherwise the default keys.

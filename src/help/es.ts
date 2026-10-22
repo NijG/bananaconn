@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Puerta de enlace SSH</b>: en el editor de sesiones RDP, VNC o Telnet, elija una sesión SSH guardada como puerta de enlace para llegar a dispositivos detrás de un firewall a través de ese servidor.</li>
+        <li><b>Proxy</b>: en «Proxy» del editor de sesiones elija, como en Connection → Proxy de PuTTY, SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (conectar con un comando) o un comando local. SSH, SFTP, Telnet, FTP/FTPS, RDP y VNC, y el monitor de recursos de la sesión, pasan por él. Elija el inicio de sesión del proxy en el almacén de credenciales e indique los hosts que no usan el proxy (*.corp.local, 10.0.0.0/8), dónde se resuelven los nombres y si se muestra el diagnóstico. FTP usa el modo pasivo a través de un proxy. Las sesiones importadas de PuTTY o KiTTY conservan su proxy (sin la contraseña).</li>
         <li><b>Túneles SSH</b>: Herramientas en la parte superior → Túneles SSH. Guarde reenvíos de puerto local → servidor SSH → dirección de destino y actívelos o desactívelos.</li>
         <li><b>Herramientas de red</b>: ping, comprobación de puertos TCP (varios puertos y rangos), consulta DNS.</li>
         <li><b>Servidores de archivos</b>: el botón de servidor de archivos de la parte superior comparte temporalmente una carpeta de este PC por FTP, TFTP o HTTP (p. ej., para cargar imágenes del SO de dispositivos).</li>

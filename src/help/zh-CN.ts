@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH 网关</b>：在 RDP、VNC 或 Telnet 会话编辑器中，选择一个已保存的 SSH 会话作为网关，即可通过该服务器访问防火墙后的设备。</li>
+        <li><b>代理</b>：在会话编辑的“代理”中，可像 PuTTY 的 Connection → Proxy 一样选择 SOCKS 4/4a、SOCKS 5、HTTP CONNECT、Telnet（用命令连接）或本地命令。SSH、SFTP、Telnet、FTP/FTPS、RDP、VNC 以及该会话的资源监视器都会经过代理。代理登录从凭据保管库中选择，还可设置不经过代理的主机（*.corp.local、10.0.0.0/8）、DNS 解析位置以及是否显示诊断信息。经代理连接时 FTP 使用被动 (PASV) 模式。从 PuTTY、KiTTY 导入的会话会一并导入代理设置（不含密码）。</li>
         <li><b>SSH 隧道</b>：顶部的工具 → SSH 隧道。保存 本地端口 → SSH 服务器 → 目标地址 的转发，并可随时开启和关闭。</li>
         <li><b>网络工具</b>：ping、TCP 端口检查 (多个端口和范围)、DNS 查询。</li>
         <li><b>文件服务器</b>：顶部的文件服务器按钮可通过 FTP、TFTP 或 HTTP 临时共享本机上的文件夹 (例如用于上传设备 OS 镜像)。</li>

@@ -99,6 +99,8 @@ export const SENSITIVE_OPTIONS = [
   "logOnConnect",
   "logOnDisconnect",
   "logLinePrefix",
+  // A local proxy runs a command on this PC for every connection.
+  "proxyLocalCommand",
 ] as const;
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);

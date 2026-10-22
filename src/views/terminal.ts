@@ -5,7 +5,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } from "../api";
-import type { PasteEvent } from "../api";
+import type { PasteEvent, ProxyLogEvent } from "../api";
+import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
@@ -53,6 +54,7 @@ function ensureRouting() {
     setMonitorInfo(m, nextMonitorInfo(m.info, e));
   });
   on<PasteEvent>("term-paste", (e) => allViews.forEach((v) => v.pasteProgress(e)));
+  on<ProxyLogEvent>("proxy-log", (e) => allViews.forEach((v) => v.proxyLog(e)));
 }
 
 // ---- shared resource monitors ----------------------------------------------------------
@@ -214,7 +216,8 @@ export class TerminalView implements View {
     private ws: Workspace,
     private openFiles: (s: Session, beside?: View) => void,
   ) {
-    this.gateway = new GatewayLink(session, 23);
+    // Telnet's proxy goes to term_open (its steps then show in the terminal).
+    this.gateway = new GatewayLink(session, 23, false);
     ensureRouting();
     allViews.add(this);
     const p = PROTOCOLS[session.protocol];
@@ -504,6 +507,7 @@ export class TerminalView implements View {
         port: this.session.port,
         username: this.session.username || m.user,
         credentialId: this.session.credentialId,
+        proxy: this.session.options.gateway ? null : proxyOf(this.session),
         ...extra,
       });
       // The login can outlast the tabs: if all of them closed meanwhile, the
@@ -720,6 +724,13 @@ export class TerminalView implements View {
       this.pasteActive = false;
       this.renderPasteProgress(null);
     }
+  }
+
+  /** A step of this SSH session's proxy forward (proxy.rs, id "term-<runtime id>"). */
+  proxyLog(e: ProxyLogEvent) {
+    if (this.disposed || e.id !== `term-${this.runtimeId}`) return;
+    if (e.error) this.term.write(`\r\n\x1b[31m${tr(`프록시: ${e.line}`)}\x1b[0m\r\n`);
+    else if (proxyOf(this.session)?.diagnostics) this.term.write(`\x1b[90m${e.line}\x1b[0m\r\n`);
   }
 
   pasteProgress(e: PasteEvent) {
@@ -996,6 +1007,8 @@ export class TerminalView implements View {
         rows: this.term.rows,
         cols: this.term.cols,
         serial: p === "serial" ? { ...serialSettings(this.session.options), io: state.settings.serialIo } : null,
+        // Through a gateway tunnel the proxy is the gateway's business.
+        proxy: tunnelPort ? null : proxyOf(this.session),
         },
         (bytes) => this.receive(rid, bytes),
         (code) => this.exited(rid, code),

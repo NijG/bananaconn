@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::paste;
 use crate::telnet;
@@ -367,6 +367,9 @@ pub struct OpenRequest {
     /// Serial: line settings (the COM port name is in `host`).
     #[serde(default)]
     pub serial: Option<SerialSettings>,
+    /// SSH / Telnet: the session's proxy (proxy.rs).
+    #[serde(default)]
+    pub proxy: Option<crate::proxy::ProxyConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -420,8 +423,8 @@ pub async fn term_open(
     let opened = match req.protocol.as_str() {
         // Starting ssh.exe (and "ssh -G" before it) blocks: not on a runtime thread.
         "ssh" => {
-            let req2 = req.clone();
-            tauri::async_runtime::spawn_blocking(move || open_ssh(&req2, cred, out))
+            let (req2, app2) = (req.clone(), app.clone());
+            tauri::async_runtime::spawn_blocking(move || open_ssh(&app2, &req2, cred, out))
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|r| r)
@@ -431,7 +434,9 @@ pub async fn term_open(
             let port = req.port.unwrap_or(23);
             let (rows, cols) = (req.rows, req.cols);
             let username = req.username.clone();
-            tauri::async_runtime::spawn_blocking(move || open_telnet(&host, port, &username, cred, rows, cols, out))
+            let auth = crate::proxy::auth_for(&app, req.proxy.as_ref())?;
+            let route = req.proxy.clone().map(|p| (p, auth));
+            tauri::async_runtime::spawn_blocking(move || open_telnet(&host, port, &username, cred, rows, cols, out, route))
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|r| r)
@@ -870,7 +875,7 @@ pub(crate) fn ssh_config(host: &str, port: u16, username: &str) -> SshConfig {
     }
 }
 
-fn open_ssh(req: &OpenRequest, cred: Option<vault::Resolved>, out: Arc<OutPump>) -> Result<Arc<Session>, String> {
+fn open_ssh(app: &AppHandle, req: &OpenRequest, cred: Option<vault::Resolved>, out: Arc<OutPump>) -> Result<Arc<Session>, String> {
     safe_token(&req.host, "호스트", "")?;
     let forwards = forward_args(&req.forwards)?;
     if !req.jump_host.trim().is_empty() {
@@ -927,6 +932,22 @@ fn open_ssh(req: &OpenRequest, cred: Option<vault::Resolved>, out: Arc<OutPump>)
             if c.key_path.is_none() {
                 cmd.args(["-o", "PreferredAuthentications=password,keyboard-interactive,publickey,gssapi-with-mic,hostbased"]);
             }
+        }
+    }
+    // Behind a proxy: ssh.exe reaches the server through our ProxyCommand
+    // (bananaconn.exe --proxy-stdio), piped to a local forward that dials the
+    // proxy. Host and port stay as typed, so ~/.ssh/config and known_hosts
+    // apply unchanged; the forward goes where ssh_config resolves them.
+    if let Some(p) = req.proxy.clone() {
+        let target = ssh_config(&req.host, req.port.unwrap_or(22), &username);
+        if !p.bypasses(&target.hostname) {
+            if !req.jump_host.trim().is_empty() {
+                return Err("점프 호스트와 프록시를 함께 쓸 수 없습니다. 세션 편집에서 둘 중 하나만 지정하세요.".into());
+            }
+            let state = app.state::<crate::proxy::ProxyState>();
+            let port = crate::proxy::open_forward(app, &state, &format!("term-{}", req.id), &target.hostname, target.port, p)?;
+            let exe = std::env::current_exe().map_err(|e| format!("프록시 중계를 시작할 수 없습니다: {e}"))?;
+            cmd.args(["-o", &format!("ProxyCommand=\"{}\" --proxy-stdio {port}", exe.display())]);
         }
     }
     if !req.jump_host.trim().is_empty() {
@@ -1005,30 +1026,46 @@ fn open_telnet(
     rows: u16,
     cols: u16,
     out: Arc<OutPump>,
+    proxy: Option<(crate::proxy::ProxyConfig, crate::proxy::Auth)>,
 ) -> Result<Arc<Session>, String> {
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("호스트 주소를 찾을 수 없습니다: {e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err("호스트 주소를 찾을 수 없습니다".into());
-    }
-    // Try every address: "localhost" often resolves to ::1 first while the
-    // server listens on IPv4 only.
-    let mut last = None;
-    let mut connected = None;
-    for addr in &addrs {
-        match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
-            Ok(s) => {
-                connected = Some(s);
-                break;
-            }
-            Err(e) => last = Some(e),
+    // The proxy's steps, shown in the terminal when diagnostics are on.
+    let mut steps = Vec::new();
+    let stream = match proxy.as_ref().filter(|(p, _)| !p.bypasses(host)) {
+        Some((p, auth)) => {
+            let diag = p.diagnostics;
+            crate::proxy::dial(Some(p), auth, host, port, &mut |l| {
+                if diag {
+                    steps.push(l);
+                }
+            })?
         }
+        None => {
+            let addrs: Vec<_> = (host, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("호스트 주소를 찾을 수 없습니다: {e}"))?
+                .collect();
+            if addrs.is_empty() {
+                return Err("호스트 주소를 찾을 수 없습니다".into());
+            }
+            // Try every address: "localhost" often resolves to ::1 first while the
+            // server listens on IPv4 only.
+            let mut last = None;
+            let mut connected = None;
+            for addr in &addrs {
+                match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
+                    Ok(s) => {
+                        connected = Some(s);
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            connected.ok_or_else(|| format!("{host}:{port} 에 연결할 수 없습니다: {}", last.map(|e| e.to_string()).unwrap_or_default()))?
+        }
+    };
+    for line in &steps {
+        out.push(format!("\x1b[90m{line}\x1b[0m\r\n").as_bytes());
     }
-    let stream = connected.ok_or_else(|| {
-        format!("{host}:{port} 에 연결할 수 없습니다: {}", last.map(|e| e.to_string()).unwrap_or_default())
-    })?;
     let _ = stream.set_nodelay(true);
     let mut reader = stream.try_clone().map_err(|e| e.to_string())?;
     let control = stream.try_clone().map_err(|e| e.to_string())?;
@@ -1226,7 +1263,9 @@ pub fn end_all_logs(state: &TermState) {
 }
 
 #[tauri::command]
-pub async fn term_close(state: State<'_, TermState>, id: String) -> Result<(), String> {
+pub async fn term_close(app: AppHandle, state: State<'_, TermState>, id: String) -> Result<(), String> {
+    // The SSH session's proxy forward, if it had one.
+    crate::proxy::close_forward(&app.state::<crate::proxy::ProxyState>(), &format!("term-{id}"));
     let Some(session) = state.sessions.lock().unwrap().remove(&id) else { return Ok(()) };
     if let Some(job) = session.paste.lock().unwrap().take() {
         job.stop();

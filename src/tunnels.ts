@@ -3,7 +3,8 @@
 // (tunnel.rs) does the forwarding in-process; this module handles the login
 // dialogs (host key, password) and the saved tunnel list.
 
-import { api, on, type TunnelInfo } from "./api";
+import { api, on, type ProxyLogEvent, type TunnelInfo } from "./api";
+import { proxyOf } from "./proxy";
 import { icon } from "./icons";
 import { endpoint, type Session } from "./model";
 import { state } from "./store";
@@ -59,6 +60,7 @@ export async function openSshTunnel(
         targetHost,
         targetPort,
         localPort,
+        gatewayProxy: proxyOf(gw),
         ...extra,
       });
     } catch (err) {
@@ -282,19 +284,25 @@ export function openTunnelManager() {
 export class GatewayLink {
   readonly id = `gw-${crypto.randomUUID()}`;
   private info: TunnelInfo | null = null;
+  /** Local port of the session's proxy forward (no gateway), once open. */
+  private proxyPort: number | null = null;
+  private unlisten: (() => void) | null = null;
   /** The login in progress; a second caller waits for it instead of opening another. */
   private opening: Promise<TunnelInfo | null> | null = null;
   private closed = false;
 
+  /** `viaProxy`: without a gateway, reach a proxied session through a local
+   * proxy forward (RDP, VNC); Telnet and SSH hand the proxy to term_open. */
   constructor(
     private session: Session,
     private defaultPort: number,
+    private viaProxy = true,
   ) {}
 
-  /** Local port to connect to: undefined without a gateway, null if the user cancelled. */
+  /** Local port to connect to: undefined without a gateway or proxy, null if the user cancelled. */
   async port(): Promise<number | null | undefined> {
     const gw = gatewayOf(this.session);
-    if (!gw) return undefined;
+    if (!gw) return this.viaProxy ? this.proxyForward() : undefined;
     if (this.closed) return null;
     if (this.info && (await api.tunnelList()).some((t) => t.id === this.id)) return this.info.localPort;
     if (!this.opening) {
@@ -310,9 +318,28 @@ export class GatewayLink {
     return info?.localPort ?? null;
   }
 
+  private async proxyForward(): Promise<number | undefined> {
+    const proxy = proxyOf(this.session);
+    if (!proxy) return undefined;
+    if (this.proxyPort) return this.proxyPort;
+    // Each proxied connection is dialled when the view connects: its failure
+    // arrives as an event, said here (the view only sees a closed connection).
+    if (!this.unlisten) {
+      const id = this.id;
+      on<ProxyLogEvent>("proxy-log", (e) => {
+        if (e.id === id && e.error) toast(`프록시: ${e.line}`, "error", 8000);
+      }).then((u) => (this.closed ? u() : (this.unlisten = u)));
+    }
+    this.proxyPort = await api.proxyForwardOpen(this.id, this.session.host, this.session.port ?? this.defaultPort, proxy);
+    return this.proxyPort;
+  }
+
   close() {
     this.closed = true;
     api.tunnelClose(this.id).catch(() => {});
+    if (this.proxyPort) api.proxyForwardClose(this.id).catch(() => {});
+    this.unlisten?.();
     this.info = null;
+    this.proxyPort = null;
   }
 }

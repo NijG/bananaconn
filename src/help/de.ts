@@ -201,6 +201,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>SSH-Gateway</b>: Wählen Sie im Sitzungseditor für RDP, VNC oder Telnet eine gespeicherte SSH-Sitzung als Gateway, um Geräte hinter einer Firewall über diesen Server zu erreichen.</li>
+        <li><b>Proxy</b>: Unter „Proxy“ im Sitzungseditor wählen Sie wie in PuTTY (Connection → Proxy) SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet (per Befehl verbinden) oder einen lokalen Befehl. SSH, SFTP, Telnet, FTP/FTPS, RDP und VNC sowie der Ressourcenmonitor der Sitzung laufen darüber. Die Proxy-Anmeldung wählen Sie aus dem Anmeldedaten-Tresor; außerdem lassen sich Hosts ohne Proxy (*.corp.local, 10.0.0.0/8), der Ort der Namensauflösung und die Diagnoseanzeige festlegen. FTP nutzt über einen Proxy den passiven Modus. Aus PuTTY oder KiTTY importierte Sitzungen übernehmen ihre Proxy-Einstellungen (ohne Kennwort).</li>
         <li><b>SSH-Tunnel</b>: Werkzeuge oben → SSH-Tunnel. Speichern Sie Weiterleitungen lokaler Port → SSH-Server → Zieladresse und schalten Sie sie ein und aus.</li>
         <li><b>Netzwerk-Tools</b>: Ping, TCP-Portprüfung (mehrere Ports und Bereiche), DNS-Abfrage.</li>
         <li><b>Dateiserver</b>: Die Dateiserver-Schaltfläche oben gibt einen Ordner dieses PCs vorübergehend per FTP, TFTP oder HTTP frei (z. B. zum Hochladen von Geräte-OS-Images).</li>

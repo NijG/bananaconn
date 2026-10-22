@@ -28,6 +28,7 @@ use suppaftp::{FtpResult, FtpStream, RustlsConnector, RustlsFtpStream};
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::proxy::{Auth as ProxyAuth, ProxyConfig};
 use crate::vault;
 
 const CHUNK: usize = 64 * 1024;
@@ -239,6 +240,9 @@ pub struct ConnectRequest {
     /// FTPS: accept a certificate Windows does not trust (self-signed etc.).
     #[serde(default)]
     pub allow_invalid_cert: bool,
+    /// The session's proxy (proxy.rs).
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -339,9 +343,10 @@ pub async fn remote_connect(
         .clone()
         .filter(|p| !p.is_empty())
         .or_else(|| cred.as_ref().and_then(|c| c.password.clone()));
+    let proxy_auth = crate::proxy::auth_for(&app, req.proxy.as_ref())?;
 
     let (remote, connected) = match req.protocol.as_str() {
-        "sftp" => connect_sftp(&req, &username, password, cred, known_hosts_path()).await?,
+        "sftp" => connect_sftp(&req, &username, password, cred, known_hosts_path(), proxy_auth).await?,
         "ftp" | "ftps" => {
             let security = match (req.protocol.as_str(), req.ftps_mode.as_deref()) {
                 ("ftp", _) => FtpSecurity::Plain,
@@ -357,6 +362,8 @@ pub async fn remote_connect(
                 active: req.active_mode,
                 security,
                 allow_invalid_cert: req.allow_invalid_cert,
+                proxy: req.proxy.clone(),
+                proxy_auth,
             };
             tauri::async_runtime::spawn_blocking(move || connect_ftp(&opts))
                 .await
@@ -377,6 +384,9 @@ pub(crate) struct SshLogin {
     pub cred: Option<vault::Resolved>,
     pub trusted_fingerprint: Option<String>,
     pub known_hosts: PathBuf,
+    /// The session's proxy, and its login from the vault.
+    pub proxy: Option<ProxyConfig>,
+    pub proxy_auth: ProxyAuth,
 }
 
 /// Connect and authenticate. Errors use the shared codes the UI understands:
@@ -398,7 +408,22 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
         nodelay: true,
         ..Default::default()
     });
-    let connecting = client::connect(config, (l.host.as_str(), port), handler);
+    let connecting = async {
+        match l.proxy.clone().filter(|p| !p.bypasses(&l.host)) {
+            // Through the proxy: its connection carries the SSH session.
+            Some(p) => {
+                let (host, auth) = (l.host.clone(), l.proxy_auth.clone());
+                let stream = tauri::async_runtime::spawn_blocking(move || crate::proxy::dial(Some(&p), &auth, &host, port, &mut |_| {}))
+                    .await
+                    .map_err(|e| russh::Error::IO(std::io::Error::other(e.to_string())))?
+                    .map_err(|e| russh::Error::IO(std::io::Error::other(e)))?;
+                stream.set_nonblocking(true).map_err(russh::Error::IO)?;
+                let stream = tokio::net::TcpStream::from_std(stream).map_err(russh::Error::IO)?;
+                client::connect_stream(config, stream, handler).await
+            }
+            None => client::connect(config, (l.host.as_str(), port), handler).await,
+        }
+    };
     let mut handle = match tokio::time::timeout(Duration::from_secs(15), connecting).await {
         Err(_) => return Err(format!("{}:{port} 연결 시간이 초과되었습니다", l.host)),
         Ok(Err(e)) => {
@@ -493,6 +518,7 @@ async fn connect_sftp(
     password: Option<String>,
     cred: Option<vault::Resolved>,
     known_hosts: PathBuf,
+    proxy_auth: ProxyAuth,
 ) -> Result<(Remote, Connected), String> {
     let handle = ssh_login(SshLogin {
         host: req.host.clone(),
@@ -502,6 +528,8 @@ async fn connect_sftp(
         cred,
         trusted_fingerprint: req.trusted_fingerprint.clone(),
         known_hosts,
+        proxy: req.proxy.clone(),
+        proxy_auth,
     })
     .await?;
     let channel = handle.channel_open_session().await.map_err(|e| e.to_string())?;
@@ -540,6 +568,8 @@ struct FtpOptions {
     active: bool,
     security: FtpSecurity,
     allow_invalid_cert: bool,
+    proxy: Option<ProxyConfig>,
+    proxy_auth: ProxyAuth,
 }
 
 /// Map a TLS-layer failure. Untrusted / mismatched certificates come back as
@@ -628,13 +658,18 @@ fn connect_ftp(o: &FtpOptions) -> Result<(Remote, Connected), String> {
 }
 
 fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
-    let addrs: Vec<SocketAddr> = (o.host.as_str(), o.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("호스트 주소를 찾을 수 없습니다: {e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err("호스트 주소를 찾을 수 없습니다".into());
-    }
+    // Looked up here only for a direct connection: behind a proxy the name
+    // may resolve on the proxy's side only.
+    let lookup = || -> Result<Vec<SocketAddr>, String> {
+        let addrs: Vec<SocketAddr> = (o.host.as_str(), o.port)
+            .to_socket_addrs()
+            .map_err(|e| format!("호스트 주소를 찾을 수 없습니다: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err("호스트 주소를 찾을 수 없습니다".into());
+        }
+        Ok(addrs)
+    };
     let user = if o.username.is_empty() { "anonymous" } else { o.username.as_str() };
     let pass = o
         .password
@@ -656,7 +691,8 @@ fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
             ftp.transfer_type(FileType::Binary).map_err(|e| e.to_string())?;
             // Ask for UTF-8 names; servers that refuse simply answer with an error.
             let _ = ftp.custom_command("OPTS UTF8 ON", &[suppaftp::Status::CommandOk]);
-            if o.active {
+            // Active mode needs the server to connect back: not through a proxy.
+            if o.active && !o.proxy.as_ref().is_some_and(|p| !p.bypasses(&o.host)) {
                 ftp.set_mode(suppaftp::Mode::Active);
             } else {
                 ftp.set_passive_nat_workaround(true);
@@ -672,11 +708,38 @@ fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
     // The control socket gets its timeouts before the first byte: a server
     // that accepts the connection but never greets (wrong port, a dead NAS)
     // fails after FTP_IO_TIMEOUT instead of hanging the tab and its queue.
+    let proxied = o.proxy.clone().filter(|p| !p.bypasses(&o.host));
+    // Passive data connections: through the proxy too, to the server's own
+    // name (the address in its PASV reply is often a private one).
+    let data: Arc<dyn Fn(SocketAddr) -> FtpResult<TcpStream> + Send + Sync> = match proxied.clone() {
+        Some(p) => {
+            let (host, auth) = (o.host.clone(), o.proxy_auth.clone());
+            Arc::new(move |addr: SocketAddr| {
+                let s = crate::proxy::dial(Some(&p), &auth, &host, addr.port(), &mut |_| {})
+                    .map_err(|e| suppaftp::FtpError::ConnectionError(std::io::Error::other(e)))?;
+                s.set_read_timeout(Some(FTP_IO_TIMEOUT))
+                    .and_then(|()| s.set_write_timeout(Some(FTP_IO_TIMEOUT)))
+                    .map_err(suppaftp::FtpError::ConnectionError)?;
+                Ok(s)
+            })
+        }
+        None => Arc::new(ftp_data_stream),
+    };
+    let builder = || {
+        let data = data.clone();
+        move |addr: SocketAddr| data(addr)
+    };
     let control = || -> Result<TcpStream, String> {
+        if let Some(p) = &proxied {
+            let s = crate::proxy::dial(Some(p), &o.proxy_auth, &o.host, o.port, &mut |_| {})?;
+            let _ = s.set_read_timeout(Some(FTP_IO_TIMEOUT));
+            let _ = s.set_write_timeout(Some(FTP_IO_TIMEOUT));
+            return Ok(s);
+        }
         // The first address that answers ("localhost" is ::1 first; a server
         // may listen on 127.0.0.1 only).
         let mut last = None;
-        let s = addrs
+        let s = lookup()?
             .iter()
             .find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(15)).map_err(|e| last = Some(e)).ok())
             .ok_or_else(|| connect_err(suppaftp::FtpError::ConnectionError(last.take().expect("one address was tried"))))?;
@@ -688,17 +751,17 @@ fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
     let (ftp, connected) = match o.security {
         FtpSecurity::Plain => finish!(FtpStream::connect_with_stream(control()?)
             .map_err(connect_err)?
-            .passive_stream_builder(ftp_data_stream)),
+            .passive_stream_builder(builder())),
         FtpSecurity::Explicit => {
             let plain = RustlsFtpStream::connect_with_stream(control()?)
                 .map_err(connect_err)?
-                .passive_stream_builder(ftp_data_stream);
+                .passive_stream_builder(builder());
             finish!(plain.into_secure(tls()?, &o.host).map_err(|e| tls_error(e, o))?)
         }
         FtpSecurity::Implicit => {
             let mut secure = RustlsFtpStream::connect_secure_implicit_with_stream(control()?, tls()?, &o.host)
                 .map_err(|e| tls_error(e, o))?
-                .passive_stream_builder(ftp_data_stream);
+                .passive_stream_builder(builder());
             // suppaftp's implicit mode wraps data connections in TLS but never
             // negotiates data protection; servers then reject the data channel.
             for cmd in ["PBSZ 0", "PROT P"] {
@@ -2258,6 +2321,8 @@ pub fn test_active_ftp(port: u16, user: &str, pw: &str, file: &str, data: &[u8])
         active: true,
         security: FtpSecurity::Plain,
         allow_invalid_cert: false,
+        proxy: None,
+        proxy_auth: Default::default(),
     };
     let (mut ftp, _) = open_ftp(&opts)?;
     let mut down = Vec::new();
@@ -2275,7 +2340,7 @@ pub async fn test_connect_sftp(req: &ConnectRequest) -> Result<Vec<FileEntry>, S
     if req.trusted_fingerprint.is_none() {
         let _ = std::fs::remove_file(&kh);
     }
-    let (remote, connected) = connect_sftp(req, &req.username, req.password.clone(), None, kh).await?;
+    let (remote, connected) = connect_sftp(req, &req.username, req.password.clone(), None, kh, Default::default()).await?;
     let Remote::Sftp { sftp, .. } = &remote else { unreachable!() };
     list_sftp(sftp, &connected.home).await
 }
@@ -2303,8 +2368,9 @@ pub async fn test_sftp_folder(
         active_mode: false,
         ftps_mode: None,
         allow_invalid_cert: false,
+        proxy: None,
     };
-    let (conn, _) = connect_sftp(&req, &req.username, req.password.clone(), None, known_hosts.to_path_buf()).await?;
+    let (conn, _) = connect_sftp(&req, &req.username, req.password.clone(), None, known_hosts.to_path_buf(), Default::default()).await?;
     let Remote::Sftp { sftp, .. } = &conn else { unreachable!() };
     let mut rep = Reporter {
         app: None,
@@ -2344,6 +2410,8 @@ pub fn test_connect_ftp(host: &str, port: u16, security: &str) -> Result<(Vec<Fi
             _ => FtpSecurity::Plain,
         },
         allow_invalid_cert: false,
+        proxy: None,
+        proxy_auth: Default::default(),
     };
     let (remote, connected) = connect_ftp(&opts)?;
     let Remote::Ftp { conn, .. } = remote else { unreachable!() };
@@ -2402,6 +2470,8 @@ mod tests {
             active: false,
             security: FtpSecurity::Plain,
             allow_invalid_cert: false,
+            proxy: None,
+            proxy_auth: Default::default(),
         }
     }
 

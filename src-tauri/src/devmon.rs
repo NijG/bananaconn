@@ -153,11 +153,22 @@ fn lower_tail(text: &str) -> String {
 }
 
 impl Line {
-    pub(crate) async fn telnet(host: &str, port: u16) -> Result<Self, String> {
-        let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host, port)))
-            .await
-            .map_err(|_| format!("{host}:{port} 연결 시간이 초과되었습니다"))?
-            .map_err(|e| format!("{host}:{port} 에 연결할 수 없습니다: {e}"))?;
+    /// `proxy`: the session's proxy and its login (proxy.rs).
+    pub(crate) async fn telnet(host: &str, port: u16, proxy: Option<&Route>) -> Result<Self, String> {
+        let stream = match proxy.filter(|(p, _)| !p.bypasses(host)) {
+            Some((p, auth)) => {
+                let (p, auth, h) = (p.clone(), auth.clone(), host.to_string());
+                let s = tokio::task::spawn_blocking(move || crate::proxy::dial(Some(&p), &auth, &h, port, &mut |_| {}))
+                    .await
+                    .map_err(|e| e.to_string())??;
+                s.set_nonblocking(true).map_err(|e| e.to_string())?;
+                TcpStream::from_std(s).map_err(|e| e.to_string())?
+            }
+            None => tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host, port)))
+                .await
+                .map_err(|_| format!("{host}:{port} 연결 시간이 초과되었습니다"))?
+                .map_err(|e| format!("{host}:{port} 에 연결할 수 없습니다: {e}"))?,
+        };
         let _ = stream.set_nodelay(true);
         Ok(Self { io: Box::new(stream), telnet: Some(telnet::Parser::new()), text: String::new(), partial: Vec::new(), prompt: None })
     }
@@ -1116,6 +1127,10 @@ pub(crate) async fn drive(
 const OUT_OF_STEP: &str = "장비의 응답이 끝나지 않아 자원 표시를 멈췄습니다. 탭을 다시 연결하면 다시 시작합니다";
 
 /// Telnet: connect, log in, then `drive`.
+/// A session's proxy and its login.
+pub(crate) type Route = (crate::proxy::ProxyConfig, crate::proxy::Auth);
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_telnet(
     host: &str,
     port: u16,
@@ -1124,8 +1139,9 @@ pub(crate) async fn run_telnet(
     no_password: bool,
     report: impl FnMut(Value),
     queries: mpsc::Receiver<Query>,
+    proxy: Option<Route>,
 ) -> Result<(), String> {
-    let mut t = Line::telnet(host, port).await?;
+    let mut t = Line::telnet(host, port, proxy.as_ref()).await?;
     let prompt = login(&mut t, username, password, no_password).await?;
     drive(t, prompt, report, queries).await
 }
@@ -1260,7 +1276,7 @@ mod device_tests {
                     }
                 }
             });
-            let mut t = Line::telnet("127.0.0.1", port).await?;
+            let mut t = Line::telnet("127.0.0.1", port, None).await?;
             login(&mut t, "root", Some(password), false).await.map(|_| ())
         }
         assert_eq!(attempt("good").await, Ok(()));
@@ -1321,7 +1337,7 @@ mod device_tests {
         let sink = events.clone();
         let (query, queries) = mpsc::channel(1);
         let monitor = tokio::spawn(async move {
-            run_telnet("127.0.0.1", port, "admin", Some("secret"), false, move |e| sink.lock().unwrap().push(e), queries).await
+            run_telnet("127.0.0.1", port, "admin", Some("secret"), false, move |e| sink.lock().unwrap().push(e), queries, None).await
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !events.lock().unwrap().iter().any(|e: &Value| e.get("stats").is_some()) && tokio::time::Instant::now() < deadline {
@@ -1478,7 +1494,7 @@ mod device_tests {
         let sink = events.clone();
         let (_query, queries) = mpsc::channel(1);
         let monitor = tokio::spawn(async move {
-            run_telnet("127.0.0.1", port, "monitor", Some("hp-pass"), false, move |e| sink.lock().unwrap().push(e), queries).await
+            run_telnet("127.0.0.1", port, "monitor", Some("hp-pass"), false, move |e| sink.lock().unwrap().push(e), queries, None).await
         });
         let (device, stats) = first_sample(&events).await;
         monitor.abort();
@@ -1543,7 +1559,7 @@ mod device_tests {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
         let (_query, queries) = mpsc::channel(1);
-        let monitor = tokio::spawn(async move { run_telnet("127.0.0.1", port, "root", Some("pw"), false, move |e| sink.lock().unwrap().push(e), queries).await });
+        let monitor = tokio::spawn(async move { run_telnet("127.0.0.1", port, "root", Some("pw"), false, move |e| sink.lock().unwrap().push(e), queries, None).await });
         let (device, stats) = first_sample(&events).await;
         let ended = monitor.is_finished();
         monitor.abort();

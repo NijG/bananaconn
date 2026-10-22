@@ -247,6 +247,29 @@ function parseXml(xml: string): Document {
 
 const PUTTY_PROTOCOLS: Record<string, Protocol> = { ssh: "ssh", telnet: "telnet", serial: "serial" };
 
+/** PuTTY's Connection → Proxy settings as session options (proxy.ts). The
+ * proxy's username and password are not taken: PuTTY keeps the password in
+ * the registry in plain text, and BananaConn keeps secrets in the vault only.
+ * SSH proxies (ProxyMethod 6–8) have no counterpart and are left out. */
+function puttyProxy(v: Map<string, string>): Record<string, unknown> {
+  const kind = ["", "socks4", "socks5", "http", "telnet", "local"][Number(v.get("ProxyMethod") ?? 0)] ?? "";
+  if (!kind) return {};
+  const o: Record<string, unknown> = {
+    proxyType: kind,
+    proxyHost: v.get("ProxyHost") ?? "",
+    proxyPort: Number(v.get("ProxyPort") ?? 80) || 80,
+    proxyExclude: v.get("ProxyExcludeList") ?? "",
+    proxyLocal: v.get("ProxyLocalhost") === "1",
+    proxyDns: ["no", "auto", "yes"][Number(v.get("ProxyDNS") ?? 1)] ?? "auto",
+    // PuTTY: 0 yes, 1 no, 2 only until the session starts.
+    proxyDiag: (v.get("ProxyLogToTerm") ?? "1") !== "1",
+  };
+  const command = v.get("ProxyTelnetCommand") ?? "";
+  if (kind === "telnet" && command) o.proxyTelnetCommand = command;
+  if (kind === "local") o.proxyLocalCommand = command;
+  return o;
+}
+
 /** PuTTY or KiTTY sessions from `reg export` text. */
 export function parsePuttyReg(text: string, source: "PuTTY" | "KiTTY"): ParsedImport {
   const out = empty();
@@ -278,7 +301,7 @@ export function parsePuttyReg(text: string, source: "PuTTY" | "KiTTY"): ParsedIm
         folder: source,
         options: serial
           ? { baud: Number(v.get("SerialSpeed") ?? 9600), dataBits: Number(v.get("SerialDataBits") ?? 8), parity, stopBits: Number(v.get("SerialStopHalfbits") ?? 2) >= 4 ? 2 : 1, flow, keyMode: "network" }
-          : {},
+          : puttyProxy(v),
       },
       proto,
     );
