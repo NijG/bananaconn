@@ -835,6 +835,16 @@ mod tests {
         assert!(client.initiate_copy(&[]).is_ok(), "the start-up copy goes out");
     }
 
+    /// The clipboard channel is declared like mstsc and FreeRDP declare it
+    /// (vendor/ironrdp-svc): Windows 7 starts its clipboard only then.
+    #[test]
+    fn clipboard_channel_is_declared_like_mstsc() {
+        let channel = ironrdp::svc::StaticVirtualChannel::new(ironrdp::cliprdr::CliprdrClient::new(Box::new(Noop)));
+        let def = ironrdp::svc::make_channel_definition(&channel);
+        assert_eq!(def.name.as_str(), Some("cliprdr"));
+        assert_eq!(def.options.bits(), 0xC0A0_0000, "INITIALIZED | ENCRYPT_RDP | COMPRESS_RDP | SHOW_PROTOCOL");
+    }
+
     /// The start-up as a server runs it: capabilities, then Monitor Ready once
     /// its clipboard program runs (Windows 7: seconds after the logon), then
     /// the Format List Response. Local copies may go out only from Monitor

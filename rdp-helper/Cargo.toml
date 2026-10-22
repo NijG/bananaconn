@@ -47,6 +47,9 @@ sha2 = "0.10"
 ironrdp-session = { path = "vendor/ironrdp-session" }
 # Adds KeyboardType::Korean (8) so the local keyboard is described like mstsc does.
 ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
+# Declares static channels with mstsc's options (cliprdr: SHOW_PROTOCOL), which
+# Windows 7 needs to start the clipboard.
+ironrdp-svc = { path = "vendor/ironrdp-svc" }
 
 [profile.release]
 codegen-units = 1

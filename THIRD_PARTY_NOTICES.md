@@ -338,7 +338,7 @@ The app icon is the project's own BananaConn. logo; see
 | ironrdp-input | 0.7.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
 | ironrdp-pdu (local patch) | 0.9.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
 | ironrdp-session (local patch) | 0.11.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
-| ironrdp-svc | 0.8.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
+| ironrdp-svc (local patch) | 0.8.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
 | ironrdp-tls | 0.2.2 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
 | ironrdp-tokio | 0.10.0 | MIT OR Apache-2.0 | https://github.com/Devolutions/IronRDP |
 | is-docker | 0.2.0 | MIT | https://github.com/TheLarkInn/is-docker |
