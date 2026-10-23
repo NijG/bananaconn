@@ -11,7 +11,7 @@ import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
 import { addMacro, snippetMenu } from "../snippets";
-import { findRisks } from "../riskRules";
+import { findRisks, findTypedRisk, type RiskHit } from "../riskRules";
 import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
@@ -288,11 +288,12 @@ export class TerminalView implements View {
 
     this.term.onData((data) => {
       if (this.state !== "connected" && this.state !== "connecting") return;
-      this.sendInput(data);
       // Broadcast only what the user typed; xterm's automatic replies (device
       // reports, focus and mouse events) belong to this terminal alone, and
       // pastes are mirrored as text below.
       const typed = !this.pasting && this.userTurn;
+      if (typed && data === "\r" && this.holdRiskyEnter()) return;
+      this.sendInput(data);
       if (typed) this.ws.mirrorInput(this, { keys: data });
       if (typed && this.recording) this.recording.push(data);
     });
@@ -841,73 +842,115 @@ export class TerminalView implements View {
     toast(`입력을 보내지 못했습니다: ${errorText(err)}`, "warn");
   }
 
+  /** Risky commands (riskRules.ts): blocked ones never go out; the others
+   * only after a confirmation, with the tab's log on and an audit line.
+   * Resolves to the other tabs (broadcast) the confirmed input goes to, or
+   * null when nothing may be sent. A risky command goes exactly to the tabs
+   * that were confirmed, logged and audited, even if another tab connects
+   * while the dialog is open. `source` names where the command came from;
+   * `tag` marks the audit events ("" for snippets and macros). */
+  private async riskGate(hits: RiskHit[], source: string, tag: string): Promise<Tab[] | null> {
+    // With broadcast on the same input also goes to these tabs.
+    const others = this.ws.mirrorTargets(this);
+    const targets = [{ session: this.session, view: this as View }, ...others];
+    const where = targets.map((t) => endpoint(t.session)).join(", ");
+    const audit = (event: string) =>
+      Promise.all(
+        targets.flatMap((t) => hits.map((h) => api.riskAudit(tag ? `${event} ${tag}` : event, t.session.name || endpoint(t.session), endpoint(t.session), h.rule.note, h.line))),
+      ).then(
+        () => true,
+        (err) => {
+          toast(errorText(err), "error");
+          return false;
+        },
+      );
+    // User data (commands, names) is shown as is, never run through translation.
+    const item = (h: RiskHit) => `<li><code data-i18n-skip>${esc(h.line)}</code> — <span>${esc(h.rule.note)}</span></li>`;
+    const blocked = hits.filter((h) => h.rule.action === "block");
+    if (blocked.length) {
+      await audit("BLOCKED");
+      await confirmDialog({
+        title: "차단된 명령입니다",
+        icon: "ShieldAlert",
+        danger: true,
+        message: `<p>보낼 수 없는 명령이 있어 아무것도 보내지 않았습니다.</p><p class="muted small">${source}</p><ul>${blocked.map(item).join("")}</ul>
+          <p class="muted small">이 시도는 위험 명령 기록(risky-commands.log)에 남았습니다. 규칙은 설정 → 위험 명령에서 바꿀 수 있습니다.</p>`,
+        confirm: "확인",
+        cancel: null,
+      });
+      return null;
+    }
+    const ok = await confirmDialog({
+      title: "위험한 명령이 있습니다",
+      icon: "TriangleAlert",
+      danger: true,
+      message: `<p>보내면 다음 명령이 실행됩니다.</p><p class="muted small">${source} · 대상: <b data-i18n-skip>${esc(where)}</b></p><ul>${hits.map(item).join("")}</ul>
+        ${others.length ? `<p class="muted small">${others.length}개 탭에 동시 입력이 켜져 있어 함께 보냅니다.</p>` : ""}
+        <p class="muted small">보내면 받는 탭의 로그 기록이 켜지고, 위험 명령 기록(risky-commands.log)에 남습니다.</p>`,
+      confirm: "로그를 켜고 보내기",
+      cancel: "취소",
+      focusCancel: true,
+    });
+    if (!ok) {
+      await audit("CANCELLED");
+      return null;
+    }
+    if (this.state !== "connected") {
+      toast("연결이 끊어져 보내지 않았습니다", "warn");
+      return null;
+    }
+    // The log and the audit line are the condition for sending: when
+    // either cannot be written, nothing goes out.
+    const logged = await Promise.all(targets.map((t) => t.view.ensureLog?.() ?? Promise.resolve(false)));
+    if (logged.includes(false) || !(await audit("SENT"))) {
+      await audit("NOT SENT");
+      toast("로그를 켜거나 위험 명령 기록을 남길 수 없어 보내지 않았습니다", "error");
+      return null;
+    }
+    return others;
+  }
+
+  /** Enter typed on a command line that a risk rule matches is held and goes
+   * through riskGate like a snippet. The line is read from the screen, so
+   * history recall, Tab completion and in-line edits count as they ended up.
+   * True when the Enter was held (it is sent later, or never). */
+  private holdRiskyEnter(): boolean {
+    if (this.state !== "connected" || !state.settings.checkTypedCommands) return false;
+    const buf = this.term.buffer.active;
+    // Full-screen programs (vi, less, top, menus) own the screen: no command line there.
+    if (buf.type !== "normal") return false;
+    let y = buf.baseY + buf.cursorY;
+    while (y > 0 && buf.getLine(y)?.isWrapped) y--;
+    const parts: string[] = [];
+    for (let line = buf.getLine(y); line; line = buf.getLine(++y)) {
+      const last = !buf.getLine(y + 1)?.isWrapped;
+      parts.push(line.translateToString(last));
+      if (last) break;
+    }
+    const hit = findTypedRisk(parts.join(""));
+    if (!hit) return false;
+    void this.riskGate([hit], "직접 입력한 명령", "(typed)").then((others) => {
+      if (others) {
+        this.sendInput("\r");
+        for (const t of others) if (t.view.state === "connected") t.view.receiveBroadcast?.({ keys: "\r" });
+        this.recording?.push("\r");
+      }
+      this.term.focus();
+    });
+    return true;
+  }
+
   /** Send a saved command; it follows broadcast like typed input does. */
   private async sendSnippet(s: Snippet) {
     if (this.state !== "connected") return toast("연결된 다음 보낼 수 있습니다", "warn");
     // Macro text may hold editing-key marks; other tabs expand them their own way.
     const marked = s.macro ? s.text : s.text.replace(/\r?\n/g, "\r") + (s.run ? "\r" : "");
     const data = this.expandKeys(marked);
-    // Risky commands (riskRules.ts): blocked ones never go out; the others
-    // only after a confirmation, with the tab's log on and an audit line.
     const hits = findRisks(data);
-    // A risky command goes exactly to the tabs that were confirmed, logged and
-    // audited, even if another tab connects while the dialog is open.
     let confirmedOthers: Tab[] | null = null;
     if (hits.length) {
-      // With broadcast on the same text also goes to these tabs.
-      const others = this.ws.mirrorTargets(this);
-      confirmedOthers = others;
-      const targets = [{ session: this.session, view: this as View }, ...others];
-      const where = targets.map((t) => endpoint(t.session)).join(", ");
-      const audit = (event: string) =>
-        Promise.all(
-          targets.flatMap((t) => hits.map((h) => api.riskAudit(event, t.session.name || endpoint(t.session), endpoint(t.session), h.rule.note, h.line))),
-        ).then(
-          () => true,
-          (err) => {
-            toast(errorText(err), "error");
-            return false;
-          },
-        );
-      // User data (commands, names) is shown as is, never run through translation.
-      const item = (h: (typeof hits)[number]) => `<li><code data-i18n-skip>${esc(h.line)}</code> — <span>${esc(h.rule.note)}</span></li>`;
-      const blocked = hits.filter((h) => h.rule.action === "block");
-      if (blocked.length) {
-        await audit("BLOCKED");
-        await confirmDialog({
-          title: "차단된 명령입니다",
-          icon: "ShieldAlert",
-          danger: true,
-          message: `<p>보낼 수 없는 명령이 있어 아무것도 보내지 않았습니다.</p><p class="muted small">스니펫: <b data-i18n-skip>${esc(s.name)}</b></p><ul>${blocked.map(item).join("")}</ul>
-            <p class="muted small">이 시도는 위험 명령 기록(risky-commands.log)에 남았습니다. 규칙은 설정 → 위험 명령에서 바꿀 수 있습니다.</p>`,
-          confirm: "확인",
-          cancel: null,
-        });
-        return;
-      }
-      const ok = await confirmDialog({
-        title: "위험한 명령이 있습니다",
-        icon: "TriangleAlert",
-        danger: true,
-        message: `<p>보내면 다음 명령이 실행됩니다.</p><p class="muted small">스니펫: <b data-i18n-skip>${esc(s.name)}</b> · 대상: <b data-i18n-skip>${esc(where)}</b></p><ul>${hits.map(item).join("")}</ul>
-          ${others.length ? `<p class="muted small">${others.length}개 탭에 동시 입력이 켜져 있어 함께 보냅니다.</p>` : ""}
-          <p class="muted small">보내면 받는 탭의 로그 기록이 켜지고, 위험 명령 기록(risky-commands.log)에 남습니다.</p>`,
-        confirm: "로그를 켜고 보내기",
-        cancel: "취소",
-        focusCancel: true,
-      });
-      if (!ok) {
-        await audit("CANCELLED");
-        return;
-      }
-      if (this.state !== "connected") return toast("연결이 끊어져 보내지 않았습니다", "warn");
-      // The log and the audit line are the condition for sending: when
-      // either cannot be written, nothing goes out.
-      const logged = await Promise.all(targets.map((t) => t.view.ensureLog?.() ?? Promise.resolve(false)));
-      if (logged.includes(false) || !(await audit("SENT"))) {
-        await audit("NOT SENT");
-        return toast("로그를 켜거나 위험 명령 기록을 남길 수 없어 보내지 않았습니다", "error");
-      }
+      confirmedOthers = await this.riskGate(hits, `스니펫: <b data-i18n-skip>${esc(s.name)}</b>`, "");
+      if (!confirmedOthers) return;
     }
     this.sendInput(data);
     if (confirmedOthers) {

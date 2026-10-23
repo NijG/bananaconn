@@ -124,7 +124,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <p>可以儲存常用命令 (片段)，或錄製在終端機中輸入的按鍵並原封不動地再次傳送 (巨集)。</p>
       <p><b>各 OS 的內建片段</b>：提供 Linux、AIX、HP-UX、Solaris、Windows、Cisco IOS · NX-OS · ASA、FortiGate、Aruba、Juniper 與 Huawei 的常用唯讀檢查 (不會變更任何內容的命令)。片段清單會優先顯示您自己的片段以及該分頁辨識出的 OS 的片段；其他系統可在「… 片段」中一鍵找到。在管理程式碼片段中可以編輯、刪除，或變更其 OS 分類。</p>
-      <p><b>危險命令</b>：片段或巨集傳送的每一行都會依 設定 → 危險命令 中的規則檢查。變更時間或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 會被<b>封鎖</b>，不會傳送；重新開機、刪除、格式化或變更設備組態等命令需要先在<b>警告</b>中確認。傳送時會開啟該分頁的記錄，每次嘗試、取消與封鎖都會寫入記錄資料夾中的 <code>risky-commands.log</code>。以 <code>;</code>、<code>&amp;&amp;</code> 串接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及以行尾 <code>\\</code> 接續的命令也會檢查。含有 Tab 自動完成或游標移動鍵 (←→、Home、命令記錄 ↑↓) 的巨集會發出警告，因為無法得知實際傳送的命令。自己輸入的命令不會被檢查。</p>
+      <p><b>危險命令</b>：片段或巨集傳送的每一行都會依 設定 → 危險命令 中的規則檢查。變更時間或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 會被<b>封鎖</b>，不會傳送；重新開機、刪除、格式化或變更設備組態等命令需要先在<b>警告</b>中確認。傳送時會開啟該分頁的記錄，每次嘗試、取消與封鎖都會寫入記錄資料夾中的 <code>risky-commands.log</code>。以 <code>;</code>、<code>&amp;&amp;</code> 串接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及以行尾 <code>\\</code> 接續的命令也會檢查。含有 Tab 自動完成或游標移動鍵 (←→、Home、命令記錄 ↑↓) 的巨集會發出警告，因為無法得知實際傳送的命令。自己輸入的命令也會檢查：按 Enter 時，會用相同的規則檢查畫面上顯示的命令列（包括命令記錄 ↑↓ 與 Tab 自動完成的結果）。vi、less 等全螢幕程式中不檢查，可在設定 → 危險指令中關閉此檢查。</p>
       <h4>建立與傳送片段</h4>
       <ol>
         <li>在終端機工具列中：<b>片段</b> → <b>管理程式碼片段…</b> → <b>新增片段</b>。</li>

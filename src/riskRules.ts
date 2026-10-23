@@ -1,4 +1,4 @@
-// Risky commands in snippets and macros. A rule is a regular expression
+// Risky commands in snippets, macros and typed commands. A rule is a regular expression
 // matched against each line sent (case-insensitive): "block" never sends it
 // (time and NTP changes, which break logins, logs and certificates across
 // systems), "warn" asks first and, when sent, turns the tab's log on and
@@ -148,23 +148,48 @@ function commands(line: string): string[] {
     .filter(Boolean);
 }
 
+type Compiled = { rule: RiskRule; re: RegExp | null }[];
+const compiled = (): Compiled => riskRules().map((rule) => ({ rule, re: compile(rule) }));
+
+/** The rule a command line hits, block before warn. Each line is tested as
+ * written and as every command it runs; commands inside quotes run too:
+ * su -c '...', bash -lc "...", eval "...", echo "..." | sh. */
+function lineRule(lines: string[], rules: Compiled): RiskRule | null {
+  const forms = lines.flatMap((line) => {
+    const quoted = [...line.matchAll(/'([^']*)'|"([^"]*)"/g)].map((m) => m[1] ?? m[2]).filter((q) => q.trim());
+    return [line, ...commands(line), ...quoted.flatMap((q) => [q, ...commands(q)])];
+  });
+  const matches = (r: Compiled[number]) => !!r.re && forms.some((f) => r.re!.test(f));
+  return (rules.find((r) => r.rule.action === "block" && matches(r)) ?? rules.find(matches))?.rule ?? null;
+}
+
 /** The risky lines of what a snippet or macro sends; a block rule outranks a
- * warning. Each line is tested as written and as every command it runs. */
+ * warning. */
 export function findRisks(text: string): RiskHit[] {
-  const rules = riskRules().map((rule) => ({ rule, re: compile(rule) }));
+  const rules = compiled();
   const { lines, unreadable } = sentLines(text);
   const hits: RiskHit[] = [];
   for (const line of lines) {
     if (!line.trim()) continue;
-    // Commands inside quotes run too: su -c '...', bash -lc "...", eval "...",
-    // echo "..." | sh.
-    const quoted = [...line.matchAll(/'([^']*)'|"([^"]*)"/g)].map((m) => m[1] ?? m[2]).filter((q) => q.trim());
-    const forms = [line, ...commands(line), ...quoted.flatMap((q) => [q, ...commands(q)])];
-    const matches = (r: (typeof rules)[number]) => !!r.re && forms.some((f) => r.re!.test(f));
-    const hit = rules.find((r) => r.rule.action === "block" && matches(r)) ?? rules.find(matches);
-    if (hit) hits.push({ rule: hit.rule, line: line.trim() });
+    const rule = lineRule([line], rules);
+    if (rule) hits.push({ rule, line: line.trim() });
   }
   if (unreadable && !hits.some((h) => h.rule.action === "block"))
     hits.push({ rule: UNREADABLE_MACRO, line: lines.filter((l) => l.trim()).join(" ⏎ ").slice(0, 200) });
   return hits;
+}
+
+/** A command typed by hand, read from the terminal screen when Enter is
+ * pressed, so history recall and Tab completion are seen as they ended up.
+ * The screen line still starts with the prompt ("host:/dir>", "[root@h ~]# ",
+ * "router(config)#"), whose end is unknown: the command is also tried after
+ * each prompt-ending character, so rules anchored at the line start apply.
+ * A ">" or "#" inside the command itself can only add a warning, never hide one. */
+export function findTypedRisk(screenLine: string): RiskHit | null {
+  const line = screenLine.trim();
+  if (!line) return null;
+  const tails = [line];
+  for (let i = 0; i < line.length; i++) if ("#>$%]:".includes(line[i]) && line.slice(i + 1).trim()) tails.push(line.slice(i + 1));
+  const rule = lineRule(tails, compiled());
+  return rule ? { rule, line } : null;
 }

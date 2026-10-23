@@ -151,8 +151,9 @@ command can take a site down:
 ### Risky command protection
 
 Every line sent from a snippet or a macro — to one tab, or to every connected tab when broadcast input is on — is
-checked against a list of rules before it leaves the app. (Keys typed one by one go to the remote shell as they are:
-with line editing and history the final command cannot be known reliably.) Rules see through `sudo`/`doas`/`su -c`/`sh -c`/`eval`,
+checked against a list of rules before it leaves the app. Commands typed by hand are checked when Enter is pressed:
+the command line shown on the screen is matched, so history recall and Tab completion count as they ended up
+(full-screen programs such as vi are skipped; the check can be turned off in Settings). Rules see through `sudo`/`doas`/`su -c`/`sh -c`/`eval`,
 `env VAR=…`, chained commands (`;`, `&&`, `||`, `|`, `$( )`), absolute paths and line continuations, and they
 apply the effect of Backspace and Ctrl-U before matching.
 

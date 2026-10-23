@@ -124,7 +124,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <p>保存常用命令 (片段)，或录制在终端中输入的按键并原样再次发送 (宏)。</p>
       <p><b>各操作系统的内置片段</b>：适用于 Linux、AIX、HP-UX、Solaris、Windows、Cisco IOS · NX-OS · ASA、FortiGate、Aruba、Juniper 和 Huawei 的常用只读检查 (不做任何更改的命令)。片段列表优先显示您自己的片段和该标签页中识别出的操作系统的片段；其他系统的片段在“… 片段”下，点击即可查看。可在“管理代码片段”中编辑、删除或更改其 OS 分组。</p>
-      <p><b>危险命令</b>：片段或宏发送的每一行都会按 设置 → 危险命令 中的规则进行检查。更改时间或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 会被<b>阻止</b>，不会发送；重启、删除、格式化或更改设备配置等命令需要先在<b>警告</b>中确认。发送时会开启该标签页的日志记录，每次尝试、取消和阻止都会记录到日志文件夹中的 <code>risky-commands.log</code>。用 <code>;</code>、<code>&amp;&amp;</code> 连接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及用行尾 <code>\\</code> 续行的命令也会被检查。包含 Tab 补全或光标移动键 (←→、Home、命令历史 ↑↓) 的宏会发出警告，因为无法确定实际发送的命令。自己输入的命令不会被检查。</p>
+      <p><b>危险命令</b>：片段或宏发送的每一行都会按 设置 → 危险命令 中的规则进行检查。更改时间或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 会被<b>阻止</b>，不会发送；重启、删除、格式化或更改设备配置等命令需要先在<b>警告</b>中确认。发送时会开启该标签页的日志记录，每次尝试、取消和阻止都会记录到日志文件夹中的 <code>risky-commands.log</code>。用 <code>;</code>、<code>&amp;&amp;</code> 连接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及用行尾 <code>\\</code> 续行的命令也会被检查。包含 Tab 补全或光标移动键 (←→、Home、命令历史 ↑↓) 的宏会发出警告，因为无法确定实际发送的命令。自己输入的命令也会检查：按 Enter 时，会用相同的规则检查屏幕上显示的命令行（包括命令历史 ↑↓ 和 Tab 补全的结果）。vi、less 等全屏程序中不检查，可在设置 → 危险命令中关闭此检查。</p>
       <h4>创建和发送片段</h4>
       <ol>
         <li>在终端工具栏中：<b>片段</b> → <b>管理代码片段…</b> → <b>新建片段</b>。</li>

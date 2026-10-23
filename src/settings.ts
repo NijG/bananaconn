@@ -169,8 +169,9 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
         ${check("sftpWithSsh", "SSH 연결 시 SFTP 파일 창을 옆에 함께 열기", "SSH 터미널 옆 칸에 같은 서버의 파일 브라우저를 엽니다. 터미널 툴바의 \"파일\" 버튼으로도 열 수 있습니다.")}
         ${check("remoteMonitor", "SSH·Telnet 접속 대상의 CPU·메모리를 상태 표시줄에 표시", "탭마다 연결을 하나 더 열어 읽기 전용 명령으로 확인합니다. 리눅스는 2초, 네트워크 장비는 15초, AIX·HP-UX는 10초마다 읽고, 그 장비의 탭이 화면에 없으면 멈춥니다. 터미널 화면에는 아무것도 입력하지 않습니다.")}
         ${check("confirmClose", "연결된 탭을 닫을 때 확인", "실수로 연결을 끊지 않도록 묻습니다.")}
-        <h4 data-section="risk">위험 명령 (스니펫·매크로)</h4>
+        <h4 data-section="risk">위험 명령</h4>
         <p class="muted small">보내는 내용을 줄마다 정규식(대소문자 무시)으로 검사합니다. <b>차단</b>: 보내지 않습니다. <b>경고</b>: 확인한 뒤에만 보내고, 그 탭의 로그를 켜며 위험 명령 기록(risky-commands.log)에 남깁니다.</p>
+        ${check("checkTypedCommands", "직접 입력한 명령도 검사", "Enter를 누를 때 화면에 보이는 명령 줄을 같은 규칙으로 검사합니다. 명령 기록(↑↓)이나 Tab 자동 완성으로 만든 명령도 검사하고, vi·less처럼 화면 전체를 쓰는 프로그램 안에서는 검사하지 않습니다.")}
         <div class="risk-rules" data-risk-rules></div>
         <div class="row">
           <button type="button" class="btn btn-sm" data-risk-add>${icon("Plus", 14)}규칙 추가</button>
@@ -329,6 +330,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
       updateCredentialId: val("updateCredentialId").value || null,
       autoUpdate: bool("autoUpdate"),
       highlightKeywords: bool("highlightKeywords"),
+      checkTypedCommands: bool("checkTypedCommands"),
       autoLockMinutes: Math.max(0, Math.min(1440, Math.trunc(Number(val("autoLockMinutes").value)) || 0)),
       // Unchanged from the built-in list: keep following it (later versions may add rules).
       riskRules: (() => {

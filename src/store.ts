@@ -40,6 +40,8 @@ export interface Settings {
   terminalTheme: string;
   /** Colour ERROR/WARN/OK words in plain terminal output. */
   highlightKeywords: boolean;
+  /** Check commands typed by hand against the risk rules when Enter is pressed. */
+  checkTypedCommands: boolean;
   /** Lock after this many idle minutes when a master password is set (0 = never). */
   autoLockMinutes: number;
   /** Open the SFTP browser next to every new SSH session. */
@@ -97,6 +99,7 @@ const DEFAULT_SETTINGS: Settings = {
   confirmClose: true,
   terminalTheme: "banana",
   highlightKeywords: true,
+  checkTypedCommands: true,
   autoLockMinutes: 15,
   sftpWithSsh: false,
   remoteMonitor: true,
