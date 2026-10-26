@@ -162,6 +162,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>設定與記錄分析</b>：對話窗格中的檔案按鈕可選擇設定或記錄檔案進行檢查（安全問題、危險設定）或分析（錯誤、異常跡象）。網路裝置可透過裝置按鈕 →「用 AI 檢查設定」直接檢查 running-config。</li>
         <li><b>傳送的內容</b>：傳送到雲端 AI 之前，會顯示將傳送的內容並請您確認（每個對話可選擇「不再詢問」）。密碼、金鑰與權杖（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私密金鑰等）一律會隱藏；開啟設定後，IP 位址與主機名稱也會替換為 IP_1、HOST_1 等再傳送，回答中會還原為實際值。本地 LLM 不會離開本機，因此不會詢問或隱藏。傳送公司設備資訊給外部 AI 之前，請確認公司的安全政策。</li>
         <li>訂閱 CLI：Claude Code 在關閉所有工具（不執行指令、不讀取檔案）的狀態下於空資料夾中執行，Codex 在唯讀沙箱中執行。應用程式不會處理您的登入資訊。</li>
+        <li><b>附件與遠端桌面</b>：以對話窗格的 📎 按鈕、拖放或 <kbd>Ctrl</kbd>+<kbd>V</kbd>（螢幕擷取）附加圖片、PDF 與文字檔。文字檔會併入訊息並套用隱藏；圖片與 PDF 無法隱藏，會在預覽中按原樣顯示。大圖片會自動縮小。大多數服務接受圖片；PDF 由 Claude、Gemini、OpenAI API 與 Claude Code 接受。在 RDP 與 VNC 中，工具列的「AI」可擷取遠端畫面以取得說明或附加到對話。遠端桌面中 AI 不執行指令，回答中的指令可用複製按鈕複製後貼到遠端畫面。</li>
       </ul>`,
   },
   {

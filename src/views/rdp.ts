@@ -10,6 +10,7 @@ import { patchSession, reloadCredentials } from "../store";
 import { confirmDialog, errorText, esc, h, modal, toast } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import { GatewayLink } from "../tunnels";
+import { desktopHost, ViewAi } from "../ai/viewAi";
 import { tr } from "../i18n";
 import { KEY, MODIFIER_CODES, namedKeyFor, scancodeFor } from "./rdpKeys";
 
@@ -77,6 +78,7 @@ export class RdpView implements View {
            <span class="tool-sep"></span>
            <button class="tool" data-act="fit" title="창에 맞추기 / 실제 크기">${icon("Maximize2", 15)}<span>맞춤</span></button>
            <button class="tool" data-act="external" title="Windows 원격 데스크톱(mstsc)으로 열기">${icon("ExternalLink", 15)}</button>
+           <button class="tool" data-act="ai" title="AI: 화면 설명·캡처·대화">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
        </div>
@@ -87,6 +89,16 @@ export class RdpView implements View {
     this.canvas = this.el.querySelector("canvas")!;
     this.ctx = this.canvas.getContext("2d", { alpha: false })!;
     this.overlay = this.el.querySelector(".view-overlay")!;
+    this.ai = new ViewAi(
+      this.el,
+      desktopHost({
+        system: "a Windows computer seen through Remote Desktop (RDP); the engineer can attach screenshots of its screen",
+        names: () => [session.host, session.name, session.username],
+        canvas: () => (this.desktop.w ? this.canvas : null),
+        focus: () => this.canvas.focus(),
+      }),
+      () => {},
+    );
     this.wireToolbar();
     this.wireInput();
     this.resizer.observe(this.screen);
@@ -95,6 +107,7 @@ export class RdpView implements View {
     // Not if the tab was closed before the first frame (the helper would be orphaned).
     requestAnimationFrame(() => this.state !== "closed" && this.connect());
   }
+  private ai: ViewAi;
   private resizer = new ResizeObserver(() => this.onScreenResize());
   private dpiQuery: MediaQueryList | null = null;
   /** Moving the window to a monitor with another scale changes the pixel
@@ -756,6 +769,7 @@ export class RdpView implements View {
       }
       if (act === "external") this.openExternal(this.session);
       if (act === "reconnect") this.reconnect();
+      if (act === "ai") return this.ai.menu(this.el.querySelector<HTMLElement>('[data-act="ai"]')!);
       if (act !== "type") this.canvas.focus();
     });
   }
@@ -782,6 +796,7 @@ export class RdpView implements View {
   }
 
   dispose() {
+    this.ai.dispose();
     this.state = "closed";
     this.resizer.disconnect();
     this.dpiQuery?.removeEventListener("change", this.watchDpi);

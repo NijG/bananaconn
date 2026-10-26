@@ -88,11 +88,15 @@ import {
   MessageSquarePlus,
   Send,
   WandSparkles,
+  Camera,
+  Paperclip,
+  ScanEye,
 } from "lucide";
 
 type IconNode = Parameters<typeof createElement>[0];
 
 const ICONS: Record<string, IconNode> = {
+  Camera, Paperclip, ScanEye,
   Ban, Bot, FileSearch, LoaderCircle, MessageSquarePlus, Send, WandSparkles,
   CircleHelp,
   ClipboardPaste,

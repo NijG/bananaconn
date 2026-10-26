@@ -13,6 +13,7 @@ import { state, updateSettings } from "../store";
 import { errorText, esc, h, toast } from "../ui";
 import { tr } from "../i18n";
 import { judge } from "./policy";
+import { fromCanvas, fromFile, sizeLabel, type Attached } from "./attach";
 import { ask, confirmSend, currentProvider, isLocal, Masker, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type Asking, type Target } from "./core";
 
 /** What the panel needs from its terminal. */
@@ -31,6 +32,12 @@ export interface AiHost {
   run(command: string, reason: string): Promise<{ output: string; timedOut: boolean }>;
   /** The terminal talks to network gear (device CLI rules apply). */
   network(): boolean;
+  /** What the insert button does, when not "put on the input line". */
+  insertTitle?: string;
+  /** false: no command can run here (RDP, VNC); the panel only talks. */
+  canRun?: boolean;
+  /** The remote screen, for a screenshot attachment (RDP, VNC). */
+  capture?(): HTMLCanvasElement | null;
 }
 
 /** Commands an AI may run in one answer, at most. */
@@ -65,7 +72,7 @@ function riskOf(command: string): { action: "block" | "warn"; note: string } | n
 
 /** Answer text as HTML: paragraphs, **bold**, `code`, and code blocks whose
  * lines can each be put on the input line. The text is the AI's, shown as is. */
-function render(answer: string, insertable = true): string {
+function render(answer: string, insertable = true, insertTitle = "입력 줄에 넣기 (실행하지 않음)"): string {
   const inline = (s: string) =>
     esc(s)
       .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
@@ -85,7 +92,7 @@ function render(answer: string, insertable = true): string {
                 return `<div class="ai-cmd${r ? ` risk-${r.action}` : ""}"><code>${esc(l)}</code>${
                   r?.action === "block"
                     ? `<span class="ai-risk" title="${esc(r.note)}">${icon("Ban", 13)}차단</span>`
-                    : `<button class="tool" data-insert="${esc(l)}" title="입력 줄에 넣기 (실행하지 않음)">${icon("CornerDownLeft", 13)}</button>`
+                    : `<button class="tool" data-insert="${esc(l)}" title="${esc(insertTitle)}">${icon(insertTitle.startsWith("복사") ? "Copy" : "CornerDownLeft", 13)}</button>`
                 }${r?.action === "warn" ? `<span class="ai-risk" title="${esc(r.note)}">${icon("TriangleAlert", 13)}</span>` : ""}</div>`;
               })
               .join("")
@@ -113,6 +120,8 @@ interface Turn {
   run?: { command: string; reason: string; status: "approve" | "running" | "done" | "skipped" | "blocked" | "failed" | "auto" };
   /** A command's output sent back to the AI. */
   output?: { command: string; text: string; timedOut: boolean };
+  /** Images and PDFs sent with this message. */
+  media?: Attached[];
 }
 
 const RUN_STATUS: Record<NonNullable<Turn["run"]>["status"], string> = {
@@ -152,18 +161,50 @@ export class AiPanel {
         </span></div>
       <div class="ai-log" data-i18n-skip></div>
       <div class="ai-compose">
-        <textarea rows="2" placeholder="질문하거나 할 일을 적으세요 (Enter 보내기, Shift+Enter 줄 바꿈)"></textarea>
+        <div class="ai-attach-row" data-pending hidden></div>
+        <textarea rows="2" placeholder="질문하거나 할 일을 적으세요 (Enter 보내기, Shift+Enter 줄 바꿈, Ctrl+V로 이미지 붙여넣기)"></textarea>
         <div class="ai-compose-row">
-          <label class="check small"><input type="checkbox" data-attach /><span>선택 영역 첨부</span></label>
-          <button type="button" class="tool ai-mode" data-act="mode" title="AI가 터미널에서 명령을 실행하는 방식"></button>
+          <button type="button" class="tool" data-act="pick" title="이미지·PDF·텍스트 파일 첨부 (끌어다 놓아도 됩니다)">${icon("Paperclip", 15)}</button>
+          ${host.capture ? `<button type="button" class="tool" data-act="capture" title="원격 화면을 캡처해 첨부">${icon("Camera", 15)}</button>` : ""}
+          ${host.canRun === false ? "" : `<label class="check small"><input type="checkbox" data-attach /><span>선택 영역 첨부</span></label>`}
+          ${host.canRun === false ? "" : `<button type="button" class="tool ai-mode" data-act="mode" title="AI가 터미널에서 명령을 실행하는 방식"></button>`}
           <span class="ai-where muted small"></span>
           <button class="btn btn-sm btn-primary" data-act="send">${icon("Send", 13)}질문하기</button>
         </div>
+        <input type="file" multiple hidden data-files accept="image/*,application/pdf,.pdf,.txt,.log,.conf,.cfg,.config,.ini,.json,.xml,.yml,.yaml,.csv,.md,.sh,.ps1,.py,.sql,.out" />
       </div>`,
     );
     this.log = this.el.querySelector(".ai-log")!;
     this.input = this.el.querySelector("textarea")!;
     this.el.addEventListener("click", (e) => this.click(e));
+    // Files: picked, pasted (screenshots) or dropped onto the panel.
+    const files = this.el.querySelector<HTMLInputElement>("[data-files]")!;
+    files.addEventListener("change", () => {
+      void this.addFiles([...(files.files ?? [])]);
+      files.value = "";
+    });
+    this.input.addEventListener("paste", (e) => {
+      const list = [...(e.clipboardData?.files ?? [])];
+      if (!list.length) return;
+      e.preventDefault();
+      void this.addFiles(list);
+    });
+    this.el.addEventListener("dragover", (e) => {
+      if ([...(e.dataTransfer?.types ?? [])].includes("Files")) {
+        e.preventDefault();
+        this.el.classList.add("drop");
+      }
+    });
+    this.el.addEventListener("dragleave", (e) => {
+      if (!this.el.contains(e.relatedTarget as Node)) this.el.classList.remove("drop");
+    });
+    this.el.addEventListener("drop", (e) => {
+      this.el.classList.remove("drop");
+      const list = [...(e.dataTransfer?.files ?? [])];
+      if (!list.length) return;
+      e.preventDefault();
+      void this.addFiles(list);
+    });
     this.input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
@@ -179,6 +220,51 @@ export class AiPanel {
     });
     this.refreshProviders();
     this.draw();
+  }
+
+  /** Attachments waiting for the next message. */
+  private pending: Attached[] = [];
+
+  private async addFiles(files: File[]) {
+    for (const f of files) {
+      try {
+        this.pending.push(await fromFile(f));
+      } catch (err) {
+        toast(errorText(err), "warn", 5000);
+      }
+    }
+    this.drawPending();
+    this.input.focus();
+  }
+
+  /** Capture the remote screen and ask what it shows (RDP, VNC). */
+  explainScreen() {
+    this.newConversation();
+    if (!this.captureScreen()) return;
+    void this.send(tr("이 화면에 보이는 내용을 설명하고, 오류나 문제가 있다면 원인과 해결 방법을 알려 주세요."), true);
+  }
+
+  /** Capture the remote screen (RDP, VNC) as the next message's image. */
+  captureScreen(): boolean {
+    const canvas = this.host.capture?.();
+    if (!canvas || !canvas.width) {
+      toast("캡처할 화면이 없습니다", "warn");
+      return false;
+    }
+    this.pending.push(fromCanvas(canvas, `screen-${new Date().toISOString().slice(11, 19).replace(/:/g, "")}.png`));
+    this.drawPending();
+    return true;
+  }
+
+  private drawPending() {
+    const row = this.el.querySelector<HTMLElement>("[data-pending]")!;
+    row.hidden = !this.pending.length;
+    row.innerHTML = this.pending
+      .map(
+        (a, i) =>
+          `<span class="ai-chip" title="${esc(`${a.name} · ${sizeLabel(a.size)}`)}">${a.preview ? `<img class="ai-thumb small" src="${a.preview}" alt="" />` : icon(a.kind === "pdf" ? "FileText" : "File", 13)}<span data-i18n-skip>${esc(a.name)}</span><button type="button" class="tool" data-unattach="${i}" title="빼기">${icon("X", 12)}</button></span>`,
+      )
+      .join("");
   }
 
   /** Settings changed: the provider list may have too. */
@@ -231,8 +317,16 @@ export class AiPanel {
       resolve(decide === "yes");
       return;
     }
+    const unattach = t.closest<HTMLElement>("[data-unattach]")?.dataset.unattach;
+    if (unattach !== undefined) {
+      this.pending.splice(+unattach, 1);
+      this.drawPending();
+      return;
+    }
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
-    if (act === "close") this.onClose();
+    if (act === "pick") this.el.querySelector<HTMLInputElement>("[data-files]")!.click();
+    else if (act === "capture") this.captureScreen();
+    else if (act === "close") this.onClose();
     else if (act === "new") this.newConversation();
     else if (act === "send") void (this.busy ? this.stop() : this.send());
     else if (act === "file") void this.analyseFile();
@@ -290,7 +384,8 @@ export class AiPanel {
     if (t.role === "user") {
       // A note to the AI about a command that did not run.
       if (this.turns[this.turns.indexOf(t) - 1]?.run) return "";
-      return `<div class="ai-msg user">${render(shortened(t.shown), false)}</div>`;
+      const media = t.media?.length ? `<div class="ai-attach-row">${t.media.map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip">${icon("FileText", 13)}<span data-i18n-skip>${esc(a.name)}</span></span>`)).join("")}</div>` : "";
+      return `<div class="ai-msg user">${media}${render(shortened(t.shown), false)}</div>`;
     }
     const body = (t.run ? t.shown.replace(/```run[ \t]*\r?\n[\s\S]*?```/, "") : t.shown).trim();
     const run = t.run
@@ -302,7 +397,7 @@ export class AiPanel {
         </div>`
       : "";
     const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
-    return `<div class="ai-msg assistant">${body ? render(body) : waiting}${run}${t.error ? `<div class="ai-error">${esc(t.error)}</div>` : ""}</div>`;
+    return `<div class="ai-msg assistant">${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(t.error)}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
@@ -356,22 +451,30 @@ export class AiPanel {
     if (!p) return void openAiSettings();
     if (this.asking || this.busy) return;
     let text = (typed ?? this.input.value).trim();
-    if (!text) return;
-    const attach = this.el.querySelector<HTMLInputElement>("[data-attach]")!;
-    if (!internal && attach.checked) {
+    const attached = this.pending;
+    if (!text && !attached.length) return;
+    // Attachments without a question: ask about them.
+    if (!text) text = tr(attached.some((a) => a.kind === "image") ? "첨부한 내용을 보고 무엇인지, 문제가 있다면 원인과 해결 방법을 알려 주세요." : "첨부한 파일을 분석해 주세요.");
+    const attach = this.el.querySelector<HTMLInputElement>("[data-attach]");
+    if (!internal && attach?.checked) {
       const sel = this.host.selection();
       if (sel.trim()) text += `\n\n\`\`\`text\n${sel}\n\`\`\``;
       attach.checked = false;
     }
+    // Text files become part of the message (and are masked with it).
+    for (const a of attached) if (a.kind === "text") text += `\n\n${a.name}:\n\`\`\`text\n${a.text}\n\`\`\``;
+    const media = attached.filter((a) => a.kind !== "text");
     this.masker ??= new Masker(!isLocal(p) && state.settings.aiMaskHosts, this.host.hostNames());
     const masker = this.masker;
     const mask = (s: string) => (isLocal(p) ? s : masker.mask(s));
     const sent = mask(text);
     // With commands allowed, the AI may look around in the terminal itself.
-    const agent = this.runMode !== "off" && (this.system === "chat" || this.system === "explain");
-    if (!(await confirmSend(p, sent, masker, this.skip, agent))) return;
+    const agent = this.host.canRun !== false && this.runMode !== "off" && (this.system === "chat" || this.system === "explain");
+    if (!(await confirmSend(p, sent, masker, this.skip, agent, attached))) return;
     if (typed === undefined) this.input.value = "";
-    this.turns.push({ role: "user", shown: text, sent });
+    this.pending = [];
+    this.drawPending();
+    this.turns.push({ role: "user", shown: text, sent, media });
     const target = this.host.target();
     const system = agent ? prompts.agent(target, MAX_STEPS) : this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
     this.busy = true;
@@ -380,7 +483,9 @@ export class AiPanel {
       for (let step = 0; ; step++) {
         const answer: Turn = { role: "assistant", shown: "", sent: "" };
         this.turns.push(answer);
-        const history: AiMessage[] = this.turns.filter((t) => t !== answer && !t.error).map((t) => ({ role: t.role, content: t.sent }));
+        const history: AiMessage[] = this.turns
+          .filter((t) => t !== answer && !t.error)
+          .map((t) => ({ role: t.role, content: t.sent, ...(t.media?.length ? { attachments: t.media.map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
         let frame = 0;
         this.asking = ask(p, system, history, (sofar) => {
           answer.sent = sofar;

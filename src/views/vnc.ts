@@ -17,6 +17,7 @@ const ENCODING_NAMES: Record<number, string> = {
   0: "Raw (무압축)", 1: "CopyRect", 2: "RRE", 5: "Hextile", 6: "Zlib", 7: "Tight", 16: "ZRLE", 21: "JPEG", 50: "H.264", [-260]: "TightPNG",
 };
 import { GatewayLink } from "../tunnels";
+import { desktopHost, ViewAi } from "../ai/viewAi";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 export class VncView implements View {
@@ -30,6 +31,7 @@ export class VncView implements View {
   private scale: boolean;
   private viewOnly: boolean;
   private disposed = false;
+  private ai: ViewAi;
   /** The last attempt failed authentication. */
   private authFailed = false;
   /** A refusal the server explained (not a wrong password). */
@@ -63,6 +65,7 @@ export class VncView implements View {
            <button class="tool" data-act="cad" title="Ctrl+Alt+Del 보내기">${icon("Keyboard", 15)}<span>Ctrl+Alt+Del</span></button>
            <button class="tool" data-act="quality" title="화질과 속도 (JPEG 화질·압축)">${icon("Sparkles", 15)}<span data-quality-label></span></button>
            <button class="tool" data-act="stats" title="전송 상태: 서버가 쓰는 인코딩, 초당 갱신, 받는 양">${icon("Activity", 15)}<span>상태</span></button>
+           <button class="tool" data-act="ai" title="AI: 화면 설명·캡처·대화">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
        </div>
@@ -70,11 +73,22 @@ export class VncView implements View {
        <div class="view-overlay" hidden></div>`,
     );
     this.screen = this.el.querySelector(".vnc-screen")!;
+    this.ai = new ViewAi(
+      this.el,
+      desktopHost({
+        system: "a computer seen through VNC; the engineer can attach screenshots of its screen",
+        names: () => [session.host, session.name, session.username, this.desktopName],
+        canvas: () => this.screen.querySelector("canvas"),
+        focus: () => this.rfb?.focus(),
+      }),
+      () => {},
+    );
     this.overlay = this.el.querySelector(".view-overlay")!;
     this.el.querySelector(".view-actions")!.addEventListener("click", (e) => {
       const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
       if (act === "scale") this.setScale(!this.scale);
       if (act === "viewonly") this.setViewOnly(!this.viewOnly);
+      if (act === "ai") return this.ai.menu(this.el.querySelector<HTMLElement>('[data-act="ai"]')!);
       if (act === "cad") this.rfb?.sendCtrlAltDel();
       if (act === "paste") this.pasteClipboard();
       if (act === "reconnect") this.reconnect();
@@ -383,6 +397,7 @@ export class VncView implements View {
   }
 
   dispose() {
+    this.ai.dispose();
     this.disposed = true;
     clearInterval(this.statsTimer);
     this.state = "closed";

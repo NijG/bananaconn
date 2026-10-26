@@ -322,7 +322,7 @@ export const api = {
   monitorBackup: (id: string) => call<string>("monitor_backup", { id }),
   monitorCommands: (id: string) => call<string[]>("monitor_commands", { id }),
   // AI (ai.rs): the answer streams back as "ai-stream" events, then "ai-done".
-  aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string }[]) => call<void>("ai_chat", { id, provider, system, messages }),
+  aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string; attachments?: { mime: string; data: string; name: string }[] }[]) => call<void>("ai_chat", { id, provider, system, messages }),
   aiCancel: (id: string) => call<void>("ai_cancel", { id }),
   aiModels: (provider: AiProviderWire) => call<string[]>("ai_models", { provider }),
   aiCliModels: (cli: string) => call<{ default: string | null; models: [string, string][] }>("ai_cli_models", { cli }),

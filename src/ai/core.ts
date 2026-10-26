@@ -12,6 +12,7 @@ import { api, on } from "../api";
 import { state } from "../store";
 import { confirmDialog, esc } from "../ui";
 import { language } from "../i18n";
+import type { Attached } from "./attach";
 
 export type AiKind = "anthropic" | "openai" | "gemini" | "compatible" | "ollama" | "cli";
 
@@ -178,8 +179,9 @@ export class Masker {
 /** Ask the user before text goes to a cloud provider (Settings → AI decides).
  * Resolves to false when the user says no. `skip` remembers "don't ask again"
  * for the rest of the conversation. */
-export async function confirmSend(p: AiProvider, text: string, masker: Masker, skip: { skip: boolean }, agent = false): Promise<boolean> {
+export async function confirmSend(p: AiProvider, text: string, masker: Masker, skip: { skip: boolean }, agent = false, attached: Attached[] = []): Promise<boolean> {
   if (isLocal(p) || skip.skip || state.settings.aiPreview === false) return true;
+  const media = attached.filter((a) => a.kind !== "text");
   const shown = text.length > 6000 ? `${text.slice(0, 6000)}\n…(${text.length - 6000}자 더)` : text;
   return confirmDialog({
     title: "AI로 보낼 내용",
@@ -192,7 +194,14 @@ export async function confirmSend(p: AiProvider, text: string, masker: Masker, s
           ? `<p class="muted small">${masker.secrets ? `<span>비밀번호·키·토큰 ${masker.secrets}곳을 가렸습니다.</span>` : ""}${masker.masked ? ` <span>IP·호스트 이름 ${masker.masked}개를 IP_1, HOST_1 같은 이름으로 바꿨습니다 (답에서는 원래 값으로 보입니다).</span>` : ""}</p>`
           : ""
       }
-      <pre class="ai-preview" data-i18n-skip>${esc(shown)}</pre>`,
+      <pre class="ai-preview" data-i18n-skip>${esc(shown)}</pre>
+      ${
+        media.length
+          ? `<p class="muted small">첨부한 이미지·PDF는 가릴 수 없어 그대로 보냅니다.</p><div class="ai-attach-row">${media
+              .map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip" data-i18n-skip>${esc(a.name)}</span>`))
+              .join("")}</div>`
+          : ""
+      }`,
     dontAsk: () => (skip.skip = true),
   });
 }
@@ -216,6 +225,8 @@ function wire() {
 export interface AiMessage {
   role: "user" | "assistant";
   content: string;
+  /** Images and PDFs sent with the message (base64). */
+  attachments?: { mime: string; data: string; name: string }[];
 }
 
 export interface Asking {

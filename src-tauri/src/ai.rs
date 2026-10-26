@@ -43,6 +43,87 @@ pub struct Message {
     /// "user" or "assistant".
     pub role: String,
     pub content: String,
+    /// Images and documents sent with this message (base64).
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct Attachment {
+    /// "image/png", "image/jpeg", "image/webp", "image/gif" or "application/pdf".
+    pub mime: String,
+    /// Base64 of the bytes.
+    pub data: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()
+}
+
+fn is_image(a: &Attachment) -> bool {
+    matches!(a.mime.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif")
+}
+
+/// The attachments a provider kind can take, or why not.
+fn check_attachments(kind: &str, cli: &str, messages: &[Message]) -> Result<(), String> {
+    for a in messages.iter().flat_map(|m| &m.attachments) {
+        let pdf = a.mime == "application/pdf";
+        if !is_image(a) && !pdf {
+            return Err(format!("보낼 수 없는 첨부 형식입니다: {} ({})", a.name, a.mime));
+        }
+        let ok = match kind {
+            "anthropic" | "gemini" | "openai" => true,
+            "compatible" | "ollama" => !pdf,
+            "cli" => match cli {
+                "claude" => true,
+                "codex" => !pdf,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            return Err(if pdf { format!("이 AI 서비스는 PDF 첨부를 받지 않습니다: {}", a.name) } else { format!("이 AI 서비스는 이미지 첨부를 받지 않습니다: {}", a.name) });
+        }
+    }
+    Ok(())
+}
+
+/// Anthropic content: images and PDFs as blocks, then the text.
+fn anthropic_content(m: &Message) -> Value {
+    if m.attachments.is_empty() {
+        return json!(m.content);
+    }
+    let mut blocks: Vec<Value> = m
+        .attachments
+        .iter()
+        .map(|a| {
+            let kind = if is_image(a) { "image" } else { "document" };
+            json!({ "type": kind, "source": { "type": "base64", "media_type": a.mime, "data": a.data } })
+        })
+        .collect();
+    blocks.push(json!({ "type": "text", "text": m.content }));
+    json!(blocks)
+}
+
+/// OpenAI (and compatible) content: the text, then images as data URLs and
+/// PDFs as files.
+fn openai_content(m: &Message) -> Value {
+    if m.attachments.is_empty() {
+        return json!(m.content);
+    }
+    let mut parts = vec![json!({ "type": "text", "text": m.content })];
+    for a in &m.attachments {
+        let url = format!("data:{};base64,{}", a.mime, a.data);
+        parts.push(if is_image(a) {
+            json!({ "type": "image_url", "image_url": { "url": url } })
+        } else {
+            json!({ "type": "file", "file": { "filename": if a.name.is_empty() { "document.pdf" } else { a.name.as_str() }, "file_data": url } })
+        });
+    }
+    json!(parts)
 }
 
 #[derive(Serialize, Clone)]
@@ -142,6 +223,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
     if p.model.trim().is_empty() {
         return Err("모델을 지정하세요 (설정 → AI)".into());
     }
+    check_attachments(&p.kind, &p.cli, messages)?;
     let model = p.model.trim();
     let mut headers: Vec<(&str, String)> = vec![("Content-Type", "application/json".into())];
     let (url, body) = match p.kind.as_str() {
@@ -151,7 +233,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
             }
             headers.push(("x-api-key", key));
             headers.push(("anthropic-version", "2023-06-01".into()));
-            let msgs: Vec<Value> = messages.iter().map(|m| json!({ "role": m.role, "content": m.content })).collect();
+            let msgs: Vec<Value> = messages.iter().map(|m| json!({ "role": m.role, "content": anthropic_content(m) })).collect();
             (format!("{}/v1/messages", base(p, "https://api.anthropic.com")), json!({ "model": model, "max_tokens": MAX_TOKENS, "system": system, "messages": msgs, "stream": true }))
         }
         "gemini" => {
@@ -161,7 +243,11 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
             headers.push(("x-goog-api-key", key));
             let contents: Vec<Value> = messages
                 .iter()
-                .map(|m| json!({ "role": if m.role == "assistant" { "model" } else { "user" }, "parts": [{ "text": m.content }] }))
+                .map(|m| {
+                    let mut parts: Vec<Value> = m.attachments.iter().map(|a| json!({ "inline_data": { "mime_type": a.mime, "data": a.data } })).collect();
+                    parts.push(json!({ "text": m.content }));
+                    json!({ "role": if m.role == "assistant" { "model" } else { "user" }, "parts": parts })
+                })
                 .collect();
             let model = model.trim_start_matches("models/");
             (
@@ -171,7 +257,11 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
         }
         "ollama" => {
             let mut msgs = vec![json!({ "role": "system", "content": system })];
-            msgs.extend(messages.iter().map(|m| json!({ "role": m.role, "content": m.content })));
+            msgs.extend(messages.iter().map(|m| {
+                // Vision models take images as a list of base64 strings.
+                let images: Vec<&str> = m.attachments.iter().map(|a| a.data.as_str()).collect();
+                if images.is_empty() { json!({ "role": m.role, "content": m.content }) } else { json!({ "role": m.role, "content": m.content, "images": images }) }
+            }));
             (format!("{}/api/chat", base(p, "http://127.0.0.1:11434")), json!({ "model": model, "messages": msgs, "stream": true }))
         }
         "openai" | "compatible" => {
@@ -181,7 +271,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
                 return Err("API 키를 지정하세요 (설정 → AI)".into());
             }
             let mut msgs = vec![json!({ "role": "system", "content": system })];
-            msgs.extend(messages.iter().map(|m| json!({ "role": m.role, "content": m.content })));
+            msgs.extend(messages.iter().map(|m| json!({ "role": m.role, "content": openai_content(m) })));
             let default = if p.kind == "openai" { "https://api.openai.com/v1" } else { "http://127.0.0.1:1234/v1" };
             (format!("{}/chat/completions", base(p, default)), json!({ "model": model, "messages": msgs, "stream": true }))
         }
@@ -378,6 +468,8 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         }
     }
     let _cleanup = Cleanup(dir.clone());
+    check_attachments("cli", name, messages)?;
+    let attachments: Vec<&Attachment> = messages.iter().flat_map(|m| &m.attachments).collect();
     let mut cmd = Command::new(path);
     let stream_json = name == "claude";
     let stdin_text = match name {
@@ -386,12 +478,35 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
             std::fs::write(&sys, system).map_err(|e| e.to_string())?;
             cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--tools", "", "--restricted", "--strict-mcp-config", "--no-session-persistence", "--system-prompt-file"]);
             cmd.arg(&sys);
-            cli_prompt(None, messages)
+            if attachments.is_empty() {
+                cli_prompt(None, messages)
+            } else {
+                // Images and PDFs go in as content blocks of one stream-json user message.
+                cmd.args(["--input-format", "stream-json"]);
+                let mut blocks: Vec<Value> = attachments
+                    .iter()
+                    .map(|a| json!({ "type": if is_image(a) { "image" } else { "document" }, "source": { "type": "base64", "media_type": a.mime, "data": a.data } }))
+                    .collect();
+                blocks.push(json!({ "type": "text", "text": cli_prompt(None, messages) }));
+                format!("{}\n", json!({ "type": "user", "message": { "role": "user", "content": blocks } }))
+            }
         }
         "codex" => {
             // No MCP servers from the user's config: they are not needed for
             // an answer, slow it down, fail noisily, and are tools.
             cmd.args(["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", "-c", "mcp_servers={}"]);
+            if !attachments.is_empty() {
+                // Images as files beside the run, in one --image=a,b (the "-" after it stays the prompt).
+                let mut files = Vec::new();
+                for (i, a) in attachments.iter().enumerate() {
+                    let ext = a.mime.trim_start_matches("image/").replace("jpeg", "jpg");
+                    let file = dir.join(format!("image-{i}.{ext}"));
+                    let bytes = base64_decode(&a.data).ok_or("첨부 이미지를 읽을 수 없습니다")?;
+                    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+                    files.push(file.display().to_string());
+                }
+                cmd.arg(format!("--image={}", files.join(",")));
+            }
             cli_prompt(Some(system), messages)
         }
         "gemini" => cli_prompt(Some(system), messages),
@@ -653,7 +768,7 @@ mod tests {
     fn ask(kind: &str, url: &str, key: &str) -> (Result<(), String>, String) {
         let p = Provider { kind: kind.into(), base_url: url.into(), model: "m-1".into(), credential_id: None, cli: String::new() };
         let mut out = String::new();
-        let r = chat_http(key.into(), &p, "SYS", &[Message { role: "user".into(), content: "Q".into() }], &mut |t| {
+        let r = chat_http(key.into(), &p, "SYS", &[Message { role: "user".into(), content: "Q".into(), attachments: vec![] }], &mut |t| {
             out.push_str(t);
             true
         });
@@ -707,6 +822,82 @@ mod tests {
         assert!(req.starts_with("POST /api/chat "), "{req}");
     }
 
+    fn with_image(text: &str) -> Message {
+        Message { role: "user".into(), content: text.into(), attachments: vec![Attachment { mime: "image/png".into(), data: "iVBORw0KGgo=".into(), name: "screen.png".into() }] }
+    }
+
+    /// Each API gets the image in its own shape, next to the text.
+    #[test]
+    fn images_reach_every_api_in_its_format() {
+        let ask_with = |kind: &str, url: &str| {
+            let p = Provider { kind: kind.into(), base_url: url.into(), model: "m".into(), credential_id: None, cli: String::new() };
+            chat_http("k".into(), &p, "S", &[with_image("what is on screen?")], &mut |_| true)
+        };
+        let (url, h) = fake_api("200 OK", "text/event-stream", vec!["data: {\"type\":\"message_stop\"}\n\n".into()]);
+        ask_with("anthropic", &url).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.contains(r#"{"source":{"data":"iVBORw0KGgo=","media_type":"image/png","type":"base64"},"type":"image"}"#) && req.contains(r#"{"text":"what is on screen?","type":"text"}"#), "{req}");
+        let (url, h) = fake_api("200 OK", "text/event-stream", vec!["data: [DONE]\n\n".into()]);
+        ask_with("openai", &format!("{url}/v1")).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.contains(r#""image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}"#), "{req}");
+        let (url, h) = fake_api("200 OK", "text/event-stream", vec!["data: {}\n\n".into()]);
+        ask_with("gemini", &url).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.contains(r#"{"inline_data":{"data":"iVBORw0KGgo=","mime_type":"image/png"}}"#), "{req}");
+        let (url, h) = fake_api("200 OK", "application/x-ndjson", vec!["{\"done\":true}\n".into()]);
+        ask_with("ollama", &url).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.contains(r#""images":["iVBORw0KGgo="]"#), "{req}");
+    }
+
+    #[test]
+    fn attachments_a_service_cannot_take_are_refused_before_sending() {
+        let pdf = Message { role: "user".into(), content: "x".into(), attachments: vec![Attachment { mime: "application/pdf".into(), data: "JVBE".into(), name: "a.pdf".into() }] };
+        assert!(check_attachments("compatible", "", std::slice::from_ref(&pdf)).unwrap_err().contains("PDF"));
+        assert!(check_attachments("cli", "codex", std::slice::from_ref(&pdf)).is_err());
+        assert!(check_attachments("cli", "gemini", &[with_image("x")]).unwrap_err().contains("이미지"));
+        assert!(check_attachments("anthropic", "", &[pdf, with_image("x")]).is_ok());
+        let exe = Message { role: "user".into(), content: "x".into(), attachments: vec![Attachment { mime: "application/x-msdownload".into(), data: "TVo=".into(), name: "a.exe".into() }] };
+        assert!(check_attachments("anthropic", "", &[exe]).unwrap_err().contains("형식"));
+    }
+
+    /// Claude Code takes an image as a stream-json content block; Codex as a
+    /// file beside the run (--image=), the prompt still on stdin.
+    #[test]
+    fn clis_take_images() {
+        let dir = std::env::temp_dir().join(format!("bx-fake-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("args.txt");
+        let claude = dir.join("claude.cmd");
+        std::fs::write(&claude, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\nmore > \"{log}.stdin\"\r\necho {{\"type\":\"result\",\"is_error\":false,\"result\":\"a dialog\"}}\r\n", log = log.display())).unwrap();
+        let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "claude".into() };
+        let mut out = String::new();
+        let r = chat_cli_at(&claude, &p, "S", &[with_image("what is this?")], &|| false, &mut |t| {
+            out.push_str(t);
+            true
+        });
+        let args = std::fs::read_to_string(&log).unwrap_or_default();
+        let stdin = std::fs::read_to_string(dir.join("args.txt.stdin")).unwrap_or_default();
+        assert_eq!((r, out.as_str()), (Ok(()), "a dialog"));
+        assert!(args.contains("--input-format stream-json"), "{args}");
+        let v: Value = serde_json::from_str(stdin.trim()).unwrap();
+        assert_eq!(v["message"]["content"][0]["type"], "image");
+        assert_eq!(v["message"]["content"][1]["text"], "what is this?");
+
+        let codex = dir.join("codex.cmd");
+        // The fake copies the image it was given, to show the file existed during the run.
+        std::fs::write(&codex, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\ncopy /y \"%CD%\\image-0.png\" \"{dir}\\seen.png\" >nul\r\nmore > nul\r\necho ok\r\n", log = log.display(), dir = dir.display())).unwrap();
+        let p = Provider { cli: "codex".into(), ..p };
+        let r = chat_cli_at(&codex, &p, "S", &[with_image("what is this?")], &|| false, &mut |_| true);
+        let args = std::fs::read_to_string(&log).unwrap_or_default();
+        let seen = std::fs::read(dir.join("seen.png")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()));
+        assert!(args.contains("--image=") && args.contains("image-0.png") && args.trim_end().ends_with(" -"), "{args}");
+        assert_eq!(seen, base64_decode("iVBORw0KGgo=").unwrap());
+    }
+
     #[test]
     fn provider_errors_are_shown() {
         let (url, h) = fake_api("401 Unauthorized", "application/json", vec![r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#.into()]);
@@ -742,7 +933,7 @@ mod tests {
         .unwrap();
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: "sonnet".into(), credential_id: None, cli: "claude".into() };
         let mut out = String::new();
-        let r = chat_cli_at(&script, &p, "SYSTEM RULES", &[Message { role: "user".into(), content: "list files".into() }], &|| false, &mut |t| {
+        let r = chat_cli_at(&script, &p, "SYSTEM RULES", &[Message { role: "user".into(), content: "list files".into(), attachments: vec![] }], &|| false, &mut |t| {
             out.push_str(t);
             true
         });
@@ -789,7 +980,7 @@ mod tests {
         std::fs::write(&script, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\nmore > \"{log}.stdin\"\r\necho uptime\r\n", log = log.display())).unwrap();
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "codex".into() };
         let mut out = String::new();
-        let r = chat_cli_at(&script, &p, "SYS", &[Message { role: "user".into(), content: "load?".into() }], &|| false, &mut |t| {
+        let r = chat_cli_at(&script, &p, "SYS", &[Message { role: "user".into(), content: "load?".into(), attachments: vec![] }], &|| false, &mut |t| {
             out.push_str(t);
             true
         });
@@ -820,7 +1011,7 @@ ERROR: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_
 
     #[test]
     fn conversation_becomes_one_prompt() {
-        let m = |r: &str, c: &str| Message { role: r.into(), content: c.into() };
+        let m = |r: &str, c: &str| Message { role: r.into(), content: c.into(), attachments: vec![] };
         assert_eq!(cli_prompt(None, &[m("user", "hi")]), "hi");
         assert_eq!(cli_prompt(Some("S"), &[m("user", "a"), m("assistant", "b"), m("user", "c")]), "<instructions>\nS\n</instructions>\n\n[User]\na\n\n[Assistant]\nb\n\n[User]\nc\n\n[Assistant]\n");
     }
