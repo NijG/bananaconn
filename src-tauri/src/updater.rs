@@ -159,57 +159,15 @@ const WEB_LIMIT: usize = 512 * 1024 * 1024;
 /// GET over HTTPS with WinHTTP: the system's certificate store and proxy
 /// settings, redirects followed (GitHub serves release files from another host).
 fn https_get(url: &str, limit: usize) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Networking::WinHttp::*;
-    let rest = url.get(8..).filter(|_| url[..8].eq_ignore_ascii_case("https://")).ok_or("https 주소가 아닙니다")?;
-    let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap_or((rest, "/".into()));
-    let (host, port) = match host.rsplit_once(':').map(|(h, p)| (h, p.parse::<u16>())) {
-        Some((h, Ok(p))) => (h, p),
-        _ => (host, INTERNET_DEFAULT_HTTPS_PORT),
-    };
-    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let fail = |what: &str| format!("{url} 에서 받을 수 없습니다({what}): {}", std::io::Error::last_os_error());
-    struct Handle(*mut core::ffi::c_void);
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            // SAFETY: a handle WinHTTP returned, closed once.
-            unsafe { WinHttpCloseHandle(self.0) };
-        }
+    if !url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        return Err("https 주소가 아닙니다".into());
     }
-    let open = |h: *mut core::ffi::c_void, what: &str| if h.is_null() { Err(fail(what)) } else { Ok(Handle(h)) };
-    let (agent, host_w, verb, path_w) = (wide("BananaConn-Updater"), wide(host), wide("GET"), wide(&path));
-    // SAFETY: NUL-terminated buffers that outlive each call; the handles are
-    // closed by Handle, in reverse order of creation.
-    unsafe {
-        let session = open(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, std::ptr::null(), std::ptr::null(), 0), "open")?;
-        WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, 60_000);
-        let conn = open(WinHttpConnect(session.0, host_w.as_ptr(), port, 0), "connect")?;
-        let req = open(WinHttpOpenRequest(conn.0, verb.as_ptr(), path_w.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(), WINHTTP_FLAG_SECURE), "request")?;
-        if WinHttpSendRequest(req.0, std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) == 0 || WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
-            return Err(fail("응답 없음"));
-        }
-        let mut status = 0u32;
-        let mut len = 4u32;
-        WinHttpQueryHeaders(req.0, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, std::ptr::null(), (&mut status as *mut u32).cast(), &mut len, std::ptr::null_mut());
-        if status != 200 {
-            return Err(format!("{url} 에서 받을 수 없습니다(HTTP {status})"));
-        }
-        let mut body = Vec::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let mut read = 0u32;
-            if WinHttpReadData(req.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read) == 0 {
-                return Err(fail("읽기"));
-            }
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&buf[..read as usize]);
-            if body.len() > limit {
-                return Err(format!("{url} 의 파일이 너무 큽니다"));
-            }
-        }
-        Ok(body)
+    let req = crate::http::Request { method: "GET", url, headers: &[], body: None, receive_timeout_ms: 60_000 };
+    let (status, body) = crate::http::fetch(&req, limit).map_err(|e| format!("{url} 에서 받을 수 없습니다: {e}"))?;
+    if status != 200 {
+        return Err(format!("{url} 에서 받을 수 없습니다(HTTP {status})"));
     }
+    Ok(body)
 }
 
 /// Windows errors meaning the share refused this account (it is not offline).

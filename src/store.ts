@@ -42,6 +42,18 @@ export interface Settings {
   highlightKeywords: boolean;
   /** Check commands typed by hand against the risk rules when Enter is pressed. */
   checkTypedCommands: boolean;
+  /** Colour the words of the command line being typed. */
+  cmdColor: boolean;
+  /** Suggest the rest of a command from the commands run before. */
+  cmdSuggest: boolean;
+  /** AI providers (ai/core.ts); none until the user adds one. */
+  aiProviders?: import("./ai/core").AiProvider[];
+  /** The provider used unless another is picked. */
+  aiDefault?: string | null;
+  /** Hide IP addresses and host names from cloud AI (IP_1, HOST_1 …). */
+  aiMaskHosts: boolean;
+  /** Show what will be sent before it goes to a cloud AI. */
+  aiPreview: boolean;
   /** Lock after this many idle minutes when a master password is set (0 = never). */
   autoLockMinutes: number;
   /** Open the SFTP browser next to every new SSH session. */
@@ -100,6 +112,10 @@ const DEFAULT_SETTINGS: Settings = {
   terminalTheme: "banana",
   highlightKeywords: true,
   checkTypedCommands: true,
+  cmdColor: true,
+  cmdSuggest: true,
+  aiMaskHosts: false,
+  aiPreview: true,
   autoLockMinutes: 15,
   sftpWithSsh: false,
   remoteMonitor: true,

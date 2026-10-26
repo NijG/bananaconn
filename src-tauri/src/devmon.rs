@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::monitor::{parse_block, parse_top, Section, Stats, TOP_SCRIPT};
+use crate::monitor::{parse_block, parse_commands, parse_top, Section, Stats, COMMANDS_SCRIPT, TOP_SCRIPT};
 use crate::telnet;
 
 const STEP: Duration = Duration::from_secs(15);
@@ -38,6 +38,8 @@ const PAUSED_INTERVAL: Duration = Duration::from_secs(300);
 pub(crate) enum Query {
     Top(oneshot::Sender<Result<Vec<Section>, String>>),
     Backup(oneshot::Sender<Result<String, String>>),
+    /// The programs on a Unix server's PATH (command suggestions).
+    Commands(oneshot::Sender<Result<Vec<String>, String>>),
     /// Pause (no tab of this device on screen) or resume sampling.
     Pause(bool),
 }
@@ -241,6 +243,16 @@ impl Line {
                 return Err("장비가 응답하지 않습니다".into());
             }
         }
+    }
+
+    /// Run a Unix script whose output ends with an "@@END" marker line; done
+    /// at the next prompt, the shell's own one included ("[user@aix01 /home/user]",
+    /// kept by csh and the like).
+    async fn run_script(&mut self, script: &str) -> Result<String, String> {
+        self.send(script).await?;
+        let learned = self.prompt.clone();
+        self.until(move |x| x.contains("\n@@END") && (is_prompt(last_line(x)) || learned.as_deref() == Some(last_line(x))), STEP)
+            .await
     }
 
     /// Run a command and return its output (up to the next prompt).
@@ -918,9 +930,7 @@ async fn top(t: &mut Line, kind: Kind) -> Result<Vec<Section>, String> {
                 Kind::Solaris => SOLARIS_TOP,
                 _ => HPUX_TOP,
             };
-            t.send(script).await?;
-            let out = t.until(|x| x.contains("\n@@END") && is_prompt(last_line(x)), STEP).await?;
-            parse_top(&out)
+            parse_top(&t.run_script(script).await?)
         }
         Kind::Ios | Kind::IosXe => {
             let cpu = t.run("show processes cpu sorted").await?;
@@ -1115,6 +1125,17 @@ pub(crate) async fn drive(
                     let _ = reply.send(r);
                     if lost { return Err(OUT_OF_STEP.into()) }
                     !paused
+                }
+                Some(Query::Commands(reply)) => {
+                    if kind.network() {
+                        let _ = reply.send(Err("네트워크 장비는 명령 목록을 읽지 않습니다".into()));
+                    } else {
+                        let r = t.run_script(COMMANDS_SCRIPT).await.map(|out| parse_commands(&out));
+                        let failed = r.is_err();
+                        let _ = reply.send(r);
+                        if failed { return Err(OUT_OF_STEP.into()) }
+                    }
+                    false
                 }
                 // Shown again: a fresh sample at once.
                 Some(Query::Pause(p)) => { let resumed = paused && !p; paused = p; resumed }
@@ -1349,6 +1370,10 @@ mod device_tests {
         let (reply, answer) = oneshot::channel();
         query.send(Query::Backup(reply)).await.unwrap();
         let config = tokio::time::timeout(Duration::from_secs(10), answer).await.unwrap().unwrap().unwrap();
+        // Network gear has no PATH: refused without typing anything.
+        let (reply, answer) = oneshot::channel();
+        query.send(Query::Commands(reply)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), answer).await.unwrap().unwrap().is_err());
         monitor.abort();
 
         let events = events.lock().unwrap();
@@ -1427,13 +1452,19 @@ mod device_tests {
                 ("show version", "ksh: show:  not found."),
                 ("get system status", "ksh: get:  not found."),
                 ("vmstat 1 2", AIX_VMSTAT),
+                ("echo @@C''MDS", "@@CMDS\r\nlsdev\r\nlslpp\r\nsvmon\r\n@@END"),
             ],
         ));
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
-        let (_query, queries) = mpsc::channel(1);
+        let (query, queries) = mpsc::channel(1);
         let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
         let (device, stats) = first_sample(&events).await;
+        // The command list for suggestions, asked between two samples.
+        let (reply, answer) = oneshot::channel();
+        query.send(Query::Commands(reply)).await.unwrap();
+        let names = tokio::time::timeout(Duration::from_secs(8), answer).await.unwrap().unwrap().unwrap();
+        assert_eq!(names, ["lsdev", "lslpp", "svmon"]);
         monitor.abort();
         assert_eq!((device["kind"].as_str(), device["label"].as_str(), device["name"].as_str()), (Some("aix"), Some("AIX 7300-02-01-2346"), Some("aix01")), "{stats}");
         assert_eq!(stats["cpu"], 22.0, "{stats}");

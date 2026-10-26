@@ -149,7 +149,17 @@ function commands(line: string): string[] {
 }
 
 type Compiled = { rule: RiskRule; re: RegExp | null }[];
-const compiled = (): Compiled => riskRules().map((rule) => ({ rule, re: compile(rule) }));
+// Compiled once per rule list: typed lines are checked on every keystroke.
+let compiledFor: RiskRule[] | null = null;
+let compiledRules: Compiled = [];
+function compiled(): Compiled {
+  const rules = riskRules();
+  if (rules !== compiledFor) {
+    compiledFor = rules;
+    compiledRules = rules.map((rule) => ({ rule, re: compile(rule) }));
+  }
+  return compiledRules;
+}
 
 /** The rule a command line hits, block before warn. Each line is tested as
  * written and as every command it runs; commands inside quotes run too:

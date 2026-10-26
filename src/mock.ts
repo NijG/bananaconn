@@ -24,6 +24,38 @@ function fake(dir: string, names: [string, boolean, number][]): FileEntry[] {
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
 
+// The preview's pretend shell edits its line the way a real one does:
+// Backspace (DEL or ^H) erases a character, Ctrl-U the line, Enter starts a
+// new prompt; cursor and function keys are ignored.
+const mockLines = new Map<string, string>();
+function mockLine(id: string, data: string): string {
+  let line = mockLines.get(id) ?? "";
+  let out = "";
+  for (const ch of data.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1bO.|\x1b./g, "")) {
+    if (ch === "\r") {
+      line = "";
+      out += "\r\n$ ";
+    } else if (ch === "\x7f" || ch === "\b") {
+      if (!line) continue;
+      // A wide character (Hangul) takes two cells.
+      const last = [...line].pop()!;
+      line = line.slice(0, -last.length);
+      out += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿＀-｠]/.test(last) ? "\b\b  \b\b" : "\b \b";
+    } else if (ch === "\x15") {
+      out += "\b \b".repeat([...line].length);
+      line = "";
+    } else if (ch === "\x03") {
+      line = "";
+      out += "^C\r\n$ ";
+    } else if (ch >= " ") {
+      line += ch;
+      out += ch;
+    }
+  }
+  mockLines.set(id, line);
+  return out;
+}
+
 // MobaXterm.ini sample in the bookmark format observed in MobaXterm 26.5.
 const MOBA_TAIL = "%%-1%-1%%%22%%0%0%0%%%-1%0%0%0%%1080%%0%0%1#MobaFont%10%0%0%-1%15%236,236,236%30,30,30%180,180,192%0%-1%0%%xterm%-1%-1%_Std_Colors_0_%80%24%0%1%-1%<none>%%0%0%-1#0# #-1";
 export const MOBA_SAMPLE = [
@@ -128,7 +160,7 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       return;
     }
     case "term_write":
-      mockEmit("term-output", [a.id, utf8(a.data === "\r" ? "\r\n$ " : a.data)]);
+      mockEmit("term-output", [a.id, utf8(mockLine(a.id, a.data))]);
       return;
     case "term_ack":
       return;
@@ -284,6 +316,8 @@ ${a.host}에 대한 Ping 통계:
       return { current: "0.7.4", available: a.source.includes("new") ? "0.7.5" : null, notes: "- RDP 화면 크기 자동 조정\n- 로그 파일 이름 지정" };
     case "update_install":
       throw "미리보기에서는 설치하지 않습니다";
+    case "monitor_commands":
+      return ["journalctl", "jq", "systemctl", "ss", "tail"];
     case "monitor_top":
       if (!monitors.has(a.id)) throw "모니터링이 실행 중이 아닙니다";
       return [

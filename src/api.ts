@@ -8,6 +8,15 @@ import { tr } from "./i18n";
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
 
+/** What ai.rs needs of a provider (no secrets: the key is a vault credential). */
+export interface AiProviderWire {
+  kind: string;
+  baseUrl: string;
+  model: string;
+  credentialId: string | null;
+  cli: string;
+}
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -311,6 +320,12 @@ export const api = {
   rdpVisible: (id: string, visible: boolean) => call<void>("rdp_visible", { id, visible }),
   /** Running configuration of a monitored network device. */
   monitorBackup: (id: string) => call<string>("monitor_backup", { id }),
+  monitorCommands: (id: string) => call<string[]>("monitor_commands", { id }),
+  // AI (ai.rs): the answer streams back as "ai-stream" events, then "ai-done".
+  aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string }[]) => call<void>("ai_chat", { id, provider, system, messages }),
+  aiCancel: (id: string) => call<void>("ai_cancel", { id }),
+  aiModels: (provider: AiProviderWire) => call<string[]>("ai_models", { provider }),
+  aiDetectCli: () => call<{ name: string; path: string; version: string }[]>("ai_detect_cli"),
   /** Busiest processes and file systems of a monitored server. */
   monitorTop: (id: string) => call<{ title: string; lines: string[] }[]>("monitor_top", { id }),
   serialPorts: () => call<{ name: string; description: string }[]>("serial_ports"),

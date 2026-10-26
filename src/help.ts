@@ -134,6 +134,7 @@ const KO_SECTIONS: HelpSection[] = [
       <p>자주 쓰는 명령을 저장해 두고(스니펫), 터미널에 친 키를 녹화해 그대로 다시 보냅니다(매크로).</p>
       <p><b>OS별 기본 스니펫</b>: Linux, AIX, HP-UX, Solaris, Windows, Cisco IOS·NX-OS·ASA, FortiGate, Aruba, Juniper, Huawei에서 자주 쓰는 확인용 명령(설정을 바꾸지 않는 명령)이 들어 있습니다. 스니펫 목록에는 내 스니펫과, 그 탭에서 인식한 장비의 OS 스니펫이 먼저 나오고, 다른 OS는 "○○ 스니펫"을 누르면 나옵니다. 스니펫 관리에서 고치거나 지울 수 있고, OS 분류도 바꿀 수 있습니다.</p>
       <p><b>위험 명령</b>: 스니펫·매크로가 보내는 줄마다 설정 → 위험 명령의 규칙으로 검사합니다. 시간·NTP를 바꾸는 명령(<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> 등)은 <b>차단</b>되어 보내지 않고, 재부팅·삭제·포맷·장비 설정 변경 같은 명령은 <b>경고</b> 창에서 확인해야 보냅니다. 보내면 그 탭의 로그가 켜지고, 시도·취소·차단이 모두 로그 폴더의 <code>risky-commands.log</code>에 남습니다. <code>;</code>·<code>&amp;&amp;</code>로 이어 쓴 명령, <code>sudo</code>·<code>su -c</code>·<code>bash -c</code>·<code>eval</code> 안의 명령, 줄 끝 <code>\\</code>로 이어진 명령도 검사합니다. Tab 자동 완성이나 커서 이동 키(←→, Home, 명령 기록 ↑↓)가 든 매크로는 실제로 보낼 명령을 알 수 없어 경고합니다. 직접 입력한 명령은 Enter를 누를 때 화면에 보이는 명령 줄을 같은 규칙으로 검사합니다(명령 기록 ↑↓·Tab 자동 완성 결과 포함). vi·less처럼 화면 전체를 쓰는 프로그램 안에서는 검사하지 않고, 설정 → 위험 명령에서 끌 수 있습니다.</p>
+      <p><b>입력 중인 명령의 색과 자동 완성</b>: 프롬프트 뒤에 입력 중인 명령을 명령어·옵션·문자열·경로·연결 기호별로 색을 나눠 보여 주고, 위험 명령 규칙에 걸리면 Enter 전에 빨간색으로 바꿉니다. 전에 실행한 명령(이 PC에만 저장)과 스니펫에서 나머지를 회색으로 제안하며, <kbd>→</kbd> 또는 <kbd>End</kbd>로 모두, <kbd>Ctrl</kbd>+<kbd>→</kbd>로 한 단어씩 입력합니다. <kbd>Tab</kbd>은 서버의 자동 완성 그대로입니다. <kbd>Ctrl</kbd>+<kbd>Space</kbd>는 후보 목록을 엽니다(↑↓로 고르고 Enter·Tab으로 입력, Esc로 닫기). 후보는 실행 기록, 스니펫, 인식한 장비의 명령 사전(Linux, AIX, HP-UX, Solaris, Windows, Cisco, FortiGate, Aruba, Juniper, Huawei), 리소스 모니터가 켜진 Unix 서버라면 그 서버의 PATH에 있는 명령 이름 순서로 찾습니다. 서버의 명령 이름은 모니터 연결로 한 번만 읽고, 터미널에는 아무것도 입력하지 않습니다. 명령 줄은 화면에서 읽으므로 화면에 보이지 않는 비밀번호는 기록되지 않고, 위험 명령과 비밀번호·토큰이 든 명령(<code>mysql -p…</code>, <code>--password=…</code>, <code>TOKEN=…</code>)은 기록하지도 제안하지도 않습니다. 잘못 입력한 기록은 후보 목록에서 <kbd>Shift</kbd>+<kbd>Delete</kbd>로 지웁니다. 설정 → 터미널에서 각각 끄고, 명령 기록을 지울 수 있습니다.</p>
       <h4>스니펫 만들기·보내기</h4>
       <ol>
         <li>터미널 툴바의 <b>스니펫</b> → <b>스니펫 관리…</b> → <b>새 스니펫</b>.</li>
@@ -153,6 +154,22 @@ const KO_SECTIONS: HelpSection[] = [
         <li><b>비밀번호는 기록하지 마세요</b>: 매크로는 친 키를 그대로 저장하므로, 기록 중에 입력한 비밀번호도 저장됩니다.</li>
         <li>매크로 내용은 <b>스니펫 관리…</b>에서 확인할 수 있습니다(⏎ = Enter, ⇥ = Tab, ^C = Ctrl+C). 이름 변경과 삭제는 되지만 키 내용은 바꿀 수 없으니, 고치려면 다시 기록하세요.</li>
         <li>스니펫과 매크로는 이 PC에 저장되며, 모든 세션에서 같이 씁니다.</li>
+      </ul>`,
+  },
+  {
+    id: "ai",
+    title: "AI (명령 만들기 · 설명 · 대화 · 분석)",
+    icon: "Sparkles",
+    body: `
+      <p>클라우드 AI(API 키), 구독 CLI, 이 PC의 로컬 LLM을 연결해 터미널 작업을 돕게 합니다. 설정 → AI에서 서비스를 추가하고 기본으로 쓸 AI를 고릅니다.</p>
+      <ul>
+        <li><b>연결 방식</b>: API 키(Anthropic Claude, OpenAI, Google Gemini, OpenAI 호환 서버), 구독 CLI(Claude Code, Codex CLI, Gemini CLI: PC에 설치하고 한 번 로그인해 두면 그 구독으로 답합니다), 로컬 LLM(Ollama, LM Studio·llama.cpp·vLLM 같은 OpenAI 호환 서버). API 키는 자격 증명 보관함에 저장되고, "목록 불러오기"로 모델을 고르고 "연결 확인"으로 시험합니다.</li>
+        <li><b>명령 만들기</b> (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>): 할 일을 말로 적으면, 인식한 장비·OS에 맞는 명령 하나를 만들어 줍니다. Enter를 한 번 더 누르면 입력 줄에 들어가고(실행하지 않음), 실행은 직접 Enter로 합니다. 위험 명령 규칙이 그대로 적용되어, 차단 대상(시간·NTP 변경 등)은 입력 줄에 넣지도 않습니다.</li>
+        <li><b>출력 설명</b> (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>): 선택한 텍스트(없으면 화면의 최근 출력)의 의미와 원인, 다음 단계를 설명합니다.</li>
+        <li><b>AI 대화</b> (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>): 터미널 오른쪽에 대화 창을 엽니다. "선택 영역 첨부"로 출력을 함께 보내고, 답의 명령 줄마다 있는 버튼으로 입력 줄에 넣습니다.</li>
+        <li><b>설정·로그 분석</b>: 대화 창의 파일 버튼으로 설정이나 로그 파일을 골라 점검(보안 문제, 위험한 설정)이나 분석(오류, 이상 징후)을 받습니다. 네트워크 장비는 장비 버튼 → "설정을 AI로 점검"으로 running-config를 바로 점검합니다.</li>
+        <li><b>보내는 내용</b>: 클라우드 AI로 보내기 전에 보낼 내용을 보여 주고 확인을 받습니다(대화마다 "다시 묻지 않기" 가능). 비밀번호·키·토큰(<code>password=…</code>, <code>-p…</code>, <code>enable secret</code>, <code>snmp-server community</code>, 개인 키 등)은 항상 가리고, 설정에서 켜면 IP 주소·호스트 이름도 IP_1, HOST_1처럼 바꿔 보낸 뒤 답에서는 원래 값으로 보여 줍니다. 로컬 LLM은 이 PC 밖으로 나가지 않으므로 묻거나 가리지 않습니다. 회사 장비의 정보를 외부 AI에 보내도 되는지는 회사 보안 정책을 확인하세요.</li>
+        <li>구독 CLI는 Claude Code를 도구를 모두 끈 채(명령 실행·파일 읽기 없음) 빈 폴더에서, Codex를 읽기 전용 샌드박스로 실행합니다. 로그인 정보는 앱이 다루지 않습니다.</li>
       </ul>`,
   },
   {

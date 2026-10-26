@@ -143,6 +143,23 @@ command can take a site down:
   for common devices is included.
 - **Output highlighting:** ERROR/FAIL in red, WARN in yellow, OK/SUCCESS in green — never inside programs that
   set their own colours or use the full screen.
+- **Command line colours and suggestions:** the command being typed is coloured by commands, options, strings,
+  paths and operators (network-gear syntax on switches and firewalls) and turns red before Enter when a risky-command
+  rule matches. The rest of a command is suggested in grey from commands run before and from snippets; → or End
+  takes it, Ctrl+→ one word, while Tab stays the server's own completion. Ctrl+Space opens a list of candidates
+  from the history, snippets, a command dictionary for the recognised device (Linux, AIX, HP-UX, Solaris, Windows,
+  Cisco, FortiGate, Aruba, Juniper, Huawei) and the program names on a monitored Unix server's PATH (read once over
+  the monitor's own connection). The line is read from the screen, so passwords typed at a prompt are never recorded;
+  risky commands and lines carrying a password or token (`mysql -p…`, `--password=…`, `TOKEN=…`) are neither
+  recorded nor suggested, and Shift+Delete in the list removes a mistyped entry.
+- **AI assistant:** connect a cloud API (Anthropic Claude, OpenAI, Google Gemini, any OpenAI-compatible service),
+  a subscription through its official CLI (Claude Code, Codex CLI, Gemini CLI, signed in on this PC) or a local LLM
+  (Ollama, LM Studio, llama.cpp, vLLM). Describe a task to get one command for the recognised device
+  (Ctrl+Shift+A), explain the selected output (Ctrl+Shift+E), chat beside the terminal (Ctrl+Shift+L), or review a
+  configuration or log file. Nothing an AI answers is run: commands go onto the input line only on request, and the
+  risky-command rules still apply. Before text goes to a cloud AI it is shown for confirmation; passwords, keys and
+  tokens are always masked, IP addresses and host names on request (and restored in the answer). API keys live in
+  the credential vault; requests use Windows' proxy and certificate settings.
 - **Device keys mode:** sends Ctrl-D/A/E for Delete/Home/End so that Cisco IOS and similar CLIs do not print `~`.
 - **Everyday details:** find in terminal, copy on select, right-click paste, Ctrl+mouse wheel to zoom,
   GPU rendering (WebGL) when a real graphics card is present, input from remote-desktop tools that inject Unicode
@@ -391,6 +408,8 @@ src/                     TypeScript front end (Vite)
   sidebar.ts             session tree
   views/                 terminal (xterm.js), files, editor (CodeMirror), RDP, VNC (noVNC), TFTP
   riskRules.ts           risky command rules and the line parser
+  cmdLine.ts, cmdAssist.ts, cmdDictionary.ts   command line colours, history, suggestions
+  ai/                    AI panel, command bar, providers, masking of what is sent
   importers.ts           importers for other tools' session formats
   i18n/, help/           interface translations and the built-in manual
 src-tauri/src/           Rust backend (Tauri v2)
@@ -399,6 +418,7 @@ src-tauri/src/           Rust backend (Tauri v2)
   devmon.rs, monitor.rs  resource monitor and device recognition
   tunnel.rs              SSH gateways and port forwarding
   proxy.rs               SOCKS, HTTP, Telnet and local-command proxies
+  ai.rs, http.rs         AI providers (APIs, subscription CLIs, local LLMs) over WinHTTP
   ftpserver.rs, fileservers.rs   built-in FTP, TFTP and HTTP servers
   vault.rs, lock.rs      Credential Manager storage, master password
   updater.rs             signed updates from GitHub Releases or a share

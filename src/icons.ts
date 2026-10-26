@@ -81,11 +81,19 @@ import {
   X,
   ZoomIn,
   ZoomOut,
+  Ban,
+  Bot,
+  FileSearch,
+  LoaderCircle,
+  MessageSquarePlus,
+  Send,
+  WandSparkles,
 } from "lucide";
 
 type IconNode = Parameters<typeof createElement>[0];
 
 const ICONS: Record<string, IconNode> = {
+  Ban, Bot, FileSearch, LoaderCircle, MessageSquarePlus, Send, WandSparkles,
   CircleHelp,
   ClipboardPaste,
   CopyPlus,

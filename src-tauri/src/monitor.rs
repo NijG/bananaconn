@@ -40,6 +40,26 @@ ps -eo pid,user,pcpu,pmem,rss,comm --sort=-pcpu 2>/dev/null | head -n 11; \
 echo @@M''EM; ps -eo pid,user,pmem,rss,comm --sort=-rss 2>/dev/null | head -n 11; \
 echo @@D''ISK; df -hP 2>/dev/null | grep -vE '^(tmpfs|devtmpfs|overlay|shm|udev|none|efivarfs) '; echo @@EN''D";
 
+/// Read-only list of the programs on the server's PATH, for command-line
+/// suggestions. Plain sh syntax, so ksh on AIX and HP-UX runs it too; markers
+/// are split with quotes like TOP_SCRIPT's.
+pub(crate) const COMMANDS_SCRIPT: &str = "echo @@C''MDS; ( IFS=:; for d in $PATH; do ls -1 \"$d\" 2>/dev/null; done ) | sort -u | head -n 5000; echo @@EN''D";
+
+/// Command names from COMMANDS_SCRIPT output (lines between the markers).
+pub(crate) fn parse_commands(text: &str) -> Vec<String> {
+    let mut inside = false;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        match line.trim() {
+            "@@CMDS" => inside = true,
+            "@@END" => break,
+            name if inside && !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c)) => names.push(name.to_string()),
+            _ => {}
+        }
+    }
+    names
+}
+
 /// One table in the "top processes" view.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Section {
@@ -505,10 +525,10 @@ pub async fn monitor_pause(state: State<'_, MonitorState>, id: String, paused: b
     Ok(())
 }
 
-/// Run TOP_SCRIPT in a fresh exec channel and collect its output.
-pub(crate) async fn ssh_top(handle: &russh::client::Handle<crate::remote::HostCheck>) -> Result<Vec<Section>, String> {
+/// Run a read-only script in a fresh exec channel and collect its output.
+async fn ssh_exec(handle: &russh::client::Handle<crate::remote::HostCheck>, script: &str) -> Result<String, String> {
     let mut channel = handle.channel_open_session().await.map_err(|e| format!("모니터링 연결이 끊어졌습니다: {e}"))?;
-    channel.exec(true, TOP_SCRIPT).await.map_err(|e| e.to_string())?;
+    channel.exec(true, script).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let read = async {
         while let Some(msg) = channel.wait().await {
@@ -520,7 +540,30 @@ pub(crate) async fn ssh_top(handle: &russh::client::Handle<crate::remote::HostCh
         }
     };
     tokio::time::timeout(Duration::from_secs(15), read).await.map_err(|_| "서버가 응답하지 않습니다".to_string())?;
-    Ok(parse_top(&String::from_utf8_lossy(&out)))
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Run TOP_SCRIPT in a fresh exec channel.
+pub(crate) async fn ssh_top(handle: &russh::client::Handle<crate::remote::HostCheck>) -> Result<Vec<Section>, String> {
+    Ok(parse_top(&ssh_exec(handle, TOP_SCRIPT).await?))
+}
+
+/// The programs on a monitored Unix server's PATH (for command suggestions),
+/// read over the monitor's own connection. Network devices have none.
+#[tauri::command]
+pub async fn monitor_commands(state: State<'_, MonitorState>, id: String) -> Result<Vec<String>, String> {
+    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    match probe {
+        Probe::Ssh(handle, _) => Ok(parse_commands(&ssh_exec(&handle, COMMANDS_SCRIPT).await?)),
+        Probe::Line(tx) => {
+            let (reply, answer) = oneshot::channel();
+            tx.send(crate::devmon::Query::Commands(reply)).await.map_err(|_| "모니터링 연결이 끊어졌습니다".to_string())?;
+            tokio::time::timeout(Duration::from_secs(30), answer)
+                .await
+                .map_err(|_| "장비가 응답하지 않습니다".to_string())?
+                .map_err(|_| "모니터링 연결이 끊어졌습니다".to_string())?
+        }
+    }
 }
 
 /// The busiest processes (and file systems) of a monitored server, read over
@@ -562,6 +605,44 @@ pub async fn monitor_backup(state: State<'_, MonitorState>, id: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_list_keeps_names_between_the_markers() {
+        // The echoed command line (Telnet) carries the quoted markers, not the real ones.
+        let out = "echo @@C''MDS; ( IFS=:; ...\r\n@@CMDS\r\nawk\r\ngit-upload-pack\r\npython3.11\r\nweird name\r\n\x1b[0m\r\n@@END\r\nbxmon> ";
+        assert_eq!(parse_commands(out), ["awk", "git-upload-pack", "python3.11"]);
+    }
+
+    /// COMMANDS_SCRIPT in a real sh (Git for Windows), PATH = two folders.
+    #[test]
+    fn command_list_script_reads_every_path_folder() {
+        let sh = r"C:\Program Files\Git\usr\bin\sh.exe";
+        if !std::path::Path::new(sh).exists() {
+            eprintln!("no Git sh: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bx-cmds-{}", std::process::id()));
+        let (a, b) = (dir.join("a b"), dir.join("c"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for (d, n) in [(&a, "zeta"), (&a, "alpha"), (&b, "alpha"), (&b, "mid")] {
+            std::fs::write(d.join(n), "").unwrap();
+        }
+        let path = |p: &std::path::Path| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            format!("/{}{}", s[..1].to_lowercase(), &s[2..])
+        };
+        let out = std::process::Command::new(sh)
+            // /usr/bin last: the script's own sort and head come from there.
+            .args(["-c", &format!("PATH='{}:{}:/nonexistent:/usr/bin'; {COMMANDS_SCRIPT}", path(&a), path(&b))])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = parse_commands(&String::from_utf8_lossy(&out.stdout));
+        let found = |n: &str| names.iter().filter(|x| *x == n).count();
+        assert_eq!((found("alpha"), found("mid"), found("zeta"), found("sort.exe")), (1, 1, 1, 1), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+    }
 
     fn block(cpu: &str, avail: bool) -> Vec<String> {
         let mut v = vec![cpu.to_string(), "MemTotal:        8000000 kB".into()];

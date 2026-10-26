@@ -945,7 +945,7 @@ fn open_ssh(app: &AppHandle, req: &OpenRequest, cred: Option<vault::Resolved>, o
                 return Err("점프 호스트와 프록시를 함께 쓸 수 없습니다. 세션 편집에서 둘 중 하나만 지정하세요.".into());
             }
             let state = app.state::<crate::proxy::ProxyState>();
-            let port = crate::proxy::open_forward(app, &state, &format!("term-{}", req.id), &target.hostname, target.port, p)?;
+            let port = crate::proxy::open_forward(app, &state, &format!("term-{}", req.id), &target.hostname, target.port, p, true)?;
             let exe = std::env::current_exe().map_err(|e| format!("프록시 중계를 시작할 수 없습니다: {e}"))?;
             cmd.args(["-o", &format!("ProxyCommand=\"{}\" --proxy-stdio {port}", exe.display())]);
         }

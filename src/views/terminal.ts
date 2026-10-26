@@ -5,7 +5,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } from "../api";
-import type { PasteEvent, ProxyLogEvent } from "../api";
+import type { PasteEvent } from "../api";
 import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
@@ -15,6 +15,12 @@ import { findRisks, findTypedRisk, type RiskHit } from "../riskRules";
 import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
+import { CmdAssist } from "../cmdAssist";
+import type { AiHost, AiPanel } from "../ai/panel";
+
+/** The AI panel and command bar load on first use. */
+const aiModule = () => import("../ai/panel");
+import { hasRemoteCommands, setRemoteCommands } from "../cmdLine";
 import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands";
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
@@ -54,7 +60,6 @@ function ensureRouting() {
     setMonitorInfo(m, nextMonitorInfo(m.info, e));
   });
   on<PasteEvent>("term-paste", (e) => allViews.forEach((v) => v.pasteProgress(e)));
-  on<ProxyLogEvent>("proxy-log", (e) => allViews.forEach((v) => v.proxyLog(e)));
 }
 
 // ---- shared resource monitors ----------------------------------------------------------
@@ -203,6 +208,8 @@ export class TerminalView implements View {
   /** The log settings last started with (a reconnect continues with them). */
   private logUsed: LogConfig | null = null;
   private highlighter = new KeywordHighlighter();
+  /** Colours and suggestions for the command line being typed. */
+  private assist: CmdAssist;
   /** The automatic SFTP panel was opened once for this tab. */
   private filesOpened = false;
   /** Keystrokes captured while a macro is being recorded. */
@@ -238,6 +245,7 @@ export class TerminalView implements View {
            <button class="tool" data-act="zoomin" title="글자 크게">${icon("ZoomIn", 15)}</button>
            ${session.protocol === "ssh" ? `<span class="tool-sep"></span><button class="tool" data-act="sftp" title="같은 서버의 파일 브라우저 열기">${icon("FolderLock", 15)}<span>SFTP</span></button>` : ""}
            <button class="tool" data-act="snippet" title="명령 스니펫·매크로 보내기">${icon("ClipboardType", 15)}<span>스니펫</span></button>
+           <button class="tool" data-act="ai" title="AI: 명령 만들기·출력 설명·대화·파일 분석">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool device-tool" data-act="device" title="자동으로 인식한 장비: 자주 쓰는 명령, 설정 백업, 상위 프로세스" hidden>${icon("Server", 15)}<span data-device-label></span></button>
            <button class="tool" data-act="keys" title="Delete·Home·End 키를 보내는 방식 (네트워크 장비는 Ctrl-D·Ctrl-A·Ctrl-E)">${icon("Keyboard", 15)}<span data-keys-label></span></button>
            <button class="tool" data-act="sendfile" title="텍스트 파일 보내기 (설정 파일을 붙여넣듯이)">${icon("FileText", 15)}</button>
@@ -278,6 +286,12 @@ export class TerminalView implements View {
     this.term.open(this.host);
     this.applyThemeBackground();
     this.wireBlink();
+    this.assist = new CmdAssist(
+      this.term,
+      () => this.historyKey,
+      () => this.device,
+      () => termTheme(state.settings.terminalTheme),
+    );
     // SSH runs ssh.exe inside ConPTY, which rewraps lines itself on resize:
     // xterm must know, or resized lines come out doubled or torn.
     if (session.protocol === "ssh") {
@@ -293,6 +307,7 @@ export class TerminalView implements View {
       // pastes are mirrored as text below.
       const typed = !this.pasting && this.userTurn;
       if (typed && data === "\r" && this.holdRiskyEnter()) return;
+      if (typed || this.pasting) this.assist.note(data);
       this.sendInput(data);
       if (typed) this.ws.mirrorInput(this, { keys: data });
       if (typed && this.recording) this.recording.push(data);
@@ -384,6 +399,11 @@ export class TerminalView implements View {
     if (!this.disposed) this.ws.changed();
   }
 
+  /** Command history and the server's command list are kept under this. */
+  private get historyKey(): string {
+    return `${this.session.protocol}:${endpoint(this.session)}`;
+  }
+
   /** The device behind this tab, as the monitor recognised it. */
   get device(): DeviceInfo | undefined {
     return this.shared?.device;
@@ -393,6 +413,13 @@ export class TerminalView implements View {
    * for network gear unless this session already chose a mode. */
   deviceDetected(d: DeviceInfo) {
     if (this.disposed) return;
+    // A Unix server's command names for suggestions, read once per server and
+    // app run over the monitor's own connection (never typed into this tab).
+    const key = this.historyKey;
+    if (!d.network && state.settings.cmdSuggest && this.shared && !hasRemoteCommands(key)) {
+      setRemoteCommands(key, []);
+      api.monitorCommands(this.shared.id).then((names) => setRemoteCommands(key, names), () => {});
+    }
     const button = this.el.querySelector<HTMLElement>('[data-act="device"]')!;
     button.hidden = false;
     button.querySelector("[data-device-label]")!.textContent = d.network ? deviceTitle(d) : d.name || deviceTitle(d);
@@ -428,9 +455,103 @@ export class TerminalView implements View {
       { label: `${deviceTitle(d)}${d.name ? ` · ${d.name}` : ""}`, icon: "Server", disabled: true },
       "-",
       ...(d.backup ? [{ label: "설정 백업 (running-config를 파일로 저장)…", icon: "Save", action: () => this.backupConfig() }] : []),
+      ...(d.backup ? [{ label: "설정을 AI로 점검…", icon: "Sparkles", action: () => void this.aiConfigReview() }] : []),
       { label: "상위 프로세스·리소스", icon: "Activity", action: () => showTopProcesses(sh.id, this.title()) },
       ...(commands.length ? ["-" as const, ...commands] : []),
     ]);
+  }
+
+  // ---- AI (ai/panel.ts) ----
+
+  private aiPanel: AiPanel | null = null;
+
+  /** What the AI sees of this tab. */
+  private get aiHost(): AiHost {
+    return {
+      target: () => {
+        const d = this.device;
+        if (d) return { system: [deviceTitle(d), d.label].filter(Boolean).join(" · "), network: d.network };
+        return { system: this.session.protocol === "serial" ? "a device on a serial console" : "", network: this.keyMode === "network" };
+      },
+      hostNames: () => [this.session.host, this.session.name, this.device?.name ?? "", this.session.username ?? "", ...this.assist.promptNames()].filter((s) => s && s.length >= 3),
+      selection: () => this.term.getSelection(),
+      recentOutput: (lines) => {
+        const buf = this.term.buffer.active;
+        const end = buf.baseY + buf.cursorY;
+        const out: string[] = [];
+        for (let y = Math.max(0, end - lines); y <= end; y++) out.push(buf.getLine(y)?.translateToString(true) ?? "");
+        return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+      },
+      insert: (command) => {
+        if (this.state !== "connected") return toast("연결된 다음 넣을 수 있습니다", "warn");
+        // Replace what is typed on the line (Ctrl-U), never press Enter.
+        const typed = this.assist.typedText();
+        const data = (typed ? "\x15" : "") + command.replace(/[\r\n]+/g, " ");
+        this.assist.note(data);
+        this.sendInput(data);
+      },
+      focus: () => this.term.focus(),
+    };
+  }
+
+  private aiMenu() {
+    const r = this.el.querySelector<HTMLElement>('[data-act="ai"]')!.getBoundingClientRect();
+    contextMenu(r.left, r.bottom + 4, [
+      { label: "명령 만들기 (할 일을 말로 적기)", icon: "WandSparkles", action: () => void this.aiCommand() },
+      { label: this.term.hasSelection() ? "선택 영역 설명" : "화면 출력 설명", icon: "Sparkles", action: () => void this.aiExplain() },
+      { label: this.aiPanel ? "AI 대화 닫기" : "AI 대화 열기", icon: "Bot", action: () => void this.toggleAiPanel() },
+      { label: "파일 분석 (설정·로그)…", icon: "FileSearch", action: () => void this.openAiPanel().then((p) => p.el.querySelector<HTMLElement>('[data-act="file"]')?.click()) },
+      ...(this.device?.backup ? [{ label: "장비 설정을 AI로 점검", icon: "ShieldCheck", action: () => void this.aiConfigReview() }] : []),
+    ]);
+  }
+
+  private async aiCommand() {
+    const m = await aiModule();
+    m.commandBar(this.el, this.aiHost);
+  }
+
+  private async openAiPanel(): Promise<AiPanel> {
+    if (this.aiPanel) return this.aiPanel;
+    const m = await aiModule();
+    this.aiPanel = new m.AiPanel(this.aiHost, () => this.closeAiPanel());
+    this.el.append(this.aiPanel.el);
+    this.el.classList.add("with-ai");
+    this.layout();
+    return this.aiPanel;
+  }
+
+  private closeAiPanel() {
+    this.aiPanel?.dispose();
+    this.aiPanel = null;
+    this.el.classList.remove("with-ai");
+    this.layout();
+    this.term.focus();
+  }
+
+  private async toggleAiPanel() {
+    if (this.aiPanel) return this.closeAiPanel();
+    (await this.openAiPanel()).focus();
+  }
+
+  /** Explain the selection, or the last screenful when nothing is selected. */
+  private async aiExplain() {
+    const text = this.term.getSelection().trim() || this.aiHost.recentOutput(40);
+    if (!text) return toast("설명할 출력이 없습니다", "info");
+    (await this.openAiPanel()).explain(text);
+  }
+
+  /** Read the running configuration over the monitor connection and review it. */
+  private async aiConfigReview() {
+    const d = this.device;
+    const sh = this.shared;
+    if (!d || !sh) return;
+    toast("장비에서 설정을 읽는 중…", "info", 2500);
+    try {
+      const text = await api.monitorBackup(sh.id);
+      (await this.openAiPanel()).analyse(text, "config", `${deviceTitle(d)} ${d.name || this.session.host} running-config`);
+    } catch (err) {
+      toast(`설정을 읽지 못했습니다: ${errorText(err)}`, "error", 6000);
+    }
   }
 
   /** Save the device's running configuration, read over the monitor connection. */
@@ -727,13 +848,6 @@ export class TerminalView implements View {
     }
   }
 
-  /** A step of this SSH session's proxy forward (proxy.rs, id "term-<runtime id>"). */
-  proxyLog(e: ProxyLogEvent) {
-    if (this.disposed || e.id !== `term-${this.runtimeId}`) return;
-    if (e.error) this.term.write(`\r\n\x1b[31m${tr(`프록시: ${e.line}`)}\x1b[0m\r\n`);
-    else if (proxyOf(this.session)?.diagnostics) this.term.write(`\x1b[90m${e.line}\x1b[0m\r\n`);
-  }
-
   pasteProgress(e: PasteEvent) {
     if (e.id !== this.runtimeId || this.disposed) return;
     if (e.state === "running") {
@@ -802,7 +916,10 @@ export class TerminalView implements View {
   }
 
   receiveBroadcast(input: BroadcastInput) {
-    if ("keys" in input) this.sendInput(this.expandKeys(input.keys));
+    if ("keys" in input) {
+      this.assist.note(input.keys);
+      this.sendInput(this.expandKeys(input.keys));
+    }
     else if ("editKey" in input) this.sendInput(this.editKeyBytes(input.editKey));
     else this.pasteText(input.paste);
   }
@@ -884,7 +1001,7 @@ export class TerminalView implements View {
       title: "위험한 명령이 있습니다",
       icon: "TriangleAlert",
       danger: true,
-      message: `<p>보내면 다음 명령이 실행됩니다.</p><p class="muted small">${source} · 대상: <b data-i18n-skip>${esc(where)}</b></p><ul>${hits.map(item).join("")}</ul>
+      message: `<p>보내면 다음 명령이 실행됩니다.</p><p class="muted small"><span>${source}</span> · 대상: <b data-i18n-skip>${esc(where)}</b></p><ul>${hits.map(item).join("")}</ul>
         ${others.length ? `<p class="muted small">${others.length}개 탭에 동시 입력이 켜져 있어 함께 보냅니다.</p>` : ""}
         <p class="muted small">보내면 받는 탭의 로그 기록이 켜지고, 위험 명령 기록(risky-commands.log)에 남습니다.</p>`,
       confirm: "로그를 켜고 보내기",
@@ -932,6 +1049,7 @@ export class TerminalView implements View {
     void this.riskGate([hit], "직접 입력한 명령", "(typed)").then((others) => {
       if (others) {
         this.sendInput("\r");
+        this.assist.sent();
         for (const t of others) if (t.view.state === "connected") t.view.receiveBroadcast?.({ keys: "\r" });
         this.recording?.push("\r");
       }
@@ -990,6 +1108,7 @@ export class TerminalView implements View {
   /** Apply changed settings only: an unrelated change (a "don't ask again"
    * box) must not re-render every terminal or undo this tab's zoom. */
   applySettings() {
+    this.aiPanel?.refreshProviders();
     const s = state.settings;
     const o = this.term.options;
     if (o.fontFamily !== s.fontFamily) o.fontFamily = s.fontFamily;
@@ -1265,6 +1384,8 @@ export class TerminalView implements View {
             () => toast("Break 신호를 보냈습니다", "success", 2000),
             (err) => toast(errorText(err), "error"),
           );
+        case "ai":
+          return this.aiMenu();
         case "snippet":
           return snippetMenu(this.el.querySelector('[data-act="snippet"]')!, (s) => this.sendSnippet(s), this.device?.kind);
         case "record":
@@ -1432,6 +1553,8 @@ export class TerminalView implements View {
 
   private handleKey(e: KeyboardEvent): boolean {
     if (e.type !== "keydown") return true;
+    // Command suggestions and the candidates list (cmdAssist.ts) come first.
+    if (this.assist.key(e) === false) return false;
     // Network gear (Cisco IOS & co.) does not understand ESC [ 3 ~ and prints
     // the "~"; it edits lines with Emacs-style control keys instead.
     // Delete/Home/End are sent here in both key modes, and broadcast as the key
@@ -1480,6 +1603,23 @@ export class TerminalView implements View {
       case "term.selectAll":
         this.term.selectAll();
         return false;
+      // Without a typed command the key goes to the remote as usual (Ctrl+Space = NUL).
+      case "term.aiCommand":
+        e.preventDefault();
+        void this.aiCommand();
+        return false;
+      case "term.aiExplain":
+        e.preventDefault();
+        void this.aiExplain();
+        return false;
+      case "term.aiChat":
+        e.preventDefault();
+        void this.toggleAiPanel();
+        return false;
+      case "term.complete":
+        if (!this.assist.openList()) break;
+        e.preventDefault();
+        return false;
       default: {
         // The rest do what their toolbar button does (hidden buttons do not apply here).
         const button = act && TOOLBAR_KEYS[act];
@@ -1512,6 +1652,8 @@ export class TerminalView implements View {
     if (this.runtimeId) {
       api.termClose(this.runtimeId).catch(() => {});
     }
+    this.assist.dispose();
+    this.aiPanel?.dispose();
     this.term.dispose();
     this.gateway.close();
   }

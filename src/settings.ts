@@ -5,7 +5,9 @@ import { icon } from "./icons";
 import { state, updateSettings, type Settings } from "./store";
 import { appLock, openMasterPassword } from "./lock";
 import { LIGHT_THEMES, TERM_THEMES } from "./themes";
-import { esc, modal, toast } from "./ui";
+import { confirmDialog, esc, modal, toast } from "./ui";
+import { clearCommandHistory, commandHistoryCount } from "./cmdLine";
+import { aiSettingsSection, wireAiSettings } from "./ai/settings";
 import { checkForUpdate } from "./updates";
 import { compile, DEFAULT_RISK_RULES, riskRules, type RiskRule } from "./riskRules";
 import { isLanguage, LANGUAGES, language as shownLanguage } from "./i18n";
@@ -43,6 +45,7 @@ const PAGES: { id: string; label: string; icon: string }[] = [
   { id: "security", label: "보안", icon: "LockKeyhole" },
   { id: "session", label: "세션", icon: "Server" },
   { id: "risk", label: "위험 명령", icon: "ShieldAlert" },
+  { id: "ai", label: "AI", icon: "Sparkles" },
   { id: "log", label: "로그", icon: "ScrollText" },
   { id: "update", label: "업데이트", icon: "RefreshCw" },
 ];
@@ -107,7 +110,7 @@ function revealPage(el: Element | null | undefined) {
 }
 
 /** `section`: open at that page (e.g. "update" from the update login guide). */
-export function openSettings(section?: "update" | "risk" | "shortcuts") {
+export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
   const s = state.settings;
   const passwords = state.credentials.filter((c) => c.kind === "password");
   const check = (name: keyof Settings, label: string, hint: string) =>
@@ -140,6 +143,9 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
             ${[["auto", "자동 (그래픽 카드가 있으면 GPU 가속)"], ["webgl", "항상 GPU 가속 (WebGL)"], ["dom", "기본 (GPU 사용 안 함)"]].map(([v, l]) => `<option value="${v}" ${v === s.renderer ? "selected" : ""}>${l}</option>`).join("")}
           </select></label>
         </div>
+        ${check("cmdColor", "입력 중인 명령에 색 입히기", "명령어·옵션·문자열·경로·연결 기호를 색으로 구분합니다. 위험 명령 규칙에 걸리는 명령은 Enter를 누르기 전에 빨간색으로 보입니다. 서버가 직접 색을 입히는 셸(zsh 강조 등)에는 적용하지 않습니다.")}
+        ${check("cmdSuggest", "명령 자동 완성 제안", "전에 실행한 명령과 스니펫에서 나머지를 회색으로 보여 줍니다. → 또는 End로 모두, Ctrl+→로 한 단어씩 입력합니다. Tab은 서버의 자동 완성 그대로입니다. 위험 명령과 비밀번호·토큰이 든 명령은 기록하지도 제안하지도 않습니다.")}
+        <div class="row"><button type="button" class="btn btn-sm" data-clear-history>${icon("Trash2", 14)}명령 기록 지우기</button></div>
         ${check("highlightKeywords", "출력 키워드 강조", "ERROR·FAIL은 빨강, WARN은 노랑, OK·SUCCESS는 초록으로 표시합니다. 색을 직접 쓰는 프로그램과 vim 같은 전체 화면 프로그램에는 적용하지 않습니다.")}
         ${check("copyOnSelect", "선택하면 바로 복사", "PuTTY처럼 드래그로 선택한 글자를 클립보드에 복사합니다.")}
         ${check("rightClickPaste", "오른쪽 클릭으로 붙여넣기", "터미널에서 오른쪽 버튼을 누르면 클립보드 내용을 붙여넣습니다.")}
@@ -178,6 +184,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
           <button type="button" class="btn btn-sm" data-risk-reset>${icon("RefreshCw", 14)}기본 규칙으로</button>
           <button type="button" class="btn btn-sm" data-risk-log>${icon("FolderOpen", 14)}위험 명령 기록 보기</button>
         </div>
+        ${aiSettingsSection(check)}
         <h4 data-section="log">로그 (기본값 · 세션마다 따로 정할 수도 있습니다)</h4>
         ${logFields(
           {
@@ -256,6 +263,15 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
     rules = DEFAULT_RISK_RULES.map((r) => ({ ...r }));
     renderRules();
   });
+  wireAiSettings(m.root);
+  m.root.querySelector("[data-clear-history]")!.addEventListener("click", async () => {
+    const n = commandHistoryCount();
+    if (!n) return toast("지울 명령 기록이 없습니다", "info");
+    const ok = await confirmDialog({ title: "명령 기록 지우기", icon: "Trash2", danger: true, message: `<p>자동 완성에 쓰는 명령 기록 ${n}개를 모두 지웁니다.</p>`, confirm: "지우기", cancel: "취소", focusCancel: true });
+    if (!ok) return;
+    clearCommandHistory();
+    toast("명령 기록을 지웠습니다", "success");
+  });
   m.root.querySelector("[data-risk-log]")!.addEventListener("click", async () => {
     try {
       const folder = await api.logsFolder();
@@ -330,6 +346,10 @@ export function openSettings(section?: "update" | "risk" | "shortcuts") {
       updateCredentialId: val("updateCredentialId").value || null,
       autoUpdate: bool("autoUpdate"),
       highlightKeywords: bool("highlightKeywords"),
+      cmdColor: bool("cmdColor"),
+      cmdSuggest: bool("cmdSuggest"),
+      aiPreview: bool("aiPreview"),
+      aiMaskHosts: bool("aiMaskHosts"),
       checkTypedCommands: bool("checkTypedCommands"),
       autoLockMinutes: Math.max(0, Math.min(1440, Math.trunc(Number(val("autoLockMinutes").value)) || 0)),
       // Unchanged from the built-in list: keep following it (later versions may add rules).

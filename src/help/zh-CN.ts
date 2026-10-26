@@ -125,6 +125,7 @@ export const SECTIONS: HelpSection[] = [
       <p>保存常用命令 (片段)，或录制在终端中输入的按键并原样再次发送 (宏)。</p>
       <p><b>各操作系统的内置片段</b>：适用于 Linux、AIX、HP-UX、Solaris、Windows、Cisco IOS · NX-OS · ASA、FortiGate、Aruba、Juniper 和 Huawei 的常用只读检查 (不做任何更改的命令)。片段列表优先显示您自己的片段和该标签页中识别出的操作系统的片段；其他系统的片段在“… 片段”下，点击即可查看。可在“管理代码片段”中编辑、删除或更改其 OS 分组。</p>
       <p><b>危险命令</b>：片段或宏发送的每一行都会按 设置 → 危险命令 中的规则进行检查。更改时间或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 会被<b>阻止</b>，不会发送；重启、删除、格式化或更改设备配置等命令需要先在<b>警告</b>中确认。发送时会开启该标签页的日志记录，每次尝试、取消和阻止都会记录到日志文件夹中的 <code>risky-commands.log</code>。用 <code>;</code>、<code>&amp;&amp;</code> 连接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及用行尾 <code>\\</code> 续行的命令也会被检查。包含 Tab 补全或光标移动键 (←→、Home、命令历史 ↑↓) 的宏会发出警告，因为无法确定实际发送的命令。自己输入的命令也会检查：按 Enter 时，会用相同的规则检查屏幕上显示的命令行（包括命令历史 ↑↓ 和 Tab 补全的结果）。vi、less 等全屏程序中不检查，可在设置 → 危险命令中关闭此检查。</p>
+      <p><b>输入命令时的着色与自动补全</b>：提示符后正在输入的命令会按命令、选项、字符串、路径和连接符号着色，符合危险命令规则时在按 Enter 之前变为红色。根据以前执行过的命令（仅保存在本机）和代码片段，以灰色建议命令的其余部分：<kbd>→</kbd> 或 <kbd>End</kbd> 输入全部，<kbd>Ctrl</kbd>+<kbd>→</kbd> 逐词输入。<kbd>Tab</kbd> 仍是服务器自己的补全。<kbd>Ctrl</kbd>+<kbd>Space</kbd> 打开候选列表（↑↓ 选择，Enter 或 Tab 输入，Esc 关闭）。候选项依次来自执行历史、代码片段、已识别设备的命令词典（Linux、AIX、HP-UX、Solaris、Windows、Cisco、FortiGate、Aruba、Juniper、Huawei），以及开启资源监视器的 Unix 服务器 PATH 中的程序名。这些程序名通过监视器连接只读取一次，不会在终端中输入任何内容。命令行从屏幕读取，因此不显示的密码不会被记录，危险命令以及含有密码或令牌的命令（<code>mysql -p…</code>、<code>--password=…</code>、<code>TOKEN=…</code>）既不记录也不建议。输错的历史记录可在候选列表中按 <kbd>Shift</kbd>+<kbd>Delete</kbd> 删除。可在设置 → 终端中分别关闭，并清除命令历史。</p>
       <h4>创建和发送片段</h4>
       <ol>
         <li>在终端工具栏中：<b>片段</b> → <b>管理代码片段…</b> → <b>新建片段</b>。</li>
@@ -144,6 +145,22 @@ export const SECTIONS: HelpSection[] = [
         <li><b>不要录制密码</b>：宏会原样保存按键，因此录制期间输入的密码也会被保存。</li>
         <li>可以在<b>管理代码片段…</b>中查看宏内容 (⏎ = Enter、⇥ = Tab、^C = Ctrl+C)。可以重命名和删除，但无法编辑按键；如需更改请重新录制。</li>
         <li>片段和宏保存在本机，所有会话共享。</li>
+      </ul>`,
+  },
+  {
+    id: "ai",
+    title: "AI（生成命令 · 解释 · 对话 · 分析）",
+    icon: "Sparkles",
+    body: `
+      <p>连接云端 AI（API 密钥）、订阅 CLI 或本机的本地 LLM，协助终端工作。在设置 → AI 中添加服务并选择默认使用的 AI。</p>
+      <ul>
+        <li><b>连接方式</b>：API 密钥（Anthropic Claude、OpenAI、Google Gemini、OpenAI 兼容服务器）、订阅 CLI（Claude Code、Codex CLI、Gemini CLI：在本机安装并登录一次后，即可用您的订阅回答）、本地 LLM（Ollama，或 LM Studio、llama.cpp、vLLM 等 OpenAI 兼容服务器）。API 密钥保存在凭据保管库中；“加载列表”获取模型，“测试连接”试用服务。</li>
+        <li><b>生成命令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可得到一条适合所识别设备或系统的命令。再按一次 Enter 将其放入输入行（不会执行），由您自己按 Enter 执行。危险命令规则同样适用：被阻止的命令（修改时间、NTP 等）甚至不会放入输入行。</li>
+        <li><b>解释输出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：解释所选文本（若未选择则为屏幕上最近的输出）的含义、可能原因和后续步骤。</li>
+        <li><b>AI 对话</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在终端右侧打开对话窗格。用“附加所选内容”一并发送输出；回答中每行命令旁的按钮可将其放入输入行。</li>
+        <li><b>配置与日志分析</b>：对话窗格中的文件按钮可选择配置或日志文件进行检查（安全问题、危险设置）或分析（错误、异常迹象）。网络设备可通过设备按钮 → “用 AI 检查配置”直接检查 running-config。</li>
+        <li><b>发送的内容</b>：发送到云端 AI 之前，会显示将要发送的内容并请您确认（每个对话可选择“不再询问”）。密码、密钥和令牌（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私钥等）始终会被隐藏；开启设置后，IP 地址和主机名也会替换为 IP_1、HOST_1 等再发送，回答中会还原为真实值。本地 LLM 不会离开本机，因此不会询问或隐藏。向外部 AI 发送公司设备信息前，请确认公司的安全策略。</li>
+        <li>订阅 CLI：Claude Code 在关闭所有工具（不执行命令、不读取文件）的状态下于空文件夹中运行，Codex 在只读沙箱中运行。应用不会处理您的登录信息。</li>
       </ul>`,
   },
   {

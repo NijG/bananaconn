@@ -507,8 +507,11 @@ pub fn auth_for(app: &AppHandle, proxy: Option<&ProxyConfig>) -> Result<Auth, St
 
 /// A local port that reaches `host:port` through the proxy, one proxied
 /// connection per accepted one, until `forward_close`. Each step is reported
-/// as a "proxy-log" event with this id.
-pub fn open_forward(app: &AppHandle, state: &ProxyState, id: &str, host: &str, port: u16, proxy: ProxyConfig) -> Result<u16, String> {
+/// as a "proxy-log" event with this id. With `announce` (the `--proxy-stdio`
+/// helper of an SSH terminal is the client), each connection starts with an
+/// announcement (see `stdio_main`) carrying the diagnostics (when the proxy
+/// asks for them) and any error.
+pub fn open_forward(app: &AppHandle, state: &ProxyState, id: &str, host: &str, port: u16, proxy: ProxyConfig, announce: bool) -> Result<u16, String> {
     if let Some(f) = state.forwards.lock().unwrap().get(id) {
         return Ok(f.port);
     }
@@ -536,10 +539,24 @@ pub fn open_forward(app: &AppHandle, state: &ProxyState, id: &str, host: &str, p
                 let emit = |line: String, error: bool| {
                     let _ = app.emit("proxy-log", ProxyLog { id: id.clone(), line, error });
                 };
-                match dial(Some(&proxy), &auth, &host, port, &mut |l| emit(l, false)) {
+                let mut said = Vec::new();
+                let result = dial(Some(&proxy), &auth, &host, port, &mut |l| {
+                    if proxy.diagnostics {
+                        said.push(l.clone());
+                    }
+                    emit(l, false)
+                });
+                if let Err(e) = &result {
+                    emit(e.clone(), true);
+                    said.push(format!("BananaConn proxy: {e}"));
+                }
+                let mut client = client;
+                if announce && announcement(&mut client, &said).is_err() {
+                    return;
+                }
+                match result {
                     Ok(server) => pipe(client, server),
-                    Err(e) => {
-                        emit(e, true);
+                    Err(_) => {
                         let _ = client.shutdown(Shutdown::Both);
                     }
                 }
@@ -547,6 +564,28 @@ pub fn open_forward(app: &AppHandle, state: &ProxyState, id: &str, host: &str, p
         }
     });
     Ok(local)
+}
+
+/// The announcement a term forward sends before the connection's bytes: a
+/// 4-byte big-endian length, then that many bytes of UTF-8 lines.
+fn announcement(client: &mut TcpStream, lines: &[String]) -> io::Result<()> {
+    let text = lines.join("\n");
+    let mut head = (text.len() as u32).to_be_bytes().to_vec();
+    head.extend_from_slice(text.as_bytes());
+    client.write_all(&head)
+}
+
+/// Read a term forward's announcement (at most 64 KiB of lines).
+fn read_announcement(s: &mut TcpStream) -> io::Result<String> {
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len)?;
+    let n = u32::from_be_bytes(len) as usize;
+    if n > 64 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "announcement too long"));
+    }
+    let mut text = vec![0u8; n];
+    s.read_exact(&mut text)?;
+    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 /// Copy both ways until either side closes.
@@ -572,7 +611,7 @@ pub fn close_forward(state: &ProxyState, id: &str) {
 pub async fn proxy_forward_open(app: AppHandle, state: State<'_, ProxyState>, id: String, host: String, port: u16, proxy: ProxyConfig) -> Result<u16, String> {
     let state: &ProxyState = &state;
     // Vault access and the bind are quick; no blocking work here otherwise.
-    open_forward(&app, state, &id, &host, port, proxy)
+    open_forward(&app, state, &id, &host, port, proxy, false)
 }
 
 #[tauri::command]
@@ -587,7 +626,7 @@ pub fn stdio_main(args: &[String]) -> i32 {
         eprintln!("usage: bananaconn --proxy-stdio <port>");
         return 2;
     };
-    let s = match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+    let mut s = match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("BananaConn proxy: {e}");
@@ -595,6 +634,20 @@ pub fn stdio_main(args: &[String]) -> i32 {
         }
     };
     let _ = s.set_nodelay(true);
+    // The forward's diagnostics and errors go to ssh.exe's console (stderr),
+    // so they are part of the terminal's own screen: lines the app wrote
+    // there itself would be lost when ConPTY repaints.
+    match read_announcement(&mut s) {
+        Ok(text) => {
+            for line in text.lines() {
+                eprintln!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("BananaConn proxy: {e}");
+            return 1;
+        }
+    }
     let mut up = match s.try_clone() {
         Ok(c) => c,
         Err(e) => {
@@ -677,6 +730,37 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"hello through the proxy");
+    }
+
+    /// A term forward's announcement reaches the helper whole (Korean text
+    /// included), and the connection's own bytes follow untouched.
+    #[test]
+    fn term_forward_announcement_comes_before_the_stream() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            announcement(&mut c, &["Connecting to HTTP proxy at 127.0.0.1:3128".into(), "BananaConn proxy: 프록시가 연결을 거부했습니다".into()]).unwrap();
+            c.write_all(b"SSH-2.0-Fake\r\n").unwrap();
+        });
+        let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let text = read_announcement(&mut s).unwrap();
+        assert_eq!(text.lines().collect::<Vec<_>>(), ["Connecting to HTTP proxy at 127.0.0.1:3128", "BananaConn proxy: 프록시가 연결을 거부했습니다"]);
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"SSH-2.0-Fake\r\n");
+        server.join().unwrap();
+        // No diagnostics: an empty announcement, the stream starts at once.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            announcement(&mut c, &[]).unwrap();
+            c.write_all(b"x").unwrap();
+        });
+        let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        assert_eq!(read_announcement(&mut s).unwrap(), "");
     }
 
     #[test]

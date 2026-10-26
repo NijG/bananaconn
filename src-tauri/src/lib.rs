@@ -19,6 +19,8 @@ mod monitor;
 mod devmon;
 mod nettools;
 mod paste;
+mod ai;
+pub mod http;
 pub mod proxy;
 mod rdp;
 mod remote;
@@ -75,6 +77,7 @@ pub fn run() {
     builder
         .manage(term::TermState::default())
         .manage(proxy::ProxyState::default())
+        .manage(ai::AiState::default())
         .manage(remote::RemoteState::default())
         .manage(vnc::VncState::default())
         .manage(rdp::RdpState::default())
@@ -117,6 +120,10 @@ pub fn run() {
             term::term_break,
             term::term_paste,
             proxy::proxy_forward_open,
+            ai::ai_chat,
+            ai::ai_cancel,
+            ai::ai_models,
+            ai::ai_detect_cli,
             proxy::proxy_forward_close,
             term::term_paste_stop,
             term::term_set_logging,
@@ -154,6 +161,7 @@ pub fn run() {
             monitor::monitor_stop,
             monitor::monitor_top,
             monitor::monitor_backup,
+            monitor::monitor_commands,
             monitor::monitor_pause,
             tftpclient::tftp_transfer,
             tftpclient::tftp_cancel,

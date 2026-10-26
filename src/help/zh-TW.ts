@@ -125,6 +125,7 @@ export const SECTIONS: HelpSection[] = [
       <p>可以儲存常用命令 (片段)，或錄製在終端機中輸入的按鍵並原封不動地再次傳送 (巨集)。</p>
       <p><b>各 OS 的內建片段</b>：提供 Linux、AIX、HP-UX、Solaris、Windows、Cisco IOS · NX-OS · ASA、FortiGate、Aruba、Juniper 與 Huawei 的常用唯讀檢查 (不會變更任何內容的命令)。片段清單會優先顯示您自己的片段以及該分頁辨識出的 OS 的片段；其他系統可在「… 片段」中一鍵找到。在管理程式碼片段中可以編輯、刪除，或變更其 OS 分類。</p>
       <p><b>危險命令</b>：片段或巨集傳送的每一行都會依 設定 → 危險命令 中的規則檢查。變更時間或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 會被<b>封鎖</b>，不會傳送；重新開機、刪除、格式化或變更設備組態等命令需要先在<b>警告</b>中確認。傳送時會開啟該分頁的記錄，每次嘗試、取消與封鎖都會寫入記錄資料夾中的 <code>risky-commands.log</code>。以 <code>;</code>、<code>&amp;&amp;</code> 串接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及以行尾 <code>\\</code> 接續的命令也會檢查。含有 Tab 自動完成或游標移動鍵 (←→、Home、命令記錄 ↑↓) 的巨集會發出警告，因為無法得知實際傳送的命令。自己輸入的命令也會檢查：按 Enter 時，會用相同的規則檢查畫面上顯示的命令列（包括命令記錄 ↑↓ 與 Tab 自動完成的結果）。vi、less 等全螢幕程式中不檢查，可在設定 → 危險指令中關閉此檢查。</p>
+      <p><b>輸入指令時的上色與自動完成</b>：提示字元後正在輸入的指令會依指令、選項、字串、路徑與連接符號上色，符合危險指令規則時在按 Enter 之前變為紅色。根據先前執行過的指令（僅保存在本機）與程式碼片段，以灰色建議指令的其餘部分：<kbd>→</kbd> 或 <kbd>End</kbd> 輸入全部，<kbd>Ctrl</kbd>+<kbd>→</kbd> 逐字輸入。<kbd>Tab</kbd> 仍是伺服器本身的自動完成。<kbd>Ctrl</kbd>+<kbd>Space</kbd> 開啟候選清單（↑↓ 選擇，Enter 或 Tab 輸入，Esc 關閉）。候選項依序來自執行記錄、程式碼片段、已辨識裝置的指令辭典（Linux、AIX、HP-UX、Solaris、Windows、Cisco、FortiGate、Aruba、Juniper、Huawei），以及開啟資源監視器的 Unix 伺服器 PATH 中的程式名稱。這些名稱透過監視器連線只讀取一次，不會在終端機中輸入任何內容。命令列從畫面讀取，因此不顯示的密碼不會被記錄，危險指令以及含有密碼或權杖的指令（<code>mysql -p…</code>、<code>--password=…</code>、<code>TOKEN=…</code>）既不記錄也不建議。輸入錯誤的記錄可在候選清單中按 <kbd>Shift</kbd>+<kbd>Delete</kbd> 刪除。可在設定 → 終端機中分別關閉，並清除命令記錄。</p>
       <h4>建立與傳送片段</h4>
       <ol>
         <li>在終端機工具列中：<b>片段</b> → <b>管理程式碼片段…</b> → <b>新增片段</b>。</li>
@@ -144,6 +145,22 @@ export const SECTIONS: HelpSection[] = [
         <li><b>不要錄製密碼</b>：巨集會原樣儲存輸入的按鍵，因此錄製期間輸入的密碼也會被儲存。</li>
         <li>可以在<b>管理程式碼片段…</b>中檢視巨集內容 (⏎ = Enter、⇥ = Tab、^C = Ctrl+C)。可以重新命名與刪除，但無法編輯按鍵；要變更請重新錄製。</li>
         <li>片段與巨集儲存在這台電腦上，由所有工作階段共用。</li>
+      </ul>`,
+  },
+  {
+    id: "ai",
+    title: "AI（產生指令 · 說明 · 對話 · 分析）",
+    icon: "Sparkles",
+    body: `
+      <p>連接雲端 AI（API 金鑰）、訂閱 CLI 或本機的本地 LLM，協助終端機工作。在設定 → AI 中新增服務並選擇預設使用的 AI。</p>
+      <ul>
+        <li><b>連接方式</b>：API 金鑰（Anthropic Claude、OpenAI、Google Gemini、OpenAI 相容伺服器）、訂閱 CLI（Claude Code、Codex CLI、Gemini CLI：在本機安裝並登入一次後，即可用您的訂閱回答）、本地 LLM（Ollama，或 LM Studio、llama.cpp、vLLM 等 OpenAI 相容伺服器）。API 金鑰儲存在認證保管庫中；「載入清單」取得模型，「測試連線」試用服務。</li>
+        <li><b>產生指令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可取得一條適合所辨識裝置或系統的指令。再按一次 Enter 會放入輸入列（不會執行），由您自己按 Enter 執行。危險指令規則同樣適用：被封鎖的指令（修改時間、NTP 等）甚至不會放入輸入列。</li>
+        <li><b>說明輸出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：說明所選文字（若未選取則為畫面上最近的輸出）的意義、可能原因與後續步驟。</li>
+        <li><b>AI 對話</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在終端機右側開啟對話窗格。以「附加選取內容」一併傳送輸出；回答中每行指令旁的按鈕可將其放入輸入列。</li>
+        <li><b>設定與記錄分析</b>：對話窗格中的檔案按鈕可選擇設定或記錄檔案進行檢查（安全問題、危險設定）或分析（錯誤、異常跡象）。網路裝置可透過裝置按鈕 →「用 AI 檢查設定」直接檢查 running-config。</li>
+        <li><b>傳送的內容</b>：傳送到雲端 AI 之前，會顯示將傳送的內容並請您確認（每個對話可選擇「不再詢問」）。密碼、金鑰與權杖（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私密金鑰等）一律會隱藏；開啟設定後，IP 位址與主機名稱也會替換為 IP_1、HOST_1 等再傳送，回答中會還原為實際值。本地 LLM 不會離開本機，因此不會詢問或隱藏。傳送公司設備資訊給外部 AI 之前，請確認公司的安全政策。</li>
+        <li>訂閱 CLI：Claude Code 在關閉所有工具（不執行指令、不讀取檔案）的狀態下於空資料夾中執行，Codex 在唯讀沙箱中執行。應用程式不會處理您的登入資訊。</li>
       </ul>`,
   },
   {
