@@ -7,11 +7,38 @@ import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
 
-interface LogEntry {
+export interface LogEntry {
+  /** Increasing per log: tells a dialog which rows it has not drawn yet. */
+  seq: number;
   at: string;
   kind: string;
   user: string;
   detail: string;
+}
+
+/** Draws an activity log newest first into `box`. Each call adds only the
+ * entries that arrived since the previous one (a busy server sends an event per
+ * file; redrawing up to `max` rows each time would be quadratic). */
+export function logRenderer(box: HTMLElement, kinds: Record<string, [string, string]>, emptyHtml: string, max: number) {
+  let shown = 0;
+  const row = (e: LogEntry) => {
+    const [ic, label] = kinds[e.kind] ?? ["Info", e.kind];
+    return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
+          ${e.user ? `<span class="who">${esc(e.user)}</span>` : ""}<span class="what">${esc(e.detail)}</span></div>`;
+  };
+  return (log: LogEntry[]) => {
+    if (!log.length) {
+      if (!box.querySelector(".ftpd-empty")) box.innerHTML = emptyHtml;
+      return;
+    }
+    let i = log.length;
+    while (i > 0 && log[i - 1].seq > shown) i--;
+    if (i === log.length) return;
+    box.querySelector(".ftpd-empty")?.remove();
+    box.insertAdjacentHTML("afterbegin", log.slice(i).reverse().map(row).join(""));
+    shown = log[log.length - 1].seq;
+    while (box.childElementCount > max) box.lastElementChild!.remove();
+  };
 }
 
 const PREFS = "bx.ftpServer";
@@ -74,10 +101,12 @@ const KIND_TEXT: Record<string, [string, string]> = {
   rename: ["Pencil", "이름 변경"],
 };
 
-function pushLog(e: Omit<LogEntry, "at">) {
+let logSeq = 0;
+
+function pushLog(e: Omit<LogEntry, "at" | "seq">) {
   const d = new Date();
   const at = [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
-  log.push({ ...e, at });
+  log.push({ ...e, at, seq: ++logSeq });
   if (log.length > LOG_MAX) log.splice(0, log.length - LOG_MAX);
 }
 
@@ -164,53 +193,52 @@ export function openFtpServer() {
     warn.innerHTML = msgs.map((t) => `<span>${icon("TriangleAlert", 14)}${esc(t)}</span>`).join("");
   }
 
+  // Every log event calls refresh(): the state box and controls are touched
+  // only when what they show changed, so a click on an address is not lost.
+  let drawnControls = "";
+  let drawnState = "";
   function renderState() {
     const running = !!status;
-    form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => {
-      el.disabled = el.matches("[data-copy-pw]") ? running && !livePassword : running || busy;
-    });
-    toggle.disabled = busy;
-    toggle.className = `btn ${running ? "btn-danger" : "btn-primary"}`;
-    toggle.innerHTML = running ? `${icon("Square", 14)}서버 중지` : `${icon("Play", 14)}서버 시작`;
+    const controls = `${running}|${busy}|${!!livePassword}`;
+    if (controls !== drawnControls) {
+      drawnControls = controls;
+      form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => {
+        el.disabled = el.matches("[data-copy-pw]") ? running && !livePassword : running || busy;
+      });
+      toggle.disabled = busy;
+      toggle.className = `btn ${running ? "btn-danger" : "btn-primary"}`;
+      toggle.innerHTML = running ? `${icon("Square", 14)}서버 중지` : `${icon("Play", 14)}서버 시작`;
+    }
+    let html: string;
     if (!status) {
-      stateBox.innerHTML = `<div class="ftpd-off"><span class="sb-dot idle"></span><b>중지됨</b><span class="muted">폴더를 고르고 서버를 시작하세요.</span></div>`;
+      html = `<div class="ftpd-off"><span class="sb-dot idle"></span><b>중지됨</b><span class="muted">폴더를 고르고 서버를 시작하세요.</span></div>`;
     } else {
       const s = status;
-      stateBox.innerHTML = `<div class="ftpd-on"><span class="sb-dot connected"></span><b>실행 중</b>
+      html = `<div class="ftpd-on"><span class="sb-dot connected"></span><b>실행 중</b>
           <span class="muted">${esc(s.root)} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.anonymous ? " · 익명 허용" : ""}</span></div>
         <div class="ftpd-addrs">${s.addresses
           .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
           .join("")}</div>
         ${s.addresses.some(isPublicAddress) ? `<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷 어디에서나 접속을 시도할 수 있습니다. 필요할 때만 켜 두세요.</p>` : ""}
         <p class="muted small">계정: <code>${esc(s.username || "anonymous")}</code>${s.anonymous && s.username ? " 또는 <code>anonymous</code>" : ""}</p>`;
-      stateBox.querySelectorAll<HTMLElement>("[data-addr]").forEach((b) =>
-        b.addEventListener("click", async () => {
-          await writeClipboard(b.dataset.addr!);
-          toast("주소를 복사했습니다", "success", 1600);
-        }),
-      );
+    }
+    if (html !== drawnState) {
+      drawnState = html;
+      stateBox.innerHTML = html;
     }
   }
+  stateBox.addEventListener("click", async (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>("[data-addr]");
+    if (!b) return;
+    await writeClipboard(b.dataset.addr!);
+    toast("주소를 복사했습니다", "success", 1600);
+  });
 
-  function renderLog() {
-    if (!log.length) {
-      logBox.innerHTML = `<p class="muted ftpd-empty">아직 기록이 없습니다. 접속, 업로드, 다운로드가 여기에 표시됩니다.</p>`;
-      return;
-    }
-    logBox.innerHTML = log
-      .slice()
-      .reverse()
-      .map((e) => {
-        const [ic, label] = KIND_TEXT[e.kind] ?? ["Info", e.kind];
-        return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
-          ${e.user ? `<span class="who">${esc(e.user)}</span>` : ""}<span class="what">${esc(e.detail)}</span></div>`;
-      })
-      .join("");
-  }
+  const renderLog = logRenderer(logBox, KIND_TEXT, `<p class="muted ftpd-empty">아직 기록이 없습니다. 접속, 업로드, 다운로드가 여기에 표시됩니다.</p>`, LOG_MAX);
 
   const refresh = () => {
     renderState();
-    renderLog();
+    renderLog(log);
   };
   const off = ftpServer.onChange(refresh);
 
@@ -229,7 +257,7 @@ export function openFtpServer() {
   });
   m.root.querySelector("[data-clear]")!.addEventListener("click", () => {
     log.length = 0;
-    renderLog();
+    renderLog(log);
   });
 
   toggle.addEventListener("click", async () => {

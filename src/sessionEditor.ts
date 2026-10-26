@@ -160,6 +160,24 @@ function keyModeField(current: unknown, backspace: unknown): string {
     </div>`;
 }
 
+/** Session fields the editor form sets; the rest (id, createdAt, lastUsed) it never touches. */
+const EDITED_FIELDS = ["name", "protocol", "host", "port", "username", "credentialId", "folder", "notes"] as const;
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/** `current` with the changes made in the form (`before` → `after`) applied:
+ * a field or option the user left alone keeps whatever is stored now. */
+function applyEdits(before: Session, after: Session, current: Session): Session {
+  const out = structuredClone(current);
+  for (const k of EDITED_FIELDS) if (!same(before[k], after[k])) Object.assign(out, { [k]: after[k] });
+  for (const k of new Set([...Object.keys(before.options), ...Object.keys(after.options)])) {
+    if (same(before.options[k], after.options[k])) continue;
+    if (k in after.options) out.options[k] = after.options[k];
+    else delete out.options[k];
+  }
+  return out;
+}
+
 /** Open the editor. Resolves with the saved session and whether to connect now. */
 export function editSession(
   existing: Session | null,
@@ -167,6 +185,8 @@ export function editSession(
 ): Promise<{ session: Session; connect: boolean } | null> {
   return new Promise((resolve) => {
     const s: Session = existing ? structuredClone(existing) : { ...newSession(defaults.protocol ?? "ssh"), ...defaults };
+    /** The record as the form first showed it; save compares against it. */
+    const original = existing ? structuredClone(existing) : null;
     let result: { session: Session; connect: boolean } | null = null;
 
     const m = modal({
@@ -358,8 +378,21 @@ export function editSession(
         return;
       }
       if (!s.name) s.name = s.host;
-      await upsertSession(s);
-      result = { session: s, connect };
+      let saved = s;
+      if (original) {
+        // The stored record may have changed while the dialog was open (a
+        // credential linked from a tab, a certificate accepted, lastUsed) or
+        // been deleted: apply only what was edited here, and never revive it.
+        const current = state.sessions.find((x) => x.id === original.id);
+        if (!current) {
+          toast("편집하는 동안 삭제된 세션이라 저장하지 않았습니다", "warn");
+          m.close();
+          return;
+        }
+        saved = applyEdits(original, s, current);
+      }
+      await upsertSession(saved);
+      result = { session: saved, connect };
       m.close();
     };
     form.addEventListener("submit", (e) => {

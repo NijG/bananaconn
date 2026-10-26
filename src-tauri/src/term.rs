@@ -430,16 +430,21 @@ pub async fn term_open(
                 .and_then(|r| r)
         }
         "telnet" => {
-                        let host = req.host.clone();
+            let host = req.host.clone();
             let port = req.port.unwrap_or(23);
             let (rows, cols) = (req.rows, req.cols);
             let username = req.username.clone();
-            let auth = crate::proxy::auth_for(&app, req.proxy.as_ref())?;
-            let route = req.proxy.clone().map(|p| (p, auth));
-            tauri::async_runtime::spawn_blocking(move || open_telnet(&host, port, &username, cred, rows, cols, out, route))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r)
+            // Not `?`: the output pump is running and must be closed below.
+            match crate::proxy::auth_for(&app, req.proxy.as_ref()) {
+                Ok(auth) => {
+                    let route = req.proxy.clone().map(|p| (p, auth));
+                    tauri::async_runtime::spawn_blocking(move || open_telnet(&host, port, &username, cred, rows, cols, out, route))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                }
+                Err(e) => Err(e),
+            }
         }
         "serial" => {
             let req2 = req.clone_serial();
@@ -454,6 +459,12 @@ pub async fn term_open(
         Ok(session) => session,
         Err(e) => {
             pump.close();
+            // open_ssh may have opened the proxy forward before ssh.exe failed
+            // to start; nothing will ever close it then. A live session of
+            // this tab (sharing the id) keeps its own.
+            if req.protocol == "ssh" && !state.sessions.lock().unwrap().contains_key(&req.id) {
+                crate::proxy::close_forward(&app.state::<crate::proxy::ProxyState>(), &format!("term-{}", req.id));
+            }
             return Err(e);
         }
     };
@@ -739,8 +750,11 @@ struct PasteProgress {
 pub fn term_paste(app: AppHandle, state: State<TermState>, id: String, text: String, mode: paste::Mode) -> Result<(), String> {
     let session = get(&state, &id)?;
     let mut current = session.paste.lock().unwrap();
-    if let Some(job) = current.as_ref().filter(|j| !j.stopped()) {
-        job.add(text.as_bytes());
+    // A job that already sent its last line refuses the text (its thread is
+    // about to forget it): a new job takes it instead.
+    if let Some(job) = current.as_ref().filter(|j| !j.stopped())
+        && job.add(text.as_bytes()).is_some()
+    {
         return Ok(());
     }
     let job = Arc::new(paste::Job::new());

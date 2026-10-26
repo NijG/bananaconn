@@ -57,7 +57,7 @@ export class VncView implements View {
       { class: "view vnc-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
-         <span class="view-endpoint">${esc(endpoint(session))}</span>
+         <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state></span>
          <div class="view-actions">
            <button class="tool" data-act="scale" title="창 크기에 맞추기">${icon("Maximize2", 15)}<span>맞춤</span></button>
@@ -411,6 +411,13 @@ export class VncView implements View {
       /* already closed */
     }
     this.rfb = null;
+    // Clearing the screen detaches the stats box; stop its 1 Hz poll too, or it
+    // would keep calling the backend forever against a dead proxy after reconnect.
+    if (this.statsBox) {
+      clearInterval(this.statsTimer);
+      this.statsBox = null;
+      this.el.querySelector('[data-act="stats"]')?.classList.remove("on");
+    }
     this.screen.innerHTML = "";
     api.vncProxyStop(this.proxyId).catch(() => {});
   }

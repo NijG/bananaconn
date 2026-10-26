@@ -113,6 +113,8 @@ export interface RemoteConnect {
   activeMode?: boolean;
   ftpsMode?: "explicit" | "implicit";
   allowInvalidCert?: boolean;
+  /** FTPS: SHA-256 of the one certificate the user pinned after an FTPS_CERT prompt. */
+  trustedCert?: string;
   proxy?: ProxyConfig | null;
 }
 
@@ -243,6 +245,22 @@ export interface TunnelRequest {
 
 export type FileServerKind = "tftp" | "http";
 
+/** The OpenSSH share for a remote PC: its URL and the lines to run there. */
+export interface SshKit {
+  url: string;
+  /** For Win+R: asks for administrator rights, then sets OpenSSH up. */
+  runLine: string;
+  /** For a PowerShell already running as administrator. */
+  adminLine: string;
+  /** Whether this PC found its address toward the remote PC. */
+  routed: boolean;
+}
+/** A step of the OpenSSH setup: here (log, error) or on the remote PC (remote, done, failed). */
+export interface SshKitEvent {
+  kind: "log" | "error" | "remote" | "done" | "failed";
+  text: string;
+}
+
 export interface FileServerStatus {
   kind: FileServerKind;
   root: string;
@@ -322,6 +340,9 @@ export const api = {
   monitorBackup: (id: string) => call<string>("monitor_backup", { id }),
   monitorCommands: (id: string) => call<string[]>("monitor_commands", { id }),
   monitorTypes: (id: string, folder: string) => call<string[]>("monitor_types", { id, folder }),
+  sshKitStart: (target: string) => call<SshKit>("ssh_kit_start", { target }),
+  sshKitStop: () => call<void>("ssh_kit_stop"),
+  sshKitAllow: (remote: string, port: number) => call<void>("ssh_kit_allow", { remote, port }),
   // AI (ai.rs): the answer streams back as "ai-stream" events, then "ai-done".
   aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string; attachments?: { mime: string; data: string; name: string }[] }[]) => call<void>("ai_chat", { id, provider, system, messages }),
   aiCancel: (id: string) => call<void>("ai_cancel", { id }),

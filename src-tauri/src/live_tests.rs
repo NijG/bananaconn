@@ -21,6 +21,7 @@ fn rebex(protocol: &str, port: u16) -> ConnectRequest {
         active_mode: false,
         ftps_mode: None,
         allow_invalid_cert: false,
+        trusted_cert: None,
         proxy: None,
     }
 }

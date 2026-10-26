@@ -115,6 +115,7 @@ struct Clipboard {
 /// Start the clipboard bridge thread. None when the clipboard cannot be used
 /// (the session then simply has no clipboard channel).
 fn start_clipboard(out: &Out) -> Option<Clipboard> {
+    fileclip::remove_stale_downloads();
     let (tx, rx) = mpsc::unbounded_channel();
     // File copy progress for the app (download of files copied on the remote).
     let (events_tx, mut events) = mpsc::unbounded_channel::<Value>();
@@ -1196,6 +1197,7 @@ async fn main() {
     // last event, then exit. (tokio's stdin reader sits on a blocking thread
     // that the runtime would wait for at shutdown, hence the explicit exit.)
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    fileclip::remove_own_downloads();
     std::process::exit(0);
 }
 
@@ -1605,6 +1607,13 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(repeat.len(), 1);
         assert!(matches!(repeat[0], FastPathInputEvent::KeyboardEvent(f, 0x1e) if !f.contains(KeyboardFlags::RELEASE)));
+    }
+
+    #[test]
+    fn unicode_typing_emits_press_and_release() {
+        let ops: Vec<Op> = serde_json::from_str(r#"[{"t":"unicode","ch":"가","down":true},{"t":"unicode","ch":"가","down":false}]"#).unwrap();
+        let events = input_events(&mut Database::new(), ops);
+        assert_eq!(events.len(), 2, "unicode press+release should emit two events: {events:?}");
     }
 
     #[test]

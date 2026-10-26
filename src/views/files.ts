@@ -13,7 +13,7 @@ import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
 
 type Side = "local" | "remote";
-type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean };
+type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean; trustedCert?: string };
 type SortKey = "name" | "size" | "modified";
 
 interface Job {
@@ -38,7 +38,9 @@ interface Job {
 function isSafeLocalName(name: string): boolean {
   if (!name || name === "." || name === ".." || /[\\/:<>"|?*\x00-\x1f]/.test(name) || /[. ]$/.test(name)) return false;
   const stem = name.split(".")[0].trimEnd().toUpperCase();
-  return !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem);
+  // Every Windows device name the backend (local_component) rejects: COM0/LPT0
+  // and the superscripts ¹²³, and the console streams CONIN$/CONOUT$.
+  return !/^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])$/.test(stem);
 }
 
 /** A remote file opened in a local app, watched for saves. */
@@ -50,7 +52,10 @@ interface EditWatch {
   mtime: number;
   /** A newer mtime seen once, uploaded when it is seen again unchanged. */
   pending: number;
-  uploading: boolean;
+  /** The poll's upload in flight; stopping waits for it before releasing the temp file. */
+  upload: Promise<void> | null;
+  /** "Stop watching" is in progress (dialog open or final upload): the poll keeps out. */
+  stopping: boolean;
   /** mtime whose upload last failed (0 = none); reported once, retried each poll. */
   failedAt: number;
 }
@@ -204,6 +209,11 @@ class Pane {
       if (seq === this.loadSeq) this.requested = null;
       if (--this.pendingLoads === 0) this.el.classList.remove("busy");
     }
+  }
+
+  /** A listing is on its way: `path` and `entries` are about to change. */
+  get loading() {
+    return this.pendingLoads > 0;
   }
 
   /** Reload the folder being shown, or the one being opened right now. */
@@ -574,6 +584,9 @@ export class FilesView implements View, EditorHost {
   private remoteHome = "/";
   private localHome = "";
   private queue: Job[] = [];
+  /** Jobs queued or running, kept in step with every status change so the
+   * counter does not scan the whole queue after each of 500 transfers. */
+  private active = 0;
   private running = false;
   private jobsEl: HTMLElement;
   private overlay: HTMLElement;
@@ -649,7 +662,7 @@ export class FilesView implements View, EditorHost {
   }
 
   closeWarning(): string | null {
-    const pending = this.queue.filter((j) => j.status === "queued" || j.status === "running").length;
+    const pending = this.active;
     const dirty = [...this.editors].filter((e) => e.dirty).length;
     const parts = [
       pending ? `전송 ${pending}건이 끝나지 않았습니다` : "",
@@ -714,7 +727,7 @@ export class FilesView implements View, EditorHost {
       await openWithDefaultApp(local);
       // Watch only once the editor actually opened; a failed open leaves nothing behind.
       if (this.disposed) throw new Error("탭이 닫혔습니다");
-      this.editing.push({ remote: entry.path, local, name: entry.name, mtime, pending: 0, uploading: false, failedAt: 0 });
+      this.editing.push({ remote: entry.path, local, name: entry.name, mtime, pending: 0, upload: null, stopping: false, failedAt: 0 });
       toast(`${entry.name} 을(를) 열었습니다. 저장하면 서버에 자동으로 올립니다.`, "success", 5000);
       this.renderEditing();
       this.ensureEditTimer();
@@ -745,7 +758,7 @@ export class FilesView implements View, EditorHost {
   private async pollEditsOnce() {
     for (const w of [...this.editing]) {
       if (this.disposed || this.state !== "connected") return;
-      if (w.uploading || !this.editing.includes(w)) continue;
+      if (w.upload || w.stopping || !this.editing.includes(w)) continue;
       let mtime: number;
       try {
         [mtime] = await api.localStat(w.local);
@@ -761,60 +774,81 @@ export class FilesView implements View, EditorHost {
         w.pending = mtime;
         continue;
       }
-      w.uploading = true;
-      try {
-        await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
-        w.mtime = mtime;
-        w.failedAt = 0;
-        if (this.disposed) return;
-        toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
-        this.remotePane.refresh();
-      } catch (err) {
-        // Retried on the next poll; report each failing version only once.
-        if (w.failedAt !== mtime && !this.disposed && this.state === "connected")
-          toast(`${w.name} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있으며 다시 시도합니다)`, "error", 8000);
-        w.failedAt = mtime;
-      } finally {
-        w.uploading = false;
-        w.pending = 0;
-      }
+      const upload = (async () => {
+        try {
+          await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
+          w.mtime = mtime;
+          w.failedAt = 0;
+          if (this.disposed) return;
+          toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
+          this.remotePane.refresh();
+        } catch (err) {
+          // Retried on the next poll; report each failing version only once.
+          if (w.failedAt !== mtime && !this.disposed && this.state === "connected")
+            toast(`${w.name} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있으며 다시 시도합니다)`, "error", 8000);
+          w.failedAt = mtime;
+        } finally {
+          w.upload = null;
+          w.pending = 0;
+        }
+      })();
+      w.upload = upload;
+      await upload;
     }
   }
 
   private async stopEditing(remote: string) {
     const w = this.editing.find((x) => x.remote === remote);
-    if (!w) return;
-    // Saved in the editor but not uploaded yet (settling, failed, offline)?
-    const [mtime] = await api.localStat(w.local).catch(() => [w.mtime] as [number]);
-    if (mtime !== w.mtime || w.uploading) {
-      const choice = await choiceDialog({
-        title: "올리지 않은 변경이 있습니다",
-        icon: "TriangleAlert",
-        message: `<b>${esc(w.name)}</b>에 서버로 아직 올리지 않은 변경이 있습니다. 감시를 끝내면 내 PC의 임시 파일도 지워집니다.`,
-        choices: [
-          ...(this.state === "connected" && !w.uploading ? [{ value: "upload", label: "올리고 끝내기" }] : []),
-          { value: "discard", label: "버리고 끝내기", kind: "danger" as const },
-        ],
-      });
-      if (!choice) return;
-      if (choice === "upload") {
-        try {
-          await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
-          toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
-          this.remotePane.refresh();
-        } catch (err) {
-          return toast(`${w.name} 업로드 실패: ${errorText(err)} (감시를 계속합니다)`, "error", 8000);
+    // A second click while the first is still asking or uploading does nothing.
+    if (!w || w.stopping) return;
+    // From here the poll leaves this file alone, so it cannot start a second
+    // upload of the same file or upload a temp file that is being released.
+    w.stopping = true;
+    try {
+      // An upload the poll already started finishes first; it may make the
+      // question below unnecessary.
+      if (w.upload) await w.upload;
+      // Saved in the editor but not uploaded yet (settling, failed, offline)?
+      const [mtime] = await api.localStat(w.local).catch(() => [w.mtime] as [number]);
+      if (mtime !== w.mtime) {
+        const choice = await choiceDialog({
+          title: "올리지 않은 변경이 있습니다",
+          icon: "TriangleAlert",
+          message: `<b>${esc(w.name)}</b>에 서버로 아직 올리지 않은 변경이 있습니다. 감시를 끝내면 내 PC의 임시 파일도 지워집니다.`,
+          choices: [
+            ...(this.state === "connected" ? [{ value: "upload", label: "올리고 끝내기" }] : []),
+            { value: "discard", label: "버리고 끝내기", kind: "danger" as const },
+          ],
+        });
+        if (!choice) return;
+        if (choice === "upload") {
+          try {
+            await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
+            toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
+            this.remotePane.refresh();
+          } catch (err) {
+            return toast(`${w.name} 업로드 실패: ${errorText(err)} (감시를 계속합니다)`, "error", 8000);
+          }
         }
       }
+      if (!this.editing.includes(w)) return;
+      api.editTempRelease(w.local).catch(() => {});
+      this.editing = this.editing.filter((x) => x !== w);
+      if (!this.editing.length && this.editTimer) {
+        clearInterval(this.editTimer);
+        this.editTimer = 0;
+      }
+      this.renderEditing();
+    } finally {
+      w.stopping = false;
+      // If the tab was closed while the dialog was open, an early return above
+      // (cancel, or upload failure) would leave the temp file behind, since
+      // dispose() deliberately left this stopping watch to us. Release it now.
+      if (this.disposed) {
+        api.editTempRelease(w.local).catch(() => {});
+        this.editing = this.editing.filter((x) => x !== w);
+      }
     }
-    if (!this.editing.includes(w)) return;
-    api.editTempRelease(w.local).catch(() => {});
-    this.editing = this.editing.filter((x) => x !== w);
-    if (!this.editing.length && this.editTimer) {
-      clearInterval(this.editTimer);
-      this.editTimer = 0;
-    }
-    this.renderEditing();
   }
 
   private renderEditing() {
@@ -841,7 +875,7 @@ export class FilesView implements View, EditorHost {
   }
 
   status(): StatusInfo {
-    const running = this.queue.filter((j) => j.status === "running" || j.status === "queued").length;
+    const running = this.active;
     return {
       protocol: this.session.protocol,
       endpoint: endpoint(this.session),
@@ -889,6 +923,7 @@ export class FilesView implements View, EditorHost {
         activeMode: !!this.session.options.activeMode,
         ftpsMode: this.session.options.ftpsMode === "implicit" ? "implicit" : "explicit",
         allowInvalidCert: !!this.session.options.allowInvalidCert,
+        trustedCert: (this.session.options.trustedCert as string) || undefined,
         proxy: proxyOf(this.session),
         ...extra,
       });
@@ -919,21 +954,29 @@ export class FilesView implements View, EditorHost {
   private async handleConnectError(msg: string, extra: ConnectExtra) {
     this.pendingCredential = null;
     if (msg.startsWith("FTPS_CERT::")) {
-      const detail = msg.slice("FTPS_CERT::".length);
+      // "FTPS_CERT::<sha256>::<detail>": the exact certificate the server sent.
+      const rest = msg.slice("FTPS_CERT::".length);
+      const sep = rest.indexOf("::");
+      const fp = sep >= 0 ? rest.slice(0, sep) : "";
+      const detail = sep >= 0 ? rest.slice(sep + 2) : rest;
       const ok = await confirmDialog({
         title: "신뢰할 수 없는 서버 인증서",
         icon: "ShieldAlert",
         danger: true,
         message: `<b>${esc(this.session.host)}</b> 서버의 TLS 인증서를 Windows가 신뢰하지 않습니다.<br><br>
-          <code class="fp">${esc(detail)}</code><br><br>
-          내부망의 자체 서명 인증서 서버라면 계속해도 되지만, 인터넷 서버라면 중간자 공격일 수 있습니다.
-          계속하면 이 세션에서는 인증서 오류를 무시하도록 기억합니다.`,
-        confirm: "위험을 알고 계속",
+          서버가 보낸 인증서 지문 (SHA-256):<br><code class="fp">${esc(fp || detail)}</code><br><br>
+          서버 관리자가 알려 준 지문과 같은지 확인한 다음 신뢰하세요. 내부망의 자체 서명 인증서 서버라면 계속해도 되지만,
+          인터넷 서버라면 중간자 공격일 수 있습니다. 신뢰하면 이 지문의 인증서만 다음 접속에서 자동으로 허용합니다.`,
+        confirm: "이 인증서를 신뢰하고 연결",
       });
       if (!ok) return this.fail("인증서를 신뢰하지 않아 연결을 취소했습니다.");
-      this.session.options.allowInvalidCert = true;
-      await patchSession(this.session.id, {}, { allowInvalidCert: true });
-      return this.connect({ ...extra, allowInvalidCert: true });
+      // Pin this one certificate: only a certificate with exactly this
+      // fingerprint is accepted later, so a man-in-the-middle certificate is
+      // rejected and prompts again. Fall back to the one-connection override
+      // only if the backend gave no fingerprint (e.g. a non-TLS failure).
+      if (!fp) return this.connect({ ...extra, allowInvalidCert: true });
+      await patchSession(this.session.id, {}, { trustedCert: fp });
+      return this.connect({ ...extra, trustedCert: fp });
     }
     if (msg.startsWith("HOSTKEY_UNKNOWN::")) {
       const fp = msg.slice("HOSTKEY_UNKNOWN::".length);
@@ -1035,7 +1078,15 @@ export class FilesView implements View, EditorHost {
     if (this.state !== "connected") return toast("서버에 연결된 다음 전송할 수 있습니다", "warn");
     const to = from === "local" ? "remote" : "local";
     const dest = this.pane(to);
-    if (to === "local" && !dest.path) return toast("내 PC 쪽에서 저장할 폴더를 먼저 여세요", "warn");
+    // No folder listed yet (the first listing failed, or the drive list on the
+    // PC side) or a listing still on its way: the target folder and the clash
+    // check below would both be wrong, so a name could land relative to the
+    // server's working folder and overwrite without asking.
+    if (!dest.path || dest.loading)
+      return toast(to === "local" ? "내 PC 쪽에서 저장할 폴더를 먼저 여세요" : "서버 쪽 폴더 목록을 연 다음 올리세요", "warn");
+    // Captured now: the user can open another folder while the dialog below is up.
+    const destDir = dest.path;
+    const destEntries = dest.entries;
 
     // A server can name entries "..\x" or "C:\x"; such names cannot become a
     // local file name (the backend refuses them too).
@@ -1061,22 +1112,23 @@ export class FilesView implements View, EditorHost {
     });
     if (dupes.length) {
       toast(`대소문자만 다른 같은 이름 ${dupes.length}개를 건너뜁니다: ${dupes.slice(0, 3).map((d) => d.name).join(", ")}`, "warn", 6000);
-      entries = entries.filter((e) => !dupes.includes(e));
+      const drop = new Set(dupes);
+      entries = entries.filter((e) => !drop.has(e));
     }
     // Clash with what is there now and with what is already queued for this folder.
-    const existing = new Set(dest.entries.map((d) => key(d.name)));
+    const existing = new Set(destEntries.map((d) => key(d.name)));
     const queuedHere = new Set(
       this.queue
         .filter((j) => (j.status === "queued" || j.status === "running") && (j.direction === "download") === (to === "local"))
         .map((j) => key(j.dest)),
     );
-    const clashes = entries.filter((e) => existing.has(key(e.name)) || queuedHere.has(key(dest.join(dest.path, e.name))));
+    const clashes = entries.filter((e) => existing.has(key(e.name)) || queuedHere.has(key(dest.join(destDir, e.name))));
     if (clashes.length) {
       const list = clashes.slice(0, 6).map((c) => `<li>${esc(c.name)}${c.isDir ? " (폴더 — 안의 같은 파일을 덮어씀)" : ""}</li>`).join("");
       const choice = await choiceDialog({
         title: "같은 이름이 이미 있습니다",
         icon: "TriangleAlert",
-        message: `${to === "local" ? "내 PC" : "서버"}의 <b>${esc(dest.path)}</b> 에 같은 이름 ${clashes.length}개가 있습니다.
+        message: `${to === "local" ? "내 PC" : "서버"}의 <b>${esc(destDir)}</b> 에 같은 이름 ${clashes.length}개가 있습니다.
           <ul class="clash-list">${list}${clashes.length > 6 ? `<li>외 ${clashes.length - 6}개</li>` : ""}</ul>`,
         choices: [
           ...(clashes.length < entries.length ? [{ value: "skip", label: "겹치는 항목 건너뛰기" }] : []),
@@ -1084,8 +1136,13 @@ export class FilesView implements View, EditorHost {
         ],
       });
       if (!choice) return;
-      if (choice === "skip") entries = entries.filter((e) => !clashes.includes(e));
+      if (choice === "skip") {
+        const drop = new Set(clashes);
+        entries = entries.filter((e) => !drop.has(e));
+      }
     }
+    // Closed or disconnected while the dialog was up.
+    if (this.disposed) return;
 
     for (const e of entries) {
       const job: Job = {
@@ -1093,7 +1150,7 @@ export class FilesView implements View, EditorHost {
         direction: from === "remote" ? "download" : "upload",
         name: e.name,
         src: e.path,
-        dest: dest.join(dest.path, e.name),
+        dest: dest.join(destDir, e.name),
         isDir: e.isDir,
         status: "queued",
         done: 0,
@@ -1103,6 +1160,7 @@ export class FilesView implements View, EditorHost {
       };
       jobs.set(job.id, { job, view: this });
       this.queue.push(job);
+      this.active++;
       this.jobsEl.prepend(job.el);
       this.renderJob(job);
     }
@@ -1149,6 +1207,7 @@ export class FilesView implements View, EditorHost {
         continue;
       }
       job.requeue = false;
+      this.active--;
       jobs.delete(job.id);
       if (this.disposed) break;
       this.renderJob(job);
@@ -1202,6 +1261,7 @@ export class FilesView implements View, EditorHost {
     if (!j) return;
     if (j.status === "queued") {
       j.status = "cancelled";
+      this.active--;
       jobs.delete(j.id);
       this.renderJob(j);
       this.updateCount();
@@ -1209,16 +1269,23 @@ export class FilesView implements View, EditorHost {
   }
 
   private updateCount() {
-    const active = this.queue.filter((j) => j.status === "running" || j.status === "queued").length;
-    this.el.querySelector("[data-count]")!.textContent = active ? `${active}` : `${this.queue.length}`;
-    this.el.querySelector("[data-count]")!.classList.toggle("active", active > 0);
+    const count = this.el.querySelector("[data-count]")!;
+    count.textContent = this.active ? `${this.active}` : `${this.queue.length}`;
+    count.classList.toggle("active", this.active > 0);
   }
 
   dispose() {
     this.disposed = true;
     if (this.editTimer) clearInterval(this.editTimer);
-    for (const w of this.editing) api.editTempRelease(w.local).catch(() => {});
-    this.editing = [];
+    // An upload still reading the temp file finishes (or fails) before it goes.
+    // A watch being stopped owns its own cleanup (its dialog may still be open
+    // and about to upload), so releasing its temp here would pull the file out
+    // from under that upload: leave those to stopEditing.
+    for (const w of this.editing) {
+      if (w.stopping) continue;
+      void (w.upload ?? Promise.resolve()).then(() => api.editTempRelease(w.local)).catch(() => {});
+    }
+    this.editing = this.editing.filter((w) => w.stopping);
     for (const j of this.queue) {
       if (j.status === "running") api.transferCancel(j.id);
       if (j.status === "queued") j.status = "cancelled";

@@ -8,6 +8,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -31,12 +32,32 @@ struct Stored {
 pub struct LockState {
     unlocked: AtomicBool,
     failures: AtomicU32,
+    /// Held across a password check and its failure delay: parallel attempts
+    /// would otherwise each be checked at once and wait side by side, which
+    /// makes the delay no brake on guessing.
+    attempt: Mutex<()>,
 }
 
 impl Default for LockState {
     fn default() -> Self {
         // Locked until checked: start() unlocks when no master password is set.
-        Self { unlocked: AtomicBool::new(false), failures: AtomicU32::new(0) }
+        Self { unlocked: AtomicBool::new(false), failures: AtomicU32::new(0), attempt: Mutex::new(()) }
+    }
+}
+
+impl LockState {
+    /// Runs one password check, one attempt at a time. A failure waits
+    /// longer each time (1 s, 2 s, 4 s ... up to 30 s) before the next
+    /// attempt may start; a success resets that.
+    fn check(&self, right: impl FnOnce() -> bool) -> bool {
+        let _one = self.attempt.lock().unwrap_or_else(|p| p.into_inner());
+        if right() {
+            self.failures.store(0, Ordering::Relaxed);
+            return true;
+        }
+        let n = self.failures.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs((1u64 << n.min(5)).min(30)));
+        false
     }
 }
 
@@ -106,14 +127,10 @@ pub async fn lock_unlock(app: AppHandle, password: String) -> Result<(), String>
             state.unlocked.store(true, Ordering::Relaxed);
             return Ok(());
         };
-        if verify(&s, &password) {
-            state.failures.store(0, Ordering::Relaxed);
+        if state.check(|| verify(&s, &password)) {
             state.unlocked.store(true, Ordering::Relaxed);
             return Ok(());
         }
-        // Each failure waits longer (1 s, 2 s, 4 s ... up to 30 s).
-        let n = state.failures.fetch_add(1, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_secs((1u64 << n.min(5)).min(30)));
         Err("마스터 비밀번호가 올바르지 않습니다".into())
     })
     .await
@@ -132,9 +149,10 @@ pub fn lock_lock(app: AppHandle, state: State<LockState>) -> Result<(), String> 
 #[tauri::command]
 pub async fn lock_set(app: AppHandle, current: Option<String>, new: Option<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // The same one-at-a-time check as unlocking: this is a way to test
+        // a guess as well.
         if let Some(s) = stored(&app)?
-            && !verify(&s, current.as_deref().unwrap_or("")) {
-                std::thread::sleep(Duration::from_secs(1));
+            && !app.state::<LockState>().check(|| verify(&s, current.as_deref().unwrap_or(""))) {
                 return Err("현재 마스터 비밀번호가 올바르지 않습니다".into());
             }
         let p = path(&app)?;
@@ -178,5 +196,21 @@ mod tests {
         assert!(!verify(&s, ""));
         let broken = Stored { salt: "%%".into(), iterations: 0, hash: String::new() };
         assert!(!verify(&broken, "x"));
+    }
+
+    /// Two wrong guesses at once are checked one after the other: the second
+    /// waits for the first one's delay (1 s) and then serves its own (2 s).
+    #[test]
+    fn parallel_attempts_wait_for_each_other() {
+        let state = LockState::default();
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| assert!(!state.check(|| false)));
+            }
+        });
+        assert!(start.elapsed() >= Duration::from_secs(3), "{:?}", start.elapsed());
+        assert!(state.check(|| true));
+        assert_eq!(state.failures.load(Ordering::Relaxed), 0);
     }
 }

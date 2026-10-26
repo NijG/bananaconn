@@ -296,30 +296,41 @@ export function savesSettled(): Promise<unknown> {
   return saves;
 }
 
-async function persistSessions() {
+/** Undo steps for state outside the session list (folders, folder order)
+ * changed together with sessions the next save writes. */
+let pendingRollbacks: (() => void)[] = [];
+
+/** `rollback` undoes what the caller changed besides `state.sessions`; it runs
+ * when this change does not reach the disk and the session list is restored. */
+async function persistSessions(rollback?: () => void) {
   if (!sessionsLoaded) {
+    rollback?.();
     const err = new Error("세션 목록을 읽지 못해 저장하지 않았습니다. 앱을 다시 시작하세요.");
     toast(`세션을 저장하지 못했습니다: ${errorText(err)}`, "error");
     throw err;
   }
+  if (rollback) pendingRollbacks.push(rollback);
   if (!nextSave) {
     const save = saves
       .then(() => new Promise((r) => setTimeout(r, 0)))
       .then(async () => {
         nextSave = null;
         const list = [...state.sessions];
+        const undo = pendingRollbacks;
+        pendingRollbacks = [];
         try {
           await api.sessionsSave([...list, ...unreadable]);
         } catch (err) {
           // Not on disk (file locked by antivirus, say). Said once for this
           // write. With a newer save queued, that one writes the current list
-          // (this change and later edits); otherwise the screen goes back to
-          // what is really stored.
+          // (this change and later edits) and inherits the undo steps; otherwise
+          // the screen goes back to what is really stored, folders included.
           toast(`세션을 저장하지 못했습니다: ${errorText(err)}`, "error");
           if (!nextSave) {
             state.sessions = structuredClone(savedSessions);
+            for (const u of undo.reverse()) u();
             notify("sessions");
-          }
+          } else pendingRollbacks = [...undo, ...pendingRollbacks];
           throw err;
         }
         savedSessions = structuredClone(list);
@@ -340,10 +351,14 @@ export async function upsertSession(s: Session) {
 
 /** Add many sessions at once (imports) with a single save. */
 export async function upsertSessions(list: Session[]) {
+  // One id→index map instead of a findIndex per imported session (O(m+n), not
+  // O(m·n)): a big backup into a big store would otherwise scan the whole list
+  // for every entry.
+  const at = new Map(state.sessions.map((s, i) => [s.id, i]));
   for (const s of list) {
-    const i = state.sessions.findIndex((x) => x.id === s.id);
-    if (i >= 0) state.sessions[i] = s;
-    else state.sessions.push(s);
+    const i = at.get(s.id);
+    if (i !== undefined) state.sessions[i] = s;
+    else at.set(s.id, state.sessions.push(s) - 1);
   }
   await persistSessions();
 }
@@ -430,6 +445,23 @@ function saveFolders() {
   notify("folders");
 }
 
+/** Restores the folder list and folder order as they are now; for a folder
+ * change whose session save fails (the sessions go back, so must the folders). */
+/** Capture the folder list, folder order and sort mode, to restore them if a
+ * later save fails (the manual-order switch changes them before the save). */
+export function folderSnapshot(): () => void {
+  const folders = new Set(state.extraFolders);
+  const order = [...state.settings.folderOrder];
+  // The sort mode too: the manual-order paths flip it, and a failed save must
+  // not leave "manual" over a session order that was rolled back.
+  const sort = state.settings.sessionSort;
+  return () => {
+    state.extraFolders = folders;
+    saveFolders();
+    updateSettings({ folderOrder: order, sessionSort: sort });
+  };
+}
+
 export function addFolder(path: string) {
   const clean = normalizeFolder(path);
   if (!clean) return;
@@ -437,7 +469,7 @@ export function addFolder(path: string) {
   saveFolders();
 }
 
-export async function renameFolder(from: string, to: string) {
+export async function renameFolder(from: string, to: string, rollback = folderSnapshot()) {
   const clean = normalizeFolder(to);
   if (!clean || clean === from) return;
   const remap = (f: string) => (f === from ? clean : f.startsWith(from + "/") ? clean + f.slice(from.length) : f);
@@ -445,13 +477,14 @@ export async function renameFolder(from: string, to: string) {
   state.extraFolders = new Set([...state.extraFolders].map(remap));
   if (state.settings.folderOrder.length) updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.map(remap))] });
   saveFolders();
-  await persistSessions();
+  await persistSessions(rollback);
 }
 
 /** Delete a folder; its sessions move to the parent folder. */
 export async function deleteFolder(path: string) {
   const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
   const remap = (f: string) => (f === path ? parent : f.startsWith(path + "/") ? parent + f.slice(path.length) : f);
+  const rollback = folderSnapshot();
   state.sessions.forEach((s) => (s.folder = remap(s.folder).replace(/^\//, "")));
   // Subfolders move up with the sessions, so empty ones are not lost.
   state.extraFolders = new Set(
@@ -461,7 +494,7 @@ export async function deleteFolder(path: string) {
     updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.filter((f) => f !== path).map((f) => remap(f).replace(/^\//, "")).filter(Boolean))] });
   }
   saveFolders();
-  await persistSessions();
+  await persistSessions(rollback);
 }
 
 // ---- manual order ------------------------------------------------------------------------------
@@ -496,12 +529,13 @@ export function adoptManualOrder(): boolean {
 
 /** The sort menu's "manual": keep the order on screen from now on. */
 export async function startManualOrder() {
-  if (adoptManualOrder()) await persistSessions();
+  const undo = folderSnapshot();
+  if (adoptManualOrder()) await persistSessions(undo);
 }
 
 /** Put sessions `ids` (in this order) into `folder`, just before or after
  * session `anchor`, or at the end when there is no anchor. */
-export async function placeSessions(ids: string[], folder: string, anchor: string | null, where: "before" | "after") {
+export async function placeSessions(ids: string[], folder: string, anchor: string | null, where: "before" | "after", rollback?: () => void) {
   const moving = new Set(ids);
   const list = ids.map((id) => state.sessions.find((s) => s.id === id)).filter((s): s is Session => !!s);
   if (!list.length) return;
@@ -510,26 +544,35 @@ export async function placeSessions(ids: string[], folder: string, anchor: strin
   const i = anchor ? rest.findIndex((s) => s.id === anchor) : -1;
   rest.splice(i < 0 ? rest.length : where === "before" ? i : i + 1, 0, ...list);
   state.sessions = rest;
-  await persistSessions();
+  // `rollback` (given when the caller switched to the manual order first)
+  // restores the sort mode and folder order if the save fails.
+  await persistSessions(rollback);
 }
 
 /** Move folder `path` next to folder `anchor` (before or after it, among
  * its siblings) or into it. A folder that changes parent is renamed, so its
  * sessions and subfolders go with it. Returns an error text when refused. */
-export async function placeFolder(path: string, anchor: string, where: "before" | "after" | "into"): Promise<string | null> {
+export async function placeFolder(path: string, anchor: string, where: "before" | "after" | "into", rollback?: () => void): Promise<string | null> {
   if (anchor === path || anchor.startsWith(path + "/")) return "폴더를 자기 자신이나 그 안의 폴더로 옮길 수 없습니다";
   const parent = where === "into" ? anchor : parentOf(anchor);
   const name = path.split("/").pop()!;
   const target = parent ? `${parent}/${name}` : name;
   if (target !== path) {
     if (allFolders().includes(target)) return `같은 이름의 폴더가 이미 있습니다: ${target}`;
-    await renameFolder(path, target);
+    // The save in renameFolder uses the caller's snapshot (taken before the
+    // sort mode was switched) so a failure restores that too.
+    await renameFolder(path, target, rollback);
   }
   if (where !== "into") {
     const order = fullFolderOrder().filter((f) => f !== target);
     const at = order.indexOf(anchor);
     order.splice(at < 0 ? order.length : where === "before" ? at : at + 1, 0, target);
     updateSettings({ folderOrder: order });
+    // Reordering a folder among its siblings does not rename it, so nothing
+    // persisted the session list — but the caller may have switched to the
+    // manual order, which reordered the sessions in memory. Save them too, or
+    // they would revert to the old on-disk order on the next launch.
+    if (target === path) await persistSessions(rollback);
   }
   return null;
 }
@@ -537,6 +580,7 @@ export async function placeFolder(path: string, anchor: string, where: "before" 
 /** Sort what a folder holds directly (its sessions, its subfolders by name)
  * once; the manual order keeps it until the next change. */
 export async function sortFolder(path: string, by: "name" | "address") {
+  const undo = folderSnapshot();
   adoptManualOrder();
   const slots = state.sessions.flatMap((s, i) => (s.folder === path ? [i] : []));
   const sorted = slots.map((i) => state.sessions[i]).sort(sessionCompare(by, new Map()));
@@ -546,7 +590,7 @@ export async function sortFolder(path: string, by: "name" | "address") {
   const names = kids.map((i) => order[i]).sort(folderCompare("name", []));
   kids.forEach((i, k) => (order[i] = names[k]));
   updateSettings({ folderOrder: order });
-  await persistSessions();
+  await persistSessions(undo);
 }
 
 export function updateSettings(patch: Partial<Settings>) {

@@ -153,6 +153,19 @@ fn options(body: &[u8]) -> HashMap<String, String> {
     parts.chunks(2).filter(|c| c.len() == 2 && !c[0].is_empty()).map(|c| (c[0].clone(), c[1].clone())).collect()
 }
 
+/// The block size an OACK settles on: 512 when it names none. RFC 2348
+/// allows 8..=65464, and a server may only lower what was asked; anything
+/// else is refused (0 made an upload send empty blocks forever).
+fn negotiated_blksize(oack: &HashMap<String, String>, wanted: u16) -> Result<u16, String> {
+    let Some(value) = oack.get("blksize") else { return Ok(512) };
+    value
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|b| (8..=65464).contains(b) && *b <= wanted)
+        .ok_or_else(|| format!("TFTP 서버가 올바르지 않은 블록 크기를 보냈습니다 ({value})"))
+}
+
 fn server_error(packet: &[u8]) -> String {
     let code = u16::from_be_bytes([packet[2], packet[3]]);
     let msg = String::from_utf8_lossy(&packet[4..]).trim_end_matches('\0').to_string();
@@ -239,7 +252,7 @@ fn get(
             match op {
                 OACK => {
                     let o = options(&buf[2..n]);
-                    block_size = o.get("blksize").and_then(|v| v.parse().ok()).unwrap_or(512);
+                    block_size = negotiated_blksize(&o, wanted)?;
                     total = o.get("tsize").and_then(|v| v.parse().ok());
                     n = exchange(sock, &ack(0), peer.unwrap(), &mut peer, cancel, &mut buf)?;
                 }
@@ -298,7 +311,7 @@ fn put(
     let mut peer = None;
     let mut n = exchange(sock, &request(WRQ, remote, wanted, total), server, &mut peer, cancel, &mut buf)?;
     let block_size = match u16::from_be_bytes([buf[0], buf[1]]) {
-        OACK => options(&buf[2..n]).get("blksize").and_then(|v| v.parse().ok()).unwrap_or(512),
+        OACK => negotiated_blksize(&options(&buf[2..n]), wanted)?,
         ACK if u16::from_be_bytes([buf[2], buf[3]]) == 0 => 512,
         ERROR => return Err(server_error(&buf[..n])),
         _ => return Err("TFTP 서버가 알 수 없는 응답을 보냈습니다".into()),
@@ -355,6 +368,19 @@ fn put(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_block_sizes_outside_the_rfc_or_above_the_request() {
+        let oack = |v: &str| HashMap::from([("blksize".to_string(), v.to_string())]);
+        assert_eq!(negotiated_blksize(&HashMap::new(), 1428), Ok(512));
+        assert_eq!(negotiated_blksize(&oack("1428"), 1428), Ok(1428));
+        assert_eq!(negotiated_blksize(&oack("1024"), 1428), Ok(1024));
+        assert_eq!(negotiated_blksize(&oack("8"), 1428), Ok(8));
+        for bad in ["0", "7", "1429", "65465", "-1", "x", ""] {
+            assert!(negotiated_blksize(&oack(bad), 1428).is_err(), "{bad}");
+        }
+        assert!(negotiated_blksize(&oack("65465"), 65464).is_err());
+    }
 
     /// Block 3 is lost once; meanwhile the server repeats its last ACK every
     /// second (as tftpd-hpa does). The client must still resend block 3 when
@@ -419,8 +445,7 @@ mod tests {
             xfer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             xfer.send_to(&ack(0), client).unwrap();
             let mut per_block = std::collections::BTreeMap::<u16, u32>::new();
-            loop {
-                let Ok((n, from)) = xfer.recv_from(&mut buf) else { break };
+            while let Ok((n, from)) = xfer.recv_from(&mut buf) {
                 let block = u16::from_be_bytes([buf[2], buf[3]]);
                 *per_block.entry(block).or_default() += 1;
                 xfer.send_to(&ack(block), from).unwrap();

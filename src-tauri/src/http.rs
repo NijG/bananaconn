@@ -23,12 +23,13 @@ struct Url<'a> {
 }
 
 fn parse(url: &str) -> Result<Url<'_>, String> {
-    let (secure, rest) = if url.len() > 8 && url[..8].eq_ignore_ascii_case("https://") {
-        (true, &url[8..])
-    } else if url.len() > 7 && url[..7].eq_ignore_ascii_case("http://") {
-        (false, &url[7..])
-    } else {
-        return Err(format!("http(s) 주소가 아닙니다: {url}"));
+    // `get` instead of indexing: the 7th/8th byte may fall inside a
+    // multi-byte character ("http://서버" is fine, "가나다" must not panic).
+    let scheme = |s: &str| url.get(..s.len()).filter(|head| head.eq_ignore_ascii_case(s)).map(|_| &url[s.len()..]);
+    let (secure, rest) = match (scheme("https://"), scheme("http://")) {
+        (Some(rest), _) if !rest.is_empty() => (true, rest),
+        (_, Some(rest)) if !rest.is_empty() => (false, rest),
+        _ => return Err(format!("http(s) 주소가 아닙니다: {url}")),
     };
     let (authority, path) = match rest.find(['/', '?']) {
         Some(i) if rest[i..].starts_with('/') => (&rest[..i], rest[i..].to_string()),
@@ -156,6 +157,9 @@ mod tests {
         assert_eq!((u.host, u.port, u.path.as_str()), ("::1", 1234, "/v1/models"));
         assert!(parse("ftp://x").is_err());
         assert!(parse("https://user:pw@host/").is_err());
+        // Multi-byte text where the scheme should be is an error, not a panic.
+        assert!(parse("가나다라마").is_err() && parse("http가://x").is_err() && parse("https://").is_err());
+        assert_eq!(parse("HTTP://서버:8080/경로").map(|u| (u.host, u.port)).ok(), Some(("서버", 8080)));
         assert!(loopback("localhost") && loopback("127.0.0.1") && loopback("::1") && !loopback("10.0.0.1"));
     }
 

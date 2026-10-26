@@ -10,7 +10,7 @@
 
 import type { IBufferCell, IDecoration, IMarker, ITheme, Terminal } from "@xterm/xterm";
 import { candidates, colorSpans, forgetCommand, PROMPT_END, rememberCommand, suggest, type Candidate, type WordKind } from "./cmdLine";
-import { findTypedRisk } from "./riskRules";
+import { findCommandRisk } from "./riskRules";
 import { state } from "./store";
 import { esc } from "./ui";
 
@@ -368,7 +368,8 @@ export class CmdAssist {
     const t = this.theme();
     const device = this.device();
     if (state.settings.cmdColor) {
-      const risk = findTypedRisk(line.text);
+      // The prompt is already off the line: no prompt tails to try.
+      const risk = findCommandRisk(line.text);
       // The remote colours its own command line (zsh-syntax-highlighting, fish): leave it.
       const own = line.cells.slice(0, line.text.indexOf(" ") < 0 ? line.cells.length : line.text.indexOf(" ")).some((c) => c.styled);
       const colors: Record<WordKind, string | undefined> = {

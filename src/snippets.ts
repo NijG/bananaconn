@@ -90,7 +90,7 @@ export function openSnippetManager() {
   const render = () => {
     // The user's own snippets first, then one section per operating system.
     const groups = [...new Set(list.flatMap((s) => (s.group ? [s.group] : [])))];
-    const item = (s: Snippet) => `<button class="vault-item${s.id === selected ? " on" : ""}" data-id="${s.id}">
+    const item = (s: Snippet) => `<button class="vault-item${s.id === selected ? " on" : ""}" data-id="${esc(s.id)}">
               ${icon(s.macro ? "Circle" : s.run ? "Play" : "ClipboardType", 15)}
               <span><b>${esc(s.name)}</b><small class="mono-ellipsis">${esc(s.macro ? showKeys(s.text) : s.text.split("\n")[0])}</small></span></button>`;
     const own = list.filter((s) => !s.group);

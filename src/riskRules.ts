@@ -198,8 +198,27 @@ export function findRisks(text: string): RiskHit[] {
 export function findTypedRisk(screenLine: string): RiskHit | null {
   const line = screenLine.trim();
   if (!line) return null;
-  const tails = [line];
-  for (let i = 0; i < line.length; i++) if ("#>$%]:".includes(line[i]) && line.slice(i + 1).trim()) tails.push(line.slice(i + 1));
-  const rule = lineRule(tails, compiled());
+  // Each tail is split and matched again, and this runs per keystroke: a long
+  // line full of ">" or ":" (URLs, redirections) would cost lines × chars.
+  // A prompt ends within its first chars, so only tails starting there are
+  // tried, each once.
+  const tails = new Set([line]);
+  for (let i = 0; i < Math.min(line.length, MAX_PROMPT) && tails.size <= MAX_TAILS; i++) {
+    if (!"#>$%]:".includes(line[i])) continue;
+    const tail = line.slice(i + 1).trim();
+    if (tail) tails.add(tail);
+  }
+  const rule = lineRule([...tails], compiled());
+  return rule ? { rule, line } : null;
+}
+const MAX_PROMPT = 256;
+const MAX_TAILS = 16;
+
+/** A command without a prompt in front (the command line part the terminal
+ * already separated): only the line itself is checked. */
+export function findCommandRisk(command: string): RiskHit | null {
+  const line = command.trim();
+  if (!line) return null;
+  const rule = lineRule([line], compiled());
   return rule ? { rule, line } : null;
 }

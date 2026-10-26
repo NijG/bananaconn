@@ -89,15 +89,30 @@ pub(crate) fn vnc_credential_ids(app: &AppHandle) -> Vec<String> {
 /// code page (INI files of other tools are often CP949 on Korean Windows).
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let bytes = fs::read(&path).map_err(|e| format!("파일을 읽을 수 없습니다: {e}"))?;
-        if bytes.len() > 20 * 1024 * 1024 {
-            return Err("파일이 너무 큽니다 (20MB 이하)".into());
-        }
-        Ok(decode_text(&bytes))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || read_limited(Path::new(&path), MAX_TEXT_FILE).map(|bytes| decode_text(&bytes)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+const MAX_TEXT_FILE: u64 = 20 * 1024 * 1024;
+
+/// The file's bytes, refused before reading when it is larger than `limit`
+/// (a wrongly picked disk image would otherwise be read into memory whole).
+/// The read itself is capped too, in case the file grows meanwhile.
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path).map_err(|e| format!("파일을 읽을 수 없습니다: {e}"))?;
+    let size = file.metadata().map_err(|e| format!("파일을 읽을 수 없습니다: {e}"))?.len();
+    let too_big = || "파일이 너무 큽니다 (20MB 이하)".to_string();
+    if size > limit {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(|e| format!("파일을 읽을 수 없습니다: {e}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big());
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn decode_text(bytes: &[u8]) -> String {
@@ -144,7 +159,31 @@ pub(crate) fn decode_code_page(code_page: u32, bytes: &[u8], strict: bool) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::decode_text;
+    use super::{decode_text, read_limited, save_in_order};
+
+    #[test]
+    fn refuses_large_files_before_reading() {
+        let path = std::env::temp_dir().join(format!("bx-store-limit-{}.txt", std::process::id()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_limited(&path, 10).unwrap(), b"0123456789");
+        assert!(read_limited(&path, 9).unwrap_err().contains("20MB"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A save that reaches the disk after a later one does not overwrite it.
+    #[test]
+    fn older_saves_never_overwrite_newer_ones() {
+        let saved = std::sync::Mutex::new(0);
+        let mut written = Vec::new();
+        for ticket in [2, 1, 3] {
+            save_in_order(&saved, ticket, || {
+                written.push(ticket);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(written, [2, 3]);
+    }
 
     #[test]
     fn decodes_utf8_utf16_and_cp949() {
@@ -160,11 +199,31 @@ mod tests {
 /// sync command would freeze the window meanwhile.
 #[tauri::command]
 pub async fn sessions_save(app: AppHandle, sessions: Vec<Value>) -> Result<(), String> {
+    // The ticket is taken in the order the saves arrive; the blocking writes
+    // may start in any order.
+    let ticket = SAVE_TICKETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let path = store_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let text = serde_json::to_string_pretty(&sessions).map_err(|e| e.to_string())?;
-        write_atomic(&path, text.as_bytes()).map_err(|e| format!("세션 목록을 저장할 수 없습니다: {e}"))
+        save_in_order(&SAVED, ticket, || write_atomic(&path, text.as_bytes()).map_err(|e| format!("세션 목록을 저장할 수 없습니다: {e}")))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+static SAVE_TICKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Held while sessions.json is written, with the ticket of the list on disk:
+/// two quick saves (an edit, then a drag) could otherwise land out of order
+/// and leave the older list behind.
+static SAVED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// Runs `write` for save `ticket` unless a later save already wrote its list.
+fn save_in_order(saved: &std::sync::Mutex<u64>, ticket: u64, write: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let mut on_disk = saved.lock().unwrap_or_else(|p| p.into_inner());
+    if *on_disk > ticket {
+        return Ok(());
+    }
+    write()?;
+    *on_disk = ticket;
+    Ok(())
 }

@@ -3,16 +3,12 @@
 
 import { api, on, pickFolder, type FileServerKind, type FileServerStatus } from "./api";
 import { writeClipboard } from "./clipboard";
-import { isPublicAddress } from "./ftpServer";
+import { isPublicAddress, logRenderer, type LogEntry } from "./ftpServer";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
 
-interface LogEntry {
-  at: string;
-  kind: string;
-  user: string;
-  detail: string;
-}
+const LOG_MAX = 300;
+let logSeq = 0;
 
 const INFO: Record<FileServerKind, { title: string; icon: string; port: number; hint: string }> = {
   tftp: {
@@ -60,8 +56,8 @@ export async function initFileServers() {
   await on<{ server: string; kind: string; user: string; detail: string }>("file-server-event", (e) => {
     const kind = e.server as FileServerKind;
     if (!logs[kind]) return;
-    logs[kind].push({ at: now(), kind: e.kind, user: e.user, detail: e.detail });
-    if (logs[kind].length > 300) logs[kind].splice(0, logs[kind].length - 300);
+    logs[kind].push({ seq: ++logSeq, at: now(), kind: e.kind, user: e.user, detail: e.detail });
+    if (logs[kind].length > LOG_MAX) logs[kind].splice(0, logs[kind].length - LOG_MAX);
     if (e.kind === "started" || e.kind === "stopped") refreshStatus();
     else notify();
   });
@@ -140,13 +136,28 @@ export function openFileServer(kind: FileServerKind) {
   const toggle = m.root.querySelector<HTMLButtonElement>("[data-toggle]")!;
   let busy = false;
 
+  // Every log event calls render(): the state box and controls are touched
+  // only when what they show changed, and only new log rows are added.
+  const renderLog = logRenderer(logBox, KIND_TEXT, `<p class="muted ftpd-empty">아직 기록이 없습니다.</p>`, LOG_MAX);
+  let drawnControls = "";
+  let drawnState = "";
+  stateBox.addEventListener("click", async (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>("[data-addr]");
+    if (!b) return;
+    await writeClipboard(b.dataset.addr!);
+    toast("주소를 복사했습니다", "success", 1600);
+  });
   function render() {
     const s = status[kind];
-    form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = !!s || busy));
-    toggle.disabled = busy;
-    toggle.className = `btn ${s ? "btn-danger" : "btn-primary"}`;
-    toggle.innerHTML = s ? `${icon("Square", 14)}서버 중지` : `${icon("Play", 14)}서버 시작`;
-    stateBox.innerHTML = s
+    const controls = `${!!s}|${busy}`;
+    if (controls !== drawnControls) {
+      drawnControls = controls;
+      form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = !!s || busy));
+      toggle.disabled = busy;
+      toggle.className = `btn ${s ? "btn-danger" : "btn-primary"}`;
+      toggle.innerHTML = s ? `${icon("Square", 14)}서버 중지` : `${icon("Play", 14)}서버 시작`;
+    }
+    const html = s
       ? `<div class="ftpd-on"><span class="sb-dot connected"></span><b>실행 중</b>
            <span class="muted">${esc(s.root)} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.auth ? " · 인증 사용" : ""}</span></div>
          <div class="ftpd-addrs">${s.addresses
@@ -154,24 +165,11 @@ export function openFileServer(kind: FileServerKind) {
            .join("")}</div>
          ${s.addresses.some((a) => isPublicAddress(a.replace(/^\w+:/, "ftp:"))) ? `<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷에서 접속을 시도할 수 있습니다.</p>` : ""}`
       : `<div class="ftpd-off"><span class="sb-dot idle"></span><b>중지됨</b><span class="muted">폴더를 고르고 서버를 시작하세요.</span></div>`;
-    stateBox.querySelectorAll<HTMLElement>("[data-addr]").forEach((b) =>
-      b.addEventListener("click", async () => {
-        await writeClipboard(b.dataset.addr!);
-        toast("주소를 복사했습니다", "success", 1600);
-      }),
-    );
-    const log = logs[kind];
-    logBox.innerHTML = log.length
-      ? log
-          .slice()
-          .reverse()
-          .map((e) => {
-            const [ic, label] = KIND_TEXT[e.kind] ?? ["Info", e.kind];
-            return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
-              ${e.user ? `<span class="who">${esc(e.user)}</span>` : ""}<span class="what">${esc(e.detail)}</span></div>`;
-          })
-          .join("")
-      : `<p class="muted ftpd-empty">아직 기록이 없습니다.</p>`;
+    if (html !== drawnState) {
+      drawnState = html;
+      stateBox.innerHTML = html;
+    }
+    renderLog(logs[kind]);
   }
   const off = fileServers.onChange(render);
 

@@ -318,6 +318,14 @@ ${a.host}에 대한 Ping 통계:
       throw "미리보기에서는 설치하지 않습니다";
     case "monitor_commands":
       return ["journalctl", "jq", "systemctl", "ss", "tail"];
+    case "ssh_kit_start": {
+      const url = "http://192.168.0.10:51234/ab12cd34ef56";
+      const admin = `iex ((New-Object Net.WebClient).DownloadString('${url}/s'))`;
+      return { url, adminLine: admin, runLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command ${admin.replace(/'/g, "''")}'"`, routed: true };
+    }
+    case "ssh_kit_stop":
+    case "ssh_kit_allow":
+      return;
     case "monitor_top":
       if (!monitors.has(a.id)) throw "모니터링이 실행 중이 아닙니다";
       return [

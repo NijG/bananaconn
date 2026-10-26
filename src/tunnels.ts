@@ -202,26 +202,50 @@ export function openTunnelManager() {
     render();
   };
 
+  /** Each row's markup without its connection counters, as last drawn. */
+  const drawn = new Map<string, string>();
+
+  /** Called every 2 s: rows are rebuilt only when their state changed, and the
+   * counters are updated as text, so a click on 시작/중지/삭제 is not lost to a
+   * re-render between mousedown and mouseup. */
   function render() {
     if (!list.length) {
-      listEl.innerHTML = `<p class="muted tunnel-empty">저장된 터널이 없습니다. 아래에서 추가하세요.</p>`;
+      drawn.clear();
+      if (!listEl.querySelector(".tunnel-empty")) listEl.innerHTML = `<p class="muted tunnel-empty">저장된 터널이 없습니다. 아래에서 추가하세요.</p>`;
       return;
     }
-    listEl.innerHTML = list
-      .map((t) => {
-        const r = running.find((x) => x.id === t.id);
-        const gw = state.sessions.find((s) => s.id === t.gatewayId);
-        return `<div class="tunnel-row${r ? " on" : ""}" data-id="${esc(t.id)}">
+    const rows = list.map((t) => {
+      const r = running.find((x) => x.id === t.id);
+      const gw = state.sessions.find((s) => s.id === t.gatewayId);
+      const html = `<div class="tunnel-row${r ? " on" : ""}" data-id="${esc(t.id)}">
           <span class="sb-dot ${r ? "connected" : "idle"}"></span>
           <div class="tunnel-main"><b>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>
             <span class="mono small">127.0.0.1:${esc(String(t.localPort))} → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span>
-            <span class="muted small">${gw ? `${esc(gw.name)} 경유` : "SSH 세션이 삭제됨"}${r ? ` · 연결 ${r.active}개 / 누적 ${r.total}` : ""}</span></div>
+            <span class="muted small">${gw ? `${esc(gw.name)} 경유` : "SSH 세션이 삭제됨"}<span class="tunnel-stats"></span></span></div>
           <button class="btn btn-sm ${r ? "btn-danger" : "btn-primary"}" data-toggle ${busy.has(t.id) || !gw ? "disabled" : ""}>
             ${r ? `${icon("Square", 13)}중지` : `${icon("Play", 13)}시작`}</button>
           <button class="tool" data-del title="삭제" ${r || busy.has(t.id) ? "disabled" : ""}>${icon("Trash2", 14)}</button>
         </div>`;
-      })
-      .join("");
+      return { id: t.id, html, stats: r ? ` · 연결 ${r.active}개 / 누적 ${r.total}` : "" };
+    });
+    let els = [...listEl.querySelectorAll<HTMLElement>(".tunnel-row")];
+    if (els.length !== rows.length || els.some((el, i) => el.dataset.id !== rows[i].id)) {
+      // Tunnels added or removed: draw the list again.
+      listEl.innerHTML = rows.map((r) => r.html).join("");
+      drawn.clear();
+      for (const r of rows) drawn.set(r.id, r.html);
+      els = [...listEl.querySelectorAll<HTMLElement>(".tunnel-row")];
+    }
+    rows.forEach((r, i) => {
+      let el = els[i];
+      if (drawn.get(r.id) !== r.html) {
+        el.outerHTML = r.html;
+        el = listEl.querySelectorAll<HTMLElement>(".tunnel-row")[i];
+        drawn.set(r.id, r.html);
+      }
+      const stats = el.querySelector(".tunnel-stats")!;
+      if (stats.textContent !== r.stats) stats.textContent = r.stats;
+    });
   }
 
   listEl.addEventListener("click", async (e) => {
@@ -287,6 +311,10 @@ export class GatewayLink {
   /** Local port of the session's proxy forward (no gateway), once open. */
   private proxyPort: number | null = null;
   private unlisten: (() => void) | null = null;
+  /** The proxy-log subscription was requested (on() resolves later). */
+  private listening = false;
+  /** The proxy forward being opened; a second caller waits for it. */
+  private forwarding: Promise<number> | null = null;
   /** The login in progress; a second caller waits for it instead of opening another. */
   private opening: Promise<TunnelInfo | null> | null = null;
   private closed = false;
@@ -318,20 +346,35 @@ export class GatewayLink {
     return info?.localPort ?? null;
   }
 
-  private async proxyForward(): Promise<number | undefined> {
+  private async proxyForward(): Promise<number | null | undefined> {
     const proxy = proxyOf(this.session);
     if (!proxy) return undefined;
+    if (this.closed) return null;
     if (this.proxyPort) return this.proxyPort;
     // Each proxied connection is dialled when the view connects: its failure
     // arrives as an event, said here (the view only sees a closed connection).
-    if (!this.unlisten) {
+    // Marked before on() resolves, so concurrent callers subscribe once.
+    if (!this.listening) {
+      this.listening = true;
       const id = this.id;
       on<ProxyLogEvent>("proxy-log", (e) => {
         if (e.id === id && e.error) toast(`프록시: ${e.line}`, "error", 8000);
       }).then((u) => (this.closed ? u() : (this.unlisten = u)));
     }
-    this.proxyPort = await api.proxyForwardOpen(this.id, this.session.host, this.session.port ?? this.defaultPort, proxy);
-    return this.proxyPort;
+    // A second caller waits for the forward being opened instead of opening another.
+    if (!this.forwarding) {
+      this.forwarding = api
+        .proxyForwardOpen(this.id, this.session.host, this.session.port ?? this.defaultPort, proxy)
+        .finally(() => (this.forwarding = null));
+    }
+    const port = await this.forwarding;
+    // Closed while the forward was opening: close() saw no port, so close it here.
+    if (this.closed) {
+      api.proxyForwardClose(this.id).catch(() => {});
+      return null;
+    }
+    this.proxyPort = port;
+    return port;
   }
 
   close() {

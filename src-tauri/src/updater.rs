@@ -289,6 +289,19 @@ pub async fn update_check(app: AppHandle, source: String, credential_id: Option<
     Ok(UpdateInfo { current, available, notes: m.notes, notes_i18n: m.notes_i18n })
 }
 
+/// Removes the installers of earlier updates (one folder per version under
+/// `downloads`): each is a full installer, and nothing needs it once that
+/// update ran. Done before a new download, the only time the app writes
+/// there; a folder still in use (an installer running) simply stays.
+fn remove_other_versions(downloads: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(downloads) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name() != keep && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Copy the verified installer locally, start it after this app exits, and
 /// relaunch the app when it finishes.
 #[tauri::command]
@@ -311,7 +324,9 @@ pub async fn update_install(app: AppHandle, source: String, credential_id: Optio
         if !sha.eq_ignore_ascii_case(&sha256_hex(&data)) {
             return Err("설치 파일이 업데이트 정보와 다릅니다(SHA-256 불일치). 다시 게시된 뒤에 시도하세요".into());
         }
-        let work = std::env::temp_dir().join("BananaConn").join("update").join(&m.version);
+        let downloads = std::env::temp_dir().join("BananaConn").join("update");
+        remove_other_versions(&downloads, &m.version);
+        let work = downloads.join(&m.version);
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
         let installer = work.join(name);
         std::fs::write(&installer, &data).map_err(|e| format!("설치 파일을 저장할 수 없습니다: {e}"))?;
@@ -353,6 +368,21 @@ pub async fn update_install(app: AppHandle, source: String, credential_id: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn earlier_update_downloads_are_removed() {
+        let downloads = std::env::temp_dir().join(format!("bx-update-dl-{}", std::process::id()));
+        for v in ["0.6.0", "0.7.0", "0.7.1"] {
+            std::fs::create_dir_all(downloads.join(v)).unwrap();
+            std::fs::write(downloads.join(v).join("setup.exe"), b"x").unwrap();
+        }
+        std::fs::write(downloads.join("note.txt"), b"not a version folder").unwrap();
+        remove_other_versions(&downloads, "0.7.1");
+        assert!(!downloads.join("0.6.0").exists() && !downloads.join("0.7.0").exists());
+        assert!(downloads.join("0.7.1").join("setup.exe").exists() && downloads.join("note.txt").exists());
+        let _ = std::fs::remove_dir_all(&downloads);
+        remove_other_versions(&downloads, "0.7.1");
+    }
 
     fn signed(key: &ring::signature::Ed25519KeyPair, mut m: Manifest) -> Manifest {
         m.signature = base64::engine::general_purpose::STANDARD.encode(key.sign(signed_message(&m).as_bytes()).as_ref());

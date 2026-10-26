@@ -402,7 +402,7 @@ fn status_of(r: &Running) -> ServerStatus {
 
 #[tauri::command]
 pub async fn ftp_server_start(app: AppHandle, state: State<'_, FtpServerState>, config: ServerConfig) -> Result<ServerStatus, String> {
-    if state.running.lock().unwrap().is_some() {
+    if state.running.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
         return Err("FTP 서버가 이미 실행 중입니다".into());
     }
     if !Path::new(&config.root).is_dir() {
@@ -458,7 +458,7 @@ pub async fn ftp_server_start(app: AppHandle, state: State<'_, FtpServerState>, 
         // sees the flag or the entry it stored is cleared here. No phantom "running".
         finished_tx.send_replace(true);
         let st = task_app.state::<FtpServerState>();
-        let mut running = st.running.lock().unwrap();
+        let mut running = st.running.lock().unwrap_or_else(|p| p.into_inner());
         if running.as_ref().is_some_and(|r| r.id == id) {
             *running = None;
         }
@@ -478,7 +478,7 @@ pub async fn ftp_server_start(app: AppHandle, state: State<'_, FtpServerState>, 
     let running = Running { id, config, started: Instant::now(), stop: Some(stop_tx), stopped, finished: finished_rx };
     let status = status_of(&running);
     {
-        let mut slot = state.running.lock().unwrap();
+        let mut slot = state.running.lock().unwrap_or_else(|p| p.into_inner());
         // The listener may have died right after the bind check.
         if *running.finished.borrow() {
             return Err("FTP 서버가 시작 직후 종료되었습니다".into());
@@ -493,7 +493,7 @@ pub async fn ftp_server_start(app: AppHandle, state: State<'_, FtpServerState>, 
 /// immediate restart on the same port works.
 #[tauri::command]
 pub async fn ftp_server_stop(state: State<'_, FtpServerState>) -> Result<(), String> {
-    let Some(mut r) = state.running.lock().unwrap().take() else { return Ok(()) };
+    let Some(mut r) = state.running.lock().unwrap_or_else(|p| p.into_inner()).take() else { return Ok(()) };
     r.stopped.store(true, Ordering::Relaxed);
     if let Some(stop) = r.stop.take() {
         let _ = stop.send(());
@@ -504,7 +504,7 @@ pub async fn ftp_server_stop(state: State<'_, FtpServerState>) -> Result<(), Str
 
 #[tauri::command]
 pub fn ftp_server_status(state: State<FtpServerState>) -> Option<ServerStatus> {
-    state.running.lock().unwrap().as_ref().map(status_of)
+    state.running.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(status_of)
 }
 
 /// Data ports for passive transfers.

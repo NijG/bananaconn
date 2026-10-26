@@ -6,7 +6,7 @@
 // Keys are matched by their physical key (KeyboardEvent.code), so they work
 // the same with the Korean IME on (key would be "ㅊ") and on any layout.
 
-import { state, type Snippet } from "./store";
+import { state, subscribe, type Snippet } from "./store";
 
 /** Where an action applies. "global" works everywhere (a terminal passes it
  * on); the others only while that part of the window has the focus. */
@@ -184,18 +184,47 @@ export function bindings(id: string): string[] {
   return byId(id)?.keys ?? [];
 }
 
+/** Chord → action per scope, and the chords a terminal hands to the app.
+ * Every keydown looks a chord up, so it is built once from the bindings and
+ * dropped when the settings (keybindings) or the snippets change. */
+interface ChordIndex {
+  byScope: Map<Scope, Map<string, string>>;
+  appKeys: Set<string>;
+}
+let index: ChordIndex | null = null;
+subscribe("settings", () => (index = null));
+subscribe("snippets", () => (index = null));
+
+function chordIndex(): ChordIndex {
+  if (index) return index;
+  const byScope = new Map<Scope, Map<string, string>>();
+  const appKeys = new Set<string>();
+  const own = state.settings.keybindings ?? {};
+  for (const a of allActions()) {
+    let chords = byScope.get(a.scope);
+    if (!chords) byScope.set(a.scope, (chords = new Map()));
+    // bindings(a.id) without looking the action up again.
+    for (const chord of own[a.id] ?? a.keys) {
+      // The first action in list order keeps a chord, as before.
+      if (!chords.has(chord)) chords.set(chord, a.id);
+      if (a.scope === "global" && !a.terminalKeeps) appKeys.add(chord);
+    }
+  }
+  return (index = { byScope, appKeys });
+}
+
 /** First action of `scope` bound to this event's keys. */
 export function actionFor(e: KeyboardEvent, scope: Scope): string | null {
   const chord = chordOf(e);
   if (!chord) return null;
-  return allActions().find((a) => a.scope === scope && bindings(a.id).includes(chord))?.id ?? null;
+  return chordIndex().byScope.get(scope)?.get(chord) ?? null;
 }
 
 /** A terminal passes these keys on to the app instead of the remote program. */
 export function appTakesInTerminal(e: KeyboardEvent): boolean {
   const chord = chordOf(e);
   if (!chord) return false;
-  return ACTIONS.some((a) => a.scope === "global" && !a.terminalKeeps && bindings(a.id).includes(chord));
+  return chordIndex().appKeys.has(chord);
 }
 
 /** Actions that would also react to `chord` if `id` had it: the same scope,

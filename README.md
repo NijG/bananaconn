@@ -163,9 +163,10 @@ command can take a site down:
   anything that could change the system waits for your approval, block rules never run, and every run is audited.
   Each connection keeps its conversation across closing the panel and restarting the app.
   Attach images, PDFs and text files (📎, drag and drop, Ctrl+V); in RDP and VNC the AI explains a captured screen
-  (no commands run there); one click there prepares SSH to the same PC instead (a script to turn on OpenSSH, then
-  an SSH session where the AI runs read-only PowerShell commands itself). The panel can be widened by dragging its
-  edge. Before text goes to a cloud AI it is shown for confirmation; passwords, keys and
+  (no commands run there); one click there prepares SSH to the same PC instead: one line pasted into Win+R on the
+  remote PC installs and opens OpenSSH, with the package served by this app, so Windows 7 PCs without internet
+  work too, and an SSH session opens where the AI runs read-only PowerShell commands itself. The panel can be
+  widened by dragging its edge, and the conversation can be selected and copied. Before text goes to a cloud AI it is shown for confirmation; passwords, keys and
   tokens are always masked, IP addresses and host names on request (and restored in the answer). API keys live in
   the credential vault; requests use Windows' proxy and certificate settings.
 - **Device keys mode:** sends Ctrl-D/A/E for Delete/Home/End so that Cisco IOS and similar CLIs do not print `~`.

@@ -14,6 +14,7 @@ import { endpoint, PROTOCOLS, type Session } from "./model";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
   adoptManualOrder,
+  folderSnapshot,
   addFolder,
   allFolders,
   deleteFolder,
@@ -169,7 +170,14 @@ export class Sidebar {
     });
     subscribe("sessions", () => this.render());
     subscribe("folders", () => this.render());
-    subscribe("settings", () => this.render());
+    // The tree depends on only two settings; skip the full walk for unrelated
+    // settings writes (AI run mode, "don't ask again", keybindings, …).
+    subscribe("settings", () => {
+      const key = `${state.settings.sessionSort}\0${state.settings.folderOrder.join("\0")}`;
+      if (key === this.sortKey) return;
+      this.sortKey = key;
+      this.render();
+    });
     this.render();
   }
 
@@ -220,6 +228,7 @@ export class Sidebar {
     const html: string[] = [];
     const heights: number[] = [];
     const order: string[] = [];
+    this.rowIndex.clear();
     const mode = state.settings.sessionSort;
     const bySession = sessionCompare(mode, mode === "manual" ? sessionPositions() : new Map());
     const byFolder = folderCompare(mode, state.settings.folderOrder);
@@ -230,17 +239,18 @@ export class Sidebar {
         html.push(`<div class="folder-row" data-folder="${esc(f.path)}" draggable="true" style="--depth:${depth}">
             <span class="chev">${icon(open ? "ChevronDown" : "ChevronRight", 14)}</span>
             ${icon(open ? "FolderOpen" : "Folder", 15, "folder-ico")}
-            <span class="fname">${esc(f.name)}</span><span class="count">${this.count(f)}</span></div>`);
+            <span class="fname" data-i18n-skip>${esc(f.name)}</span><span class="count">${this.count(f)}</span></div>`);
         heights.push(FOLDER_H);
         if (open) walk(f, depth + 1);
       }
       const sessions = [...node.sessions].sort(bySession);
       for (const s of sessions) {
         const p = PROTOCOLS[s.protocol];
+        this.rowIndex.set(s.id, html.length);
         html.push(`<div class="session-row${this.picked.has(s.id) ? " selected" : ""}" data-session="${s.id}" draggable="true"
             style="--depth:${depth};--proto:${p.color}" title="${esc(`${p.label} · ${endpoint(s)}${s.notes ? `\n${s.notes}` : ""}`)}">
             <span class="proto-ico">${icon(p.icon, 15)}</span>
-            <span class="srow-text"><span class="sname">${esc(s.name)}</span><span class="shost">${esc(endpoint(s))}</span></span>
+            <span class="srow-text"><span class="sname" data-i18n-skip>${esc(s.name)}</span><span class="shost" data-i18n-skip>${esc(endpoint(s))}</span></span>
             <button class="row-go" data-go title="연결" tabindex="-1">${icon("Play", 13)}</button></div>`);
         heights.push(SESSION_H);
         order.push(s.id);
@@ -300,6 +310,10 @@ export class Sidebar {
   private drawn: { first: number; last: number } | null = null;
   /** Session ids in display order (sessions inside closed folders are left out). */
   private order: string[] = [];
+  /** Session id → its index in `rows`/`tops`, so reveal() is O(1), not a scan. */
+  private rowIndex = new Map<string, number>();
+  /** sessionSort + folderOrder at the last settings-driven render (skip if unchanged). */
+  private sortKey = "";
 
   /** Thousands of sessions: only the rows in view (and a margin) are in the
    * DOM, between spacers that keep the scroll height. A full tree of 3000
@@ -337,7 +351,7 @@ export class Sidebar {
   /** Scroll a session's row into view (drawing it first when rows are windowed). */
   private reveal(id: string) {
     if (this.rows.length) {
-      const i = this.rows.findIndex((r) => r.includes(`data-session="${id}"`));
+      const i = this.rowIndex.get(id) ?? -1;
       if (i >= 0) {
         const y = this.tops[i];
         const h = (i + 1 < this.rows.length ? this.tops[i + 1] : this.total) - y;
@@ -567,8 +581,9 @@ export class Sidebar {
     // changes. Among its own folder (or in the manual order) it is a reorder.
     const sameFolder = list.every((id) => this.session(id)?.folder === target.folder);
     if (state.settings.sessionSort !== "manual" && !sameFolder) return this.moveTo(list, target.folder);
+    const undo = folderSnapshot();
     const switched = adoptManualOrder();
-    await placeSessions(list, target.folder, target.id, at.where === "before" ? "before" : "after");
+    await placeSessions(list, target.folder, target.id, at.where === "before" ? "before" : "after", switched ? undo : undefined);
     if (switched) toast("정렬을 '사용자 지정'으로 바꿨습니다. 끌어서 놓은 순서가 그대로 유지됩니다", "info", 4000);
     this.refocus();
   }
@@ -576,8 +591,9 @@ export class Sidebar {
   private async dropFolder(path: string, at: DropAt) {
     const anchor = at.row?.dataset.folder ?? "";
     // Before/after another folder sets the manual order; into one does not.
+    const undo = folderSnapshot();
     const switched = at.where !== "into" && adoptManualOrder();
-    const err = await placeFolder(path, anchor, at.where);
+    const err = await placeFolder(path, anchor, at.where, switched ? undo : undefined);
     if (err) return void toast(err, "warn");
     if (at.where === "into" && anchor) {
       collapsed.delete(anchor);
@@ -591,11 +607,14 @@ export class Sidebar {
   private async nudge(step: -1 | 1) {
     const s = this.selected && this.picked.size <= 1 ? this.session(this.selected) : undefined;
     if (!s) return;
-    const siblings = this.order.filter((id) => this.session(id)?.folder === s.folder);
+    // One id→session map instead of a find() per visible row (O(n) not O(n²)).
+    const byId = new Map(state.sessions.map((x) => [x.id, x]));
+    const siblings = this.order.filter((id) => byId.get(id)?.folder === s.folder);
     const next = siblings[siblings.indexOf(s.id) + step];
     if (!next) return;
+    const undo = folderSnapshot();
     const switched = adoptManualOrder();
-    await placeSessions([s.id], s.folder, next, step < 0 ? "before" : "after");
+    await placeSessions([s.id], s.folder, next, step < 0 ? "before" : "after", switched ? undo : undefined);
     if (switched) toast("정렬을 '사용자 지정'으로 바꿨습니다", "info", 3000);
     this.reveal(s.id);
   }
@@ -691,7 +710,12 @@ export class Sidebar {
       if (port !== null && (port < 1 || port > 65535)) return toast("포트는 1~65535 사이 숫자로 입력하세요", "error");
       if (!["username", "port", "credentialId", "folder", "keyMode"].some(on)) return toast("바꿀 항목을 하나 이상 체크하세요", "error");
       const folder = val("folder").split("/").map((p) => p.trim()).filter(Boolean).join("/");
-      const updated = list.map((orig) => {
+      // `list` was taken when the dialog opened: start from each stored record
+      // as it is now (a tab may have linked a credential or touched lastUsed),
+      // and leave out sessions deleted meanwhile rather than bring them back.
+      const current = list.flatMap((orig) => state.sessions.find((x) => x.id === orig.id) ?? []);
+      const gone = list.length - current.length;
+      const updated = current.map((orig) => {
         const s = structuredClone(orig);
         if (on("username")) s.username = val("username");
         // A serial session's "port" is its COM port name, not a TCP port.
@@ -702,9 +726,10 @@ export class Sidebar {
         return s;
       });
       m.close();
-      await upsertSessions(updated);
+      if (updated.length) await upsertSessions(updated);
       this.refocus();
-      toast(`세션 ${updated.length}개를 수정했습니다`, "success");
+      if (gone) toast(`편집하는 동안 삭제된 세션 ${gone}개는 건너뛰었습니다`, "warn");
+      if (updated.length) toast(`세션 ${updated.length}개를 수정했습니다`, "success");
     };
     form.addEventListener("submit", (e) => {
       e.preventDefault();

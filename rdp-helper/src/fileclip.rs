@@ -34,13 +34,13 @@ use ironrdp::cliprdr::pdu::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, STILL_ACTIVE, WPARAM};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{GetCurrentThreadId, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{CFSTR_PREFERREDDROPEFFECT, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, RegisterClassW, TranslateMessage,
@@ -127,6 +127,108 @@ impl core::fmt::Debug for Shared {
 /// Root of the downloads (one folder per remote copy).
 fn temp_root() -> PathBuf {
     std::env::temp_dir().join("BananaConn").join("rdp-clipboard")
+}
+
+/// Download folders are named `<helper pid>-<generation>`.
+fn download_owner(name: &str) -> Option<u32> {
+    let (pid, generation) = name.split_once('-')?;
+    generation.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+fn remove_downloads(of: impl Fn(u32) -> bool) {
+    let Ok(dirs) = std::fs::read_dir(temp_root()) else { return };
+    for dir in dirs.flatten() {
+        if download_owner(&dir.file_name().to_string_lossy()).is_some_and(&of) {
+            let _ = std::fs::remove_dir_all(dir.path());
+        }
+    }
+}
+
+/// Removes this helper's downloads: a paste copies the files away at once,
+/// so nothing needs them once the session (and the helper) ends.
+pub fn remove_own_downloads() {
+    let own = std::process::id();
+    remove_downloads(|pid| pid == own);
+}
+
+/// Removes downloads left by helpers that did not get to clean up (killed
+/// with the app, crashed). Other running helpers keep theirs.
+pub fn remove_stale_downloads() {
+    let own = std::process::id();
+    remove_downloads(|pid| pid != own && !process_alive(pid));
+}
+
+/// False only when `pid` surely names no running process (a reused pid keeps
+/// a folder until a later start, which is harmless).
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: plain process query; the handle is closed right after.
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            let mut code = 0u32;
+            // SAFETY: valid handle and out pointer.
+            let known = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+            // SAFETY: the handle came from OpenProcess above.
+            let _ = unsafe { CloseHandle(handle) };
+            !known || code == STILL_ACTIVE.0 as u32
+        }
+        // ERROR_INVALID_PARAMETER: no such process. Anything else (access
+        // denied) means it exists.
+        Err(e) => e.code() != windows_core::HRESULT::from_win32(87),
+    }
+}
+
+/// True for a remote name part that is one plain component below the
+/// download folder. Path::join alone does not keep it there: Windows reads
+/// `C:x` relative to drive C's current folder, `/` as a separator, `a:b` as
+/// an alternate data stream, and device names (NUL, COM1.txt …) as devices,
+/// and it drops trailing dots and spaces ("... " becomes "..").
+fn safe_component(part: &str) -> bool {
+    if part.is_empty()
+        || part.ends_with(['.', ' '])
+        || part.chars().any(|c| c.is_control() || matches!(c, ':' | '/' | '\\' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let mut components = Path::new(part).components();
+    if !matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None)) {
+        return false;
+    }
+    !is_device_name(part)
+}
+
+/// Windows device names, which stay devices with any extension ("NUL.txt")
+/// or spaces before it ("NUL .txt").
+fn is_device_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ').to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        s if s.starts_with("COM") || s.starts_with("LPT") => {
+            matches!(&s[3..], "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        }
+        _ => false,
+    }
+}
+
+/// `rel` (backslash-separated, as the server sends it) below `folder`, or
+/// None when any part of it is not a plain name.
+fn resolve_below(folder: &Path, rel: &str) -> Option<PathBuf> {
+    let mut path = folder.to_path_buf();
+    for part in rel.split('\\') {
+        if !safe_component(part) {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+/// True when the existing `path` really lies inside `folder` (after links).
+fn stays_inside(folder: &Path, path: &Path) -> bool {
+    match (folder.canonicalize(), path.canonicalize()) {
+        (Ok(folder), Ok(path)) => path.starts_with(folder),
+        _ => false,
+    }
 }
 
 impl Shared {
@@ -294,17 +396,9 @@ impl Shared {
     /// Download every file of `generation` into a fresh folder; returns it.
     fn download(&self, generation: u64) -> Result<PathBuf, String> {
         let files = self.remote_list(generation).ok_or("원격 파일 목록을 받지 못했습니다")?;
-        let root = temp_root();
         // Earlier copies of this session are done with (a paste copies them away at once).
-        let prefix = format!("{}-", std::process::id());
-        if let Ok(old) = std::fs::read_dir(&root) {
-            for dir in old.flatten() {
-                if dir.file_name().to_string_lossy().starts_with(&prefix) {
-                    let _ = std::fs::remove_dir_all(dir.path());
-                }
-            }
-        }
-        let folder = root.join(format!("{prefix}{generation}"));
+        remove_own_downloads();
+        let folder = temp_root().join(format!("{}-{generation}", std::process::id()));
         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
         let total: u64 = files.iter().filter_map(|f| f.file_size).sum();
         let mut done = 0u64;
@@ -315,17 +409,18 @@ impl Shared {
                 Some(p) if !p.is_empty() => format!("{p}\\{}", f.name),
                 _ => f.name.clone(),
             };
-            // IronRDP already rejected traversal and device names; stay inside anyway.
-            if rel.split('\\').any(|part| part == ".." || part.is_empty()) {
-                continue;
-            }
-            let path = folder.join(rel.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            // Names come from the remote PC: anything that is not a plain name
+            // below the folder is skipped.
+            let Some(path) = resolve_below(&folder, &rel) else { continue };
             if f.attributes.is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY)) {
                 std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
                 continue;
             }
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                if !stays_inside(&folder, dir) {
+                    continue;
+                }
             }
             let size = match f.file_size {
                 Some(s) => s,
@@ -378,8 +473,8 @@ impl Shared {
                 Some(p) if !p.is_empty() => p.split('\\').next().unwrap_or(&f.name).to_string(),
                 _ => f.name.clone(),
             };
-            let path = folder.join(top);
-            if !roots.contains(&path) && path.exists() {
+            let Some(path) = resolve_below(&folder, &top) else { continue };
+            if !roots.contains(&path) && path.exists() && stays_inside(&folder, &path) {
                 roots.push(path);
             }
         }
@@ -833,6 +928,31 @@ mod tests {
         let err = client.initiate_file_copy(files).err().expect("a file list is refused before start-up");
         assert!(crate::not_ready(&err), "{err}");
         assert!(client.initiate_copy(&[]).is_ok(), "the start-up copy goes out");
+    }
+
+    /// Remote file names that Path::join would take out of the download
+    /// folder (drive-relative, separators, streams, devices) are refused.
+    #[test]
+    fn remote_names_stay_in_the_download_folder() {
+        let folder = Path::new(r"C:\Temp\BananaConn\rdp-clipboard\1-1");
+        assert_eq!(resolve_below(folder, r"logs\a.txt"), Some(folder.join("logs").join("a.txt")));
+        assert_eq!(resolve_below(folder, "보고서 v1.2.txt"), Some(folder.join("보고서 v1.2.txt")));
+        for bad in [
+            r"C:evil.dll", r"C:\evil.dll", "a/../../evil.dll", "/evil.dll", r"..\evil.dll", r"a\..\..\b", r"\\server\share\x",
+            "file.txt:stream", "", r"a\\b", "...", "x. ", "NUL", "nul.txt", "COM1", "com9.log", "LPT¹", "CON .txt", "CONOUT$",
+            "a?b", "a\u{1}b",
+        ] {
+            assert_eq!(resolve_below(folder, bad), None, "{bad:?}");
+        }
+        assert!(!is_device_name("COM10") && !is_device_name("CONSOLE.txt") && !is_device_name("NULL"));
+    }
+
+    #[test]
+    fn download_folders_are_matched_by_owner() {
+        assert_eq!(download_owner("1234-7"), Some(1234));
+        assert_eq!(download_owner("1234-x"), None);
+        assert_eq!(download_owner("notes"), None);
+        assert!(process_alive(std::process::id()));
     }
 
     /// The clipboard channel is declared like mstsc and FreeRDP declare it

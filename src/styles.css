@@ -3987,3 +3987,30 @@ body.ai-resizing canvas,
 body.ai-resizing .xterm {
   pointer-events: none;
 }
+
+/* AI conversation text can be selected and copied. */
+.ai-log {
+  user-select: text;
+}
+.ai-msg.assistant {
+  position: relative;
+}
+.ai-msg-copy {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.ai-msg.assistant:hover .ai-msg-copy,
+.ai-msg-copy:focus-visible {
+  opacity: 1;
+}
+.ssh-setup-more { margin: 4px 0 8px; }
+.ssh-setup-more summary { cursor: pointer; color: var(--muted, #94a3b8); }
+.ssh-setup-log { margin: 6px 0; padding-left: 20px; max-height: 140px; overflow: auto; font: 12px/1.5 var(--mono); user-select: text; }
+.ssh-setup-log:empty { display: none; }
+.ssh-setup-log li[data-kind="local"] { color: var(--muted, #94a3b8); }
+.ssh-setup-log li[data-kind="error"] { color: var(--danger); }
+.ssh-setup-log li[data-kind="ok"] { color: var(--ok, #4ade80); }
+.ssh-setup-script pre { white-space: pre-wrap; word-break: break-all; }

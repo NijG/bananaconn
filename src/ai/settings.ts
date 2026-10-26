@@ -77,6 +77,9 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
   let modelsState: "loading" | "ready" | "error" = "loading";
   let modelsError = "";
   let loadSeq = 0;
+  // A stable id for the key typed in this editor, so storing it again (on blur,
+  // test, or save) updates the one vault entry instead of adding duplicates.
+  let newKeyCredId: string | null = null;
   const keyCreds = () => state.credentials.filter((c) => c.kind === "password");
   const modelField = () => {
     if (modelsState === "loading") return `<select name="model" disabled><option>모델 목록을 불러오는 중…</option></select>`;
@@ -122,13 +125,18 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     p.credentialId = form.querySelector("[name=credentialId]") ? v("credentialId") || null : p.kind === "cli" || p.kind === "ollama" ? null : p.credentialId;
     if (p.kind === "cli") p.cli = v("cli") || p.cli;
   };
-  // A new key goes to the vault first; the provider keeps only its id.
+  // A new key goes to the vault first; the provider keeps only its id. Reusing
+  // a stable id updates the same entry on repeated stores, and clearing the
+  // field afterwards keeps a later blur/save from storing the same key again.
   const storeKey = async () => {
-    const key = form.querySelector<HTMLInputElement>("[name=newKey]")?.value.trim();
+    const field = form.querySelector<HTMLInputElement>("[name=newKey]");
+    const key = field?.value.trim();
     if (!key) return;
-    const cred = await api.vaultSave({ id: crypto.randomUUID(), name: `${kindInfo(p.kind).label.split(" (")[0]} API 키`, username: "", kind: "password", keyPath: null, hasSecret: false }, key);
+    const cred = await api.vaultSave({ id: newKeyCredId ?? crypto.randomUUID(), name: `${kindInfo(p.kind).label.split(" (")[0]} API 키`, username: "", kind: "password", keyPath: null, hasSecret: false }, key);
+    newKeyCredId = cred.id;
     await reloadCredentials();
     p.credentialId = cred.id;
+    if (field) field.value = "";
   };
   /** Fill the model list from the service or the CLI's files. */
   const loadModels = async () => {
@@ -177,6 +185,7 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
       p.baseUrl = "";
       p.model = "";
       p.credentialId = null;
+      newKeyCredId = null; // a different service gets its own vault entry
       void loadModels();
     } else if (t.matches("[name=cli]")) {
       read();

@@ -46,7 +46,7 @@ struct Helper {
 
 impl Helper {
     fn send(&self, value: &Value) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().unwrap();
+        let mut stdin = self.stdin.lock().unwrap_or_else(|p| p.into_inner());
         writeln!(stdin, "{value}")
             .and_then(|_| stdin.flush())
             .map_err(|_| "RDP 세션이 이미 종료되었습니다".to_string())
@@ -230,7 +230,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
             if n == 0 {
                 break;
             }
-            let mut t = tail.lock().unwrap();
+            let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
             t.push_str(&String::from_utf8_lossy(&chunk[..n]));
             if t.len() > 4096 {
                 let cut = t.len() - 4096;
@@ -255,7 +255,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
     let token = crate::wsutil::random_token();
     let (frames, frames_rx) = mpsc::channel::<Vec<u8>>(4);
     let task = tauri::async_runtime::spawn(serve_frames(listener, format!("/{token}"), frames_rx, helper.clone()));
-    *helper.frames_task.lock().unwrap() = Some(task);
+    *helper.frames_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
     helper.send(&json!({
         "host": req.host,
         "port": port,
@@ -269,7 +269,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
         "connectAddr": req.tunnel_port.map(|p| format!("127.0.0.1:{p}")),
         "clipboard": req.clipboard.unwrap_or(true),
     }))?;
-    let replaced = app.state::<RdpState>().sessions.lock().unwrap().insert(req.id.clone(), helper.clone());
+    let replaced = app.state::<RdpState>().sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(req.id.clone(), helper.clone());
     if let Some(old) = replaced {
         stop(old);
     }
@@ -284,7 +284,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
             let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
             if len > MAX_MESSAGE || !matches!(header[0], 1 | 2) {
                 corrupt = true;
-                let _ = helper.child.lock().unwrap().kill();
+                let _ = helper.child.lock().unwrap_or_else(|p| p.into_inner()).kill();
                 break;
             }
             // Read straight into an uninitialised buffer (no zero-fill of a full screen).
@@ -297,7 +297,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
                 1 => {
                     let Ok(event) = serde_json::from_slice::<Value>(&payload) else { continue };
                     if event["type"] == "cert" {
-                        *helper.pending_fingerprint.lock().unwrap() = event["fingerprint"].as_str().map(String::from);
+                        *helper.pending_fingerprint.lock().unwrap_or_else(|p| p.into_inner()) = event["fingerprint"].as_str().map(String::from);
                     }
                     let _ = events.send(event);
                 }
@@ -312,7 +312,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
         // (rdp_close needs it to force-stop a lingering helper).
         let mut code = None;
         for _ in 0..100 {
-            if let Ok(Some(status)) = helper.child.lock().unwrap().try_wait() {
+            if let Ok(Some(status)) = helper.child.lock().unwrap_or_else(|p| p.into_inner()).try_wait() {
                 code = status.code();
                 break;
             }
@@ -321,7 +321,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
         // Forget the session unless a newer helper already took over this id.
         {
             let state = app.state::<RdpState>();
-            let mut sessions = state.sessions.lock().unwrap();
+            let mut sessions = state.sessions.lock().unwrap_or_else(|p| p.into_inner());
             if sessions.get(&id).is_some_and(|h| Arc::ptr_eq(h, &helper)) {
                 sessions.remove(&id);
             }
@@ -329,7 +329,7 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
         let detail = if corrupt {
             "RDP 구성 요소가 잘못된 데이터를 보내 연결을 종료했습니다".to_string()
         } else if code.is_some_and(|c| c != 0) {
-            stderr_tail.lock().unwrap().trim().to_string()
+            stderr_tail.lock().unwrap_or_else(|p| p.into_inner()).trim().to_string()
         } else {
             String::new()
         };
@@ -340,13 +340,13 @@ fn open_blocking(app: AppHandle, req: RdpOpen, events: Channel<Value>) -> Result
 
 /// Ask a helper to disconnect, force-stopping it if it lingers.
 fn stop(h: Arc<Helper>) {
-    if let Some(task) = h.frames_task.lock().unwrap().take() {
+    if let Some(task) = h.frames_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
         task.abort();
     }
     let _ = h.send(&json!({ "cmd": "close" }));
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(4));
-        let _ = h.child.lock().unwrap().kill();
+        let _ = h.child.lock().unwrap_or_else(|p| p.into_inner()).kill();
     });
 }
 
@@ -366,7 +366,7 @@ pub fn rdp_cert(app: AppHandle, state: State<RdpState>, id: String, accept: bool
     let h = helper(&state, &id)?;
     // Accepting means pinning: if the pin cannot be saved, the helper is told
     // "no" (it must never be left waiting), and the error is reported.
-    let saved = match h.pending_fingerprint.lock().unwrap().take() {
+    let saved = match h.pending_fingerprint.lock().unwrap_or_else(|p| p.into_inner()).take() {
         Some(fp) if accept => pin(&app, &h.host_key, fp),
         _ => Ok(()),
     };
@@ -375,7 +375,7 @@ pub fn rdp_cert(app: AppHandle, state: State<RdpState>, id: String, accept: bool
 }
 
 fn pin(app: &AppHandle, host_key: &str, fingerprint: String) -> Result<(), String> {
-    let _guard = KNOWN_LOCK.lock().unwrap();
+    let _guard = KNOWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut known = load_known(app)?;
     known.insert(host_key.to_string(), fingerprint);
     let text = serde_json::to_string_pretty(&known).map_err(|e| e.to_string())?;
@@ -402,7 +402,7 @@ pub fn rdp_resize(state: State<RdpState>, id: String, width: u32, height: u32, s
 /// Disconnect gracefully; the helper is force-stopped if it lingers.
 #[tauri::command]
 pub fn rdp_close(state: State<RdpState>, id: String) {
-    if let Some(h) = state.sessions.lock().unwrap().remove(&id) {
+    if let Some(h) = state.sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
         stop(h);
     }
 }

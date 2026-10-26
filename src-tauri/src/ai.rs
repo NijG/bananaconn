@@ -142,6 +142,9 @@ struct Done {
 #[derive(Default)]
 pub struct AiState {
     cancelled: Arc<Mutex<HashSet<String>>>,
+    /// Ids of chats currently running, so a cancel for one that already ended
+    /// (or never started) does not leave a stale id in `cancelled` forever.
+    running: Arc<Mutex<HashSet<String>>>,
 }
 
 const MAX_TOKENS: u32 = 4096;
@@ -190,12 +193,21 @@ struct Lines {
     pending: Vec<u8>,
 }
 
+/// A single streamed line should never be this long; past it the buffer is
+/// flushed so a misbehaving or hostile endpoint that never sends a newline
+/// cannot grow memory without bound.
+const MAX_LINE: usize = 4 * 1024 * 1024;
+
 impl Lines {
     fn feed(&mut self, data: &[u8], mut each: impl FnMut(&str)) {
         self.pending.extend_from_slice(data);
         while let Some(i) = self.pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.pending.drain(..=i).collect();
             let line = String::from_utf8_lossy(&line);
+            each(line.trim_end_matches(['\r', '\n']));
+        }
+        if self.pending.len() > MAX_LINE {
+            let line = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
             each(line.trim_end_matches(['\r', '\n']));
         }
     }
@@ -325,12 +337,24 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
 
 // ---- Subscription CLIs ----
 
-/// Where a CLI is installed (`where`), preferring a real program over a .cmd shim.
+/// Where a CLI is installed, preferring a real program over a .cmd shim.
 fn find_cli(name: &str) -> Option<std::path::PathBuf> {
-    let out = Command::new(r"C:\Windows\System32\where.exe").arg(name).creation_flags(0x0800_0000).output().ok()?;
-    let paths: Vec<std::path::PathBuf> = String::from_utf8_lossy(&out.stdout).lines().map(|l| std::path::PathBuf::from(l.trim())).filter(|p| p.extension().is_some()).collect();
-    let ext = |p: &std::path::PathBuf, e: &str| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(e));
-    paths.iter().find(|p| ext(p, "exe")).or_else(|| paths.iter().find(|p| ext(p, "cmd") || ext(p, "bat"))).cloned()
+    find_in_path(name, &std::env::var_os("PATH")?, std::env::current_dir().ok().as_deref())
+}
+
+/// `name`.exe (else .cmd/.bat) in the folders of `path`, in their order.
+/// Searched here rather than with where.exe, which looks in the current
+/// folder first: a claude.exe dropped there would run. Relative entries
+/// ("." or ".\bin") and the current folder itself are skipped for the same
+/// reason.
+fn find_in_path(name: &str, path: &std::ffi::OsStr, current: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let current = current.and_then(|c| c.canonicalize().ok());
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .filter(|d| current.is_none() || d.canonicalize().ok() != current)
+        .collect();
+    let first = |exts: &[&str]| dirs.iter().find_map(|d| exts.iter().map(|e| d.join(format!("{name}.{e}"))).find(|p| p.is_file()));
+    first(&["exe"]).or_else(|| first(&["cmd", "bat"]))
 }
 
 #[derive(Serialize)]
@@ -449,15 +473,101 @@ fn cli_prompt(system: Option<&str>, messages: &[Message]) -> String {
     out
 }
 
+/// The processes of one CLI run. The CLIs are often .cmd shims that start
+/// node, which may start more: killing the shim alone leaves those running,
+/// holding the output pipes open (the read never ends) and the run's folder
+/// in use (it cannot be removed). A job of its own ends them all at once; it
+/// is nested in the app's job (crate::childjob), which ends them with the app.
+struct RunJob(windows_sys::Win32::Foundation::HANDLE);
+
+// The handle is only passed to job functions, which are thread-safe.
+unsafe impl Send for RunJob {}
+unsafe impl Sync for RunJob {}
+
+impl RunJob {
+    /// A job holding `child`, or None when Windows refuses (the run then
+    /// falls back to taskkill /T).
+    fn holding(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: a fresh job handle, owned by RunJob (closed on drop); the
+        // info struct lives across the call.
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let job = RunJob(h);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+            if SetInformationJobObject(h, JobObjectExtendedLimitInformation, &info as *const _ as *const _, size) == 0 {
+                return None;
+            }
+            (AssignProcessToJobObject(h, child.as_raw_handle() as _) != 0).then_some(job)
+        }
+    }
+
+    /// Ends every process of the run, then waits (briefly) until they are
+    /// gone, so their pipes are closed and the folder is free.
+    fn end_all(&self) {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        // SAFETY: valid job handle; the info struct lives across each call.
+        unsafe {
+            TerminateJobObject(self.0, 1);
+            let until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < until {
+                let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+                let size = std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32;
+                let ok = QueryInformationJobObject(self.0, JobObjectBasicAccountingInformation, &mut info as *mut _ as *mut _, size, std::ptr::null_mut());
+                if ok == 0 || info.ActiveProcesses == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+impl Drop for RunJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateJobObjectW and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Ends a CLI run's whole process tree: its job, or taskkill /T without one.
+fn end_run(job: Option<&RunJob>, pid: u32) {
+    match job {
+        Some(job) => job.end_all(),
+        None => {
+            let _ = Command::new(r"C:\Windows\System32\taskkill.exe")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// How long one CLI answer may take.
+const CLI_LIMIT: Duration = Duration::from_secs(600);
+
 /// One answer from a subscription CLI. It runs in an empty folder of its own;
 /// Claude Code gets no tools at all (nothing it says can run or read
 /// anything), Codex a read-only sandbox.
-fn chat_cli(p: &Provider, system: &str, messages: &[Message], cancelled: &dyn Fn() -> bool, on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+fn chat_cli(p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
     let path = find_cli(&p.cli).ok_or_else(|| format!("{} CLI를 찾을 수 없습니다. 설치하고 로그인한 뒤 다시 시도하세요", p.cli))?;
     chat_cli_at(&path, p, system, messages, cancelled, on_text)
 }
 
-fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[Message], cancelled: &dyn Fn() -> bool, on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
     let name = p.cli.as_str();
     let dir = std::env::temp_dir().join("BananaConn").join(format!("ai-{}-{}", std::process::id(), crate::wsutil::random_token()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -526,9 +636,18 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         .creation_flags(0x0800_0000)
         .spawn()
         .map_err(|e| format!("{name} CLI를 실행할 수 없습니다: {e}"))?;
+    // The app's job first (ends the run with the app), then the run's own
+    // job, which Windows nests inside it.
     crate::childjob::adopt(&child);
+    let job = RunJob::holding(&child);
+    let pid = child.id();
+    // Fed on a thread of its own: a CLI that does not read its input (or a
+    // big attachment filling the pipe) must not keep the watchdog from
+    // starting.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_text.as_bytes());
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(stdin_text.as_bytes());
+        });
     }
     let mut err = child.stderr.take().unwrap();
     let errors = std::thread::spawn(move || {
@@ -537,47 +656,71 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         s
     });
     let out = child.stdout.take().unwrap();
-    let start = Instant::now();
     let mut streamed = false;
     let mut result: Option<String> = None;
     let mut cli_error: Option<String> = None;
-    for line in BufReader::new(out).lines() {
-        let Ok(line) = line else { break };
-        if cancelled() || start.elapsed() > Duration::from_secs(600) {
-            let _ = child.kill();
-            break;
-        }
-        if !stream_json {
-            if !on_text(&format!("{line}\n")) {
-                let _ = child.kill();
-                break;
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let status = std::thread::scope(|scope| {
+        // Cancel and the time limit are checked here, not between output
+        // lines: a CLI that prints nothing would otherwise never be stopped.
+        scope.spawn(|| {
+            let deadline = Instant::now() + CLI_LIMIT;
+            while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                let late = Instant::now() >= deadline;
+                if cancelled() || late {
+                    timed_out.store(late, std::sync::atomic::Ordering::SeqCst);
+                    end_run(job.as_ref(), pid);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            continue;
-        }
-        // Claude Code stream-json: partial text deltas, then a result line.
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        match v["type"].as_str() {
-            Some("stream_event") if v["event"]["type"] == "content_block_delta" => {
-                if let Some(t) = v["event"]["delta"]["text"].as_str() {
-                    streamed = true;
-                    if !on_text(t) {
-                        let _ = child.kill();
-                        break;
+        });
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if !stream_json {
+                if !on_text(&format!("{line}\n")) {
+                    end_run(job.as_ref(), pid);
+                    break;
+                }
+                continue;
+            }
+            // Claude Code stream-json: partial text deltas, then a result line.
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            match v["type"].as_str() {
+                Some("stream_event") if v["event"]["type"] == "content_block_delta" => {
+                    if let Some(t) = v["event"]["delta"]["text"].as_str() {
+                        streamed = true;
+                        if !on_text(t) {
+                            end_run(job.as_ref(), pid);
+                            break;
+                        }
                     }
                 }
-            }
-            Some("result") => {
-                if v["is_error"].as_bool() == Some(true) {
-                    cli_error = Some(v["result"].as_str().unwrap_or("CLI 오류").to_string());
-                } else {
-                    result = v["result"].as_str().map(str::to_string);
+                Some("result") => {
+                    if v["is_error"].as_bool() == Some(true) {
+                        cli_error = Some(v["result"].as_str().unwrap_or("CLI 오류").to_string());
+                    } else {
+                        result = v["result"].as_str().map(str::to_string);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
+        let status = child.wait();
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        status
+    });
+    // Whatever the CLI left running ends now: it would hold stderr open
+    // (the read below would never end) and the folder removed on return.
+    if let Some(job) = &job {
+        job.end_all();
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = status.map_err(|e| e.to_string())?;
     let stderr = errors.join().unwrap_or_default();
+    if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(format!("{name} CLI가 {}분 안에 답하지 않아 중지했습니다", CLI_LIMIT.as_secs() / 60));
+    }
     if let Some(e) = cli_error {
         return Err(e);
     }
@@ -623,7 +766,9 @@ fn cli_failure(name: &str, stderr: &str, code: Option<i32>) -> String {
 #[tauri::command]
 pub fn ai_chat(app: AppHandle, state: State<'_, AiState>, id: String, provider: Provider, system: String, messages: Vec<Message>) {
     let cancelled = state.cancelled.clone();
+    let running = state.running.clone();
     cancelled.lock().unwrap().remove(&id);
+    running.lock().unwrap().insert(id.clone());
     std::thread::spawn(move || {
         let is_cancelled = || cancelled.lock().unwrap().contains(&id);
         let mut emit = |text: &str| {
@@ -634,14 +779,24 @@ pub fn ai_chat(app: AppHandle, state: State<'_, AiState>, id: String, provider: 
             true
         };
         let r = if provider.kind == "cli" { chat_cli(&provider, &system, &messages, &is_cancelled, &mut emit) } else { api_key(&app, &provider).and_then(|key| chat_http(key, &provider, &system, &messages, &mut emit)) };
+        // Lock `running` first, then `cancelled` (same order as ai_cancel), so a
+        // concurrent cancel either marks this chat before it ends or sees it gone.
+        let mut run = running.lock().unwrap();
+        run.remove(&id);
         let was_cancelled = cancelled.lock().unwrap().remove(&id);
+        drop(run);
         let _ = app.emit("ai-done", Done { id: id.clone(), error: if was_cancelled { None } else { r.err() }, cancelled: was_cancelled });
     });
 }
 
 #[tauri::command]
 pub fn ai_cancel(state: State<'_, AiState>, id: String) {
-    state.cancelled.lock().unwrap().insert(id);
+    // Only a running chat can be cancelled; otherwise the id would linger in the
+    // set with nothing to remove it.
+    let running = state.running.lock().unwrap();
+    if running.contains(&id) {
+        state.cancelled.lock().unwrap().insert(id);
+    }
 }
 
 /// The models a provider offers (for the settings list).
@@ -991,6 +1146,49 @@ mod tests {
         // Rust quotes the braces for cmd; the program behind the shim gets mcp_servers={}.
         assert!(args.contains("exec --sandbox read-only --skip-git-repo-check --color never -c \"mcp_servers={}\" -"), "{args}");
         assert!(stdin.contains("<instructions>") && stdin.contains("SYS") && stdin.contains("load?"), "{stdin}");
+    }
+
+    /// A CLI that prints nothing is still stopped on cancel, with whatever it
+    /// started (a .cmd shim's node), and its folder is removed afterwards.
+    #[test]
+    fn a_silent_cli_is_cancelled_with_its_whole_tree() {
+        let dir = std::env::temp_dir().join(format!("bx-fake-silent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("cwd.txt");
+        let script = dir.join("codex.cmd");
+        // The background ping keeps the stderr pipe open after the shim is killed.
+        let ping = r"C:\Windows\System32\PING.EXE -n 120 127.0.0.1 >nul";
+        std::fs::write(&script, format!("@echo off\r\n> \"{log}\" echo %CD%\r\nstart /b \"\" {ping}\r\n{ping}\r\n", log = log.display())).unwrap();
+        let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "codex".into() };
+        let start = Instant::now();
+        let cancel = move || start.elapsed() > Duration::from_millis(1500);
+        let r = chat_cli_at(&script, &p, "S", &[Message { role: "user".into(), content: "q".into(), attachments: vec![] }], &cancel, &mut |_| true);
+        let took = start.elapsed();
+        let cwd = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Ok(()));
+        assert!(took < Duration::from_secs(20), "stopped after {took:?}");
+        assert!(cwd.contains("BananaConn\\ai-"), "{cwd}");
+        assert!(!std::path::Path::new(cwd.trim()).exists(), "the run's folder is removed");
+    }
+
+    /// CLIs are looked up in PATH's absolute folders only, never in the
+    /// current folder; a real program beats a .cmd shim.
+    #[test]
+    fn clis_are_found_in_path_but_not_in_the_current_folder() {
+        let base = std::env::temp_dir().join(format!("bx-cli-path-{}", std::process::id()));
+        let (cwd, shims, bin) = (base.join("cwd"), base.join("shims"), base.join("bin"));
+        for d in [&cwd, &shims, &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(cwd.join("claude.exe"), b"").unwrap();
+        std::fs::write(shims.join("claude.cmd"), b"").unwrap();
+        let path = std::env::join_paths([std::path::PathBuf::from("."), cwd.clone(), shims.clone(), bin.clone()]).unwrap();
+        assert_eq!(find_in_path("claude", &path, Some(&cwd)), Some(shims.join("claude.cmd")));
+        std::fs::write(bin.join("claude.exe"), b"").unwrap();
+        assert_eq!(find_in_path("claude", &path, Some(&cwd)), Some(bin.join("claude.exe")));
+        assert_eq!(find_in_path("codex", &path, Some(&cwd)), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A user's real Codex failure: an MCP server's auth noise must not read as

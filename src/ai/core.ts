@@ -86,8 +86,12 @@ const SECRET = "«SECRET»";
 const SECRET_RULES: RegExp[] = [
   // key = value, key: value (password=, api_key:, TOKEN=, "secret": "…")
   /((?<![a-z])(?:pass(?:word|wd|phrase)?|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|client[_-]?secret)\w*["']?\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;]+)/gi,
-  // --password x, --token=x
-  /(\s--?(?:pass(?:word|wd)?|token|secret|api[_-]?key)(?:=|\s+))(\S+)/gi,
+  // --password x, --token=x (a "(" starts an expression, e.g. a ConvertTo-SecureString call, masked below)
+  /(\s--?(?:pass(?:word|wd)?|token|secret|api[_-]?key)(?:=|\s+))(?!\()(\S+)/gi,
+  // PowerShell: ConvertTo-SecureString 'plain' -AsPlainText (also inside -Password (…))
+  /(ConvertTo-SecureString\s+(?:-String\s+)?)("[^"\n]*"|'[^'\n]*'|[^\s)]+)/gi,
+  // net user <name> <password> /add — not a switch (/add, -something)
+  /(\bnet\s+user\s+[^\s/]+\s+)(?![/-])(\S+)/gi,
   // mysql -pSECRET
   /(\bmysql\w*\b[^\n]*?\s-p)(\S+)/g,
   // curl -u user:pass
@@ -110,6 +114,16 @@ const SECRET_TOKENS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b/g,
 ];
+/** Replace passwords, keys and tokens with «SECRET», leaving everything else
+ * (hosts, IPs) as is. Used before a conversation is written to disk, so secrets
+ * never persist in localStorage; the Masker counts them for the send preview. */
+export function maskSecrets(text: string): string {
+  let out = text;
+  for (const re of SECRET_TOKENS) out = out.replace(re, () => SECRET);
+  for (const re of SECRET_RULES) out = out.replace(re, (_m, keep: string) => keep + SECRET);
+  return out;
+}
+
 const IPV4 = /\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/g;
 const IPV6 = /(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])/gi;
 /** An IPv6 address, not a time (10:20:30) or a MAC address (aa:bb:cc:dd:ee:ff). */

@@ -15,7 +15,7 @@ import {
 } from "./importers";
 import type { MenuItem } from "./ui";
 import { icon } from "./icons";
-import { endpoint, normalizeSession, PROTOCOLS, SENSITIVE_OPTIONS, type Protocol, type Session } from "./model";
+import { endpoint, isSensitiveOption, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
 import { addFolder, saveSnippets, state, upsertSessions, type Snippet } from "./store";
 import { addSavedTunnels, parseTunnel, savedTunnels } from "./tunnels";
 import { errorText, esc, modal, timestamp, toast } from "./ui";
@@ -165,11 +165,9 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
       logLinePrefix: "로그 파일 위치·자동 기록",
       proxyLocalCommand: "로컬 프록시 명령 (이 PC에서 명령 실행)",
     };
-    const sensitiveOf = (s: Session) =>
-      SENSITIVE_OPTIONS.filter((k) => {
-        const v = s.options[k];
-        return v !== undefined && v !== null && v !== false && v !== "";
-      });
+    // Any other proxy option (host, port, credential...) shares one label.
+    const labelOf = (k: string) => SENSITIVE_TEXT[k] ?? (k.startsWith("proxy") ? "프록시 경유 연결" : k);
+    const sensitiveOf = (s: Session) => sensitiveOptionKeys(s.options);
     const risky = fresh.filter((s) => sensitiveOf(s).length);
     const rows = fresh
       .slice(0, 200)
@@ -177,7 +175,7 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
         const p = PROTOCOLS[s.protocol];
         const flags = sensitiveOf(s);
         return `<tr><td><span class="proto-chip" style="--proto:${p.color}">${p.label}</span></td>
-          <td>${esc(s.name)}${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}${esc([...new Set(flags.map((f) => SENSITIVE_TEXT[f]))].join(", "))}</small>` : ""}</td>
+          <td>${esc(s.name)}${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}${esc([...new Set(flags.map(labelOf))].join(", "))}</small>` : ""}</td>
           <td class="mono">${esc(endpoint(s))}</td><td class="muted">${esc(s.folder || "—")}</td></tr>`;
       })
       .join("");
@@ -194,7 +192,7 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
         ${fresh.length ? `<div class="import-table"><table><thead><tr><th>종류</th><th>이름</th><th>대상</th><th>폴더</th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}
         ${risky.length || tunnels ? `<label class="check block import-risky"><input type="checkbox" name="keepSensitive"/>
           <span><b>보안 관련 옵션도 가져오기 (${risky.length}개 세션)</b>${tunnels ? `<small>백업의 SSH 터널 ${tunnels}개는 이 옵션을 켤 때만 가져옵니다.</small>` : ""}
-          <small>인증서 오류 무시, 에이전트 전달, 포트 포워딩, 점프 호스트, 드라이브 공유, 로그 파일 위치 설정입니다. 직접 만든 백업이 아니라면 끈 채로 두세요. 끄면 이 옵션만 빼고 가져옵니다.</small></span></label>` : ""}
+          <small>인증서 오류 무시, 에이전트 전달, 포트 포워딩, 점프 호스트, 프록시, 드라이브 공유, 로그 파일 위치 설정입니다. 직접 만든 백업이 아니라면 끈 채로 두세요. 끄면 이 옵션만 빼고 가져옵니다.</small></span></label>` : ""}
         <p class="muted small">비밀번호는 가져오지 않습니다. 처음 연결할 때 입력하거나 자격 증명 보관함에서 지정하세요.</p>`,
       footer: `<button class="btn" data-close>취소</button>
                <button class="btn btn-primary" data-ok ${fresh.length || extras ? "" : "disabled"}>${icon("Check", 14)}${fresh.length ? `${fresh.length}개 가져오기` : "백업 복원"}</button>`,
@@ -204,7 +202,7 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
       try {
         keep = m.root.querySelector<HTMLInputElement>("[name=keepSensitive]")?.checked ?? false;
         if (!keep)
-          for (const s of fresh) for (const k of SENSITIVE_OPTIONS) delete s.options[k];
+          for (const s of fresh) for (const k of Object.keys(s.options)) if (isSensitiveOption(k)) delete s.options[k];
         confirmed = true;
         if (fresh.length) {
           await upsertSessions(fresh);
@@ -365,11 +363,10 @@ export async function importFromBackup() {
     });
     const tunnels = Array.isArray((data as { tunnels?: unknown }).tunnels) ? (data as { tunnels: unknown[] }).tunnels.length : 0;
     const d = data as { folders?: unknown; snippets?: unknown };
-    const have = new Set(state.snippets.map((x) => x.id));
     const extras =
       tunnels +
       (Array.isArray(d.folders) ? d.folders.filter((f) => typeof f === "string" && !state.extraFolders.has(f)).length : 0) +
-      (Array.isArray(d.snippets) ? d.snippets.filter((x) => x && typeof x === "object" && !have.has((x as { id?: string }).id ?? "")).length : 0);
+      (Array.isArray(d.snippets) ? missingSnippets(d.snippets).length : 0);
     const { keep, confirmed } = await reviewImport("세션 백업 가져오기", { sessions, skipped: [] }, tunnels, extras);
     if (confirmed) restoreExtras(data, ids, keep);
   } catch (err) {
@@ -377,15 +374,32 @@ export async function importFromBackup() {
   }
 }
 
+/** A backup's snippets that are not here yet, parsed field by field. Each gets
+ * a fresh id: the backup's id is untrusted text (it ends up in markup), so a
+ * snippet counts as present when its content matches, not its id. */
+function missingSnippets(raw: unknown[]): Snippet[] {
+  const key = (s: Pick<Snippet, "name" | "text" | "macro" | "group">) => JSON.stringify([s.name, s.text, !!s.macro, s.group ?? ""]);
+  const have = new Set(state.snippets.map(key));
+  return raw.flatMap((x): Snippet[] => {
+    if (!x || typeof x !== "object") return [];
+    const s = x as Record<string, unknown>;
+    if (typeof s.name !== "string" || typeof s.text !== "string") return [];
+    const snippet: Snippet = { id: crypto.randomUUID(), name: s.name, text: s.text, run: s.run === true };
+    if (s.macro === true) snippet.macro = true;
+    if (typeof s.group === "string" && s.group.trim()) snippet.group = s.group.trim();
+    const k = key(snippet);
+    if (have.has(k)) return [];
+    have.add(k);
+    return [snippet];
+  });
+}
+
 /** Folders, snippets and tunnels of a backup that are missing here. */
 function restoreExtras(data: unknown, ids: Map<string, string>, withTunnels: boolean) {
   const d = (data ?? {}) as { folders?: unknown; snippets?: unknown; tunnels?: unknown };
   if (Array.isArray(d.folders)) for (const f of d.folders) if (typeof f === "string") addFolder(f);
   if (Array.isArray(d.snippets)) {
-    const have = new Set(state.snippets.map((s) => s.id));
-    const add = d.snippets.filter(
-      (s): s is Snippet => !!s && typeof s === "object" && typeof s.id === "string" && typeof s.name === "string" && typeof s.text === "string" && !have.has(s.id),
-    );
+    const add = missingSnippets(d.snippets);
     if (add.length) saveSnippets([...state.snippets, ...add]);
   }
   if (withTunnels && Array.isArray(d.tunnels)) {

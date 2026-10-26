@@ -158,13 +158,13 @@ export const SECTIONS: HelpSection[] = [
         <li><b>连接方式</b>：API 密钥（Anthropic Claude、OpenAI、Google Gemini、OpenAI 兼容服务器）、订阅 CLI（Claude Code、Codex CLI、Gemini CLI：在本机安装并登录一次后，即可用您的订阅回答）、本地 LLM（Ollama，或 LM Studio、llama.cpp、vLLM 等 OpenAI 兼容服务器）。API 密钥保存在凭据保管库中；“加载列表”获取模型，“测试连接”试用服务。</li>
         <li><b>生成命令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可得到一条适合所识别设备或系统的命令。再按一次 Enter 将其放入输入行（不会执行），由您自己按 Enter 执行。危险命令规则同样适用：被阻止的命令（修改时间、NTP 等）甚至不会放入输入行。</li>
         <li><b>解释输出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：解释所选文本（若未选择则为屏幕上最近的输出）的含义、可能原因和后续步骤。</li>
-        <li><b>AI 对话</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在终端右侧打开对话窗格。用“附加所选内容”一并发送输出；回答中每行命令旁的按钮可将其放入输入行。 拖动对话窗格的左边缘可调整宽度 (所有标签页记住同一宽度)，双击恢复默认宽度。</li>
+        <li><b>AI 对话</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在终端右侧打开对话窗格。用“附加所选内容”一并发送输出；回答中每行命令旁的按钮可将其放入输入行。 拖动对话窗格的左边缘可调整宽度 (所有标签页记住同一宽度)，双击恢复默认宽度。 对话内容可以拖动选择并复制，也可以使用每条消息的复制按钮、顶部的“复制整个对话”或右键菜单复制。</li>
         <li><b>AI 执行命令</b>：在 AI 对话中写下要做的事，AI 会在此终端中逐条执行命令，读取结果并分析。每次执行都显示在屏幕上，并全部记录在 <code>risky-commands.log</code> 中。只读命令（<code>df</code>、<code>free</code>、<code>systemctl status</code>、<code>show …</code>、<code>display …</code> 等）直接执行；可能更改系统的命令会等待您选择“执行”或“跳过”。符合阻止规则的命令（修改时间、NTP 等）绝不执行。每个问题最多 8 条命令，每条命令 30 秒后用 Ctrl+C 停止。可用对话窗格下方的按钮切换为“每条都确认”或“不执行”。</li>
         <li><b>配置与日志分析</b>：对话窗格中的文件按钮可选择配置或日志文件进行检查（安全问题、危险设置）或分析（错误、异常迹象）。网络设备可通过设备按钮 → “用 AI 检查配置”直接检查 running-config。</li>
         <li><b>发送的内容</b>：发送到云端 AI 之前，会显示将要发送的内容并请您确认（每个对话可选择“不再询问”）。密码、密钥和令牌（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私钥等）始终会被隐藏；开启设置后，IP 地址和主机名也会替换为 IP_1、HOST_1 等再发送，回答中会还原为真实值。本地 LLM 不会离开本机，因此不会询问或隐藏。向外部 AI 发送公司设备信息前，请确认公司的安全策略。</li>
         <li>订阅 CLI：Claude Code 在关闭所有工具（不执行命令、不读取文件）的状态下于空文件夹中运行，Codex 在只读沙箱中运行。应用不会处理您的登录信息。</li>
         <li><b>附件与远程桌面</b>：用对话窗格的 📎 按钮、拖放或 <kbd>Ctrl</kbd>+<kbd>V</kbd>（截图）附加图片、PDF 和文本文件。文本文件会并入消息并应用隐藏；图片和 PDF 无法隐藏，会在预览中按原样显示。大图片会自动缩小。大多数服务接受图片；PDF 由 Claude、Gemini、OpenAI API 和 Claude Code 接受。在 RDP 和 VNC 中，工具栏的“AI”可截取远程屏幕来获得解释或附加到对话。远程桌面中 AI 不执行命令，回答中的命令可用复制按钮复制后粘贴到远程屏幕。</li>
-        <li><b>在 RDP 电脑上由 AI 直接执行</b>：在 RDP 工具栏的“AI”→“通过 SSH 连接以便 AI 执行命令…”中会显示启用 OpenSSH 服务器的脚本。复制后在远程画面的管理员 PowerShell 中运行，再点击“检查连接并打开 SSH 会话”，即会检查 22 端口，并以相同的主机、账户和文件夹添加并打开 SSH 会话 (已有则直接打开)。在该会话中，AI 会立即执行 Get-*、ipconfig、systeminfo 等只读 PowerShell 命令，可能更改系统的命令则先请求确认。 VNC 的“AI”菜单中也有相同的项目，并会显示在 Linux/Unix 电脑上启用 SSH 服务器的命令 (VNC 密码不会用于 SSH 登录)。</li>
+        <li><b>在 RDP/VNC 电脑上由 AI 直接执行</b>：工具栏的“AI”→“通过 SSH 连接以便 AI 执行命令…”会显示一行命令。在远程画面按 Win+R (运行) 粘贴并按 Enter，在管理员确认中选择“是”，其余自动完成。如果没有 OpenSSH，此电脑会发送到远程电脑并安装 (首次从 github.com/PowerShell/Win32-OpenSSH 下载并保存)，因此无法上网的 Windows 7 电脑也可以。会启动服务、在所有网络配置文件中允许 22 端口并将默认 shell 设为 PowerShell，进度显示在应用中，完成后以相同的主机、账户和文件夹打开 SSH 会话 (已有则使用该会话)。如果远程电脑无法从此电脑获取文件，请在此电脑的 Windows 防火墙中允许 BananaConn。在该会话中，AI 会立即执行 Get-*、ipconfig、systeminfo 等只读 PowerShell 命令，可能更改系统的命令则先请求确认。VNC 菜单还提供在 Linux/Unix 电脑上启用 SSH 服务器的命令 (VNC 密码不会用于 SSH 登录)。</li>
       </ul>`,
   },
   {

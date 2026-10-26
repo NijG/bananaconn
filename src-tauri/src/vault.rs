@@ -144,6 +144,13 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
         let mut creds = read_all(&app)?;
         let previous = creds.iter().find(|c| c.id == cred.id).map(|c| c.has_secret);
         let kind_changed = creds.iter().any(|c| c.id == cred.id && c.kind != cred.kind);
+        // The keyring changes before the list is written; if that write fails,
+        // the two would disagree. Keep the old secret so the keyring can be put
+        // back. (`touched` is set whenever the keyring entry is mutated below.)
+        let touched = secret.is_some() || kind_changed;
+        // read_secret includes the legacy store, so a not-yet-migrated secret
+        // can still be restored if the list write later fails.
+        let old_secret = if touched && previous == Some(true) { read_secret(&cred.id).ok().flatten() } else { None };
         match secret.as_deref() {
             Some("") => {
                 delete_secret(&cred.id)?;
@@ -169,11 +176,21 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
             creds.push(cred.clone());
         }
         if let Err(e) = write_all(&app, &creds) {
-            // A new credential's secret must not stay behind without its entry.
-            if previous.is_none() && cred.has_secret
-                && let Ok(en) = entry(&cred.id) {
-                    let _ = en.delete_credential();
+            // The list write failed: undo the keyring change so the two agree.
+            if touched {
+                match &old_secret {
+                    // Restore the secret that was there before this save.
+                    Some(old) => {
+                        let _ = entry(&cred.id).and_then(|en| en.set_password(old).map_err(|e| e.to_string()));
+                    }
+                    // There was none; remove the one this save had just added.
+                    None => {
+                        if let Ok(en) = entry(&cred.id) {
+                            let _ = en.delete_credential();
+                        }
+                    }
                 }
+            }
             return Err(e);
         }
         Ok(cred)

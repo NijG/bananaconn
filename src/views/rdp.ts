@@ -67,7 +67,7 @@ export class RdpView implements View {
       { class: "view rdp-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
-         <span class="view-endpoint">${esc(endpoint(session))}</span>
+         <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state></span>
          <span class="rdp-clip" data-clip hidden></span>
          <div class="view-actions">
@@ -648,13 +648,31 @@ export class RdpView implements View {
     // Types text only: images and files go through the shared clipboard instead.
     if (!text) return toast("클립보드에 입력할 텍스트가 없습니다. 이미지·파일은 원격 화면을 클릭한 뒤 Ctrl+V로 붙여넣으세요.", "warn", 5000);
     if (text.length > 4000) return toast("클립보드 텍스트가 너무 깁니다 (4000자 이하)", "warn");
-    const ops: Op[] = [];
+    this.canvas.focus();
+    // A modifier still held (Shift/Ctrl/Alt from the click or a prior key) would
+    // turn typed text into shortcuts or wrong case: start from a clean keyboard.
+    await api.rdpInput(this.id, [{ t: "releaseAll" }]).catch(() => {});
+    // Each character as its own press+release, sent in small groups with a short
+    // gap. A whole paste in one burst makes servers and apps drop characters
+    // (especially repeats); the pacing is what makes it land reliably.
+    const groups: Op[][] = [];
+    let group: Op[] = [];
     for (const ch of text) {
-      if (ch === "\n") ops.push({ t: "key", code: KEY.enter[0], ext: false, down: true }, { t: "key", code: KEY.enter[0], ext: false, down: false });
-      else if (ch === "\t") ops.push({ t: "key", code: KEY.tab[0], ext: false, down: true }, { t: "key", code: KEY.tab[0], ext: false, down: false });
-      else ops.push({ t: "unicode", ch, down: true }, { t: "unicode", ch, down: false });
+      if (ch === "\n") group.push({ t: "key", code: KEY.enter[0], ext: false, down: true }, { t: "key", code: KEY.enter[0], ext: false, down: false });
+      else if (ch === "\t") group.push({ t: "key", code: KEY.tab[0], ext: false, down: true }, { t: "key", code: KEY.tab[0], ext: false, down: false });
+      else group.push({ t: "unicode", ch, down: true }, { t: "unicode", ch, down: false });
+      if (group.length >= 16) {
+        groups.push(group);
+        group = [];
+      }
     }
-    for (let i = 0; i < ops.length; i += 200) await api.rdpInput(this.id, ops.slice(i, i + 200)).catch(() => {});
+    if (group.length) groups.push(group);
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    for (const g of groups) {
+      if (this.state !== "connected") return;
+      await api.rdpInput(this.id, g).catch(() => {});
+      await sleep(12);
+    }
     this.canvas.focus();
     toast(`${[...text].length}자를 원격에 입력했습니다`, "success");
   }
@@ -791,6 +809,10 @@ export class RdpView implements View {
 
   private cleanup() {
     clearTimeout(this.clipTimer);
+    // Resize debounce/fallback timers would otherwise fire after close and call
+    // the backend with a dead id.
+    clearTimeout(this.resizeTimer);
+    clearTimeout(this.resizeFallback);
     this.frames?.close();
     this.frames = null;
     if (this.id) api.rdpClose(this.id).catch(() => {});

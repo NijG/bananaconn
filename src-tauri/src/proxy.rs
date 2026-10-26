@@ -148,24 +148,29 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 /// PuTTY's substitutions in proxy commands: %host %port %user %pass %%, and
 /// backslash escapes \n \r \t \\ \xHH.
 pub fn expand(template: &str, host: &str, port: u16, auth: &Auth) -> Vec<u8> {
+    // Works on bytes only: every token is ASCII, and slicing the str at `i`
+    // would panic inside a multi-byte character (a Korean folder name in the
+    // command's path). Bytes that are not part of a token are copied as they
+    // are, so the UTF-8 output stays intact.
     let mut out = Vec::new();
     let b = template.as_bytes();
+    let hex = |at: usize| b.get(at..at + 2).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
     let mut i = 0;
     while i < b.len() {
-        let rest = &template[i..];
-        if rest.starts_with("%host") {
+        let rest = &b[i..];
+        if rest.starts_with(b"%host") {
             out.extend_from_slice(host.as_bytes());
             i += 5;
-        } else if rest.starts_with("%port") {
+        } else if rest.starts_with(b"%port") {
             out.extend_from_slice(port.to_string().as_bytes());
             i += 5;
-        } else if rest.starts_with("%user") {
+        } else if rest.starts_with(b"%user") {
             out.extend_from_slice(auth.user.as_bytes());
             i += 5;
-        } else if rest.starts_with("%pass") {
+        } else if rest.starts_with(b"%pass") {
             out.extend_from_slice(auth.pass.as_bytes());
             i += 5;
-        } else if rest.starts_with("%%") {
+        } else if rest.starts_with(b"%%") {
             out.push(b'%');
             i += 2;
         } else if b[i] == b'\\' && i + 1 < b.len() {
@@ -174,13 +179,20 @@ pub fn expand(template: &str, host: &str, port: u16, auth: &Auth) -> Vec<u8> {
                 b'r' => out.push(b'\r'),
                 b't' => out.push(b'\t'),
                 b'\\' => out.push(b'\\'),
-                b'x' if template.get(i + 2..i + 4).and_then(|h| u8::from_str_radix(h, 16).ok()).is_some() => {
-                    out.push(u8::from_str_radix(&template[i + 2..i + 4], 16).unwrap_or(0));
+                b'x' if hex(i + 2).is_some() => {
+                    out.push(hex(i + 2).unwrap_or(0));
                     i += 2;
                 }
-                other => {
+                // Not an escape: both kept as they are. A multi-byte
+                // character after the backslash is copied by the plain path.
+                other if other.is_ascii() => {
                     out.push(b'\\');
                     out.push(other);
+                }
+                _ => {
+                    out.push(b'\\');
+                    i += 1;
+                    continue;
                 }
             }
             i += 2;
@@ -518,21 +530,33 @@ pub fn open_forward(app: &AppHandle, state: &ProxyState, id: &str, host: &str, p
     let auth = auth_for(app, Some(&proxy))?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("프록시 중계 포트를 열 수 없습니다: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let _ = listener.set_nonblocking(true);
+    // Blocking accept (no idle polling); close_forward wakes it with a throwaway
+    // connection so an idle forward costs no CPU.
     let stop = Arc::new(AtomicBool::new(false));
-    state.forwards.lock().unwrap().insert(id.to_string(), Forward { stop: stop.clone(), port: local });
+    // Check and insert under one lock: a parallel open for the same id may
+    // have registered its forward meanwhile. That one wins and this listener
+    // is dropped before any thread serves it (an overwritten entry could
+    // never be stopped).
+    match state.forwards.lock().unwrap().entry(id.to_string()) {
+        std::collections::hash_map::Entry::Occupied(existing) => return Ok(existing.get().port),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(Forward { stop: stop.clone(), port: local });
+        }
+    }
     let (app, id, host) = (app.clone(), id.to_string(), host.to_string());
     std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            let client = match listener.accept() {
-                Ok((c, peer)) if peer.ip().is_loopback() => c,
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
+        loop {
+            let (client, peer) = match listener.accept() {
+                Ok(v) => v,
                 Err(_) => break,
             };
+            // Set on close, then woken by a local connection: exit without serving it.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if !peer.ip().is_loopback() {
+                continue;
+            }
             let _ = client.set_nonblocking(false);
             let (app, id, host, proxy, auth) = (app.clone(), id.clone(), host.clone(), proxy.clone(), auth.clone());
             std::thread::spawn(move || {
@@ -604,6 +628,8 @@ pub fn pipe(a: TcpStream, b: TcpStream) {
 pub fn close_forward(state: &ProxyState, id: &str) {
     if let Some(f) = state.forwards.lock().unwrap().remove(id) {
         f.stop.store(true, Ordering::Relaxed);
+        // Wake the blocking accept so the thread sees the flag and exits.
+        let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, f.port));
     }
 }
 
@@ -901,6 +927,17 @@ mod tests {
         let auth = Auth { user: "u".into(), pass: "p".into() };
         assert_eq!(expand("connect %host %port\\n", "h", 22, &auth), b"connect h 22\n");
         assert_eq!(expand("%user:%pass 100%% \\r\\t\\\\ \\x41", "h", 1, &auth), b"u:p 100% \r\t\\ A");
+    }
+
+    /// Multi-byte characters anywhere (after `%`, after `\`, before `\x`)
+    /// are copied unchanged instead of panicking.
+    #[test]
+    fn expands_around_korean_text() {
+        let auth = Auth { user: "사용자".into(), pass: "p".into() };
+        let template = r"C:\Users\김철수\plink.exe -nc %host:%port %김 \x4 %user\김";
+        let expected = r"C:\Users\김철수\plink.exe -nc 서버:22 %김 \x4 사용자\김";
+        assert_eq!(String::from_utf8(expand(template, "서버", 22, &auth)).unwrap(), expected);
+        assert_eq!(expand("\\x김 끝\\", "h", 1, &auth), "\\x김 끝\\".as_bytes());
     }
 
     #[test]

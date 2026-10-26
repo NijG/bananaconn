@@ -55,6 +55,10 @@ pub struct Job {
     seen: Mutex<Seen>,
     cv: Condvar,
     stop: AtomicBool,
+    /// `run` has returned (or is about to): `add` must not queue lines no
+    /// one will send. Set and read under the `lines` lock, so a paste either
+    /// lands in this job before it ends or is refused and starts a new one.
+    finished: AtomicBool,
     total: AtomicUsize,
     sent: AtomicUsize,
 }
@@ -74,15 +78,20 @@ impl Job {
             seen: Mutex::new(Seen::default()),
             cv: Condvar::new(),
             stop: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             total: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
         }
     }
 
     /// Queue text: one entry per line, each ending with its CR (the last one
-    /// may have none).
-    pub fn add(&self, text: &[u8]) -> usize {
+    /// may have none). None when the job has already ended: the caller
+    /// starts a new one (the text would otherwise be dropped).
+    pub fn add(&self, text: &[u8]) -> Option<usize> {
         let mut lines = self.lines.lock().unwrap();
+        if self.finished.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut n = 0;
         for line in text.split_inclusive(|&b| b == b'\r') {
             lines.push_back(line.to_vec());
@@ -90,7 +99,7 @@ impl Job {
         }
         self.total.fetch_add(n, Ordering::Relaxed);
         self.cv.notify_all();
-        n
+        Some(n)
     }
 
     pub fn stop(&self) {
@@ -131,13 +140,32 @@ impl Job {
     /// long one character takes on the wire (serial), so a long line is never
     /// followed before it has even left. `send` refusing with WouldBlock (the
     /// write queue is full) is retried; any other error ends the paste.
-    pub fn run(&self, mode: Mode, char_time: Duration, send: impl Fn(&[u8]) -> io::Result<()>, mut tick: impl FnMut()) -> End {
+    pub fn run(&self, mode: Mode, char_time: Duration, send: impl Fn(&[u8]) -> io::Result<()>, tick: impl FnMut()) -> End {
+        let end = self.send_lines(mode, char_time, send, tick);
+        // Stopped or failed: later text goes to a new job too.
+        let _lines = self.lines.lock().unwrap();
+        self.finished.store(true, Ordering::Relaxed);
+        end
+    }
+
+    fn send_lines(&self, mode: Mode, char_time: Duration, send: impl Fn(&[u8]) -> io::Result<()>, mut tick: impl FnMut()) -> End {
         let mut ticked = Instant::now();
         loop {
             if self.stopped() {
                 return End::Stopped;
             }
-            let Some(line) = self.lines.lock().unwrap().pop_front() else { return End::Done };
+            let line = {
+                let mut lines = self.lines.lock().unwrap();
+                match lines.pop_front() {
+                    Some(line) => line,
+                    None => {
+                        // Under the same lock as `add`: nothing can slip in
+                        // between "queue empty" and "done".
+                        self.finished.store(true, Ordering::Relaxed);
+                        return End::Done;
+                    }
+                }
+            };
             *self.seen.lock().unwrap() = Seen::default();
             let started = Instant::now();
             let ok = match mode {
@@ -282,7 +310,7 @@ mod tests {
     #[test]
     fn lines_keep_their_line_ends() {
         let job = Job::new();
-        assert_eq!(job.add(b"a\rb\r\rc"), 4);
+        assert_eq!(job.add(b"a\rb\r\rc"), Some(4));
         let lines: Vec<_> = job.lines.lock().unwrap().iter().cloned().collect();
         assert_eq!(lines, [b"a\r".to_vec(), b"b\r".to_vec(), b"\r".to_vec(), b"c".to_vec()]);
     }
@@ -399,6 +427,23 @@ mod tests {
         let job = Job::new();
         job.add(b"x\ry\r");
         assert_eq!(job.run(Mode::Echo, Duration::ZERO, |_| Err(io::ErrorKind::BrokenPipe.into()), || {}), End::Failed);
+    }
+
+    /// Text pasted after the last line went out (before the session forgot
+    /// the job) is refused, so the caller starts a new job instead of
+    /// queueing lines no one sends.
+    #[test]
+    fn a_finished_job_takes_no_more_lines() {
+        let job = Job::new();
+        job.add(b"x\r");
+        assert_eq!(job.run(Mode::Echo, Duration::ZERO, |_| Ok(()), || {}), End::Done);
+        assert_eq!(job.add(b"late\r"), None);
+        assert_eq!(job.progress(), (1, 1));
+
+        let job = Job::new();
+        job.add(b"x\r");
+        assert_eq!(job.run(Mode::Echo, Duration::ZERO, |_| Err(io::ErrorKind::BrokenPipe.into()), || {}), End::Failed);
+        assert_eq!(job.add(b"late\r"), None);
     }
 
     #[test]

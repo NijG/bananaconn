@@ -10,11 +10,12 @@ import { api, pickOpenFile } from "../api";
 import { icon } from "../icons";
 import { findTypedRisk } from "../riskRules";
 import { state, updateSettings } from "../store";
-import { errorText, esc, h, toast } from "../ui";
+import { contextMenu, errorText, esc, h, toast } from "../ui";
+import { writeClipboard } from "../clipboard";
 import { tr } from "../i18n";
 import { judge } from "./policy";
 import { fromCanvas, fromFile, sizeLabel, type Attached } from "./attach";
-import { ask, confirmSend, currentProvider, isLocal, Masker, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type Asking, type Target } from "./core";
+import { ask, confirmSend, currentProvider, isLocal, Masker, maskSecrets, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type Asking, type Target } from "./core";
 
 /** What the panel needs from its terminal. */
 export interface AiHost {
@@ -43,10 +44,16 @@ export interface AiHost {
 }
 
 // ---- Saved conversations (this PC only, one per connection) ----
+//
+// Each conversation is its own localStorage key, so a save rewrites only that
+// one (not the whole set), and the oldest can be dropped one at a time when
+// space runs out. Secrets are masked out before anything is written.
 
-const SAVED = "bx.aiConversations";
+const SAVED_PREFIX = "bx.aiConv.";
+const LEGACY_SAVED = "bx.aiConversations";
 const SAVED_MAX = 30;
-const SAVED_BYTES = 400_000;
+const SAVED_BYTES = 200_000; // one conversation, before the oldest turns are dropped
+const SAVED_TOTAL = 3_000_000; // all of them together, well under the ~5 MB localStorage limit
 
 interface SavedConversation {
   turns: Turn[];
@@ -56,36 +63,79 @@ interface SavedConversation {
   at: number;
 }
 
-function readSaved(): Record<string, SavedConversation> {
-  try {
-    const v = JSON.parse(localStorage.getItem(SAVED) || "{}");
-    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
-  } catch {
-    return {};
+const storageKey = (key: string) => SAVED_PREFIX + key;
+
+// Move conversations from the old single-blob store to per-conversation keys,
+// dropping the large blob so it no longer counts against the budget.
+try {
+  const legacy = localStorage.getItem(LEGACY_SAVED);
+  if (legacy) {
+    localStorage.removeItem(LEGACY_SAVED);
+    const all = JSON.parse(legacy);
+    if (all && typeof all === "object" && !Array.isArray(all))
+      for (const [k, c] of Object.entries(all)) if (c && Array.isArray((c as SavedConversation).turns)) try {
+        localStorage.setItem(storageKey(k), JSON.stringify(c));
+      } catch {
+        // No room for the old conversations: they are dropped.
+      }
   }
+} catch {
+  // Nothing to migrate.
+}
+
+/** Saved conversations' storage keys with their age and size, for trimming. */
+function savedEntries(): { sk: string; at: number; size: number }[] {
+  const out: { sk: string; at: number; size: number }[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const sk = localStorage.key(i);
+    if (!sk?.startsWith(SAVED_PREFIX)) continue;
+    const raw = localStorage.getItem(sk) ?? "";
+    let at = 0;
+    try {
+      at = JSON.parse(raw)?.at ?? 0;
+    } catch {
+      // A corrupt entry sorts oldest, so it is the first to go.
+    }
+    out.push({ sk, at, size: raw.length });
+  }
+  return out;
 }
 
 function loadConversation(key: string): SavedConversation | null {
-  const c = readSaved()[key];
-  return c && Array.isArray(c.turns) ? c : null;
+  try {
+    const c = JSON.parse(localStorage.getItem(storageKey(key)) || "null");
+    return c && Array.isArray(c.turns) ? c : null;
+  } catch {
+    return null;
+  }
 }
 
-/** Keep a conversation (null forgets it). Images keep their thumbnail only;
- * the oldest turns go first when it grows too large. */
+/** Keep a conversation (null forgets it). Images keep their thumbnail only; the
+ * oldest turns go first when one grows too large, and the oldest conversations
+ * go first when the store is full. */
 function storeConversation(key: string, c: SavedConversation | null) {
-  const all = readSaved();
-  delete all[key];
-  if (c && c.turns.length) {
-    const slim = { ...c, turns: c.turns.map((t) => ({ ...t, media: t.media?.map((m) => ({ ...m, data: undefined })) })) };
-    while (slim.turns.length > 2 && JSON.stringify(slim).length > SAVED_BYTES) slim.turns.splice(0, 2);
-    all[key] = slim;
-  }
-  const keys = Object.keys(all).sort((a, b) => (all[a].at ?? 0) - (all[b].at ?? 0));
-  for (const old of keys.slice(0, Math.max(0, keys.length - SAVED_MAX))) delete all[old];
-  try {
-    localStorage.setItem(SAVED, JSON.stringify(all));
-  } catch {
-    // Storage full: the conversation stays only while the app runs.
+  const sk = storageKey(key);
+  localStorage.removeItem(sk);
+  if (!c || !c.turns.length) return;
+  const slim = { ...c, turns: c.turns.map((t) => ({ ...t, media: t.media?.map((m) => ({ ...m, data: undefined })) })) };
+  while (slim.turns.length > 2 && JSON.stringify(slim).length > SAVED_BYTES) slim.turns.splice(0, 2);
+  const data = JSON.stringify(slim);
+  for (let tries = 0; tries < SAVED_MAX + 2; tries++) {
+    const others = savedEntries()
+      .filter((e) => e.sk !== sk)
+      .sort((a, b) => a.at - b.at);
+    const total = others.reduce((n, e) => n + e.size, 0);
+    if ((others.length >= SAVED_MAX || total + data.length > SAVED_TOTAL) && others.length) {
+      localStorage.removeItem(others[0].sk);
+      continue;
+    }
+    try {
+      localStorage.setItem(sk, data);
+      return;
+    } catch {
+      if (!others.length) return; // nothing left to drop: this session only
+      localStorage.removeItem(others[0].sk);
+    }
   }
 }
 
@@ -263,6 +313,7 @@ export class AiPanel {
         <select class="ai-provider" title="AI 서비스"></select>
         <span class="ai-head-actions">
           <button class="tool" data-act="file" title="파일 분석 (설정·로그)">${icon("FileSearch", 15)}</button>
+          <button class="tool" data-act="copy-all" title="대화 전체 복사">${icon("Copy", 15)}</button>
           <button class="tool" data-act="new" title="새 대화">${icon("MessageSquarePlus", 15)}</button>
           <button class="tool" data-act="close" title="닫기">${icon("X", 15)}</button>
         </span></div>
@@ -282,6 +333,7 @@ export class AiPanel {
       </div>`,
     );
     this.log = this.el.querySelector(".ai-log")!;
+    this.log.addEventListener("contextmenu", (e) => this.logMenu(e));
     this.input = this.el.querySelector("textarea")!;
     this.el.addEventListener("click", (e) => this.click(e));
     wireGrip(this.el.querySelector<HTMLElement>(".ai-grip")!);
@@ -395,6 +447,45 @@ export class AiPanel {
     this.input.focus();
   }
 
+  private copy(text: string) {
+    if (!text.trim()) return;
+    writeClipboard(text);
+    toast("복사했습니다", "success", 1500);
+  }
+
+  /** One turn as plain text: a message, a command the AI ran, or its output. */
+  private turnText(t: Turn | undefined): string {
+    if (!t || t.nudge) return "";
+    if (t.output) return `$ ${t.output.command}\n${t.output.text}`;
+    if (t.role === "user") return this.turns[this.turns.indexOf(t) - 1]?.run ? "" : t.shown;
+    const body = (t.run ? t.shown.replace(/```run[ \t]*\r?\n[\s\S]*?```/, "") : t.shown).trim();
+    return [body, t.run ? `$ ${t.run.command}` : "", t.error ?? ""].filter(Boolean).join("\n");
+  }
+
+  /** The whole conversation as text, for the clipboard. */
+  private conversationText(): string {
+    return this.turns
+      .map((t) => {
+        const text = this.turnText(t);
+        if (!text) return "";
+        return t.output ? text : `${t.role === "user" ? tr("나") : "AI"}: ${text}`;
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  /** Right-click in the conversation: the selection, this message or all of it. */
+  private logMenu(e: MouseEvent) {
+    e.preventDefault();
+    const selected = window.getSelection()?.toString() ?? "";
+    const turn = (e.target as HTMLElement).closest<HTMLElement>("[data-turn]")?.dataset.turn;
+    contextMenu(e.clientX, e.clientY, [
+      { label: "복사", icon: "Copy", disabled: !selected, action: () => this.copy(selected) },
+      { label: "이 메시지 복사", icon: "MessageSquarePlus", disabled: turn === undefined, action: () => this.copy(this.turnText(this.turns[+turn!])) },
+      { label: "대화 전체 복사", icon: "Copy", action: () => this.copy(this.conversationText()) },
+    ]);
+  }
+
   newConversation() {
     this.asking?.cancel();
     this.asking = null;
@@ -406,11 +497,28 @@ export class AiPanel {
     this.draw();
   }
 
-  /** Save this conversation under its connection, to come back after closing. */
+  /** Save this conversation under its connection, to come back after closing.
+   * Secrets are masked out of the saved copy so they never reach localStorage,
+   * and an answer still streaming when we save (closed mid-run) is marked so a
+   * restored conversation shows the interruption instead of a stuck spinner and
+   * never sends an empty assistant turn back to the provider. */
   private persist() {
     const key = this.host.conversationKey?.();
     if (!key) return;
-    storeConversation(key, this.turns.length ? { turns: this.turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now() } : null);
+    const turns: Turn[] = this.turns.map((t) => {
+      const fixed: Turn =
+        t.role === "assistant" && !t.shown && !t.error ? { ...t, error: "중지했습니다" } : t;
+      return {
+        ...fixed,
+        shown: maskSecrets(fixed.shown),
+        sent: maskSecrets(fixed.sent),
+        // The command strings carry the same secrets as `shown` (mysql -p…,
+        // net user … pw, curl -u a:pw): mask them too, not only the output.
+        ...(fixed.run ? { run: { ...fixed.run, command: maskSecrets(fixed.run.command) } } : {}),
+        ...(fixed.output ? { output: { ...fixed.output, command: maskSecrets(fixed.output.command), text: maskSecrets(fixed.output.text) } } : {}),
+      };
+    });
+    storeConversation(key, turns.length ? { turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now() } : null);
   }
 
   /** The conversation this connection had before (panel closed, app restarted). */
@@ -437,6 +545,11 @@ export class AiPanel {
       void navigator.clipboard.writeText(copy.dataset.copy!).then(() => toast("복사했습니다", "success", 1500));
       return;
     }
+    const turn = t.closest<HTMLElement>("[data-copy-turn]")?.dataset.copyTurn;
+    if (turn !== undefined) {
+      this.copy(this.turnText(this.turns[+turn]));
+      return;
+    }
     const decide = t.closest<HTMLElement>("[data-run]")?.dataset.run;
     if (decide && this.approval) {
       const resolve = this.approval;
@@ -455,6 +568,7 @@ export class AiPanel {
     else if (act === "capture") this.captureScreen();
     else if (act === "close") this.onClose();
     else if (act === "new") this.newConversation();
+    else if (act === "copy-all") this.copy(this.conversationText());
     else if (act === "send") void (this.busy ? this.stop() : this.send());
     else if (act === "file") void this.analyseFile();
     else if (act === "mode") void this.pickRunMode();
@@ -498,21 +612,38 @@ export class AiPanel {
       }</p></div>`;
       return;
     }
+    // Keep the outputs the engineer expanded and their place in the log open
+    // across a rebuild, and only follow new content when already at the bottom.
+    const open = new Set([...this.log.querySelectorAll<HTMLDetailsElement>("details[open][data-turn]")].map((d) => d.dataset.turn));
+    const atBottom = this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 40;
     this.log.innerHTML = this.turns.map((t) => this.drawTurn(t)).join("");
-    this.log.scrollTop = this.log.scrollHeight;
+    for (const d of this.log.querySelectorAll<HTMLDetailsElement>("details[data-turn]")) if (open.has(d.dataset.turn)) d.open = true;
+    if (atBottom) this.log.scrollTop = this.log.scrollHeight;
+  }
+
+  /** Redraw just one turn (the streaming answer), so a long conversation is not
+   * rebuilt on every frame — which would fold open outputs, drop the reader's
+   * text selection and jump the scroll. Falls back to a full draw if needed. */
+  private updateTurn(t: Turn) {
+    const i = this.turns.indexOf(t);
+    const el = this.log.querySelector(`[data-turn="${i}"]`);
+    if (!el) return this.draw();
+    const atBottom = this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 40;
+    el.outerHTML = this.drawTurn(t);
+    if (atBottom) this.log.scrollTop = this.log.scrollHeight;
   }
 
   private drawTurn(t: Turn): string {
     if (t.output) {
       // A command's output, folded: the AI reads it, the engineer may.
       const lines = t.output.text ? t.output.text.split("\n").length : 0;
-      return `<details class="ai-output"><summary>${icon("SquareTerminal", 13)}<code data-i18n-skip>${esc(t.output.command)}</code><span class="muted">${tr(`${lines}줄`)}${t.output.timedOut ? tr(" · 30초 후 중지") : ""}</span></summary><pre data-i18n-skip>${esc(t.output.text || tr("(출력 없음)"))}</pre></details>`;
+      return `<details class="ai-output" data-turn="${this.turns.indexOf(t)}"><summary>${icon("SquareTerminal", 13)}<code data-i18n-skip>${esc(t.output.command)}</code><span class="muted">${tr(`${lines}줄`)}${t.output.timedOut ? tr(" · 30초 후 중지") : ""}</span></summary><pre data-i18n-skip>${esc(t.output.text || tr("(출력 없음)"))}</pre></details>`;
     }
     if (t.role === "user") {
       // A note to the AI about a command that did not run, or the app's own nudge.
       if (t.nudge || this.turns[this.turns.indexOf(t) - 1]?.run) return "";
       const media = t.media?.length ? `<div class="ai-attach-row">${t.media.map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip">${icon("FileText", 13)}<span data-i18n-skip>${esc(a.name)}</span></span>`)).join("")}</div>` : "";
-      return `<div class="ai-msg user">${media}${render(shortened(t.shown), false)}</div>`;
+      return `<div class="ai-msg user" data-turn="${this.turns.indexOf(t)}">${media}${render(shortened(t.shown), false)}</div>`;
     }
     const body = (t.run ? t.shown.replace(/```run[ \t]*\r?\n[\s\S]*?```/, "") : t.shown).trim();
     const run = t.run
@@ -524,7 +655,7 @@ export class AiPanel {
         </div>`
       : "";
     const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
-    return `<div class="ai-msg assistant">${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
+    return `<div class="ai-msg assistant" data-turn="${this.turns.indexOf(t)}">${body ? `<button type="button" class="tool ai-msg-copy" data-copy-turn="${this.turns.indexOf(t)}" title="${tr("이 메시지 복사")}">${icon("Copy", 13)}</button>` : ""}${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
@@ -613,12 +744,20 @@ export class AiPanel {
         this.turns.push(answer);
         const history: AiMessage[] = this.turns
           .filter((t) => t !== answer && !t.error)
-          .map((t) => ({ role: t.role, content: t.sent, ...(t.media?.some((a) => a.data) ? { attachments: t.media.filter((a) => a.data).map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
+          // Images and PDFs are large: send them only on the first provider call
+          // of this message, not again on every agent step that re-sends history.
+          .map((t) => ({ role: t.role, content: t.sent, ...(step === 0 && t.media?.some((a) => a.data) ? { attachments: t.media.filter((a) => a.data).map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
         let frame = 0;
         this.asking = ask(p, system, history, (sofar) => {
           answer.sent = sofar;
-          answer.shown = masker.unmask(sofar);
-          if (!frame) frame = requestAnimationFrame(() => ((frame = 0), this.draw()));
+          // Unmask once per animation frame, not per streamed delta: unmasking
+          // the whole accumulated answer on every delta is O(N²) over a long reply.
+          if (!frame)
+            frame = requestAnimationFrame(() => {
+              frame = 0;
+              answer.shown = masker.unmask(answer.sent);
+              this.updateTurn(answer);
+            });
         });
         this.draw();
         try {
@@ -629,6 +768,9 @@ export class AiPanel {
         } finally {
           this.asking = null;
           cancelAnimationFrame(frame);
+          // The per-frame unmask may not have run for the last delta (or at all
+          // for a short answer): bring `shown` fully up to date before it is read.
+          answer.shown = masker.unmask(answer.sent);
         }
         const command = agent && !answer.error && !this.stopped ? runRequest(answer.shown) : null;
         // Commands handed to the engineer instead of run: ask once to run them itself.
@@ -676,15 +818,26 @@ export class AiPanel {
     } finally {
       this.busy = false;
       this.approval = null;
-      this.persist();
-      this.draw();
+      // When disposed, dispose() has already saved; persisting here would write
+      // stale turns over a conversation that may have been reopened for the same
+      // connection, so skip it (and the panel is gone, so there is nothing to draw).
+      if (!this.disposed) {
+        this.persist();
+        this.draw();
+      }
     }
   }
 
   private busy = false;
+  private disposed = false;
 
   dispose() {
-    this.asking?.cancel();
+    // Closing the panel must end the whole agent run, not just the current
+    // request: stop() sets the stopped flag, cancels the stream and answers any
+    // waiting approval "no", so the loop cannot auto-run further commands or
+    // keep talking to the provider with no visible panel.
+    this.disposed = true;
+    this.stop();
     this.persist();
     this.el.remove();
   }

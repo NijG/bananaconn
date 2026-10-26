@@ -240,6 +240,10 @@ pub struct ConnectRequest {
     /// FTPS: accept a certificate Windows does not trust (self-signed etc.).
     #[serde(default)]
     pub allow_invalid_cert: bool,
+    /// FTPS: SHA-256 of the exact certificate the user approved after an
+    /// `FTPS_CERT` prompt; only that certificate is accepted on reconnect.
+    #[serde(default)]
+    pub trusted_cert: Option<String>,
     /// The session's proxy (proxy.rs).
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
@@ -362,6 +366,7 @@ pub async fn remote_connect(
                 active: req.active_mode,
                 security,
                 allow_invalid_cert: req.allow_invalid_cert,
+                trusted_cert: req.trusted_cert.clone(),
                 proxy: req.proxy.clone(),
                 proxy_auth,
             };
@@ -439,7 +444,12 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
     let key_path = cred.as_ref().and_then(|c| c.key_path.clone());
     let auth = if let Some(path) = key_path {
         let passphrase = cred.as_ref().and_then(|c| c.passphrase.clone());
-        let key = russh::keys::load_secret_key(&path, passphrase.as_deref())
+        // Decrypting an encrypted key runs a bcrypt-pbkdf KDF (CPU-bound, up to
+        // ~1 s); keep it off the async runtime so it does not stall other commands.
+        let (p, pass) = (path.clone(), passphrase);
+        let key = tauri::async_runtime::spawn_blocking(move || russh::keys::load_secret_key(&p, pass.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
             .map_err(|e| format!("개인 키를 불러올 수 없습니다 ({path}): {e}"))?;
         let hash = handle.best_supported_rsa_hash().await.map_err(|e| e.to_string())?.flatten();
         handle
@@ -568,15 +578,34 @@ struct FtpOptions {
     active: bool,
     security: FtpSecurity,
     allow_invalid_cert: bool,
+    /// SHA-256 of the one certificate the user pinned (see `ConnectRequest`).
+    trusted_cert: Option<String>,
     proxy: Option<ProxyConfig>,
     proxy_auth: ProxyAuth,
 }
 
-/// Map a TLS-layer failure. Untrusted / mismatched certificates come back as
-/// `FTPS_CERT::<detail>` so the UI can offer an explicit opt-in.
-fn tls_error(e: suppaftp::FtpError, o: &FtpOptions) -> String {
+/// SHA-256 of a certificate as lower-case colon-separated hex ("ab:cd:…").
+fn cert_fingerprint(cert: &[u8]) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, cert);
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// Two fingerprints match ignoring case and separators (`:`, spaces).
+fn same_fingerprint(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| c.is_ascii_hexdigit()).flat_map(|c| c.to_lowercase()).collect::<String>();
+    !a.is_empty() && norm(a) == norm(b)
+}
+
+/// Map a TLS-layer failure. An untrusted or mismatched certificate comes back
+/// as `FTPS_CERT::<sha256>::<detail>` (the exact certificate the server
+/// offered, recorded by the verifier) so the UI can pin that one certificate.
+fn tls_error(e: suppaftp::FtpError, o: &FtpOptions, seen: &Arc<Mutex<Option<String>>>) -> String {
     match e {
-        suppaftp::FtpError::SecureError(msg) if !o.allow_invalid_cert => format!("FTPS_CERT::{msg}"),
+        suppaftp::FtpError::SecureError(msg) if !o.allow_invalid_cert => match seen.lock().ok().and_then(|s| s.clone()) {
+            Some(fp) => format!("FTPS_CERT::{fp}::{msg}"),
+            // The handshake failed before a certificate was seen (e.g. no TLS).
+            None => format!("TLS 연결에 실패했습니다: {msg}"),
+        },
         suppaftp::FtpError::SecureError(msg) => format!("TLS 연결에 실패했습니다: {msg}"),
         suppaftp::FtpError::UnexpectedResponse(r) => format!(
             "서버가 FTPS(TLS)를 지원하지 않거나 거부했습니다: {}",
@@ -589,44 +618,83 @@ fn tls_error(e: suppaftp::FtpError, o: &FtpOptions) -> String {
 /// One rustls config per FTPS connection. Sharing it between the control and
 /// data connections lets the data channel resume the control channel's TLS
 /// session (rustls keeps an in-memory session cache by default).
-fn tls_connector(allow_invalid_cert: bool) -> Result<RustlsConnector, String> {
+fn tls_connector(allow_invalid_cert: bool, trusted_cert: Option<String>, seen: Arc<Mutex<Option<String>>>) -> Result<RustlsConnector, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("TLS를 초기화할 수 없습니다: {e}"))?;
-    let config = if allow_invalid_cert {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth()
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
-        }
-        if roots.is_empty() {
-            return Err("Windows 인증서 저장소를 읽을 수 없습니다".into());
-        }
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
+    // Native roots back the default chain-of-trust check; a pinned fingerprint
+    // and the "accept any" option are layered on top of it.
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    let native = (!roots.is_empty())
+        .then(|| rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build().ok())
+        .flatten();
+    let trusted = trusted_cert.filter(|t| !t.is_empty());
+    // Without the native store there is no chain-of-trust check; only a pinned
+    // fingerprint or the explicit "accept any" option can then approve a
+    // certificate, so refuse rather than fall through to accepting anything.
+    if native.is_none() && !allow_invalid_cert && trusted.is_none() {
+        return Err("Windows 인증서 저장소를 읽을 수 없습니다".into());
+    }
+    let verifier = CertCheck { native, trusted, accept_any: allow_invalid_cert, seen, provider };
+    let config = builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth();
     Ok(RustlsConnector::from(Arc::new(config)))
 }
 
-/// Used only when the user explicitly opts in to an untrusted FTPS certificate.
-/// Signatures are still checked; only the chain-of-trust check is skipped.
+/// The FTPS certificate check. It always records the server's end-entity
+/// certificate fingerprint (so a failure can name it), then accepts the
+/// certificate when: it matches the pinned fingerprint, or the native
+/// chain-of-trust check passes, or the session opted in to any certificate.
+/// Signatures are verified in every case.
 #[derive(Debug)]
-struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+struct CertCheck {
+    native: Option<Arc<rustls::client::WebPkiServerVerifier>>,
+    trusted: Option<String>,
+    accept_any: bool,
+    seen: Arc<Mutex<Option<String>>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+impl rustls::client::danger::ServerCertVerifier for CertCheck {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let fingerprint = cert_fingerprint(end_entity);
+        if let Ok(mut slot) = self.seen.lock() {
+            *slot = Some(fingerprint.clone());
+        }
+        // The one certificate the user pinned is accepted on its own.
+        if self.trusted.as_deref().is_some_and(|t| same_fingerprint(t, &fingerprint)) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        // A pin was set but did not match: never fall back to accepting the
+        // certificate, or pinning would silently weaken to accept-all.
+        if self.trusted.is_some() && !self.accept_any {
+            return Err(rustls::Error::General("pinned certificate did not match".into()));
+        }
+        // Otherwise the normal chain-of-trust check decides, unless the session
+        // opted in to any certificate (self-signed internal server). Without a
+        // native verifier, only the explicit opt-in can approve it.
+        match &self.native {
+            Some(v) => match v.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+                Ok(ok) => Ok(ok),
+                Err(e) if self.accept_any => {
+                    let _ = e;
+                    Ok(rustls::client::danger::ServerCertVerified::assertion())
+                }
+                Err(e) => Err(e),
+            },
+            None if self.accept_any => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            None => Err(rustls::Error::General("no certificate trust anchors".into())),
+        }
     }
 
     fn verify_tls12_signature(
@@ -635,7 +703,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
@@ -644,11 +712,11 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -703,7 +771,10 @@ fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
         }};
     }
 
-    let tls = || tls_connector(o.allow_invalid_cert);
+    // Filled by the verifier with the server's certificate fingerprint, so a
+    // trust failure can report exactly which certificate to pin.
+    let seen = Arc::new(Mutex::new(None));
+    let tls = || tls_connector(o.allow_invalid_cert, o.trusted_cert.clone(), seen.clone());
     let connect_err = |e: suppaftp::FtpError| format!("{}:{} 에 연결할 수 없습니다: {e}", o.host, o.port);
     // The control socket gets its timeouts before the first byte: a server
     // that accepts the connection but never greets (wrong port, a dead NAS)
@@ -756,11 +827,11 @@ fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
             let plain = RustlsFtpStream::connect_with_stream(control()?)
                 .map_err(connect_err)?
                 .passive_stream_builder(builder());
-            finish!(plain.into_secure(tls()?, &o.host).map_err(|e| tls_error(e, o))?)
+            finish!(plain.into_secure(tls()?, &o.host).map_err(|e| tls_error(e, o, &seen))?)
         }
         FtpSecurity::Implicit => {
             let mut secure = RustlsFtpStream::connect_secure_implicit_with_stream(control()?, tls()?, &o.host)
-                .map_err(|e| tls_error(e, o))?
+                .map_err(|e| tls_error(e, o, &seen))?
                 .passive_stream_builder(builder());
             // suppaftp's implicit mode wraps data connections in TLS but never
             // negotiates data protection; servers then reject the data channel.
@@ -1124,8 +1195,14 @@ async fn delete_sftp_tree(sftp: &SftpSession, root: &str) -> Result<(), String> 
         }
         dirs.push(dir);
     }
-    for f in files {
-        sftp.remove_file(f.clone()).await.map_err(|err| format!("{f} 삭제 실패: {err}"))?;
+    // Files have no ordering constraint, so remove them pipelined on the one
+    // SFTP channel (like list_sftp's metadata batching) instead of one blocking
+    // round trip each — a big tree over a WAN would otherwise take minutes.
+    for group in files.chunks(32) {
+        let done = futures_util::future::join_all(group.iter().map(|f| sftp.remove_file(f.clone()))).await;
+        for (f, r) in group.iter().zip(done) {
+            r.map_err(|err| format!("{f} 삭제 실패: {err}"))?;
+        }
     }
     for dir in dirs.into_iter().rev() {
         sftp.remove_dir(dir.clone())
@@ -2321,6 +2398,7 @@ pub fn test_active_ftp(port: u16, user: &str, pw: &str, file: &str, data: &[u8])
         active: true,
         security: FtpSecurity::Plain,
         allow_invalid_cert: false,
+        trusted_cert: None,
         proxy: None,
         proxy_auth: Default::default(),
     };
@@ -2368,6 +2446,7 @@ pub async fn test_sftp_folder(
         active_mode: false,
         ftps_mode: None,
         allow_invalid_cert: false,
+        trusted_cert: None,
         proxy: None,
     };
     let (conn, _) = connect_sftp(&req, &req.username, req.password.clone(), None, known_hosts.to_path_buf(), Default::default()).await?;
@@ -2410,6 +2489,7 @@ pub fn test_connect_ftp(host: &str, port: u16, security: &str) -> Result<(Vec<Fi
             _ => FtpSecurity::Plain,
         },
         allow_invalid_cert: false,
+        trusted_cert: None,
         proxy: None,
         proxy_auth: Default::default(),
     };
@@ -2470,6 +2550,7 @@ mod tests {
             active: false,
             security: FtpSecurity::Plain,
             allow_invalid_cert: false,
+            trusted_cert: None,
             proxy: None,
             proxy_auth: Default::default(),
         }
@@ -2575,5 +2656,22 @@ mod tests {
         assert_eq!(perm_string(0o640, false), "-rw-r-----");
         assert_eq!(join_remote("/", "a"), "/a");
         assert_eq!(join_remote("/home/u", "a"), "/home/u/a");
+    }
+
+    #[test]
+    fn cert_fingerprints_and_pinning() {
+        // SHA-256 of the empty input, lower-case colon hex.
+        assert_eq!(
+            cert_fingerprint(b""),
+            "e3:b0:c4:42:98:fc:1c:14:9a:fb:f4:c8:99:6f:b9:24:27:ae:41:e4:64:9b:93:4c:a4:95:99:1b:78:52:b8:55"
+        );
+        assert_ne!(cert_fingerprint(b"a"), cert_fingerprint(b"b"));
+        // A pinned fingerprint matches ignoring case and separators, and an
+        // empty pin never matches (so it never silently accepts a certificate).
+        let fp = cert_fingerprint(b"cert");
+        assert!(same_fingerprint(&fp, &fp));
+        assert!(same_fingerprint(&fp.replace(':', "").to_uppercase(), &fp));
+        assert!(!same_fingerprint("", &fp));
+        assert!(!same_fingerprint(&cert_fingerprint(b"other"), &fp));
     }
 }

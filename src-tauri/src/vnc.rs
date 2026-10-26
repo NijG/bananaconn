@@ -32,7 +32,7 @@ struct Proxy {
 impl Proxy {
     fn stop(self) {
         self.accept.abort();
-        for relay in self.relays.lock().unwrap().drain(..) {
+        for relay in self.relays.lock().unwrap_or_else(|p| p.into_inner()).drain(..) {
             relay.abort();
         }
     }
@@ -76,15 +76,15 @@ pub async fn vnc_proxy_start(state: State<'_, VncState>, id: String, host: Strin
             let errors = errors.clone();
             let relay = tauri::async_runtime::spawn(async move {
                 if let Err(e) = bridge(stream, path, target, counter).await {
-                    *errors.lock().unwrap() = Some(e);
+                    *errors.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                 }
             });
-            let mut list = tracked.lock().unwrap();
+            let mut list = tracked.lock().unwrap_or_else(|p| p.into_inner());
             list.retain(|t| !t.inner().is_finished());
             list.push(relay);
         }
     });
-    if let Some(old) = state.proxies.lock().unwrap().insert(id, Proxy { accept, relays, received, last_error }) {
+    if let Some(old) = state.proxies.lock().unwrap_or_else(|p| p.into_inner()).insert(id, Proxy { accept, relays, received, last_error }) {
         old.stop();
     }
     Ok(VncProxy {
@@ -107,12 +107,12 @@ pub fn vnc_proxy_stats(state: State<VncState>, id: String) -> u64 {
 /// Why the relay last failed to reach the VNC server, if it did.
 #[tauri::command]
 pub fn vnc_proxy_error(state: State<VncState>, id: String) -> Option<String> {
-    state.proxies.lock().unwrap().get(&id).and_then(|p| p.last_error.lock().unwrap().clone())
+    state.proxies.lock().unwrap_or_else(|p| p.into_inner()).get(&id).and_then(|p| p.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
 }
 
 #[tauri::command]
 pub fn vnc_proxy_stop(state: State<VncState>, id: String) {
-    if let Some(proxy) = state.proxies.lock().unwrap().remove(&id) {
+    if let Some(proxy) = state.proxies.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
         proxy.stop();
     }
 }

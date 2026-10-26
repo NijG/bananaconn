@@ -103,6 +103,21 @@ export const SENSITIVE_OPTIONS = [
   "proxyLocalCommand",
 ] as const;
 
+/** Every proxy setting is sensitive, not only the local command: an imported
+ * proxy host routes logins through someone else's machine. Matched by prefix so
+ * a proxy option added later is covered without touching this list. */
+export function isSensitiveOption(key: string): boolean {
+  return key.startsWith("proxy") || (SENSITIVE_OPTIONS as readonly string[]).includes(key);
+}
+
+/** The sensitive options a session actually sets (empty or off ones do not count). */
+export function sensitiveOptionKeys(options: Record<string, unknown>): string[] {
+  return Object.keys(options).filter((k) => {
+    const v = options[k];
+    return isSensitiveOption(k) && v !== undefined && v !== null && v !== false && v !== "";
+  });
+}
+
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** Canonical folder path: "/운영/ DB/" → "운영/DB". Folder matching relies on it. */

@@ -29,6 +29,8 @@ export function desktopHost(opts: { key: string; system: string; names: () => st
 /** The AI panel of one remote desktop view, created on first use. */
 export class ViewAi {
   private panel: AiPanel | null = null;
+  /** The in-flight open(), so two quick menu actions do not each build a panel. */
+  private opening: Promise<AiPanel> | null = null;
 
   constructor(
     private view: HTMLElement,
@@ -38,17 +40,26 @@ export class ViewAi {
     private extras: () => MenuItem[] = () => [],
   ) {}
 
-  private async open(): Promise<AiPanel> {
-    if (this.panel) return this.panel;
-    const { AiPanel } = await import("./panel");
-    this.panel = new AiPanel(this.host, () => this.close());
-    this.view.append(this.panel.el);
-    this.view.classList.add("with-ai");
-    this.relayout();
-    return this.panel;
+  private open(): Promise<AiPanel> {
+    if (this.panel) return Promise.resolve(this.panel);
+    return (this.opening ??= this.load());
+  }
+
+  private async load(): Promise<AiPanel> {
+    try {
+      const { AiPanel } = await import("./panel");
+      this.panel = new AiPanel(this.host, () => this.close());
+      this.view.append(this.panel.el);
+      this.view.classList.add("with-ai");
+      this.relayout();
+      return this.panel;
+    } finally {
+      this.opening = null;
+    }
   }
 
   close() {
+    this.opening = null;
     this.panel?.dispose();
     this.panel = null;
     this.view.classList.remove("with-ai");
@@ -71,6 +82,7 @@ export class ViewAi {
   }
 
   dispose() {
+    this.opening = null;
     this.panel?.dispose();
     this.panel = null;
   }

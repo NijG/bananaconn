@@ -20,6 +20,7 @@ mod devmon;
 mod nettools;
 mod paste;
 mod ai;
+mod sshkit;
 pub mod http;
 pub mod proxy;
 mod rdp;
@@ -78,6 +79,7 @@ pub fn run() {
         .manage(term::TermState::default())
         .manage(proxy::ProxyState::default())
         .manage(ai::AiState::default())
+        .manage(sshkit::SshKitState::default())
         .manage(remote::RemoteState::default())
         .manage(vnc::VncState::default())
         .manage(rdp::RdpState::default())
@@ -164,6 +166,9 @@ pub fn run() {
             monitor::monitor_backup,
             monitor::monitor_commands,
             monitor::monitor_types,
+            sshkit::ssh_kit_start,
+            sshkit::ssh_kit_stop,
+            sshkit::ssh_kit_allow,
             monitor::monitor_pause,
             tftpclient::tftp_transfer,
             tftpclient::tftp_cancel,

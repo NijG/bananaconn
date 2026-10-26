@@ -75,9 +75,14 @@ export function mountHome(
     root.querySelector("[data-vault]")!.addEventListener("click", () => actions.vault());
     root.querySelector("[data-shortcuts]")!.addEventListener("click", () => void import("./shortcuts").then((m) => m.openShortcuts()));
   };
-  subscribe("sessions", render);
+  // No point re-rendering the home screen while it is hidden behind tabs; the
+  // observer below re-renders it when it is shown again.
+  const renderIfShown = () => {
+    if (!root.hidden) render();
+  };
+  subscribe("sessions", renderIfShown);
   // The shortcut list follows the user's keys.
-  subscribe("settings", render);
+  subscribe("settings", renderIfShown);
   // Shown again after the last tab closed: "방금 전" from an hour ago must be
   // recomputed. The workspace shows it by clearing `hidden`.
   new MutationObserver(() => {

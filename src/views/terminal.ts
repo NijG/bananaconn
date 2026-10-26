@@ -11,7 +11,7 @@ import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
 import { addMacro, snippetMenu } from "../snippets";
-import { findRisks, findTypedRisk, type RiskHit } from "../riskRules";
+import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit, type RiskRule } from "../riskRules";
 import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
@@ -36,6 +36,17 @@ import { confirmDialog, contextMenu, errorText, esc, h, modal, promptDialog, tim
 import type { BroadcastInput, EditKey, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
 
 
+
+/** Input that riskGate confirmed, to the other broadcast tabs it was
+ * confirmed for; each still checks its own line against `hits`. */
+function deliverConfirmed(others: Tab[], input: BroadcastInput, hits: RiskHit[]) {
+  const rules = hits.map((h) => h.rule);
+  for (const t of others) {
+    if (t.view.state !== "connected") continue;
+    if (t.view instanceof TerminalView) t.view.receiveInput(input, rules);
+    else t.view.receiveBroadcast?.(input);
+  }
+}
 
 /** Asked once per app run. */
 let build: Promise<number> | null = null;
@@ -237,7 +248,7 @@ export class TerminalView implements View {
       { class: "view term-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
-         <span class="view-endpoint">${esc(endpoint(session))}</span>
+         <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state></span>
          <div class="view-actions">
            <button class="tool" data-act="find" title="찾기 (Ctrl+Shift+F)">${icon("Search", 15)}</button>
@@ -316,19 +327,18 @@ export class TerminalView implements View {
       // Broadcast only what the user typed; xterm's automatic replies (device
       // reports, focus and mouse events) belong to this terminal alone, and
       // pastes are mirrored as text below.
-      const typed = !this.pasting && this.userTurn;
-      if (typed && data === "\r" && this.holdRiskyEnter()) return;
-      if (typed && data === "\r") {
-        // The line on screen; before its echo arrives (fast typing, slow
-        // links), the keys pressed since the last Enter.
-        this.lsColors.submitted(this.assist.typedText() || this.keyLine || "", this.assist.knownPrompt());
-        this.keyLine = "";
-      } else if (typed) this.keyLine = keyLine(this.keyLine, data);
-      else if (this.pasting) this.keyLine = null;
-      if (typed || this.pasting) this.assist.note(data);
+      if (!this.pasting && this.userTurn) return this.typedInput(data);
+      if (this.pasting) {
+        // Follow the pasted text on the command line like typing, so a paste
+        // with no line break (which stays on the line) is still risk-checked
+        // when Enter is pressed, even before the server echoes it. keyLine()
+        // returns null when the data holds a line break or other control byte
+        // (a multi-line paste or a bracketed-paste wrapper), so those fall
+        // back to the screen line as before.
+        this.keyLine = keyLine(this.keyLine, data);
+        this.assist.note(data);
+      }
       this.sendInput(data);
-      if (typed) this.ws.mirrorInput(this, { keys: data });
-      if (typed && this.recording) this.recording.push(data);
     });
     // xterm turns a key or IME event into onData within the same event
     // dispatch; replies to terminal queries come later from output parsing.
@@ -1030,12 +1040,45 @@ export class TerminalView implements View {
   }
 
   receiveBroadcast(input: BroadcastInput) {
+    this.receiveInput(input, null);
+  }
+
+  /** Broadcast input; `confirmed`: the rules the sender's riskGate confirmed
+   * for this tab too (null when nothing was confirmed). An Enter runs what
+   * is on THIS tab's line, which may differ from the sender's (keys typed
+   * before broadcast was turned on): it is checked here, and a line that is
+   * risky beyond what was confirmed gets neither the Enter nor what follows. */
+  receiveInput(input: BroadcastInput, confirmed: RiskRule[] | null) {
+    if ("editKey" in input) {
+      this.keyLine = input.editKey === "Backspace" ? keyLine(this.keyLine, "\b") : null;
+      return this.sendInput(this.editKeyBytes(input.editKey));
+    }
+    const text = "keys" in input ? this.expandKeys(input.keys) : input.paste;
+    // What lands on the line before the first Enter (a paste's line breaks are Enters too).
+    const enter = /[\r\n]/.exec(text);
+    if (enter && (confirmed || state.settings.checkTypedCommands || "paste" in input)) {
+      const hit = this.enterRisk(text.slice(0, enter.index));
+      if (hit && !(confirmed?.includes(hit.rule) && hit.rule.action !== "block")) {
+        toast(`${this.title()}: 줄에 위험한 명령이 있어 동시 입력의 Enter를 보내지 않았습니다 (${hit.rule.note}). 확인한 뒤 이 탭에서 직접 Enter를 누르세요`, "warn", 8000);
+        // Keys before the Enter still arrive, so the line matches what was typed.
+        if ("keys" in input && enter.index) {
+          const head = input.keys.slice(0, input.keys.search(/[\r\n]/));
+          this.assist.note(head);
+          this.keyLine = keyLine(this.keyLine, this.expandKeys(head));
+          this.sendInput(this.expandKeys(head));
+        }
+        return;
+      }
+    }
     if ("keys" in input) {
       this.assist.note(input.keys);
-      this.sendInput(this.expandKeys(input.keys));
+      // The line after these keys: an Enter starts a new one.
+      const last = Math.max(text.lastIndexOf("\r"), text.lastIndexOf("\n"));
+      this.keyLine = last < 0 ? keyLine(this.keyLine, text) : keyLine("", text.slice(last + 1));
+      this.sendInput(text);
+    } else {
+      this.pasteText(input.paste);
     }
-    else if ("editKey" in input) this.sendInput(this.editKeyBytes(input.editKey));
-    else this.pasteText(input.paste);
   }
 
   /** A recorded macro's editing-key marks as this tab's own bytes. */
@@ -1141,15 +1184,47 @@ export class TerminalView implements View {
     return others;
   }
 
-  /** Enter typed on a command line that a risk rule matches is held and goes
-   * through riskGate like a snippet. The line is read from the screen, so
-   * history recall, Tab completion and in-line edits count as they ended up.
-   * True when the Enter was held (it is sent later, or never). */
-  private holdRiskyEnter(): boolean {
-    if (this.state !== "connected" || !state.settings.checkTypedCommands) return false;
+  /** Keys the user typed here. Enter is CR or LF (Ctrl+J), and one key event
+   * can bring text and Enter together (Alt+Enter is ESC CR): every Enter is
+   * checked and ends the line, whatever came with it. */
+  private typedInput(data: string) {
+    for (const part of data.split(/(?<=[\r\n])/)) {
+      const enter = /[\r\n]$/.test(part) ? part.slice(-1) : "";
+      const keys = enter ? part.slice(0, -1) : part;
+      if (keys) {
+        this.keyLine = keyLine(this.keyLine, keys);
+        this.typedOut(keys);
+      }
+      if (!enter) continue;
+      // Held: it goes out after the confirmation, or never; keys typed after
+      // it in the same event would land on the wrong line, so they are dropped.
+      if (this.holdRiskyEnter(enter)) return;
+      this.enterSent();
+      this.typedOut(enter);
+    }
+  }
+
+  /** Typed input to the connection, the broadcast tabs and a macro being recorded. */
+  private typedOut(data: string) {
+    this.assist.note(data);
+    this.sendInput(data);
+    this.ws.mirrorInput(this, { keys: data });
+    this.recording?.push(data);
+  }
+
+  /** Enter goes out now (typed, or held and confirmed): the command line ends. */
+  private enterSent() {
+    // The line on screen; before its echo arrives (fast typing, slow
+    // links), the keys pressed since the last Enter.
+    this.lsColors.submitted(this.assist.typedText() || this.keyLine || "", this.assist.knownPrompt());
+    this.keyLine = "";
+  }
+
+  /** The command line the cursor is on, wrapped rows joined; null on a
+   * full-screen program's screen (vi, less, top, menus own it: no command line there). */
+  private screenLine(): string | null {
     const buf = this.term.buffer.active;
-    // Full-screen programs (vi, less, top, menus) own the screen: no command line there.
-    if (buf.type !== "normal") return false;
+    if (buf.type !== "normal") return null;
     let y = buf.baseY + buf.cursorY;
     while (y > 0 && buf.getLine(y)?.isWrapped) y--;
     const parts: string[] = [];
@@ -1158,14 +1233,35 @@ export class TerminalView implements View {
       parts.push(line.translateToString(last));
       if (last) break;
     }
-    const hit = findTypedRisk(parts.join(""));
+    return parts.join("");
+  }
+
+  /** The risk of pressing Enter here after `more` is added to the line: the
+   * screen line (history recall, Tab completion and in-line edits count as
+   * they ended up), and the keys typed since the last Enter, which are ahead
+   * of their echo on a slow link. A block rule outranks a warning. */
+  private enterRisk(more = ""): RiskHit | null {
+    const screen = this.screenLine();
+    if (screen === null) return null;
+    const keys = this.keyLine === null ? null : keyLine(this.keyLine, more);
+    const hits = [findTypedRisk(screen + more), keys === null ? null : findCommandRisk(keys)].filter((h): h is RiskHit => !!h);
+    return hits.find((h) => h.rule.action === "block") ?? hits[0] ?? null;
+  }
+
+  /** Enter typed on a command line that a risk rule matches is held and goes
+   * through riskGate like a snippet. True when the Enter was held (it is
+   * sent later, or never). */
+  private holdRiskyEnter(enter: string): boolean {
+    if (this.state !== "connected" || !state.settings.checkTypedCommands) return false;
+    const hit = this.enterRisk();
     if (!hit) return false;
     void this.riskGate([hit], "직접 입력한 명령", "(typed)").then((others) => {
       if (others) {
-        this.sendInput("\r");
+        this.enterSent();
+        this.sendInput(enter);
         this.assist.sent();
-        for (const t of others) if (t.view.state === "connected") t.view.receiveBroadcast?.({ keys: "\r" });
-        this.recording?.push("\r");
+        deliverConfirmed(others, { keys: enter }, [hit]);
+        this.recording?.push(enter);
       }
       this.term.focus();
     });
@@ -1185,9 +1281,8 @@ export class TerminalView implements View {
       if (!confirmedOthers) return;
     }
     this.sendInput(data);
-    if (confirmedOthers) {
-      for (const t of confirmedOthers) if (t.view.state === "connected") t.view.receiveBroadcast?.({ keys: marked });
-    } else this.ws.mirrorInput(this, { keys: marked });
+    if (confirmedOthers) deliverConfirmed(confirmedOthers, { keys: marked }, hits);
+    else this.ws.mirrorInput(this, { keys: marked });
     this.recording?.push(marked);
     this.term.focus();
   }
@@ -1250,6 +1345,8 @@ export class TerminalView implements View {
     this.gotOutput = false;
     // A new connection starts on the normal screen with default colours.
     this.highlighter = new KeywordHighlighter();
+    // Keys typed into the old connection are not on the new one's line.
+    this.keyLine = "";
     this.overlay.hidden = true;
     this.layout();
     this.runtimeId = crypto.randomUUID();
@@ -1345,7 +1442,8 @@ export class TerminalView implements View {
     // The highlighter always follows the escape state (alternate screen,
     // program colours), so turning it on mid-session is right at once.
     this.checkDelEcho(bytes);
-    const shown = this.highlighter.process(bytes, state.settings.highlightKeywords);
+    // An ls listing being coloured (lsColors.ts) is left as the server sent it.
+    const shown = this.highlighter.process(bytes, state.settings.highlightKeywords && !this.lsColors.listing);
     this.term.write(shown, () => this.ack(rid, n));
     if (!this.gotOutput) {
       this.gotOutput = true;
@@ -1607,6 +1705,27 @@ export class TerminalView implements View {
   /** `file`: the name of the file being sent (the confirmation names it). */
   private async pasteFromUser(text: string, file?: string) {
     const lines = text.replace(/\r?\n$/, "").split(/\r?\n|\r/);
+    // A pasted line break is an Enter: those lines run at once, so they go
+    // through riskGate like a snippet (one line with a trailing line break
+    // too). The text after the last break waits on the line for the user's
+    // own Enter, which is checked then. A paste is text, not keys: tabs in a
+    // configuration file do not make it an unreadable macro.
+    // A full-screen program (vi, less) owns the screen: nothing runs there.
+    const breakAt = this.term.buffer.active.type === "normal" ? text.search(/[\r\n][^\r\n]*$/) : -1;
+    const runs = breakAt < 0 ? "" : text.slice(0, breakAt + 1);
+    const hits = runs ? findRisks(runs).filter((h) => h.rule !== UNREADABLE_MACRO) : [];
+    // The first line joins what is already on the command line.
+    const first = runs ? this.enterRisk(runs.slice(0, runs.search(/[\r\n]/))) : null;
+    if (first && !hits.some((h) => h.rule === first.rule)) hits.unshift(first);
+    if (hits.length) {
+      const others = await this.riskGate(hits, file ? `텍스트 파일: <b data-i18n-skip>${esc(file)}</b>` : "붙여넣기", "(paste)");
+      this.term.focus();
+      if (!others) return;
+      this.pasteText(text);
+      deliverConfirmed(others, { paste: text }, hits);
+      this.recording?.push(text.replace(/\r?\n/g, "\r"));
+      return;
+    }
     if (lines.length > 1 && state.settings.confirmMultiPaste) {
       const preview = lines.slice(0, 6).map((l) => esc(l.length > 120 ? `${l.slice(0, 120)}…` : l)).join("\n");
       const how = this.paced
@@ -1661,13 +1780,20 @@ export class TerminalView implements View {
 
   /** When a Backspace went out as DEL while the session has no choice yet. */
   private delSentAt = 0;
+  /** The row the cursor was on then (absolute, normal buffer). */
+  private delSentRow = -1;
 
   /** The server echoed DEL as "^?": its erase key is ^H (AIX, HP-UX, many
    * Telnet logins). Switch this session to ^H, and take the DEL character
-   * off the line, then erase what the user meant to. */
+   * off the line, then erase what the user meant to. Only an echo counts:
+   * on the command line the cursor was on, before any line break or escape
+   * sequence in the output, so a "^?" that a program prints (tail -f, a
+   * full-screen program) never changes the session. */
   private checkDelEcho(bytes: Uint8Array) {
     if (!this.delSentAt || Date.now() - this.delSentAt > 1500) return;
-    for (let i = 0; i + 1 < bytes.length; i++) {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal" || buf.baseY + buf.cursorY !== this.delSentRow) return;
+    for (let i = 0; i + 1 < bytes.length && bytes[i] >= 0x20; i++) {
       if (bytes[i] === 0x5e && bytes[i + 1] === 0x3f) {
         this.delSentAt = 0;
         this.setKeyOption("backspace", "ctrl-h");
@@ -1700,8 +1826,14 @@ export class TerminalView implements View {
       if (this.state === "connected" || this.state === "connecting") {
         const bytes = this.editKeyBytes(e.key as EditKey);
         // Not chosen yet: watch whether the server takes DEL (receive()).
-        if (bytes === "\x7f" && !this.session.options.backspace) this.delSentAt = Date.now();
+        if (bytes === "\x7f" && !this.session.options.backspace) {
+          const buf = this.term.buffer.active;
+          this.delSentAt = buf.type === "normal" ? Date.now() : 0;
+          this.delSentRow = buf.baseY + buf.cursorY;
+        }
         this.sendInput(bytes);
+        // The line a Backspace edits; other editing keys move within it.
+        this.keyLine = e.key === "Backspace" ? keyLine(this.keyLine, "\b") : null;
         this.ws.mirrorInput(this, { editKey: e.key as EditKey });
         // Recorded as the key, not these bytes: replayed in another tab it
         // becomes that tab's bytes.
@@ -1788,9 +1920,15 @@ export class TerminalView implements View {
     if (this.runtimeId) {
       api.termClose(this.runtimeId).catch(() => {});
     }
-    this.assist.dispose();
-    this.lsColors.dispose();
-    this.aiPanel?.dispose();
+    // Release each part independently so a throw in one does not skip the
+    // scarce native resources below (the xterm WebGL context, the SSH tunnel).
+    for (const close of [() => this.assist.dispose(), () => this.lsColors.dispose(), () => this.aiPanel?.dispose()]) {
+      try {
+        close();
+      } catch {
+        /* keep tearing down */
+      }
+    }
     this.term.dispose();
     this.gateway.close();
   }

@@ -119,6 +119,15 @@ interface Logical {
 }
 
 const MAX_DECORATIONS = 4000;
+/** How long the folder read over the monitor connection may take. */
+const TYPES_TIMEOUT = 5000;
+
+/** `p`'s value, or null when it fails or takes longer than `ms`. */
+function withTimeout<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), ms)));
+  return Promise.race([p.catch(() => null), late]).finally(() => clearTimeout(timer));
+}
 
 export class LsColors {
   private decorations: IDecoration[] = [];
@@ -132,26 +141,43 @@ export class LsColors {
     private enabled: () => boolean,
   ) {}
 
+  /** The listing whose output is still coming (0: none). */
+  private open = 0;
+
+  /** An ls listing is being printed: the keyword highlighter (highlight.ts)
+   * leaves it alone, or its colours ("error.log", "failed/") would read as
+   * the server's own ls colours and the listing would stay uncoloured. */
+  get listing(): boolean {
+    return this.open !== 0;
+  }
+
   /** The engineer pressed Enter on `command` after `prompt`. */
   submitted(command: string, prompt: string) {
+    // Any Enter ends the previous listing's output.
+    this.open = 0;
     if (!this.enabled() || this.term.buffer.active.type !== "normal") return;
     const req = parseLs(command, promptFolder(prompt));
     if (!req) return;
     const start = this.term.registerMarker(0);
     if (!start) return;
     const id = ++this.watching;
-    // The plain listing's folder is read meanwhile.
-    const types = !req.long && !req.classify && req.folder ? this.folderTypes(req.folder).catch(() => null) : Promise.resolve(null);
+    this.open = id;
+    // The plain listing's folder is read meanwhile; a monitor connection
+    // that never answers must not hold the colours back for ever.
+    const types = !req.long && !req.classify && req.folder ? withTimeout(this.folderTypes(req.folder), TYPES_TIMEOUT) : Promise.resolve(null);
     void this.whenDone(start, id).then(async (end) => {
-      if (end === null || id !== this.watching) return start.dispose();
-      const marks = await types;
-      this.paint(start, end, req, marks);
+      if (this.open === id) this.open = 0;
+      const marks = end && id === this.watching ? await types : null;
+      // The prompt row is a marker: rows shift while the folder is read
+      // (scrollback trimmed, screen cleared), and the screen may have moved on.
+      if (end && id === this.watching && !start.isDisposed && !end.isDisposed && this.term.buffer.active.type === "normal") this.paint(start, end.line, req, marks);
       start.dispose();
+      end?.dispose();
     });
   }
 
-  /** The row of the next prompt (the listing is above it), or null if it never comes. */
-  private async whenDone(start: IMarker, id: number): Promise<number | null> {
+  /** The next prompt's row as a marker (the listing is above it), or null if it never comes. */
+  private async whenDone(start: IMarker, id: number): Promise<IMarker | null> {
     const began = Date.now();
     let seen = "";
     let changed = Date.now();
@@ -164,7 +190,7 @@ export class LsColors {
       const left = buf.getLine(row)?.translateToString(true, 0, buf.cursorX) ?? "";
       const now = `${buf.length}:${row}:${left}`;
       if (now !== seen) (seen = now), (changed = Date.now());
-      if (row > start.line && PROMPT_END.test(left) && Date.now() - changed >= 250) return row;
+      if (row > start.line && PROMPT_END.test(left) && Date.now() - changed >= 250) return this.term.registerMarker(0) ?? null;
     }
   }
 
@@ -258,6 +284,7 @@ export class LsColors {
 
   dispose() {
     this.watching++;
+    this.open = 0;
     for (const d of this.decorations) d.dispose();
     this.decorations = [];
   }

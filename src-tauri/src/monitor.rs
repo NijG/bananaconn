@@ -71,7 +71,12 @@ pub(crate) fn types_script(folder: &str) -> Result<String, String> {
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     let target = match folder.strip_prefix('~') {
         Some("") => "~".to_string(),
-        Some(rest) if rest.starts_with('/') => format!("~{}", quote(rest)),
+        // The shell expands "~" only when an unquoted "/" ends it: `~'/logs'`
+        // stays a literal "~/logs", so the slash goes outside the quotes.
+        Some(rest) if rest.starts_with('/') => match rest.trim_start_matches('/') {
+            "" => "~/".to_string(),
+            sub => format!("~/{}", quote(sub)),
+        },
         // "~user" forms: not expanded inside quotes, not worth guessing.
         Some(_) => return Err("폴더 경로가 올바르지 않습니다".into()),
         None => quote(folder),
@@ -254,11 +259,21 @@ fn default_keys() -> Vec<String> {
 
 #[tauri::command]
 pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: MonitorRequest) -> Result<(), String> {
-    let cred = match req.credential_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(id) => Some(vault::resolve(&app, id)?),
-        None => None,
+    // Vault read + DPAPI decrypt and the proxy auth lookup are blocking (disk +
+    // Credential Manager): run them off the async runtime so a slow/contended
+    // credential store does not stall other commands.
+    let (cred, proxy_auth) = {
+        let (app2, cid, proxy) = (app.clone(), req.credential_id.clone(), req.proxy.clone());
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let cred = match cid.as_deref().filter(|s| !s.is_empty()) {
+                Some(id) => Some(vault::resolve(&app2, id)?),
+                None => None,
+            };
+            Ok((cred, crate::proxy::auth_for(&app2, proxy.as_ref())?))
+        })
+        .await
+        .map_err(|e| e.to_string())??
     };
-    let proxy_auth = crate::proxy::auth_for(&app, req.proxy.as_ref())?;
     if req.protocol == "telnet" {
         // Its own Telnet login; problems (password needed, unsupported device)
         // arrive as events because they show up only after connecting.
@@ -279,8 +294,8 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
                 }
             }
         });
-        state.probes.lock().unwrap().insert(req.id.clone(), Probe::Line(query_tx));
-        if let Some(old) = state.tasks.lock().unwrap().insert(req.id, task) {
+        state.probes.lock().unwrap_or_else(|p| p.into_inner()).insert(req.id.clone(), Probe::Line(query_tx));
+        if let Some(old) = state.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(req.id, task) {
             old.abort();
         }
         return Ok(());
@@ -333,7 +348,7 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
 
     let id = req.id.clone();
     let (pause_tx, paused) = tokio::sync::watch::channel(false);
-    state.probes.lock().unwrap().insert(req.id.clone(), Probe::Ssh(handle.clone(), Arc::new(pause_tx)));
+    state.probes.lock().unwrap_or_else(|p| p.into_inner()).insert(req.id.clone(), Probe::Ssh(handle.clone(), Arc::new(pause_tx)));
     let task = tauri::async_runtime::spawn(async move {
         let emit = |mut event: serde_json::Value| {
             event["id"] = json!(id);
@@ -349,12 +364,16 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
                 forget_probe(&app, &id, &handle);
                 emit(json!({ "closed": true }))
             }
+            PumpEnd::Failed => {
+                forget_probe(&app, &id, &handle);
+                emit(json!({ "error": BAD_SAMPLES }))
+            }
             // Not Linux (network gear, AIX, HP-UX): drive the device's own CLI
             // in an interactive shell on the same connection.
             PumpEnd::Unsupported => match open_shell(&handle).await {
                 Ok(line) => {
                     let (query_tx, queries) = mpsc::channel(2);
-                    app.state::<MonitorState>().probes.lock().unwrap().insert(id.clone(), Probe::Line(query_tx));
+                    app.state::<MonitorState>().probes.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), Probe::Line(query_tx));
                     if let Err(e) = crate::devmon::run_shell(line, &emit, queries).await {
                         emit(json!({ "error": e }));
                     }
@@ -367,7 +386,7 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
             },
         }
     });
-    if let Some(old) = state.tasks.lock().unwrap().insert(req.id, task) {
+    if let Some(old) = state.tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(req.id, task) {
         old.abort();
     }
     Ok(())
@@ -377,7 +396,7 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
 /// monitor for the same id has replaced it meanwhile.
 fn forget_probe(app: &AppHandle, id: &str, handle: &Arc<russh::client::Handle<crate::remote::HostCheck>>) {
     let state = app.state::<MonitorState>();
-    let mut probes = state.probes.lock().unwrap();
+    let mut probes = state.probes.lock().unwrap_or_else(|p| p.into_inner());
     if matches!(probes.get(id), Some(Probe::Ssh(h, _)) if Arc::ptr_eq(h, handle)) {
         probes.remove(id);
     }
@@ -389,6 +408,8 @@ enum PumpEnd {
     Closed,
     /// No Linux /proc here (or no exec): try the device CLI instead.
     Unsupported,
+    /// Samples kept coming back unreadable after good ones.
+    Failed,
 }
 
 /// An interactive shell with a wide PTY on the monitor's connection.
@@ -459,12 +480,95 @@ async fn pump(
     }
 }
 
+/// Unreadable samples in a row after good ones before a monitor gives up.
+/// One garbled sample (a partial read, a line from a login script, a
+/// transient /proc oddity) must not end monitoring for good; only the first
+/// sample decides that a system is unsupported.
+pub(crate) const BAD_SAMPLES_LIMIT: u32 = 5;
+
+/// Said when samples keep failing after the monitor had worked.
+pub(crate) const BAD_SAMPLES: &str = "자원 값을 계속 읽지 못해 자원 표시를 멈췄습니다. 탭을 다시 연결하면 다시 시작합니다";
+
+/// What a sample, readable or not, means for the monitor.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Verdict {
+    /// Report it; `first`: the first good one.
+    Good { first: bool },
+    /// Unreadable after good ones: skip it.
+    Skip,
+    /// The very first sample is unreadable: not a system this monitor reads.
+    Unsupported,
+    /// `BAD_SAMPLES_LIMIT` unreadable samples in a row.
+    GiveUp,
+}
+
+/// Good and bad samples so far (the /proc loop and devmon.rs's polls).
+#[derive(Default)]
+pub(crate) struct SampleRun {
+    /// Samples reported.
+    good: u32,
+    /// Unreadable samples since the last good one.
+    bad: u32,
+}
+
+impl SampleRun {
+    pub(crate) fn judge(&mut self, readable: bool) -> Verdict {
+        if readable {
+            self.good += 1;
+            self.bad = 0;
+            return Verdict::Good { first: self.good == 1 };
+        }
+        if self.good == 0 {
+            return Verdict::Unsupported;
+        }
+        self.bad += 1;
+        if self.bad >= BAD_SAMPLES_LIMIT { Verdict::GiveUp } else { Verdict::Skip }
+    }
+}
+
+/// The /proc script's samples, one line at a time.
+#[derive(Default)]
+struct Sampler {
+    block: Vec<String>,
+    disk: (Option<u64>, Option<u64>),
+    prev: Option<(u64, u64)>,
+    run: SampleRun,
+}
+
+impl Sampler {
+    /// Take one output line; at a sample's end, report it. Some(end) when
+    /// the pump should stop.
+    fn line(&mut self, line: &str, report: &mut impl FnMut(serde_json::Value)) -> Option<PumpEnd> {
+        if line != "." {
+            if self.block.len() < 16 {
+                self.block.push(line.to_string());
+            }
+            return None;
+        }
+        let parsed = parse_block(&self.block, &mut self.prev);
+        self.block.clear();
+        match (self.run.judge(parsed.is_some()), parsed) {
+            (Verdict::Good { first }, Some(mut stats)) => {
+                // The disk is read every 15th sample: keep showing the last value.
+                if stats.disk_total.is_some() {
+                    self.disk = (stats.disk_used, stats.disk_total);
+                } else {
+                    (stats.disk_used, stats.disk_total) = self.disk;
+                }
+                report(json!({ "stats": stats, "warmup": first }));
+                None
+            }
+            // The very first sample: no Linux /proc here.
+            (Verdict::Unsupported, _) => Some(PumpEnd::Unsupported),
+            (Verdict::GiveUp, _) => Some(PumpEnd::Failed),
+            _ => None,
+        }
+    }
+}
+
 async fn read_samples(channel: &mut russh::Channel<russh::client::Msg>, mut report: impl FnMut(serde_json::Value)) -> PumpEnd {
     let mut pending = String::new();
-    let mut block: Vec<String> = Vec::new();
-    let mut disk = (None, None);
-    let mut prev = None;
-    let mut samples = 0u32;
+    let mut sampler = Sampler::default();
     while let Some(msg) = channel.wait().await {
         let russh::ChannelMsg::Data { data } = msg else { continue };
         pending.push_str(&String::from_utf8_lossy(&data));
@@ -473,31 +577,13 @@ async fn read_samples(channel: &mut russh::Channel<russh::client::Msg>, mut repo
         }
         while let Some(nl) = pending.find('\n') {
             let line: String = pending.drain(..=nl).collect();
-            let line = line.trim_end().to_string();
-            if line != "." {
-                if block.len() < 16 {
-                    block.push(line);
-                }
-                continue;
+            if let Some(end) = sampler.line(line.trim_end(), &mut report) {
+                return end;
             }
-            samples += 1;
-            match parse_block(&block, &mut prev) {
-                Some(mut stats) => {
-                    // The disk is read every 15th sample: keep showing the last value.
-                    if stats.disk_total.is_some() {
-                        disk = (stats.disk_used, stats.disk_total);
-                    } else {
-                        (stats.disk_used, stats.disk_total) = disk;
-                    }
-                    report(json!({ "stats": stats, "warmup": samples == 1 }))
-                }
-                None => return PumpEnd::Unsupported,
-            }
-            block.clear();
         }
     }
     // Closed before a single sample: the script could not run here.
-    if samples == 0 { PumpEnd::Unsupported } else { PumpEnd::Closed }
+    if sampler.run.good == 0 { PumpEnd::Unsupported } else { PumpEnd::Closed }
 }
 
 /// Test helper: run the monitor loop over an already logged-in connection.
@@ -509,11 +595,11 @@ pub(crate) async fn test_pump(handle: &russh::client::Handle<crate::remote::Host
     let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = collected.clone();
     let (_keep, paused) = tokio::sync::watch::channel(false);
-    let end = tokio::time::timeout(std::time::Duration::from_secs(10), pump(channel, move |e| sink.lock().unwrap().push(e), paused)).await;
+    let end = tokio::time::timeout(std::time::Duration::from_secs(10), pump(channel, move |e| sink.lock().unwrap_or_else(|p| p.into_inner()).push(e), paused)).await;
     if matches!(end, Ok(PumpEnd::Closed)) {
-        collected.lock().unwrap().push(json!({ "closed": true }));
+        collected.lock().unwrap_or_else(|p| p.into_inner()).push(json!({ "closed": true }));
     }
-    events.extend(collected.lock().unwrap().drain(..).take(samples));
+    events.extend(collected.lock().unwrap_or_else(|p| p.into_inner()).drain(..).take(samples));
     events
 }
 
@@ -529,15 +615,15 @@ pub(crate) async fn test_pump_live(
     let sink = samples.clone();
     let (pause, paused) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        pump(channel, move |e| if e.get("stats").is_some() { sink.lock().unwrap().push(e) }, paused).await;
+        pump(channel, move |e| if e.get("stats").is_some() { sink.lock().unwrap_or_else(|p| p.into_inner()).push(e) }, paused).await;
     });
     (samples, pause)
 }
 
 #[tauri::command]
 pub fn monitor_stop(state: State<MonitorState>, id: String) {
-    state.probes.lock().unwrap().remove(&id);
-    if let Some(task) = state.tasks.lock().unwrap().remove(&id) {
+    state.probes.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    if let Some(task) = state.tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(&id) {
         task.abort(); // drops the channel and the SSH connection
     }
 }
@@ -547,7 +633,7 @@ pub fn monitor_stop(state: State<MonitorState>, id: String) {
 /// every few minutes to keep the login alive.
 #[tauri::command]
 pub async fn monitor_pause(state: State<'_, MonitorState>, id: String, paused: bool) -> Result<(), String> {
-    let probe = state.probes.lock().unwrap().get(&id).cloned();
+    let probe = state.probes.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned();
     match probe {
         Some(Probe::Ssh(_, switch)) => {
             switch.send_replace(paused);
@@ -587,7 +673,7 @@ pub(crate) async fn ssh_top(handle: &russh::client::Handle<crate::remote::HostCh
 /// read over the monitor's own connection. Network devices have none.
 #[tauri::command]
 pub async fn monitor_commands(state: State<'_, MonitorState>, id: String) -> Result<Vec<String>, String> {
-    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    let probe = state.probes.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
     match probe {
         Probe::Ssh(handle, _) => Ok(parse_commands(&ssh_exec(&handle, COMMANDS_SCRIPT).await?)),
         Probe::Line(tx) => {
@@ -606,7 +692,7 @@ pub async fn monitor_commands(state: State<'_, MonitorState>, id: String) -> Res
 #[tauri::command]
 pub async fn monitor_types(state: State<'_, MonitorState>, id: String, folder: String) -> Result<Vec<String>, String> {
     let script = types_script(&folder)?;
-    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    let probe = state.probes.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
     match probe {
         Probe::Ssh(handle, _) => Ok(parse_types(&ssh_exec(&handle, &script).await?)),
         Probe::Line(tx) => {
@@ -624,7 +710,7 @@ pub async fn monitor_types(state: State<'_, MonitorState>, id: String, folder: S
 /// the monitor's own connection.
 #[tauri::command]
 pub async fn monitor_top(state: State<'_, MonitorState>, id: String) -> Result<Vec<Section>, String> {
-    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    let probe = state.probes.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
     let sections = match probe {
         Probe::Ssh(handle, _) => ssh_top(&handle).await?,
         Probe::Line(tx) => {
@@ -646,7 +732,7 @@ pub async fn monitor_top(state: State<'_, MonitorState>, id: String) -> Result<V
 /// monitor's own connection, never typed into the user's terminal).
 #[tauri::command]
 pub async fn monitor_backup(state: State<'_, MonitorState>, id: String) -> Result<String, String> {
-    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    let probe = state.probes.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
     let Probe::Line(tx) = probe else { return Err("이 장비는 설정 백업을 지원하지 않습니다".into()) };
     let (reply, answer) = oneshot::channel();
     tx.send(crate::devmon::Query::Backup(reply)).await.map_err(|_| "모니터링 연결이 끊어졌습니다".to_string())?;
@@ -704,7 +790,8 @@ mod tests {
     fn types_script_lists_a_folder_with_marks() {
         assert!(types_script("relative/dir").is_err() && types_script("/a\nb").is_err() && types_script("~bob").is_err());
         assert_eq!(types_script("/it's").unwrap(), r"echo @@T''YPES; ( cd '/it'\''s' 2>/dev/null && ls -1aF 2>/dev/null | head -n 5000 ); echo @@EN''D");
-        assert!(types_script("~/logs").unwrap().contains("cd ~'/logs'"));
+        assert!(types_script("~/logs").unwrap().contains("cd ~/'logs' "));
+        assert!(types_script("~").unwrap().contains("cd ~ ") && types_script("~/").unwrap().contains("cd ~/ "));
         let sh = r"C:\Program Files\Git\usr\bin\sh.exe";
         if !std::path::Path::new(sh).exists() {
             eprintln!("no Git sh: skipped");
@@ -725,6 +812,33 @@ mod tests {
         let names = parse_types(&text);
         assert!(names.contains(&"sub dir/".to_string()) && names.contains(&"notes.txt".to_string()) && names.contains(&"run.sh*".to_string()), "{names:?} {}", String::from_utf8_lossy(&out.stderr));
         assert!(!text.trim_end().ends_with("here"), "the shell stays in its folder: {text}");
+    }
+
+    /// "~/sub" in a real sh: the home folder is expanded (a quoted slash
+    /// would keep "~" literal and list nothing).
+    #[test]
+    fn types_script_expands_the_home_folder() {
+        let sh = r"C:\Program Files\Git\usr\bin\sh.exe";
+        if !std::path::Path::new(sh).exists() {
+            eprintln!("no Git sh: skipped");
+            return;
+        }
+        let home = std::env::temp_dir().join(format!("bx-home-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("my sub").join("inner")).unwrap();
+        std::fs::write(home.join("my sub").join("file.txt"), "").unwrap();
+        let s = home.to_string_lossy().replace('\\', "/");
+        let home_sh = format!("/{}{}", s[..1].to_lowercase(), &s[2..]);
+        let run = |folder: &str| {
+            let out = std::process::Command::new(sh)
+                .args(["-c", &format!("PATH=/usr/bin; HOME='{home_sh}'; {}", types_script(folder).unwrap())])
+                .output()
+                .unwrap();
+            parse_types(&String::from_utf8_lossy(&out.stdout))
+        };
+        let (sub, top) = (run("~/my sub"), run("~"));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(sub.contains(&"inner/".to_string()) && sub.contains(&"file.txt".to_string()), "{sub:?}");
+        assert!(top.contains(&"my sub/".to_string()), "{top:?}");
     }
 
     fn block(cpu: &str, avail: bool) -> Vec<String> {
@@ -748,6 +862,35 @@ mod tests {
         let s = parse_top(out);
         assert_eq!(s.iter().map(|x| x.title.as_str()).collect::<Vec<_>>(), ["CPU 사용률 상위 10개", "메모리 사용량 상위 10개", "디스크"]);
         assert!(s[0].lines[1].contains("java") && s[2].lines.len() == 2);
+    }
+
+    /// Only the first sample may say "unsupported"; later a garbled sample is
+    /// skipped, and only a run of them ends the monitor.
+    #[test]
+    fn a_bad_sample_after_good_ones_is_skipped() {
+        let feed = |s: &mut Sampler, lines: &[&str], events: &mut Vec<serde_json::Value>| {
+            let mut end = None;
+            for l in lines.iter().chain(&["."]) {
+                end = end.or(s.line(l, &mut |e| events.push(e)));
+            }
+            end
+        };
+        let good = ["cpu  100 0 100 800 0 0 0 0 0 0", "MemTotal:        8000000 kB", "MemAvailable:    6000000 kB"];
+        let mut events = Vec::new();
+        assert!(matches!(feed(&mut Sampler::default(), &["-bash: /proc/stat: No such file"], &mut events), Some(PumpEnd::Unsupported)));
+
+        let mut s = Sampler::default();
+        assert!(feed(&mut s, &good, &mut events).is_none());
+        for _ in 1..BAD_SAMPLES_LIMIT {
+            assert!(feed(&mut s, &["garbled"], &mut events).is_none());
+        }
+        assert!(feed(&mut s, &good, &mut events).is_none(), "a good sample resets the count");
+        for _ in 1..BAD_SAMPLES_LIMIT {
+            assert!(feed(&mut s, &["garbled"], &mut events).is_none());
+        }
+        assert!(matches!(feed(&mut s, &["garbled"], &mut events), Some(PumpEnd::Failed)));
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0]["warmup"].as_bool(), events[1]["warmup"].as_bool()), (Some(true), Some(false)));
     }
 
     #[test]

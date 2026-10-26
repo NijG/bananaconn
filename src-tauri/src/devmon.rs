@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::monitor::{parse_block, parse_commands, parse_top, parse_types, Section, Stats, COMMANDS_SCRIPT, TOP_SCRIPT};
+use crate::monitor::{parse_block, parse_commands, parse_top, parse_types, SampleRun, Section, Stats, Verdict, BAD_SAMPLES, COMMANDS_SCRIPT, TOP_SCRIPT};
 use crate::telnet;
 
 const STEP: Duration = Duration::from_secs(15);
@@ -58,6 +58,8 @@ pub(crate) struct Line {
     partial: Vec<u8>,
     /// The device's prompt line once known ("SW-CORE-01#").
     prompt: Option<String>,
+    /// The last line sent, named when the device does not answer it.
+    doing: String,
 }
 
 /// How much of `data` can be decoded now: a UTF-8 character or an escape
@@ -129,19 +131,31 @@ fn clean(s: &str) -> String {
     out
 }
 
+/// The line the cursor is on: the text after the last line break, or ""
+/// when output ended with one. A prompt waits on its own line; a finished
+/// output line that merely ends in "%" or ">" (ASA "5 minutes: 8%", a
+/// config "description <to-core>") has its line break after it.
 fn last_line(text: &str) -> &str {
+    text.rsplit('\n').next().unwrap_or("").trim()
+}
+
+/// The last non-empty line shown, for messages ("마지막 화면").
+fn shown_line(text: &str) -> &str {
     text.trim_end_matches([' ', '\n']).rsplit('\n').next().unwrap_or("").trim()
 }
 
 /// A shell or device prompt: "Switch>", "Router#", "user@host:~$", "(Aruba7010) #".
 /// A longer prompt has a name in it ("Router#", "user@host:~$", "<SW01>"); a banner
-/// border such as "##########" or "=====>" does not.
+/// border such as "##########", "=====>" or "# Authorized use only #" does not.
 fn is_prompt(line: &str) -> bool {
+    let short = line.trim().chars().count() <= 2;
     !line.is_empty()
         && line.len() < 100
         && line.ends_with(['>', '#', '$', '%'])
         // A bare "$" or "#" (ksh, root) is a prompt; a run of symbols is a border.
-        && (line.trim().chars().count() <= 2 || line.chars().any(|c| c.is_alphanumeric()))
+        && (short || line.chars().any(|c| c.is_alphanumeric()))
+        // A banner line framed by the same symbol on both ends.
+        && (short || line.chars().next() != line.chars().next_back())
         && !is_pager(line)
 }
 
@@ -174,12 +188,12 @@ impl Line {
                 .map_err(|e| format!("{host}:{port} 에 연결할 수 없습니다: {e}"))?,
         };
         let _ = stream.set_nodelay(true);
-        Ok(Self { io: Box::new(stream), telnet: Some(telnet::Parser::new()), text: String::new(), partial: Vec::new(), prompt: None })
+        Ok(Self { io: Box::new(stream), telnet: Some(telnet::Parser::new()), text: String::new(), partial: Vec::new(), prompt: None, doing: String::new() })
     }
 
     /// An interactive SSH shell (already authenticated).
     pub(crate) fn shell(io: impl Io + 'static) -> Self {
-        Self { io: Box::new(io), telnet: None, text: String::new(), partial: Vec::new(), prompt: None }
+        Self { io: Box::new(io), telnet: None, text: String::new(), partial: Vec::new(), prompt: None, doing: String::new() }
     }
 
     async fn write_raw(&mut self, data: &[u8]) -> Result<(), String> {
@@ -189,6 +203,7 @@ impl Line {
     }
 
     async fn send(&mut self, line: &str) -> Result<(), String> {
+        self.doing = line.chars().take(40).collect();
         let mut data = line.as_bytes().to_vec();
         data.push(b'\r');
         self.write_raw(&data).await
@@ -242,7 +257,10 @@ impl Line {
                 Err(_) => {}
             }
             if tokio::time::Instant::now() > deadline {
-                return Err("장비가 응답하지 않습니다".into());
+                // What was sent and what the screen shows: enough to tell where it stuck.
+                let last: String = shown_line(&self.text).chars().take(60).collect();
+                let doing = if self.doing.is_empty() { "로그인 후".to_string() } else { self.doing.clone() };
+                return Err(format!("장비가 응답하지 않습니다 ({doing} · 마지막 화면: {})", if last.is_empty() { "없음" } else { &last }));
             }
         }
     }
@@ -257,12 +275,24 @@ impl Line {
             .await
     }
 
-    /// Run a command and return its output (up to the next prompt).
-    async fn run(&mut self, cmd: &str) -> Result<String, String> {
-        self.run_for(cmd, STEP).await
+    /// After a Unix script timed out: interrupt it (Ctrl-C) and wait until
+    /// the shell answers a marker, so later replies are in step again. What
+    /// the interrupted command still printed comes before the marker. A
+    /// process that ignores the interrupt (stuck on a dead NFS server) keeps
+    /// the marker from ever coming back: then this fails.
+    async fn resync(&mut self) -> Result<(), String> {
+        self.text.clear();
+        self.write_raw(b"\x03").await?;
+        // Its own marker: the interrupted script's late "@@END" must not end the wait.
+        self.send("echo @@S''YNC").await?;
+        let learned = self.prompt.clone();
+        self.until(move |x| x.contains("\n@@SYNC") && (is_prompt(last_line(x)) || learned.as_deref() == Some(last_line(x))), STEP)
+            .await?;
+        Ok(())
     }
 
-    async fn run_for(&mut self, cmd: &str, limit: Duration) -> Result<String, String> {
+    /// Run a command and return its output (up to the next prompt).
+    async fn run(&mut self, cmd: &str) -> Result<String, String> {
         self.send(cmd).await?;
         let learned = self.prompt.clone();
         self.until(
@@ -270,11 +300,9 @@ impl Line {
                 let last = last_line(t);
                 (is_prompt(last) || learned.as_deref() == Some(last)) && t.contains('\n')
             },
-            limit,
+            STEP,
         )
         .await
-        // Which command did not finish says more than the timeout alone.
-        .map_err(|e| if e == "장비가 응답하지 않습니다" { format!("장비가 응답하지 않습니다 ({})", cmd.chars().take(40).collect::<String>()) } else { e })
     }
 
     /// Wait for the first prompt after logging in. Answers what login scripts
@@ -365,11 +393,12 @@ fn body(out: &str) -> Vec<&str> {
 /// `no_password`: the user said the device takes none; otherwise, without a
 /// password, the login stops before the user name.
 async fn login(t: &mut Line, username: &str, password: Option<&str>, no_password: bool) -> Result<String, String> {
-    let wants = |t: &str| {
-        let l = lower_tail(t);
-        is_prompt(last_line(t)) || l.ends_with("login:") || l.ends_with("username:") || l.ends_with("password:") || l.contains("press any key")
-    };
-    let mut text = t.until(wants, STEP).await?;
+    // With a user name or password to give, a prompt-looking line before they
+    // were asked for is a banner ("Authorized use only #"): taking it for the
+    // shell would send the identification commands as the user name.
+    let creds = !username.is_empty() || password.is_some();
+    let mut sent = false;
+    let (mut text, mut prompt_ok) = login_wait(t, !creds).await?;
     for _ in 0..4 {
         let l = lower_tail(&text);
         if l.contains("press any key") {
@@ -384,6 +413,7 @@ async fn login(t: &mut Line, username: &str, password: Option<&str>, no_password
                 return Err("NEED_PASSWORD".into());
             }
             t.send(username).await?;
+            sent = true;
         } else if l.ends_with("password:") {
             let Some(pw) = password else { return Err("NEED_PASSWORD".into()) };
             t.send(pw).await?;
@@ -391,12 +421,34 @@ async fn login(t: &mut Line, username: &str, password: Option<&str>, no_password
             // login"; only another login prompt means the password was rejected.
             // Login scripts may ask for TERM, and the prompt may be custom.
             return t.first_prompt().await;
-        } else if is_prompt(last_line(&text)) {
+        } else if is_prompt(last_line(&text)) && prompt_ok {
             return Ok(text);
         }
-        text = t.until(wants, STEP).await?;
+        (text, prompt_ok) = login_wait(t, sent || !creds).await?;
     }
-    if is_prompt(last_line(&text)) { Ok(text) } else { Err("로그인 후 프롬프트를 찾지 못했습니다".into()) }
+    if is_prompt(last_line(&text)) && prompt_ok { Ok(text) } else { Err("로그인 후 프롬프트를 찾지 못했습니다".into()) }
+}
+
+/// Wait for the next login step. `prompt_ok`: a shell prompt may end the
+/// login now. Otherwise only a login question does; a prompt that is still
+/// there, unchanged, after a full step means the device let us in without
+/// asking (it takes no login), so that ends the wait too.
+/// Returns the text and whether a prompt at its end is the shell's.
+async fn login_wait(t: &mut Line, prompt_ok: bool) -> Result<(String, bool), String> {
+    let wants = move |t: &str| {
+        let l = lower_tail(t);
+        (prompt_ok && is_prompt(last_line(t))) || l.ends_with("login:") || l.ends_with("username:") || l.ends_with("password:") || l.contains("press any key")
+    };
+    // The prompt line already on screen before the wait: a device that takes no
+    // login sits at it unchanged for a whole step. A banner that scrolls in
+    // during the wait is a new line, not this one, so it is not mistaken for
+    // the shell (which would send the detection commands as a user name).
+    let before = last_line(&t.text).to_string();
+    match t.until(wants, STEP).await {
+        Ok(text) => Ok((text, prompt_ok)),
+        Err(_) if !prompt_ok && !before.is_empty() && last_line(&t.text) == before && is_prompt(&before) => Ok((std::mem::take(&mut t.text), true)),
+        Err(e) => Err(e),
+    }
 }
 
 // ---- device kinds --------------------------------------------------------------------------
@@ -662,8 +714,26 @@ pub(crate) fn aruba_switch_stats(cpu_out: &str, sys_out: &str) -> Option<Stats> 
             let before = l.split("percent").next()?;
             num(before.rsplit([' ', ':']).find(|w| !w.is_empty())?)
         })?;
-    let total = sys_out.lines().find(|l| l.contains("Total") && l.contains(':')).and_then(|l| num(l.rsplit(':').next()?));
-    let free = sys_out.lines().find(|l| l.trim_start().starts_with("Free") && l.contains(':')).and_then(|l| num(l.rsplit(':').next()?));
+    // "show system" is two columns: "Memory - Total : N" may sit right of
+    // "Up Time", and its "Free : N" right of "CPU Util (%) : 1" on the next
+    // line. "Packet - Total" and "Buffers Free" further down are not memory.
+    let value = |s: &str, key: &str| s.find(key).and_then(|i| num(s[i + key.len()..].trim_start().strip_prefix(':')?));
+    let lines: Vec<&str> = sys_out.lines().collect();
+    let at = lines.iter().position(|l| l.find("Memory").is_some_and(|i| l[i..].contains("Total")));
+    let total = at.and_then(|i| {
+        let l = lines[i];
+        let m = l.find("Memory")?;
+        value(&l[m..], "Total")
+    });
+    let free = at.and_then(|i| {
+        lines[i..].iter().take(3).find_map(|l| {
+            let f = l.find("Free")?;
+            if l[..f].trim_end().ends_with("Buffers") {
+                return None;
+            }
+            value(&l[f..], "Free")
+        })
+    });
     let (used, total) = match (total, free) {
         (Some(t), Some(f)) if t >= f => ((t - f) as u64, t as u64),
         _ => (0, 0),
@@ -966,19 +1036,38 @@ async fn top(t: &mut Line, kind: Kind) -> Result<Vec<Section>, String> {
 
 async fn backup(t: &mut Line, kind: Kind) -> Result<String, String> {
     let cmd = kind.backup().ok_or("이 장비는 설정 백업을 지원하지 않습니다")?;
-    let out = t.run_for(cmd, BACKUP_LIMIT).await?;
+    // Wait for the device's own prompt, not a configuration line that looks
+    // like one ("description <to-core>" where a slow device paused mid-line).
+    t.send(cmd).await?;
+    let learned = t.prompt.clone();
+    let out = t
+        .until(
+            move |x| {
+                let last = last_line(x);
+                x.contains('\n') && learned.as_deref().map_or(is_prompt(last), |p| last == p)
+            },
+            BACKUP_LIMIT,
+        )
+        .await?;
+    // The learned prompt came back after the config; if none was learned (it
+    // normally is), fall back to a prompt-looking last line so a prompt-ended
+    // backup is not wrongly judged truncated.
+    let last = last_line(&out);
+    let at_prompt = t.prompt.as_deref().map_or_else(|| is_prompt(last), |p| last == p);
     let lines = body(&out);
     let text = lines.join("\r\n");
     if text.trim().is_empty() {
         return Err("설정을 읽지 못했습니다".into());
     }
-    backup_complete(kind, &lines)?;
+    backup_complete(kind, &lines, at_prompt)?;
     Ok(text + "\r\n")
 }
 
 /// The device's refusal ("% Invalid input" at user EXEC, a read-only login)
-/// or a configuration cut short is not a backup.
-pub(crate) fn backup_complete(kind: Kind, lines: &[&str]) -> Result<(), String> {
+/// or a configuration cut short is not a backup. Kinds whose configuration
+/// has no end marker (NX-OS, Junos, AOS-CX) count as complete only when the
+/// device's learned prompt came back after it (`at_prompt`).
+pub(crate) fn backup_complete(kind: Kind, lines: &[&str], at_prompt: bool) -> Result<(), String> {
     let refused = lines.iter().take(5).map(|l| l.trim()).find(|l| {
         let low = l.to_lowercase();
         l.starts_with('%') || low.starts_with("error") || low.starts_with("command fail") || low.contains("unrecognized command") || low.contains("invalid input")
@@ -991,7 +1080,7 @@ pub(crate) fn backup_complete(kind: Kind, lines: &[&str]) -> Result<(), String> 
         Kind::Ios | Kind::IosXe | Kind::Asa | Kind::ArubaSwitch | Kind::ArubaController => last == "end" || last == ": end",
         Kind::Vrp => last == "return",
         Kind::Fortigate => lines.iter().any(|l| l.trim_start().starts_with("#config-version")),
-        _ => true,
+        _ => at_prompt,
     };
     if !complete {
         return Err("설정의 끝을 받지 못해 백업하지 않았습니다. 다시 시도하세요".into());
@@ -1053,6 +1142,109 @@ async fn detect(t: &mut Line, prompt: &str) -> Result<Option<(Kind, String, Stri
     Ok(None)
 }
 
+/// The login shell's family, from `echo $0` ("-ksh", "/bin/sh", "-tcsh").
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shell {
+    Bash,
+    /// sh, ksh and their kin. Some(name): a shell that may be replaced by a
+    /// history-free child of the same name; None for restricted and other
+    /// Bourne-style shells.
+    Bourne(Option<&'static str>),
+    Csh,
+    Unknown,
+}
+
+/// Bourne shells that read HISTFILE only when they start (ksh88 on AIX 5.3).
+const FRESH_SHELLS: [&str; 6] = ["ksh", "ksh88", "ksh93", "sh", "mksh", "pdksh"];
+
+fn shell_family(out: &str) -> Shell {
+    // The echoed command line carries "@@S''H", not the marker.
+    let Some(word) = out.lines().find_map(|l| l.trim().strip_prefix("@@SH")) else { return Shell::Unknown };
+    let name = word.trim().rsplit('/').next().unwrap_or("").trim_start_matches('-');
+    match name {
+        "bash" | "rbash" => Shell::Bash,
+        "csh" | "tcsh" => Shell::Csh,
+        // Restricted (rksh, rsh, Rsh) or without HISTFILE (bsh, dash, zsh):
+        // left as they are.
+        "rksh" | "rsh" | "Rsh" | "bsh" | "dash" | "zsh" | "psh" => Shell::Bourne(None),
+        _ => match FRESH_SHELLS.iter().find(|s| **s == name) {
+            Some(s) => Shell::Bourne(Some(s)),
+            None => Shell::Unknown,
+        },
+    }
+}
+
+/// Wait after a line that changes the prompt: "bxmon>", or the shell's own
+/// prompt when it kept that one (csh, a refused exec).
+async fn prompt_after(t: &mut Line) -> Result<String, String> {
+    let old = t.prompt.clone();
+    t.until(move |x| { let l = last_line(x); l == "bxmon>" || ((old.as_deref() == Some(l) || is_prompt(l)) && x.contains('\n')) }, STEP)
+        .await
+}
+
+/// Keep this hidden shell's polls out of the user's shell history and give
+/// it a prompt of its own ("bxmon> "). Each step is a nicety: one that gets
+/// no answer leaves the shell as it was and the monitor goes on.
+async fn quiet_shell(t: &mut Line) -> Result<(), String> {
+    let shell = match t.run("echo @@S''H $0").await {
+        Ok(out) => shell_family(&out),
+        Err(_) => {
+            t.text.clear();
+            Shell::Unknown
+        }
+    };
+    if shell == Shell::Csh {
+        // csh keeps its own prompt (learned at login) and has no PS1; with
+        // `savehist` it would write this shell's polls to ~/.history at logout.
+        if t.run("unset savehist").await.is_err() {
+            t.text.clear();
+        }
+        return Ok(());
+    }
+    if let Shell::Bourne(Some(name)) = shell {
+        // ksh88 opens HISTFILE once, when it starts: setting it now is too
+        // late, and ksh shares ~/.sh_history with the user's own sessions. So
+        // a child of the same shell, started with HISTFILE=/dev/null, takes
+        // this one's place. Only when $SHELL is that very shell and can be run
+        // (never a menu program or an unknown one); a restricted shell refuses
+        // the path and stays as it is. ENV= skips the user's rc file: its
+        // aliases could change the polls' output, and it may set HISTFILE again.
+        let line = format!(
+            "case \"$SHELL\" in */{name}) [ -x \"$SHELL\" ] && {{ HISTFILE=/dev/null; ENV=; PS1='bxmon> '; export HISTFILE ENV PS1; exec \"$SHELL\"; }};; esac"
+        );
+        t.send(&line).await?;
+        match prompt_after(t).await {
+            Ok(out) if last_line(&out) == "bxmon>" => t.prompt = Some("bxmon>".into()),
+            Ok(_) => {}
+            // No prompt back from the new shell: go on as before.
+            Err(_) => t.text.clear(),
+        }
+    }
+    // `set +o history` is bash's: ksh88 (AIX 5.3) fails on it and keeps the
+    // failed built-in's 2>/dev/null, so its prompt (written to stderr) is
+    // never seen again. Only bash is asked.
+    t.send("PROMPT_COMMAND=; PS1='bxmon> '; export PS1; [ -n \"$BASH_VERSION\" ] && set +o history; HISTFILE=/dev/null; export HISTFILE; unset HISTFILE").await?;
+    match prompt_after(t).await {
+        Ok(out) if last_line(&out) == "bxmon>" => t.prompt = Some("bxmon>".into()),
+        // A shell that kept its own prompt: that one stays learned.
+        Ok(_) => {}
+        // Go on with the shell's own prompt, re-synchronised by a plain
+        // command. A shell whose prompt vanished (its stderr redirected away)
+        // gets stderr back on the terminal first. csh would read `exec 2>&1`
+        // as "run 2, output to a file named 1" and end; a csh not recognised
+        // above stops at the assignment it cannot run ("BXMON=1: Command not
+        // found"), so `&&` never reaches the exec there.
+        Err(_) => {
+            t.text.clear();
+            let out = t.run("BXMON=1 && exec 2>&1").await?;
+            if last_line(&out) == "bxmon>" {
+                t.prompt = Some("bxmon>".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Identify the device, then poll it until the connection fails or the task
 /// is stopped. `report` gets {device} once, then {stats, warmup} events.
 pub(crate) async fn drive(
@@ -1070,17 +1262,7 @@ pub(crate) async fn drive(
         let _ = t.run(cmd).await;
     }
     if !kind.network() {
-        // This hidden shell's polls stay out of the user's shell history
-        // (ksh shares ~/.sh_history with the user's own session).
-        t.send("PROMPT_COMMAND=; PS1='bxmon> '; export PS1; set +o history 2>/dev/null; HISTFILE=/dev/null; export HISTFILE; unset HISTFILE").await?;
-        let old = t.prompt.clone();
-        let out = t
-            .until(move |x| { let l = last_line(x); l == "bxmon>" || ((old.as_deref() == Some(l) || is_prompt(l)) && x.contains('\n') && !l.contains("PS1=")) }, STEP)
-            .await?;
-        // csh and the like keep their own prompt; that one stays learned.
-        if last_line(&out) == "bxmon>" {
-            t.prompt = Some("bxmon>".into());
-        }
+        quiet_shell(&mut t).await?;
     }
     report(json!({ "device": {
         "kind": kind.id(),
@@ -1093,22 +1275,26 @@ pub(crate) async fn drive(
 
     let mut prev = None;
     let mut memstat = false;
-    let mut first = true;
+    // Only the first sample can say the device is unsupported; a garbled one
+    // later (a message from the device, a cut-off reply) is skipped.
+    let mut samples = SampleRun::default();
     // No tab of this device on screen: sample only every few minutes, enough
     // to keep the login from timing out (Cisco exec-timeout is 10 minutes).
     let mut paused = false;
     let mut sample = true;
     loop {
         if sample {
-            match stats(&mut t, kind, &mut prev, &mut memstat).await? {
+            let s = stats(&mut t, kind, &mut prev, &mut memstat).await?;
+            match (samples.judge(s.is_some()), s) {
                 // Device counters are ready averages; Linux /proc needs two samples.
-                Some(s) => report(json!({ "stats": s, "warmup": first && kind == Kind::Linux })),
-                None => {
+                (Verdict::Good { first }, Some(s)) => report(json!({ "stats": s, "warmup": first && kind == Kind::Linux })),
+                (Verdict::Unsupported, _) => {
                     report(json!({ "unsupported": true }));
                     return Ok(());
                 }
+                (Verdict::GiveUp, _) => return Err(BAD_SAMPLES.into()),
+                _ => {}
             }
-            first = false;
         }
         // Here every sample runs programs in an interactive shell (Telnet,
         // or the SSH shell fallback; plain SSH Linux uses an exec channel and
@@ -1142,7 +1328,9 @@ pub(crate) async fn drive(
                         let r = t.run_script(COMMANDS_SCRIPT).await.map(|out| parse_commands(&out));
                         let failed = r.is_err();
                         let _ = reply.send(r);
-                        if failed { return Err(OUT_OF_STEP.into()) }
+                        // Only this query fails (a hung NFS folder on PATH);
+                        // the monitor ends only if the shell cannot be got back.
+                        if failed && t.resync().await.is_err() { return Err(OUT_OF_STEP.into()) }
                     }
                     false
                 }
@@ -1153,7 +1341,7 @@ pub(crate) async fn drive(
                         let r = t.run_script(&script).await.map(|out| parse_types(&out));
                         let failed = r.is_err();
                         let _ = reply.send(r);
-                        if failed { return Err(OUT_OF_STEP.into()) }
+                        if failed && t.resync().await.is_err() { return Err(OUT_OF_STEP.into()) }
                     }
                     false
                 }
@@ -1188,7 +1376,7 @@ pub(crate) async fn run_telnet(
     let prompt = match tokio::time::timeout(LOGIN_LIMIT, login(&mut t, username, password, no_password)).await {
         Ok(r) => r?,
         Err(_) => {
-            let last = last_line(&t.text).chars().take(80).collect::<String>();
+            let last = shown_line(&t.text).chars().take(80).collect::<String>();
             return Err(format!("로그인이 {}초 안에 끝나지 않았습니다 (마지막 화면: {})", LOGIN_LIMIT.as_secs(), if last.is_empty() { "없음".into() } else { last }));
         }
     };
@@ -1251,6 +1439,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!((s.cpu, s.mem_total, s.mem_used), (3.0, 339738624, 339738624 - 196111104));
+        // The usual two-column layout: Free right of the CPU line; packet
+        // buffer counters below are not memory.
+        let sys = "  Status and Counters - General System Information\n\n  System Name        : HP-2920\n  Up Time            : 23 days                Memory   - Total   : 339,738,624\n  CPU Util (%)       : 1                                 Free    : 96,016,312\n\n  IP Mgmt  - Pkts Rx : 0                      Packet   - Total   : 6750\n             Pkts Tx : 0                      Buffers    Free    : 5094\n";
+        let s = aruba_switch_stats("1 sec ave: 3 percent busy", sys).unwrap();
+        assert_eq!((s.mem_total, s.mem_used), (339738624, 339738624 - 96016312));
+        let s = aruba_switch_stats("1 sec ave: 3 percent busy", "  CPU Util (%) : 1   Memory - Total : 1,000\n  Buffers Free : 5094\n").unwrap();
+        assert_eq!((s.mem_total, s.mem_used), (0, 0), "buffer counts are not free memory");
 
         let s = aruba_controller_stats("user 3.6%, system 4.4%, idle 92.0%", "Memory (Kb): total: 4012908, used: 2283764, free: 1729144").unwrap();
         assert!((s.cpu - 8.0).abs() < 0.01 && s.mem_total == 4012908 * 1024 && s.mem_used == 2283764 * 1024);
@@ -1421,32 +1616,310 @@ mod device_tests {
     /// A Unix shell as a PTY shows it: the command echoed, its output, then
     /// the prompt. Answers the monitor's commands from \`replies\`; PS1 changes
     /// the prompt like a real shell; Enter alone shows the prompt again.
-    async fn fake_unix<S>(mut io: S, banner: &str, mut prompt: String, replies: Vec<(&'static str, &'static str)>)
+    async fn fake_unix<S>(io: S, banner: &str, prompt: String, replies: Vec<(&'static str, &'static str)>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        fake_shell(io, banner, prompt, replies, Fake::default()).await
+    }
+
+    /// The login shell `fake_shell` plays.
+    #[derive(Clone, Default)]
+    struct Fake {
+        /// What `$0` prints ("-ksh"); "" for a shell that names nothing known.
+        zero: &'static str,
+        /// csh rules: no PS1, `exec 2>&1` runs "2" and ends the shell,
+        /// `NAME=value` is a command that is not found.
+        csh: bool,
+        /// Commands written to the user's shared history file (ksh88: set
+        /// by HISTFILE when the shell started, so changing it later is useless).
+        history: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn fake_shell<S>(mut io: S, banner: &str, mut prompt: String, replies: Vec<(&'static str, &'static str)>, fake: Fake)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let _ = io.write_all(format!("{banner}{prompt}").as_bytes()).await;
         let mut buf = [0u8; 4096];
         let mut line = String::new();
+        // ksh88 (AIX 5.3): a failed `set +o history 2>/dev/null` leaves stderr
+        // on /dev/null, and the prompt (written there) is gone until `exec 2>&1`.
+        let mut prompt_hidden = false;
+        // Replaced by a child shell started with HISTFILE=/dev/null.
+        let mut fresh = false;
+        let name = fake.zero.trim_start_matches('-');
         loop {
             let n = io.read(&mut buf).await.unwrap_or(0);
             if n == 0 {
                 return;
             }
             line.push_str(&String::from_utf8_lossy(&buf[..n]));
+            // Ctrl-C: the command (stuck or typed) is dropped, a new prompt shown.
+            if let Some(i) = line.rfind('\x03') {
+                line.drain(..=i);
+                let shown = if prompt_hidden { "" } else { prompt.as_str() };
+                let _ = io.write_all(format!("^C\r\n{shown}").as_bytes()).await;
+            }
             while let Some(i) = line.find('\r') {
                 let cmd: String = line.drain(..=i).collect();
                 let cmd = cmd.trim().to_string();
-                if cmd.starts_with("PS1=") {
-                    prompt = "bxmon> ".into();
+                if !fresh && !cmd.is_empty() {
+                    fake.history.lock().unwrap().push(cmd.clone());
                 }
-                let out = replies.iter().find(|(c, _)| cmd.starts_with(c)).map(|(_, o)| *o).unwrap_or("");
+                let mut said = String::new();
+                if fake.csh {
+                    if cmd.starts_with("exec 2>&1") {
+                        return; // ran "2": not found, and the shell is gone
+                    }
+                    if let Some((word, _)) = cmd.split_once(' ').filter(|(w, _)| w.contains('=')) {
+                        said = format!("{word}: Command not found.");
+                    }
+                } else {
+                    if cmd.starts_with("PS1=") || cmd.contains("; PS1=") {
+                        prompt = "bxmon> ".into();
+                    }
+                    if cmd.contains("; set +o history 2>/dev/null") {
+                        prompt_hidden = true;
+                    }
+                    if cmd.ends_with("exec 2>&1") {
+                        prompt_hidden = false;
+                    }
+                    if !name.is_empty() && cmd.starts_with(&format!("case \"$SHELL\" in */{name})")) && cmd.contains("HISTFILE=/dev/null") {
+                        fresh = true;
+                        prompt = "bxmon> ".into();
+                    }
+                }
+                if cmd.starts_with("echo @@S''H") {
+                    said = format!("@@SH {}", fake.zero);
+                }
+                if cmd == "echo @@S''YNC" {
+                    said = "@@SYNC".into();
+                }
+                // A command the shell never answers (the test of a stuck step).
+                if replies.iter().any(|(c, o)| cmd.starts_with(c) && *o == "@@SILENT") {
+                    continue;
+                }
+                let out = replies.iter().find(|(c, _)| cmd.starts_with(c)).map(|(_, o)| *o).unwrap_or(said.as_str());
                 let out = if out.is_empty() { String::new() } else { format!("{out}\r\n") };
-                if io.write_all(format!("{cmd}\r\n{out}{prompt}").as_bytes()).await.is_err() {
+                let shown = if prompt_hidden { "" } else { prompt.as_str() };
+                if io.write_all(format!("{cmd}\r\n{out}{shown}").as_bytes()).await.is_err() {
                     return;
                 }
             }
         }
+    }
+
+    /// The hidden shell never answers the prompt change (seen on an AIX 5.3
+    /// host): the monitor goes on with the shell's own prompt, and a step
+    /// that times out names what was sent and the last screen line.
+    #[tokio::test]
+    async fn monitors_aix_when_the_prompt_change_gets_no_answer() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(fake_unix(
+            server,
+            "AIX Version 5
+",
+            "pstcs:/# ".into(),
+            vec![
+                ("PROMPT_COMMAND=", "@@SILENT"),
+                ("uname -sr", "AIX 3"),
+                ("uname -v", "5"),
+                ("hostname", "pstcs"),
+                ("show version", "ksh: show:  not found."),
+                ("get system status", "ksh: get:  not found."),
+                ("vmstat 1 2", AIX_VMSTAT),
+                ("echo @@C''MDS", "@@SILENT"),
+                ("echo @@T''YPES", "@@TYPES\r\nlogs/\r\nrun.sh*\r\n@@END"),
+            ],
+        ));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (query, queries) = mpsc::channel(1);
+        let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !events.lock().unwrap().iter().any(|e: &Value| e.get("stats").is_some()) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (device, stats) = first_sample(&events).await;
+        assert_eq!((device["label"].as_str(), stats["cpu"].as_f64()), (Some("AIX 5.3"), Some(22.0)), "{stats}");
+        let (reply, answer) = oneshot::channel();
+        query.send(Query::Commands(reply)).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(25), answer).await.unwrap().unwrap().unwrap_err();
+        assert!(err.contains("echo @@C''MDS") && err.contains("마지막 화면"), "{err}");
+        // Only that query failed: Ctrl-C got the shell back, and the next
+        // query is answered in step.
+        let (reply, answer) = oneshot::channel();
+        query.send(Query::Types(crate::monitor::types_script("/home").unwrap(), reply)).await.unwrap();
+        let names = tokio::time::timeout(Duration::from_secs(20), answer).await.unwrap().unwrap();
+        let ended = monitor.is_finished();
+        monitor.abort();
+        assert_eq!(names, Ok(vec!["logs/".to_string(), "run.sh*".to_string()]));
+        assert!(!ended);
+    }
+
+    /// A query whose shell never comes back, not even after Ctrl-C (a
+    /// process stuck on a dead NFS server): the monitor ends, out of step.
+    #[tokio::test]
+    async fn a_query_that_cannot_be_interrupted_ends_the_monitor() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(fake_unix(
+            server,
+            "",
+            "$ ".into(),
+            vec![
+                ("uname -sr", "AIX 3"),
+                ("uname -v", "7"),
+                ("hostname", "aix01"),
+                ("vmstat 1 2", AIX_VMSTAT),
+                ("echo @@T''YPES", "@@SILENT"),
+                ("echo @@S''YNC", "@@SILENT"),
+            ],
+        ));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (query, queries) = mpsc::channel(1);
+        let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
+        first_sample(&events).await;
+        let (reply, answer) = oneshot::channel();
+        query.send(Query::Types(crate::monitor::types_script("/nfs").unwrap(), reply)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(20), answer).await.unwrap().unwrap().is_err());
+        let ended = tokio::time::timeout(Duration::from_secs(20), monitor).await.unwrap().unwrap();
+        assert_eq!(ended, Err(OUT_OF_STEP.to_string()));
+    }
+
+    /// ksh88 reads HISTFILE only when it starts: the monitor replaces the
+    /// login shell with a history-free child of the same shell before its
+    /// polls, so they never reach the user's ~/.sh_history.
+    #[tokio::test]
+    async fn polls_stay_out_of_the_ksh_history() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let fake = Fake { zero: "-ksh", ..Fake::default() };
+        let history = fake.history.clone();
+        tokio::spawn(fake_shell(server, "", "pstcs:/# ".into(), aix_replies(), fake));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (_query, queries) = mpsc::channel(1);
+        let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
+        let (device, stats) = first_sample(&events).await;
+        let ended = monitor.is_finished();
+        monitor.abort();
+        assert!(!ended && device["kind"] == "aix" && stats["cpu"] == 22.0, "{stats}");
+        let history = history.lock().unwrap();
+        assert!(history.last().is_some_and(|c| c.starts_with("case \"$SHELL\" in */ksh)")), "{history:?}");
+        assert!(!history.iter().any(|c| c.starts_with("vmstat")), "{history:?}");
+    }
+
+    /// The child shell never shows its prompt: the monitor goes on with
+    /// the shell as it is (the polls then do reach the history).
+    #[tokio::test]
+    async fn monitors_when_the_fresh_shell_gets_no_answer() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut replies = aix_replies();
+        replies.insert(0, ("case \"$SHELL\"", "@@SILENT"));
+        tokio::spawn(fake_shell(server, "", "pstcs:/# ".into(), replies, Fake { zero: "-ksh", ..Fake::default() }));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (_query, queries) = mpsc::channel(1);
+        let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        while !events.lock().unwrap().iter().any(|e: &Value| e.get("stats").is_some()) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (_, stats) = first_sample(&events).await;
+        let ended = monitor.is_finished();
+        monitor.abort();
+        assert!(!ended && stats["cpu"] == 22.0, "{stats}");
+    }
+
+    /// csh keeps its own prompt and never gets `exec 2>&1` (it would run a
+    /// program "2", write a file "1", and end the shell); a csh-like shell
+    /// not recognised by name stops at the guard's assignment.
+    #[tokio::test]
+    async fn csh_never_runs_the_stderr_fallback() {
+        for (zero, silent_prompt_change) in [("-csh", false), ("-xsh", true)] {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let mut replies = aix_replies();
+            if silent_prompt_change {
+                replies.insert(0, ("PROMPT_COMMAND=", "@@SILENT"));
+            }
+            tokio::spawn(fake_shell(server, "", "aix01% ".into(), replies, Fake { zero, csh: true, ..Fake::default() }));
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let (_query, queries) = mpsc::channel(1);
+            let monitor = tokio::spawn(async move { run_shell(Line::shell(client), move |e| sink.lock().unwrap().push(e), queries).await });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+            while !events.lock().unwrap().iter().any(|e: &Value| e.get("stats").is_some()) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let (_, stats) = first_sample(&events).await;
+            let ended = if monitor.is_finished() { format!("{:?}", monitor.await) } else { monitor.abort(); String::new() };
+            assert!(ended.is_empty() && stats["cpu"] == 22.0, "{zero}: {stats} {ended}");
+        }
+    }
+
+    fn aix_replies() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("uname -sr", "AIX 3"),
+            ("uname -v", "5"),
+            ("hostname", "pstcs"),
+            ("show version", "ksh: show:  not found."),
+            ("get system status", "ksh: get:  not found."),
+            ("vmstat 1 2", AIX_VMSTAT),
+        ]
+    }
+
+    /// Telnet login with a user name to give: a banner line that looks like
+    /// a prompt ("Authorized users only #", no line break yet) is not taken
+    /// for the shell; a framed one after the password does not end the wait
+    /// before the login script's TERM question either.
+    #[tokio::test]
+    async fn login_does_not_take_a_banner_for_the_prompt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = got.clone();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"\r\nAuthorized users only #").await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let _ = s.write_all(b"\r\nlogin: ").await;
+            let mut buf = [0u8; 1024];
+            let mut line = String::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(i) = line.find('\r') {
+                    let cmd: String = line.drain(..=i).collect();
+                    let cmd = cmd.trim().to_string();
+                    let stage = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(cmd.clone());
+                        seen.len()
+                    };
+                    match stage {
+                        1 => {
+                            let _ = s.write_all(b"\r\nPassword: ").await;
+                        }
+                        2 => {
+                            let _ = s.write_all(b"\r\n# Authorized use only #").await;
+                            tokio::time::sleep(Duration::from_millis(900)).await;
+                            let _ = s.write_all(b"\r\nTERM = (hp) ").await;
+                        }
+                        _ => {
+                            let _ = s.write_all(b"\r\n$ ").await;
+                        }
+                    }
+                }
+            }
+        });
+        let mut t = Line::telnet("127.0.0.1", port, None).await.unwrap();
+        let prompt = login(&mut t, "monitor", Some("pw"), false).await.unwrap();
+        assert_eq!(last_line(&prompt), "$");
+        assert_eq!(*got.lock().unwrap(), ["monitor", "pw", ""], "the TERM question got its Enter");
     }
 
     /// Events of a monitor until it reported a sample (or 15 s).
@@ -1836,12 +2309,28 @@ mod safety_tests {
     #[test]
     fn backups_must_be_complete_configurations() {
         let refused = ["show running-config", "               ^", "% Invalid input detected at '^' marker."];
-        assert!(backup_complete(Kind::Ios, &refused[1..]).is_err());
-        assert!(backup_complete(Kind::Ios, &["Building configuration...", "hostname R1", "end"]).is_ok());
-        assert!(backup_complete(Kind::Ios, &["Building configuration...", "hostname R1", "banner motd ^C"]).is_err());
-        assert!(backup_complete(Kind::Vrp, &["sysname HW", "return"]).is_ok());
-        assert!(backup_complete(Kind::Fortigate, &["#config-version=FGT100F-7.2.5", "config system global", "end"]).is_ok());
-        assert!(backup_complete(Kind::Fortigate, &["Command fail. Return code -61"]).is_err());
-        assert!(backup_complete(Kind::Nxos, &["version 9.3(8)", "hostname N9K"]).is_ok());
+        assert!(backup_complete(Kind::Ios, &refused[1..], true).is_err());
+        assert!(backup_complete(Kind::Ios, &["Building configuration...", "hostname R1", "end"], true).is_ok());
+        assert!(backup_complete(Kind::Ios, &["Building configuration...", "hostname R1", "banner motd ^C"], true).is_err());
+        assert!(backup_complete(Kind::Vrp, &["sysname HW", "return"], true).is_ok());
+        assert!(backup_complete(Kind::Fortigate, &["#config-version=FGT100F-7.2.5", "config system global", "end"], true).is_ok());
+        assert!(backup_complete(Kind::Fortigate, &["Command fail. Return code -61"], true).is_err());
+        assert!(backup_complete(Kind::Nxos, &["version 9.3(8)", "hostname N9K"], true).is_ok());
+        // No end marker: without the prompt back the output may be cut short.
+        for kind in [Kind::Nxos, Kind::Junos, Kind::ArubaCx] {
+            assert!(backup_complete(kind, &["hostname N9K", "interface Ethernet1/1", "  description <to-core>"], false).is_err(), "{kind:?}");
+        }
+    }
+
+    /// A finished output line ending in "%" or ">" is not the prompt: only
+    /// the line the cursor is on (nothing after it) can be.
+    #[test]
+    fn only_the_cursor_line_is_a_prompt() {
+        assert_eq!(last_line("show cpu usage\nCPU utilization for 5 seconds = 1%; 1 minute: 2%; 5 minutes: 8%\n"), "");
+        assert_eq!(last_line("interface Gi1\n description <to-core>\r\n"), "");
+        assert_eq!(last_line("show cpu\n...\nASA# "), "ASA#");
+        assert_eq!(shown_line("x\n5 minutes: 8%\n"), "5 minutes: 8%");
+        assert!(!is_prompt("# Authorized use only #") && !is_prompt("%% NOTICE %%"));
+        assert!(is_prompt("#") && is_prompt("$") && is_prompt("[root@h ~]#") && is_prompt("<SW01>"));
     }
 }

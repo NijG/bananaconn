@@ -129,7 +129,7 @@ pub async fn file_server_start(app: AppHandle, state: State<'_, FileServersState
     if kind != "tftp" && kind != "http" {
         return Err("알 수 없는 서버 종류입니다".into());
     }
-    if state.running.lock().unwrap().contains_key(&kind) {
+    if state.running.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&kind) {
         return Err(format!("{} 서버가 이미 실행 중입니다", kind.to_uppercase()));
     }
     let root = Path::new(&config.root)
@@ -156,7 +156,19 @@ pub async fn file_server_start(app: AppHandle, state: State<'_, FileServersState
         auth: kind == "http" && auth,
         addresses: addresses(&kind, config.port, config.lan),
     };
-    state.running.lock().unwrap().insert(kind, Running { status: status.clone(), task, ctl });
+    // A second start of the same kind may have run in parallel (on another
+    // port, so its bind succeeded too): the first one registered wins, and
+    // this server is stopped instead of replacing an entry nobody could stop.
+    match state.running.lock().unwrap_or_else(|p| p.into_inner()).entry(kind.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => {
+            ctl.stopped.store(true, Ordering::Relaxed);
+            task.abort();
+            return Err(format!("{} 서버가 이미 실행 중입니다", kind.to_uppercase()));
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(Running { status: status.clone(), task, ctl });
+        }
+    }
     notify.emit("started", "", status.addresses.join(", "));
     Ok(status)
 }
@@ -193,8 +205,10 @@ async fn start(config: &FileServerConfig, root: PathBuf, notify: Notify, ctl: Co
 
 #[tauri::command]
 pub fn file_server_stop(app: AppHandle, state: State<FileServersState>, kind: String) {
-    if let Some(r) = state.running.lock().unwrap().remove(&kind) {
-        // Ends transfers already running too, not only the listener.
+    if let Some(r) = state.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&kind) {
+        // Ends transfers already running too, not only the listener: TFTP
+        // transfers see the flag; HTTP connections are tasks of the accept
+        // loop's JoinSet, aborted when the aborted loop drops it.
         r.ctl.stopped.store(true, Ordering::Relaxed);
         r.task.abort();
         Notify(Some(app), if kind == "tftp" { "tftp" } else { "http" }).emit("stopped", "", String::new());
@@ -203,13 +217,13 @@ pub fn file_server_stop(app: AppHandle, state: State<FileServersState>, kind: St
 
 #[tauri::command]
 pub fn file_server_status(state: State<FileServersState>) -> Vec<FileServerStatus> {
-    state.running.lock().unwrap().values().map(|r| r.status.clone()).collect()
+    state.running.lock().unwrap_or_else(|p| p.into_inner()).values().map(|r| r.status.clone()).collect()
 }
 
 /// Number of transfers in progress, per server kind (for a confirmation on stop).
 #[tauri::command]
 pub fn file_server_active(state: State<FileServersState>, kind: String) -> u32 {
-    state.running.lock().unwrap().get(&kind).map(|r| r.ctl.active.load(Ordering::Relaxed)).unwrap_or(0)
+    state.running.lock().unwrap_or_else(|p| p.into_inner()).get(&kind).map(|r| r.ctl.active.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 // ---- TFTP --------------------------------------------------------------------------------------
@@ -524,13 +538,27 @@ impl Transfer<'_> {
 
 const MAX_HTTP_CONNECTIONS: u32 = 64;
 
+/// How long one write to an HTTP client may take; a client that stops
+/// reading would otherwise hold its connection (and a slot) forever.
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn write_timed(write: impl std::future::Future<Output = std::io::Result<()>>) -> std::io::Result<()> {
+    tokio::time::timeout(HTTP_WRITE_TIMEOUT, write)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "client stalled"))?
+}
+
 async fn http_serve(listener: TcpListener, root: Arc<PathBuf>, auth: Option<Arc<String>>, notify: Notify, ctl: Control) {
+    // The connections belong to this task: when it is aborted (server
+    // stopped), dropping the set aborts every connection still open.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let Ok((stream, peer)) = listener.accept().await else { continue };
+        while connections.try_join_next().is_some() {}
         // Counted before spawning, so a burst cannot get past the limit.
         let Some(slot) = take_slot(&ctl.active, MAX_HTTP_CONNECTIONS) else { continue };
         let (root, auth, notify, ctl) = (root.clone(), auth.clone(), notify.clone(), ctl.clone());
-        tauri::async_runtime::spawn(async move {
+        connections.spawn(async move {
             let _slot = slot;
             let _ = http_one(stream, peer, &root, auth.as_deref(), &notify, &ctl).await;
         });
@@ -587,11 +615,11 @@ async fn respond(stream: &mut TcpStream, status: &str, extra: &str, body: &[u8],
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{extra}\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).await?;
+    write_timed(stream.write_all(head.as_bytes())).await?;
     if !head_only {
-        stream.write_all(body).await?;
+        write_timed(stream.write_all(body)).await?;
     }
-    stream.flush().await
+    write_timed(stream.flush()).await
 }
 
 async fn http_one(mut stream: TcpStream, peer: SocketAddr, root: &Path, auth: Option<&String>, notify: &Notify, ctl: &Control) -> std::io::Result<()> {
@@ -692,7 +720,7 @@ async fn http_one(mut stream: TcpStream, peer: SocketAddr, root: &Path, auth: Op
         "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox\r\n\r\n",
         content_type(&path)
     );
-    stream.write_all(headers.as_bytes()).await?;
+    write_timed(stream.write_all(headers.as_bytes())).await?;
     if !head_only {
         // Copy in chunks: a stalled client times out per chunk (not per file, so
         // big files on slow links finish), and a stopped server ends the copy.
@@ -705,13 +733,11 @@ async fn http_one(mut stream: TcpStream, peer: SocketAddr, root: &Path, auth: Op
             if n == 0 {
                 break;
             }
-            tokio::time::timeout(Duration::from_secs(60), stream.write_all(&chunk[..n]))
-                .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "client stalled"))??;
+            write_timed(stream.write_all(&chunk[..n])).await?;
         }
         notify.emit("download", &who, format!("{decoded} ({len} bytes)"));
     }
-    stream.flush().await
+    write_timed(stream.flush()).await
 }
 
 /// Start a server without Tauri (tests). Returns the task to abort.
@@ -736,6 +762,34 @@ mod tests {
         for bad in ["../x", "/../../Windows/win.ini", "..\\x", "C:\\Windows\\win.ini", "sub/../../x", "CON", "a:b", "sub/aux.txt"] {
             assert!(resolve_in_root(&root, bad, false).is_none(), "{bad}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stopping the HTTP server (aborting its accept loop) also closes the
+    /// connections it is still serving.
+    #[tokio::test]
+    async fn stopping_http_closes_open_connections() {
+        let dir = std::env::temp_dir().join(format!("bx-fs-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config = FileServerConfig {
+            kind: "http".into(),
+            root: dir.to_string_lossy().into_owned(),
+            port,
+            lan: false,
+            read_only: true,
+            username: String::new(),
+            password: String::new(),
+        };
+        let task = test_start(config).await;
+        // A request head that never ends: its handler waits up to 10 s.
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "the connection was closed with the server");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

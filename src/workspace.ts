@@ -432,7 +432,7 @@ export class Workspace {
       // The protocol shows as the dot's color and in the tooltip; the label
       // itself cost too much width with many tabs open.
       const html = `<span class="tab-dot"></span>
-        <span class="tab-title">${esc(t.view.title())}</span>
+        <span class="tab-title" data-i18n-skip>${esc(t.view.title())}</span>
         <button class="tab-close" data-close title="닫기">${icon("X", 13)}</button>`;
       if (t.el.dataset.html !== html) {
         t.el.innerHTML = html;
