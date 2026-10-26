@@ -44,6 +44,8 @@ export interface Settings {
   checkTypedCommands: boolean;
   /** Colour the words of the command line being typed. */
   cmdColor: boolean;
+  /** Colour ls listings by file type where the server does not (AIX, HP-UX …). */
+  lsColor: boolean;
   /** Suggest the rest of a command from the commands run before. */
   cmdSuggest: boolean;
   /** AI providers (ai/core.ts); none until the user adds one. */
@@ -115,6 +117,7 @@ const DEFAULT_SETTINGS: Settings = {
   highlightKeywords: true,
   checkTypedCommands: true,
   cmdColor: true,
+  lsColor: true,
   cmdSuggest: true,
   aiMaskHosts: false,
   aiPreview: true,

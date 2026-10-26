@@ -3,11 +3,12 @@
 // a command in an answer is copied for the engineer to paste.
 
 import { writeClipboard } from "../clipboard";
-import { contextMenu, toast } from "../ui";
+import { contextMenu, toast, type MenuItem } from "../ui";
 import type { AiHost, AiPanel } from "./panel";
 
-export function desktopHost(opts: { system: string; names: () => string[]; canvas: () => HTMLCanvasElement | null; focus: () => void }): AiHost {
+export function desktopHost(opts: { key: string; system: string; names: () => string[]; canvas: () => HTMLCanvasElement | null; focus: () => void }): AiHost {
   return {
+    conversationKey: () => opts.key,
     target: () => ({ system: opts.system, network: false }),
     hostNames: () => opts.names().filter((s) => s && s.length >= 3),
     selection: () => "",
@@ -33,6 +34,8 @@ export class ViewAi {
     private view: HTMLElement,
     private host: AiHost,
     private relayout: () => void,
+    /** More menu items for this view (after a separator). */
+    private extras: () => MenuItem[] = () => [],
   ) {}
 
   private async open(): Promise<AiPanel> {
@@ -59,6 +62,7 @@ export class ViewAi {
       { label: "화면 설명 (캡처해서 묻기)", icon: "ScanEye", action: () => void this.open().then((p) => p.explainScreen()) },
       { label: "화면 캡처해 대화에 첨부", icon: "Camera", action: () => void this.open().then((p) => (p.captureScreen(), p.focus())) },
       { label: this.panel ? "AI 대화 닫기" : "AI 대화 열기", icon: "Bot", action: () => (this.panel ? this.close() : void this.open().then((p) => p.focus())) },
+      ...(this.extras().length ? ["-" as const, ...this.extras()] : []),
     ]);
   }
 

@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::monitor::{parse_block, parse_commands, parse_top, Section, Stats, COMMANDS_SCRIPT, TOP_SCRIPT};
+use crate::monitor::{parse_block, parse_commands, parse_top, parse_types, Section, Stats, COMMANDS_SCRIPT, TOP_SCRIPT};
 use crate::telnet;
 
 const STEP: Duration = Duration::from_secs(15);
@@ -40,6 +40,8 @@ pub(crate) enum Query {
     Backup(oneshot::Sender<Result<String, String>>),
     /// The programs on a Unix server's PATH (command suggestions).
     Commands(oneshot::Sender<Result<Vec<String>, String>>),
+    /// A folder's entries with ls -F marks (the script from `types_script`).
+    Types(String, oneshot::Sender<Result<Vec<String>, String>>),
     /// Pause (no tab of this device on screen) or resume sampling.
     Pause(bool),
 }
@@ -271,6 +273,8 @@ impl Line {
             limit,
         )
         .await
+        // Which command did not finish says more than the timeout alone.
+        .map_err(|e| if e == "장비가 응답하지 않습니다" { format!("장비가 응답하지 않습니다 ({})", cmd.chars().take(40).collect::<String>()) } else { e })
     }
 
     /// Wait for the first prompt after logging in. Answers what login scripts
@@ -1005,12 +1009,14 @@ async fn detect(t: &mut Line, prompt: &str) -> Result<Option<(Kind, String, Stri
                 let os = t.run("cat /etc/redhat-release 2>/dev/null || (. /etc/os-release 2>/dev/null; echo \"$PRETTY_NAME\")").await?;
                 body(&os).iter().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("Linux").to_string()
             }
-            // `uname -sr` says "AIX 3"; the technology level is more useful.
+            // `uname -sr` says "AIX 3" (the release); with `uname -v` (the version)
+            // it is "AIX 5.3". Not `oslevel -s`: it reads the ODM and can take a minute.
             Kind::Aix => {
-                let level = t.run("oslevel -s").await?;
-                match body(&level).iter().map(|l| l.trim()).find(|l| l.starts_with(|c: char| c.is_ascii_digit())) {
-                    Some(level) => format!("AIX {level}"),
-                    None => "AIX".to_string(),
+                let version = t.run("uname -v").await?;
+                let release = body(&uname).first().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+                match body(&version).iter().map(|l| l.trim()).find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit())) {
+                    Some(v) if !release.is_empty() => format!("AIX {v}.{release}"),
+                    _ => "AIX".to_string(),
                 }
             }
             // "Oracle Solaris 11.4 X86" says more than "SunOS 5.11".
@@ -1134,6 +1140,17 @@ pub(crate) async fn drive(
                         let _ = reply.send(Err("네트워크 장비는 명령 목록을 읽지 않습니다".into()));
                     } else {
                         let r = t.run_script(COMMANDS_SCRIPT).await.map(|out| parse_commands(&out));
+                        let failed = r.is_err();
+                        let _ = reply.send(r);
+                        if failed { return Err(OUT_OF_STEP.into()) }
+                    }
+                    false
+                }
+                Some(Query::Types(script, reply)) => {
+                    if kind.network() {
+                        let _ = reply.send(Err("네트워크 장비는 파일 목록을 읽지 않습니다".into()));
+                    } else {
+                        let r = t.run_script(&script).await.map(|out| parse_types(&out));
                         let failed = r.is_err();
                         let _ = reply.send(r);
                         if failed { return Err(OUT_OF_STEP.into()) }
@@ -1458,7 +1475,7 @@ mod device_tests {
             "[monitor@aix01 /home/monitor]".into(),
             vec![
                 ("uname -sr", "AIX 3"),
-                ("oslevel -s", "7300-02-01-2346"),
+                ("uname -v", "7"),
                 ("hostname", "aix01"),
                 ("show version", "ksh: show:  not found."),
                 ("get system status", "ksh: get:  not found."),
@@ -1477,7 +1494,7 @@ mod device_tests {
         let names = tokio::time::timeout(Duration::from_secs(8), answer).await.unwrap().unwrap().unwrap();
         assert_eq!(names, ["lsdev", "lslpp", "svmon"]);
         monitor.abort();
-        assert_eq!((device["kind"].as_str(), device["label"].as_str(), device["name"].as_str()), (Some("aix"), Some("AIX 7300-02-01-2346"), Some("aix01")), "{stats}");
+        assert_eq!((device["kind"].as_str(), device["label"].as_str(), device["name"].as_str()), (Some("aix"), Some("AIX 7.3"), Some("aix01")), "{stats}");
         assert_eq!(stats["cpu"], 22.0, "{stats}");
         assert_eq!((stats["memUsed"].as_u64(), stats["memTotal"].as_u64()), (Some(3145728 * 4096), Some(4194304 * 4096)));
         assert_eq!(stats["diskTotal"].as_u64(), Some(2097152 * 1024));
@@ -1594,7 +1611,7 @@ mod device_tests {
                                 "pstcp:/# ".into(),
                                 vec![
                                     ("uname -sr", "AIX 3"),
-                                    ("oslevel -s", "5300-12-04-1119"),
+                                    ("uname -v", "5"),
                                     ("hostname", "pstcp"),
                                     ("show version", "ksh: show:  not found."),
                                     ("get system status", "ksh: get:  not found."),

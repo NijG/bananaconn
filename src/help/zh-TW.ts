@@ -126,6 +126,7 @@ export const SECTIONS: HelpSection[] = [
       <p><b>各 OS 的內建片段</b>：提供 Linux、AIX、HP-UX、Solaris、Windows、Cisco IOS · NX-OS · ASA、FortiGate、Aruba、Juniper 與 Huawei 的常用唯讀檢查 (不會變更任何內容的命令)。片段清單會優先顯示您自己的片段以及該分頁辨識出的 OS 的片段；其他系統可在「… 片段」中一鍵找到。在管理程式碼片段中可以編輯、刪除，或變更其 OS 分類。</p>
       <p><b>危險命令</b>：片段或巨集傳送的每一行都會依 設定 → 危險命令 中的規則檢查。變更時間或 NTP 的命令 (<code>timedatectl set-ntp</code>, <code>date -s</code>, <code>ntpdate</code>, <code>ntp server</code>, <code>clock set</code> …) 會被<b>封鎖</b>，不會傳送；重新開機、刪除、格式化或變更設備組態等命令需要先在<b>警告</b>中確認。傳送時會開啟該分頁的記錄，每次嘗試、取消與封鎖都會寫入記錄資料夾中的 <code>risky-commands.log</code>。以 <code>;</code>、<code>&amp;&amp;</code> 串接的命令，<code>sudo</code>、<code>su -c</code>、<code>bash -c</code>、<code>eval</code> 中的命令，以及以行尾 <code>\\</code> 接續的命令也會檢查。含有 Tab 自動完成或游標移動鍵 (←→、Home、命令記錄 ↑↓) 的巨集會發出警告，因為無法得知實際傳送的命令。自己輸入的命令也會檢查：按 Enter 時，會用相同的規則檢查畫面上顯示的命令列（包括命令記錄 ↑↓ 與 Tab 自動完成的結果）。vi、less 等全螢幕程式中不檢查，可在設定 → 危險指令中關閉此檢查。</p>
       <p><b>輸入指令時的上色與自動完成</b>：提示字元後正在輸入的指令會依指令、選項、字串、路徑與連接符號上色，符合危險指令規則時在按 Enter 之前變為紅色。根據先前執行過的指令（僅保存在本機）與程式碼片段，以灰色建議指令的其餘部分：<kbd>→</kbd> 或 <kbd>End</kbd> 輸入全部，<kbd>Ctrl</kbd>+<kbd>→</kbd> 逐字輸入。<kbd>Tab</kbd> 仍是伺服器本身的自動完成。<kbd>Ctrl</kbd>+<kbd>Space</kbd> 開啟候選清單（↑↓ 選擇，Enter 或 Tab 輸入，Esc 關閉）。候選項依序來自執行記錄、程式碼片段、已辨識裝置的指令辭典（Linux、AIX、HP-UX、Solaris、Windows、Cisco、FortiGate、Aruba、Juniper、Huawei），以及開啟資源監視器的 Unix 伺服器 PATH 中的程式名稱。這些名稱透過監視器連線只讀取一次，不會在終端機中輸入任何內容。命令列從畫面讀取，因此不顯示的密碼不會被記錄，危險指令以及含有密碼或權杖的指令（<code>mysql -p…</code>、<code>--password=…</code>、<code>TOKEN=…</code>）既不記錄也不建議。輸入錯誤的記錄可在候選清單中按 <kbd>Shift</kbd>+<kbd>Delete</kbd> 刪除。可在設定 → 終端機中分別關閉，並清除命令記錄。</p>
+      <p><b>ls 清單的顏色</b>：在 AIX、HP-UX、Solaris 等 ls 不著色的伺服器上，也像 Linux 一樣以顏色區分資料夾 (藍)、執行檔 (綠)、連結 (青) 與壓縮檔 (紅)。ls -l 與 ls -F 依輸出判斷；一般 ls 會透過資源監視連線另外讀取該資料夾 (提示字元顯示路徑時)。不會向終端機傳送任何內容，伺服器自行著色的清單保持原樣。可在設定 → 終端機中關閉。</p>
       <h4>建立與傳送片段</h4>
       <ol>
         <li>在終端機工具列中：<b>片段</b> → <b>管理程式碼片段…</b> → <b>新增片段</b>。</li>
@@ -157,12 +158,13 @@ export const SECTIONS: HelpSection[] = [
         <li><b>連接方式</b>：API 金鑰（Anthropic Claude、OpenAI、Google Gemini、OpenAI 相容伺服器）、訂閱 CLI（Claude Code、Codex CLI、Gemini CLI：在本機安裝並登入一次後，即可用您的訂閱回答）、本地 LLM（Ollama，或 LM Studio、llama.cpp、vLLM 等 OpenAI 相容伺服器）。API 金鑰儲存在認證保管庫中；「載入清單」取得模型，「測試連線」試用服務。</li>
         <li><b>產生指令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可取得一條適合所辨識裝置或系統的指令。再按一次 Enter 會放入輸入列（不會執行），由您自己按 Enter 執行。危險指令規則同樣適用：被封鎖的指令（修改時間、NTP 等）甚至不會放入輸入列。</li>
         <li><b>說明輸出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：說明所選文字（若未選取則為畫面上最近的輸出）的意義、可能原因與後續步驟。</li>
-        <li><b>AI 對話</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在終端機右側開啟對話窗格。以「附加選取內容」一併傳送輸出；回答中每行指令旁的按鈕可將其放入輸入列。</li>
+        <li><b>AI 對話</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在終端機右側開啟對話窗格。以「附加選取內容」一併傳送輸出；回答中每行指令旁的按鈕可將其放入輸入列。 拖曳對話窗格的左邊緣可調整寬度 (所有分頁記住同一寬度)，按兩下恢復預設寬度。</li>
         <li><b>AI 執行指令</b>：在 AI 對話中寫下要做的事，AI 會在此終端機中逐一執行指令，讀取結果並分析。每次執行都顯示在畫面上，並全部記錄在 <code>risky-commands.log</code> 中。唯讀指令（<code>df</code>、<code>free</code>、<code>systemctl status</code>、<code>show …</code>、<code>display …</code> 等）直接執行；可能變更系統的指令會等待您選擇「執行」或「略過」。符合封鎖規則的指令（修改時間、NTP 等）絕不執行。每個問題最多 8 個指令，每個指令 30 秒後以 Ctrl+C 停止。可用對話窗格下方的按鈕切換為「每個都確認」或「不執行」。</li>
         <li><b>設定與記錄分析</b>：對話窗格中的檔案按鈕可選擇設定或記錄檔案進行檢查（安全問題、危險設定）或分析（錯誤、異常跡象）。網路裝置可透過裝置按鈕 →「用 AI 檢查設定」直接檢查 running-config。</li>
         <li><b>傳送的內容</b>：傳送到雲端 AI 之前，會顯示將傳送的內容並請您確認（每個對話可選擇「不再詢問」）。密碼、金鑰與權杖（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私密金鑰等）一律會隱藏；開啟設定後，IP 位址與主機名稱也會替換為 IP_1、HOST_1 等再傳送，回答中會還原為實際值。本地 LLM 不會離開本機，因此不會詢問或隱藏。傳送公司設備資訊給外部 AI 之前，請確認公司的安全政策。</li>
         <li>訂閱 CLI：Claude Code 在關閉所有工具（不執行指令、不讀取檔案）的狀態下於空資料夾中執行，Codex 在唯讀沙箱中執行。應用程式不會處理您的登入資訊。</li>
         <li><b>附件與遠端桌面</b>：以對話窗格的 📎 按鈕、拖放或 <kbd>Ctrl</kbd>+<kbd>V</kbd>（螢幕擷取）附加圖片、PDF 與文字檔。文字檔會併入訊息並套用隱藏；圖片與 PDF 無法隱藏，會在預覽中按原樣顯示。大圖片會自動縮小。大多數服務接受圖片；PDF 由 Claude、Gemini、OpenAI API 與 Claude Code 接受。在 RDP 與 VNC 中，工具列的「AI」可擷取遠端畫面以取得說明或附加到對話。遠端桌面中 AI 不執行指令，回答中的指令可用複製按鈕複製後貼到遠端畫面。</li>
+        <li><b>在 RDP 電腦上由 AI 直接執行</b>：在 RDP 工具列的「AI」→「透過 SSH 連線讓 AI 執行命令…」中會顯示啟用 OpenSSH 伺服器的指令碼。複製後在遠端畫面的系統管理員 PowerShell 執行，再按「確認連線並開啟 SSH 工作階段」，即會確認連接埠 22，並以相同的主機、帳戶與資料夾新增並開啟 SSH 工作階段 (已有則直接開啟)。在該工作階段中，AI 會立即執行 Get-*、ipconfig、systeminfo 等唯讀 PowerShell 命令，可能變更系統的命令則先請求確認。 VNC 的「AI」選單也有相同項目，並會顯示在 Linux/Unix 電腦上啟用 SSH 伺服器的命令 (VNC 密碼不會用於 SSH 登入)。</li>
       </ul>`,
   },
   {
@@ -210,6 +212,7 @@ export const SECTIONS: HelpSection[] = [
         <li>當您檢視其他分頁或視窗最小化時，該 RDP 分頁會停止繪製，回來時再一次取得完整畫面。</li>
         <li><b>VNC 速度</b>：在工具列的「畫質」中選擇 快速 (預設：降低色彩/畫質並盡量壓縮)、一般 或 清晰 (立即套用且不會中斷連線)。開啟「狀態」即可查看伺服器使用的編碼與每秒接收的資料量。若只出現 Raw 或 Hextile，表示伺服器沒有使用壓縮。</li>
         <li>VNC 很慢時，原因通常在於<b>伺服器設定</b>。以 TightVNC Server 為例：在伺服器設定 → Server 分頁中，將 <b>Screen polling cycle</b> 從 1000ms 降到 30–50ms、關閉 <b>Grab transparent windows</b>，若已安裝則啟用 <b>mirror driver (DFMirage)</b>。移除桌面桌布也很有幫助。在 4K 等大型畫面上，TightVNC 可能會延遲數十秒 (在某台電腦上實測：TightVNC 延遲 34–46 秒，UltraVNC 接近即時)。此時請使用 <b>UltraVNC Server</b>，並在其 Capture 分頁中開啟 Windows 桌面複製 (DDengine)。</li>
+        <li><b>VNC 檔案傳輸</b>：VNC 通訊協定本身沒有檔案傳輸 (TightVNC 與 UltraVNC 各自使用不同的擴充)。按工具列的「檔案傳輸」，會在旁邊開啟到同一台電腦的 SFTP 檔案窗格。遠端電腦需要執行 SSH 伺服器；若未執行，可用「AI」→「透過 SSH 連線讓 AI 執行命令…」中的指令碼啟用。</li>
         <li>內建 RDP 不使用 mstsc 的圖形加速 (H.264)，因此在畫面變化大時可能比 mstsc 慢。這種情況請使用「以 mstsc 開啟」。</li>
       </ul>`,
   },

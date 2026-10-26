@@ -163,6 +163,7 @@ pub fn run() {
             monitor::monitor_top,
             monitor::monitor_backup,
             monitor::monitor_commands,
+            monitor::monitor_types,
             monitor::monitor_pause,
             tftpclient::tftp_transfer,
             tftpclient::tftp_cancel,

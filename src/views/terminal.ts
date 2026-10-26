@@ -16,6 +16,7 @@ import { patchSession, state, subscribe, updateSettings, type Snippet } from "..
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
 import { CmdAssist } from "../cmdAssist";
+import { keyLine, LsColors } from "../lsColors";
 import type { AiHost, AiPanel } from "../ai/panel";
 
 /** The AI panel and command bar load on first use. */
@@ -210,6 +211,9 @@ export class TerminalView implements View {
   private highlighter = new KeywordHighlighter();
   /** Colours and suggestions for the command line being typed. */
   private assist: CmdAssist;
+  private lsColors: LsColors;
+  /** Keys typed since the last Enter; null once they cannot tell the line (arrows, history). */
+  private keyLine: string | null = "";
   /** The automatic SFTP panel was opened once for this tab. */
   private filesOpened = false;
   /** Keystrokes captured while a macro is being recorded. */
@@ -292,6 +296,13 @@ export class TerminalView implements View {
       () => this.device,
       () => termTheme(state.settings.terminalTheme),
     );
+    this.lsColors = new LsColors(
+      this.term,
+      () => termTheme(state.settings.terminalTheme),
+      // Read over the resource monitor's connection; without one, names alone.
+      (folder) => (this.shared && !this.device?.network ? api.monitorTypes(this.shared.id, folder) : Promise.resolve(null)),
+      () => state.settings.lsColor,
+    );
     // SSH runs ssh.exe inside ConPTY, which rewraps lines itself on resize:
     // xterm must know, or resized lines come out doubled or torn.
     if (session.protocol === "ssh") {
@@ -307,6 +318,13 @@ export class TerminalView implements View {
       // pastes are mirrored as text below.
       const typed = !this.pasting && this.userTurn;
       if (typed && data === "\r" && this.holdRiskyEnter()) return;
+      if (typed && data === "\r") {
+        // The line on screen; before its echo arrives (fast typing, slow
+        // links), the keys pressed since the last Enter.
+        this.lsColors.submitted(this.assist.typedText() || this.keyLine || "", this.assist.knownPrompt());
+        this.keyLine = "";
+      } else if (typed) this.keyLine = keyLine(this.keyLine, data);
+      else if (this.pasting) this.keyLine = null;
       if (typed || this.pasting) this.assist.note(data);
       this.sendInput(data);
       if (typed) this.ws.mirrorInput(this, { keys: data });
@@ -470,9 +488,12 @@ export class TerminalView implements View {
     return {
       target: () => {
         const d = this.device;
+        // Windows over OpenSSH: "PS C:\Users\me>" (PowerShell) or "C:\Users\me>" (cmd).
+        if (this.windowsShell()) return { system: "Windows", network: false, windows: true };
         if (d) return { system: [deviceTitle(d), d.label].filter(Boolean).join(" · "), network: d.network };
         return { system: this.session.protocol === "serial" ? "a device on a serial console" : "", network: this.keyMode === "network" };
       },
+      conversationKey: () => this.historyKey,
       hostNames: () => [this.session.host, this.session.name, this.device?.name ?? "", this.session.username ?? "", ...this.assist.promptNames()].filter((s) => s && s.length >= 3),
       selection: () => this.term.getSelection(),
       recentOutput: (lines) => {
@@ -502,6 +523,14 @@ export class TerminalView implements View {
    * what it printed up to the next prompt. Interactive programs and pagers
    * are left (q / space), a command still running after `timeoutMs` gets
    * Ctrl+C. Every run is written to the risky-command audit log. */
+  /** A Windows shell over SSH, told by its prompt ("PS C:\Users\me>" or
+   * "C:\Users\me>"): the one learnt, or the line the cursor is on. */
+  private windowsShell(): boolean {
+    const buf = this.term.buffer.active;
+    const left = buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true, 0, buf.cursorX) ?? "";
+    return [this.assist.knownPrompt(), left].some((p) => /^(PS )?[A-Za-z]:\\[^>]*>$/.test(p.trim()));
+  }
+
   private async runForAi(command: string, reason: string, timeoutMs = 30_000): Promise<{ output: string; timedOut: boolean }> {
     if (this.state !== "connected") throw new Error("연결이 끊어져 실행하지 않았습니다");
     if (this.aiRunning) throw new Error("다른 명령이 실행 중입니다");
@@ -514,7 +543,11 @@ export class TerminalView implements View {
       // The prompt this line started with: the next one looks like it ("[root@host /]#" → "[root@host tmp]#").
       const prompt = this.assist.knownPrompt().trim();
       const stem = prompt.slice(0, Math.min(6, prompt.length));
-      const data = (this.assist.typedText() ? "\x15" : "") + command.replace(/[\r\n]+/g, " ") + "\r";
+      // Clear what the engineer left on the line: Ctrl+U, or Backspaces in
+      // Windows PowerShell (PSReadLine does not bind Ctrl+U there).
+      const typed = this.assist.typedText();
+      const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : "\x15";
+      const data = clear + command.replace(/[\r\n]+/g, " ") + "\r";
       this.assist.note(data);
       this.sendInput(data);
       const started = Date.now();
@@ -1756,6 +1789,7 @@ export class TerminalView implements View {
       api.termClose(this.runtimeId).catch(() => {});
     }
     this.assist.dispose();
+    this.lsColors.dispose();
     this.aiPanel?.dispose();
     this.term.dispose();
     this.gateway.close();

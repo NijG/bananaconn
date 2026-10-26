@@ -42,8 +42,9 @@ const decode = (s: string) =>
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
-/** "${icon(…)}저장": a leading {0} there is the button's icon, a separate DOM node. */
-const ICON = /^\{0\}(?=\S)/;
+/** "${icon(…)}저장": a leading {0} there is the button's icon, a separate DOM node.
+ * Not "{0}: …" or "{0} · …", where {0} is a value in the text (a device name). */
+const ICON = /^\{0\}(?=[\p{L}\p{N}])/u;
 
 /** Each dictionary is loaded (and its patterns built) the first time its
  * language is chosen: Korean, the default, never pays for any at startup. */
@@ -125,11 +126,16 @@ export function tr(text: string): string {
   return out;
 }
 
+/** "(…)" around a translated phrase, or undefined when it was not known. */
+const wrap = (out: string, inner: string) => (out === inner ? undefined : `(${out})`);
+
 function translate(text: string): string {
   const core = norm(text);
   const lead = text.match(/^\s*/)![0];
   const tail = text.match(/\s*$/)![0];
-  const hit = active!.exact.get(core) ?? translatePattern(core) ?? translateParts(core);
+  // "(지원하지 않는 장비입니다)": a phrase in parentheses, often a pattern's value.
+  const inner = /^\((.+)\)$/.exec(core)?.[1];
+  const hit = active!.exact.get(core) ?? translatePattern(core) ?? translateParts(core) ?? (inner && HANGUL.test(inner) ? wrap(translate(inner), inner) : undefined);
   return hit === undefined ? text : lead + hit + tail;
 }
 

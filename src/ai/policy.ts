@@ -124,14 +124,92 @@ function readOnlyDevice(line: string): boolean {
   return DEVICE.test(first) && pipes.every((p) => DEVICE_PIPE.test(p)) && !/[;`]/.test(line);
 }
 
-/** Whether a command an AI wants to run may run without asking. */
-export function judge(command: string, network: boolean): Verdict {
+/** Read-only PowerShell cmdlets other than Get-* (and aliases), with the
+ * arguments that would make them write or never end. */
+const PS_CMDLETS: Record<string, RegExp | null> = {
+  "select-object": null, select: null, "where-object": null, where: null, "?": null, "sort-object": /\s\/o\b/i, sort: /\s\/o\b/i,
+  "format-table": null, ft: null, "format-list": null, fl: null, "format-wide": null, fw: null, "format-custom": null, fc: null,
+  "measure-object": null, measure: null, "group-object": null, group: null, "compare-object": null, compare: null, diff: null,
+  "foreach-object": null, foreach: null, "%": null, "out-string": null, "out-null": null, "write-output": null, echo: null, write: null,
+  "convertto-json": null, "convertto-csv": null, "convertto-html": null, "convertfrom-json": null, "convertfrom-csv": null,
+  "select-string": null, sls: null, "test-path": null, "test-connection": /\s-(continuous|t)\b/i, "test-netconnection": null, tnc: null,
+  "resolve-dnsname": null,
+  // Aliases of Get-* cmdlets.
+  gci: null, ls: null, dir: null, gc: /\s-wait\b/i, cat: /\s-wait\b/i, type: /\s-wait\b/i, gps: null, ps: null, gsv: null, gwmi: null,
+  gcim: null, gp: null, gpv: null, gi: null, gl: null, pwd: null, gm: null, gal: null, gcm: null, gv: null, history: null, ghy: null, gjb: null, gdr: null,
+};
+/** Get-* cmdlets that ask for input or never end with these arguments. */
+const PS_GET_DENY: Record<string, RegExp> = {
+  "get-credential": /(?:)/, "get-content": /\s-wait\b/i, "get-counter": /\s-continuous\b/i, "get-help": /\s-online\b/i,
+};
+/** Windows programs that only read, with the arguments that would change something. */
+const WIN_EXES: Record<string, RegExp | null> = {
+  ipconfig: /\/(release6?|renew6?|flushdns|registerdns|setclassid6?)\b/i, systeminfo: null, tasklist: null, netstat: null, whoami: null,
+  hostname: /\s\S/, ver: null, getmac: null, driverquery: null, ping: /\s[-/]t\b/i, tracert: null, pathping: null, nslookup: null,
+  quser: null, qwinsta: null, findstr: null, more: null, "where.exe": null, route: /^(?!\s*print\b)/i, arp: /\s-[ds]\b/i,
+  sc: /^(?!\s*(query|queryex|qc|qdescription|qfailure|qtriggerinfo|qprivs|qsidtype|getdisplayname|getkeyname|enumdepend)\b)/i,
+  netsh: /^(?!.*\sshow\b)|\s(set|add|delete|reset|dump|exec|import|export|install|uninstall|start|stop)\b/i,
+  reg: /^(?!\s*query\b)/i, schtasks: /^(?!\s*\/query\b)|\/(create|delete|run|end|change)\b/i,
+  wmic: /\s(call|delete|set|create)\b|\/(output|append|record):/i, powercfg: /^(?!\s*\/(list|l|query|q|a|availablesleepstates|getactivescheme)\b)/i,
+  // Only the forms that list or show one thing: "net user bob pass" would set a password.
+  net: /^(?!\s*(?:(?:user|localgroup|group|share|use|session|view|accounts)(?:\s+(?:"[^"]*"|[^\s"/*]+))?|(?:statistics|config)(?:\s+(?:workstation|server))?|start)?\s*$)/i,
+};
+/** .NET methods that only compute a value ((Get-Date).AddDays(-1), $s.Trim()). */
+const SAFE_METHODS = /^(AddDays|AddHours|AddMinutes|AddSeconds|AddMonths|ToString|ToLower|ToUpper|Trim|TrimStart|TrimEnd|Split|Substring|Contains|StartsWith|EndsWith|Replace|IndexOf|GetType|Equals|PadLeft|PadRight|ToShortDateString|ToLongDateString)$/i;
+
+const psAllowed = (name: string) => {
+  const n = name.toLowerCase();
+  return n.startsWith("get-") ? !(n in PS_GET_DENY && PS_GET_DENY[n].source === "(?:)") : n in PS_CMDLETS;
+};
+
+/** A one-line PowerShell (or cmd) command that only reads: every command in it
+ * is a known read-only one, script blocks only test and pick values, and
+ * nothing is assigned, redirected to a file, invoked or called on .NET. */
+function readOnlyWindows(line: string): boolean {
+  if (/`/.test(line)) return false;
+  // Strings become '' (a double-quoted string with $ may expand a command).
+  const s = line.replace(/'[^']*'|"[^"$`]*"/g, "''");
+  if (/["]|'[^']/.test(s.replace(/''/g, ""))) return false;
+  if (/\$\(|@\(|::|&|<|\b(iex|icm|invoke-\w+|start-\w+)\b/i.test(s)) return false;
+  if (/>/.test(s.replace(/[\d*]?>\s*\$null\b/gi, ""))) return false;
+  for (const m of s.matchAll(/\.(\w+)\s*\(/g)) if (!SAFE_METHODS.test(m[1])) return false;
+  // Every cmdlet named anywhere (also in parentheses and script blocks).
+  for (const m of s.matchAll(/(?<![\w$.-])([A-Za-z]+-[A-Za-z]\w*)/g)) if (!psAllowed(m[1])) return false;
+  // A parenthesis runs what it holds: only allowed cmdlets ((Get-Date), not (shutdown /r)).
+  for (const m of s.matchAll(/(?<![\w.])\(\s*([A-Za-z_][\w.-]*)/g)) if (!psAllowed(m[1])) return false;
+  // Script blocks: values, operators and allowed cmdlets only (no programs).
+  for (const m of s.matchAll(/(?<!@)\{([^{}]*)\}/g)) {
+    const words = m[1].replace(/''/g, " ").replace(/(?<![\w$.-])[A-Za-z]+-[A-Za-z]\w*/g, " ").replace(/\$[\w:?]+(\.\w+)*/g, " ").replace(/\.\w+/g, " ").replace(/-\w+/g, " ").replace(/\b\d[\w.]*\b/g, " ");
+    for (const w of words.match(/[A-Za-z_][\w-]*/g) ?? []) if (!psAllowed(w) && !/^(true|false|null)$/i.test(w)) return false;
+  }
+  // Hashtables (@{LogName=''; Level=2}) may hold '=' and ';'; then no assignment may remain.
+  const flat = s.replace(/@\{[^{}]*\}/g, "@{}").replace(/\{[^{}]*\}/g, "{}");
+  if (/(^|[^=!<>-])=(?!=)/.test(flat)) return false;
+  const list = flat.split(/[|;]/).map((p) => p.trim()).filter(Boolean);
+  if (!list.length) return false;
+  return list.every((part) => {
+    const p = part.replace(/^\(+/, "");
+    const word = /^[\w.?%-]+/.exec(p)?.[0].toLowerCase() ?? "";
+    const exe = word.replace(/\.exe$/, "");
+    const args = p.slice(word.length);
+    if (word.startsWith("get-")) return psAllowed(word) && !(word in PS_GET_DENY && PS_GET_DENY[word].test(args));
+    if (word in PS_CMDLETS) return !PS_CMDLETS[word]?.test(args);
+    if (exe in WIN_EXES || word in WIN_EXES) return !WIN_EXES[word in WIN_EXES ? word : exe]?.test(args);
+    // A bare value or variable to show ($env:COMPUTERNAME, $PSVersionTable).
+    return /^\$[\w:]+(\.\w+)*$/.test(p);
+  });
+}
+
+/** Whether a command an AI wants to run may run without asking. `windows`:
+ * the shell is PowerShell (or cmd) on Windows, where Unix rules do not apply. */
+export function judge(command: string, network: boolean, windows = false): Verdict {
   const cmd = command.trim();
   if (!cmd) return { action: "block", reason: "빈 명령" };
   if (/[\r\n]/.test(cmd)) return { action: "approve", reason: "여러 줄 명령" };
   const risk = findTypedRisk(cmd);
   if (risk?.rule.action === "block") return { action: "block", reason: risk.rule.note };
   if (risk) return { action: "approve", reason: risk.rule.note };
+  if (windows) return readOnlyWindows(cmd) ? { action: "auto", reason: "읽기 전용 명령" } : { action: "approve", reason: "시스템을 바꿀 수 있거나 확인할 수 없는 명령" };
   // A device not recognised may still be network gear: its CLI rules apply,
   // but never to a program the Unix table knows (Linux ping never ends).
   const first = /^[\w.+-]+/.exec(cmd.replace(/^(?:\S*\/)/, ""))?.[0] ?? "";

@@ -3560,7 +3560,7 @@ code.fp {
 /* ---- AI (ai/panel.ts) ---- */
 /* The panel docks on the right of the terminal; the terminal narrows. */
 .term-view.with-ai .term-host {
-  margin-right: min(380px, 45%);
+  margin-right: min(var(--ai-w, 380px), calc(100% - 240px));
 }
 .ai-panel {
   position: absolute;
@@ -3568,7 +3568,7 @@ code.fp {
   right: 0;
   bottom: 0;
   z-index: 4;
-  width: min(380px, 45%);
+  width: min(var(--ai-w, 380px), calc(100% - 240px));
   display: flex;
   flex-direction: column;
   background: var(--bg-1);
@@ -3911,7 +3911,7 @@ code.fp {
 /* AI beside a remote desktop (RDP, VNC): the screen narrows like a terminal. */
 .rdp-view.with-ai .rdp-screen,
 .vnc-view.with-ai .vnc-screen {
-  margin-right: min(380px, 45%);
+  margin-right: min(var(--ai-w, 380px), calc(100% - 240px));
 }
 /* Attachments: waiting chips, thumbnails in messages and in the preview. */
 .ai-attach-row {
@@ -3954,4 +3954,36 @@ code.fp {
 .ai-panel.drop {
   outline: 2px dashed var(--accent);
   outline-offset: -6px;
+}
+
+/* RDP → SSH setup dialog */
+.ssh-setup-steps { margin: 8px 0 10px; padding-left: 20px; line-height: 1.6; }
+.ssh-setup-script { position: relative; margin: 8px 0; }
+.ssh-setup-script pre { margin: 0; padding: 10px 12px; max-height: 220px; overflow: auto; border-radius: 6px; background: var(--bg-2, rgba(127,127,127,.12)); font: 12px/1.5 var(--mono, Consolas, monospace); white-space: pre; user-select: text; }
+.ssh-setup-script .btn { position: absolute; top: 6px; right: 6px; }
+.ssh-setup-status { margin: 8px 0 0; }
+.ssh-setup-status[data-kind="error"] { color: var(--danger, #e5484d); }
+
+/* AI panel width: drag its left edge. */
+.ai-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  z-index: 5;
+  cursor: col-resize;
+}
+.ai-grip:hover,
+body.ai-resizing .ai-grip {
+  background: linear-gradient(to right, transparent 2px, var(--accent) 2px, var(--accent) 4px, transparent 4px);
+}
+body.ai-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.ai-resizing iframe,
+body.ai-resizing canvas,
+body.ai-resizing .xterm {
+  pointer-events: none;
 }

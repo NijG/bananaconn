@@ -132,6 +132,24 @@ export class Masker {
     this.names = names;
   }
 
+  /** What a saved conversation needs to keep its placeholders meaning the same hosts. */
+  save(): { hosts: boolean; names: string[]; map: [string, string][]; secrets: number } {
+    return { hosts: this.hosts, names: this.names, map: [...this.toReal], secrets: this.secrets };
+  }
+
+  static restore(s: { hosts: boolean; names: string[]; map: [string, string][]; secrets: number }): Masker {
+    const m = new Masker(s.hosts, s.names);
+    for (const [mask, real] of s.map) {
+      m.toReal.set(mask, real);
+      m.toMask.set(real, mask);
+      const kind = mask.split("_")[0] as "IP" | "HOST" | "MAIL";
+      const n = Number(mask.split("_")[1]);
+      if (kind in m.n && n > m.n[kind]) m.n[kind] = n;
+    }
+    m.secrets = s.secrets;
+    return m;
+  }
+
   private placeholder(kind: "IP" | "HOST" | "MAIL", real: string): string {
     const known = this.toMask.get(real);
     if (known) return known;
@@ -267,13 +285,17 @@ export interface Target {
   system: string;
   /** Network gear CLI rather than a shell. */
   network: boolean;
+  /** A Windows shell (PowerShell or cmd over OpenSSH), told by its prompt. */
+  windows?: boolean;
 }
 
 function base(target: Target, agent = false): string {
   const lang = LANG_NAMES[language()] ?? "English";
   return [
     "You are the assistant built into BananaConn, a remote terminal (SSH, Telnet, serial) used by system and network engineers.",
-    target.system ? `The connected system is: ${target.system}${target.network ? " (a network device CLI, not a Unix shell)" : ""}.` : "The connected system is unknown; find out with a first command (uname -a, or show version on network gear) when it matters.",
+    target.windows
+      ? "The connected system is Windows, reached over OpenSSH; the shell is PowerShell. Use PowerShell and Windows commands (Get-CimInstance, Get-Process, Get-Service, Get-WinEvent, Get-NetIPConfiguration, ipconfig, systeminfo …), never Unix ones; each run block is one PowerShell line."
+      : target.system ? `The connected system is: ${target.system}${target.network ? " (a network device CLI, not a Unix shell)" : ""}.` : "The connected system is unknown; find out with a first command (uname -a, or show version on network gear) when it matters.",
     `Answer in ${lang}. Be concise and practical.`,
     agent ? "" : "Commands you write are never run automatically: the engineer reviews them first.",
     "Never suggest changing the system clock, the time zone or NTP settings.",
@@ -298,6 +320,7 @@ export const prompts = {
       "<one command>",
       "```",
       "and write nothing after it. The command runs in plain view and its output comes back in the next message. Run one command at a time; you may combine quick checks with ; on one line.",
+      "Do the checking yourself: never ask the engineer to run a command, paste output or check something you can check with a command, and never answer with a list of commands to type. If a question needs information from the system, your first reply is a run block.",
       "Investigate with read-only commands. Do not change configuration, restart or stop services, kill processes, delete or move files, or change the time unless the engineer asked for exactly that; such commands need the engineer's approval and may be refused or blocked — never try to work around a refusal.",
       "Never use interactive or endless commands (top without -b -n 1, less, more, vi, watch, tail -f, journalctl -f, ping without -c): use non-interactive forms, --no-pager, and limits such as | tail -n 50. On network devices turn paging off first if needed (terminal length 0, screen-length 0 temporary).",
       `Use at most ${max} commands. When you know enough, reply with your findings and recommendations, without a run block.`,

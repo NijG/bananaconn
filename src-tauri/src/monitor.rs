@@ -60,6 +60,41 @@ pub(crate) fn parse_commands(text: &str) -> Vec<String> {
     names
 }
 
+/// The script that lists one folder with type marks (ls -F: dir/ exec* link@
+/// fifo| socket=), one name per line, for colouring a plain \`ls\` on Unix
+/// systems whose ls has no colours. "~" and "~/sub" stay unquoted so the
+/// shell expands them; the rest is single-quoted.
+pub(crate) fn types_script(folder: &str) -> Result<String, String> {
+    if folder.is_empty() || folder.len() > 1024 || folder.chars().any(|c| c.is_control()) || !(folder.starts_with('/') || folder.starts_with('~')) {
+        return Err("폴더 경로가 올바르지 않습니다".into());
+    }
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let target = match folder.strip_prefix('~') {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{}", quote(rest)),
+        // "~user" forms: not expanded inside quotes, not worth guessing.
+        Some(_) => return Err("폴더 경로가 올바르지 않습니다".into()),
+        None => quote(folder),
+    };
+    Ok(format!("echo @@T''YPES; ( cd {target} 2>/dev/null && ls -1aF 2>/dev/null | head -n 5000 ); echo @@EN''D"))
+}
+
+/// The lines between "@@TYPES" and "@@END" (names with their ls -F mark).
+pub(crate) fn parse_types(text: &str) -> Vec<String> {
+    let mut inside = false;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        match line.trim() {
+            "@@TYPES" => inside = true,
+            "@@END" => break,
+            name if inside && !name.is_empty() => names.push(line.to_string()),
+            _ => {}
+        }
+    }
+    names
+}
+
 /// One table in the "top processes" view.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Section {
@@ -566,6 +601,25 @@ pub async fn monitor_commands(state: State<'_, MonitorState>, id: String) -> Res
     }
 }
 
+/// The entries of a folder on a monitored Unix server with their ls -F type
+/// marks, read over the monitor's own connection (not the engineer's shell).
+#[tauri::command]
+pub async fn monitor_types(state: State<'_, MonitorState>, id: String, folder: String) -> Result<Vec<String>, String> {
+    let script = types_script(&folder)?;
+    let probe = state.probes.lock().unwrap().get(&id).cloned().ok_or("모니터링이 실행 중이 아닙니다")?;
+    match probe {
+        Probe::Ssh(handle, _) => Ok(parse_types(&ssh_exec(&handle, &script).await?)),
+        Probe::Line(tx) => {
+            let (reply, answer) = oneshot::channel();
+            tx.send(crate::devmon::Query::Types(script, reply)).await.map_err(|_| "모니터링 연결이 끊어졌습니다".to_string())?;
+            tokio::time::timeout(Duration::from_secs(20), answer)
+                .await
+                .map_err(|_| "장비가 응답하지 않습니다".to_string())?
+                .map_err(|_| "모니터링 연결이 끊어졌습니다".to_string())?
+        }
+    }
+}
+
 /// The busiest processes (and file systems) of a monitored server, read over
 /// the monitor's own connection.
 #[tauri::command]
@@ -642,6 +696,35 @@ mod tests {
         let found = |n: &str| names.iter().filter(|x| *x == n).count();
         assert_eq!((found("alpha"), found("mid"), found("zeta"), found("sort.exe")), (1, 1, 1, 1), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+    }
+
+    /// The folder-types script in a real sh: marks per type, quotes kept, the
+    /// shell's own folder unchanged, bad paths refused.
+    #[test]
+    fn types_script_lists_a_folder_with_marks() {
+        assert!(types_script("relative/dir").is_err() && types_script("/a\nb").is_err() && types_script("~bob").is_err());
+        assert_eq!(types_script("/it's").unwrap(), r"echo @@T''YPES; ( cd '/it'\''s' 2>/dev/null && ls -1aF 2>/dev/null | head -n 5000 ); echo @@EN''D");
+        assert!(types_script("~/logs").unwrap().contains("cd ~'/logs'"));
+        let sh = r"C:\Program Files\Git\usr\bin\sh.exe";
+        if !std::path::Path::new(sh).exists() {
+            eprintln!("no Git sh: skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bx-types-{}", std::process::id())).join("it's here");
+        std::fs::create_dir_all(dir.join("sub dir")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+        let s = dir.to_string_lossy().replace('\\', "/");
+        let folder = format!("/{}{}", s[..1].to_lowercase(), &s[2..]);
+        let out = std::process::Command::new(sh)
+            .args(["-c", &format!("PATH=/usr/bin; {}; pwd", types_script(&folder).unwrap())])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let names = parse_types(&text);
+        assert!(names.contains(&"sub dir/".to_string()) && names.contains(&"notes.txt".to_string()) && names.contains(&"run.sh*".to_string()), "{names:?} {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!text.trim_end().ends_with("here"), "the shell stays in its folder: {text}");
     }
 
     fn block(cpu: &str, avail: bool) -> Vec<String> {

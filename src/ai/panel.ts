@@ -38,6 +38,55 @@ export interface AiHost {
   canRun?: boolean;
   /** The remote screen, for a screenshot attachment (RDP, VNC). */
   capture?(): HTMLCanvasElement | null;
+  /** The connection this conversation belongs to (it is kept under this). */
+  conversationKey?(): string;
+}
+
+// ---- Saved conversations (this PC only, one per connection) ----
+
+const SAVED = "bx.aiConversations";
+const SAVED_MAX = 30;
+const SAVED_BYTES = 400_000;
+
+interface SavedConversation {
+  turns: Turn[];
+  masker: ReturnType<Masker["save"]> | null;
+  system: "chat" | "explain" | "config" | "log";
+  providerId: string | null;
+  at: number;
+}
+
+function readSaved(): Record<string, SavedConversation> {
+  try {
+    const v = JSON.parse(localStorage.getItem(SAVED) || "{}");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+function loadConversation(key: string): SavedConversation | null {
+  const c = readSaved()[key];
+  return c && Array.isArray(c.turns) ? c : null;
+}
+
+/** Keep a conversation (null forgets it). Images keep their thumbnail only;
+ * the oldest turns go first when it grows too large. */
+function storeConversation(key: string, c: SavedConversation | null) {
+  const all = readSaved();
+  delete all[key];
+  if (c && c.turns.length) {
+    const slim = { ...c, turns: c.turns.map((t) => ({ ...t, media: t.media?.map((m) => ({ ...m, data: undefined })) })) };
+    while (slim.turns.length > 2 && JSON.stringify(slim).length > SAVED_BYTES) slim.turns.splice(0, 2);
+    all[key] = slim;
+  }
+  const keys = Object.keys(all).sort((a, b) => (all[a].at ?? 0) - (all[b].at ?? 0));
+  for (const old of keys.slice(0, Math.max(0, keys.length - SAVED_MAX))) delete all[old];
+  try {
+    localStorage.setItem(SAVED, JSON.stringify(all));
+  } catch {
+    // Storage full: the conversation stays only while the app runs.
+  }
 }
 
 /** Commands an AI may run in one answer, at most. */
@@ -122,6 +171,8 @@ interface Turn {
   output?: { command: string; text: string; timedOut: boolean };
   /** Images and PDFs sent with this message. */
   media?: Attached[];
+  /** A note from the app to the AI, not shown. */
+  nudge?: boolean;
 }
 
 const RUN_STATUS: Record<NonNullable<Turn["run"]>["status"], string> = {
@@ -133,6 +184,61 @@ const RUN_STATUS: Record<NonNullable<Turn["run"]>["status"], string> = {
   blocked: "차단됨",
   failed: "실행 실패",
 };
+
+// The panel width, shared by every tab and kept across restarts (--ai-w).
+const AI_WIDTH_KEY = "bx.aiWidth";
+const setAiWidth = (px: number | null) => {
+  const root = document.documentElement.style;
+  if (px === null) root.removeProperty("--ai-w");
+  else root.setProperty("--ai-w", `${Math.round(px)}px`);
+};
+try {
+  const saved = Number(localStorage.getItem(AI_WIDTH_KEY));
+  if (saved >= 260) setAiWidth(saved);
+} catch {
+  // Storage blocked: the default width.
+}
+
+/** Drag the panel's left edge to change its width; double-click resets it. */
+function wireGrip(grip: HTMLElement) {
+  grip.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const view = grip.closest<HTMLElement>(".view") ?? document.body;
+    grip.setPointerCapture(e.pointerId);
+    document.body.classList.add("ai-resizing");
+    let width = 0;
+    let frame = 0;
+    const move = (ev: PointerEvent) => {
+      const r = view.getBoundingClientRect();
+      // Room for at least 240px of terminal or screen on the left.
+      width = Math.max(260, Math.min(r.right - ev.clientX, r.width - 240));
+      if (!frame) frame = requestAnimationFrame(() => ((frame = 0), setAiWidth(width)));
+    };
+    const up = () => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+      document.body.classList.remove("ai-resizing");
+      try {
+        if (width) localStorage.setItem(AI_WIDTH_KEY, String(Math.round(width)));
+      } catch {
+        // Not kept: this session only.
+      }
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  });
+  grip.addEventListener("dblclick", () => {
+    setAiWidth(null);
+    try {
+      localStorage.removeItem(AI_WIDTH_KEY);
+    } catch {
+      // Nothing kept.
+    }
+  });
+}
 
 export class AiPanel {
   el: HTMLElement;
@@ -152,7 +258,8 @@ export class AiPanel {
     this.el = h(
       "div",
       { class: "ai-panel" },
-      `<div class="ai-head">${icon("Sparkles", 15)}<b>AI</b>
+      `<div class="ai-grip" title="끌어서 너비 조절 (두 번 누르면 기본값)"></div>
+      <div class="ai-head">${icon("Sparkles", 15)}<b>AI</b>
         <select class="ai-provider" title="AI 서비스"></select>
         <span class="ai-head-actions">
           <button class="tool" data-act="file" title="파일 분석 (설정·로그)">${icon("FileSearch", 15)}</button>
@@ -177,6 +284,7 @@ export class AiPanel {
     this.log = this.el.querySelector(".ai-log")!;
     this.input = this.el.querySelector("textarea")!;
     this.el.addEventListener("click", (e) => this.click(e));
+    wireGrip(this.el.querySelector<HTMLElement>(".ai-grip")!);
     // Files: picked, pasted (screenshots) or dropped onto the panel.
     const files = this.el.querySelector<HTMLInputElement>("[data-files]")!;
     files.addEventListener("change", () => {
@@ -218,6 +326,7 @@ export class AiPanel {
       this.providerId = (e.target as HTMLSelectElement).value;
       this.newConversation();
     });
+    this.restore();
     this.refreshProviders();
     this.draw();
   }
@@ -239,8 +348,7 @@ export class AiPanel {
 
   /** Capture the remote screen and ask what it shows (RDP, VNC). */
   explainScreen() {
-    this.newConversation();
-    if (!this.captureScreen()) return;
+    if (this.busy || !this.captureScreen()) return;
     void this.send(tr("이 화면에 보이는 내용을 설명하고, 오류나 문제가 있다면 원인과 해결 방법을 알려 주세요."), true);
   }
 
@@ -294,7 +402,26 @@ export class AiPanel {
     this.masker = null;
     this.skip = { skip: false };
     this.system = "chat";
+    this.persist();
     this.draw();
+  }
+
+  /** Save this conversation under its connection, to come back after closing. */
+  private persist() {
+    const key = this.host.conversationKey?.();
+    if (!key) return;
+    storeConversation(key, this.turns.length ? { turns: this.turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now() } : null);
+  }
+
+  /** The conversation this connection had before (panel closed, app restarted). */
+  private restore() {
+    const key = this.host.conversationKey?.();
+    const saved = key ? loadConversation(key) : null;
+    if (!saved) return;
+    this.turns = saved.turns.map((t) => (t.run?.status === "running" || t.run?.status === "approve" ? { ...t, run: { ...t.run, status: "skipped" } } : t));
+    this.masker = saved.masker ? Masker.restore(saved.masker) : null;
+    this.system = saved.system ?? "chat";
+    if (saved.providerId && providers().some((p) => p.id === saved.providerId)) this.providerId = saved.providerId;
   }
 
   private click(e: MouseEvent) {
@@ -379,11 +506,11 @@ export class AiPanel {
     if (t.output) {
       // A command's output, folded: the AI reads it, the engineer may.
       const lines = t.output.text ? t.output.text.split("\n").length : 0;
-      return `<details class="ai-output"><summary>${icon("SquareTerminal", 13)}<code data-i18n-skip>${esc(t.output.command)}</code><span class="muted">${lines}줄${t.output.timedOut ? " · 30초 후 중지" : ""}</span></summary><pre data-i18n-skip>${esc(t.output.text || "(출력 없음)")}</pre></details>`;
+      return `<details class="ai-output"><summary>${icon("SquareTerminal", 13)}<code data-i18n-skip>${esc(t.output.command)}</code><span class="muted">${tr(`${lines}줄`)}${t.output.timedOut ? tr(" · 30초 후 중지") : ""}</span></summary><pre data-i18n-skip>${esc(t.output.text || tr("(출력 없음)"))}</pre></details>`;
     }
     if (t.role === "user") {
-      // A note to the AI about a command that did not run.
-      if (this.turns[this.turns.indexOf(t) - 1]?.run) return "";
+      // A note to the AI about a command that did not run, or the app's own nudge.
+      if (t.nudge || this.turns[this.turns.indexOf(t) - 1]?.run) return "";
       const media = t.media?.length ? `<div class="ai-attach-row">${t.media.map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip">${icon("FileText", 13)}<span data-i18n-skip>${esc(a.name)}</span></span>`)).join("")}</div>` : "";
       return `<div class="ai-msg user">${media}${render(shortened(t.shown), false)}</div>`;
     }
@@ -391,31 +518,31 @@ export class AiPanel {
     const run = t.run
       ? `<div class="ai-run ${t.run.status}">${icon(t.run.status === "blocked" ? "Ban" : t.run.status === "running" ? "LoaderCircle" : "SquareTerminal", 14, t.run.status === "running" ? "spin" : "")}
           <code data-i18n-skip>${esc(t.run.command)}</code>
-          <span class="ai-run-state">${RUN_STATUS[t.run.status]}</span>
-          <span class="muted small ai-run-why">${esc(t.run.reason)}</span>
-          ${t.run.status === "approve" ? `<span class="ai-run-buttons"><button class="btn btn-sm btn-primary" data-run="yes">${icon("Play", 13)}실행</button><button class="btn btn-sm" data-run="no">건너뛰기</button></span>` : ""}
+          <span class="ai-run-state">${tr(RUN_STATUS[t.run.status])}</span>
+          <span class="muted small ai-run-why">${esc(tr(t.run.reason))}</span>
+          ${t.run.status === "approve" ? `<span class="ai-run-buttons"><button class="btn btn-sm btn-primary" data-run="yes">${icon("Play", 13)}${tr("실행")}</button><button class="btn btn-sm" data-run="no">${tr("건너뛰기")}</button></span>` : ""}
         </div>`
       : "";
     const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
-    return `<div class="ai-msg assistant">${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(t.error)}</div>` : ""}</div>`;
+    return `<div class="ai-msg assistant">${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
   explain(text: string) {
-    this.newConversation();
-    this.system = "explain";
+    if (this.busy) return;
     // The request shows in the conversation: in the screen language.
     void this.send(`${tr("이 출력의 의미와 원인, 다음 단계를 설명해 주세요.")}\n\n\`\`\`text\n${text}\n\`\`\``, true);
   }
 
   /** Review a configuration or a log. */
   analyse(text: string, what: "config" | "log", name: string) {
-    this.newConversation();
+    if (this.busy) return;
+    // This one message is a review; the conversation goes on as a chat.
     this.system = what;
     const cut = text.length > FILE_LIMIT ? (what === "log" ? text.slice(-FILE_LIMIT) : text.slice(0, FILE_LIMIT)) : text;
     const n = FILE_LIMIT.toLocaleString();
     const note = text.length > FILE_LIMIT ? tr(what === "log" ? `(마지막 ${n}자만)` : `(처음 ${n}자만)`) : "";
-    void this.send(`${tr(what === "config" ? "이 설정을 점검해 주세요" : "이 로그를 분석해 주세요")}: ${name} ${note}\n\n\`\`\`text\n${cut}\n\`\`\``, true);
+    void this.send(`${tr(what === "config" ? "이 설정을 점검해 주세요" : "이 로그를 분석해 주세요")}: ${name} ${note}\n\n\`\`\`text\n${cut}\n\`\`\``, true).finally(() => (this.system = "chat"));
   }
 
   private async analyseFile() {
@@ -480,12 +607,13 @@ export class AiPanel {
     this.busy = true;
     this.stopped = false;
     try {
+      let nudged = false;
       for (let step = 0; ; step++) {
         const answer: Turn = { role: "assistant", shown: "", sent: "" };
         this.turns.push(answer);
         const history: AiMessage[] = this.turns
           .filter((t) => t !== answer && !t.error)
-          .map((t) => ({ role: t.role, content: t.sent, ...(t.media?.length ? { attachments: t.media.map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
+          .map((t) => ({ role: t.role, content: t.sent, ...(t.media?.some((a) => a.data) ? { attachments: t.media.filter((a) => a.data).map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
         let frame = 0;
         this.asking = ask(p, system, history, (sofar) => {
           answer.sent = sofar;
@@ -503,12 +631,19 @@ export class AiPanel {
           cancelAnimationFrame(frame);
         }
         const command = agent && !answer.error && !this.stopped ? runRequest(answer.shown) : null;
+        // Commands handed to the engineer instead of run: ask once to run them itself.
+        if (!command && agent && !nudged && !answer.error && !this.stopped && /```[\w-]*\r?\n[\s\S]*?```/.test(answer.shown)) {
+          nudged = true;
+          const note = "Run the commands yourself, one per run block, instead of asking the engineer to type them; then analyse the results.";
+          this.turns.push({ role: "user", shown: "", sent: note, nudge: true });
+          continue;
+        }
         if (!command) break;
         if (step >= MAX_STEPS) {
           answer.error = `명령을 ${MAX_STEPS}개까지 실행해 멈췄습니다. 더 알아보려면 이어서 질문하세요.`;
           break;
         }
-        const verdict = judge(command, this.host.network());
+        const verdict = judge(command, this.host.network(), !!target.windows);
         answer.run = { command, reason: verdict.reason, status: verdict.action === "block" ? "blocked" : verdict.action === "auto" && this.runMode === "auto" ? "auto" : "approve" };
         this.draw();
         let result: string;
@@ -541,6 +676,7 @@ export class AiPanel {
     } finally {
       this.busy = false;
       this.approval = null;
+      this.persist();
       this.draw();
     }
   }
@@ -549,6 +685,7 @@ export class AiPanel {
 
   dispose() {
     this.asking?.cancel();
+    this.persist();
     this.el.remove();
   }
 }

@@ -45,6 +45,8 @@ export class VncView implements View {
   constructor(
     private session: Session,
     private ws: Workspace,
+    private openSession: (s: Session) => void,
+    private openFiles: (s: Session, beside?: View) => void,
   ) {
     this.gateway = new GatewayLink(session, 5900);
     const p = PROTOCOLS.vnc;
@@ -65,6 +67,7 @@ export class VncView implements View {
            <button class="tool" data-act="cad" title="Ctrl+Alt+Del 보내기">${icon("Keyboard", 15)}<span>Ctrl+Alt+Del</span></button>
            <button class="tool" data-act="quality" title="화질과 속도 (JPEG 화질·압축)">${icon("Sparkles", 15)}<span data-quality-label></span></button>
            <button class="tool" data-act="stats" title="전송 상태: 서버가 쓰는 인코딩, 초당 갱신, 받는 양">${icon("Activity", 15)}<span>상태</span></button>
+           <button class="tool" data-act="files" title="이 PC와 파일 주고받기 (SFTP · 원격 PC의 SSH 서버 필요)">${icon("FolderLock", 15)}<span>파일 전송</span></button>
            <button class="tool" data-act="ai" title="AI: 화면 설명·캡처·대화">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
@@ -76,12 +79,14 @@ export class VncView implements View {
     this.ai = new ViewAi(
       this.el,
       desktopHost({
+        key: `vnc:${endpoint(session)}`,
         system: "a computer seen through VNC; the engineer can attach screenshots of its screen",
         names: () => [session.host, session.name, session.username, this.desktopName],
         canvas: () => this.screen.querySelector("canvas"),
         focus: () => this.rfb?.focus(),
       }),
       () => {},
+      () => [{ label: "AI가 명령을 실행하도록 SSH 연결…", icon: "SquareTerminal", action: () => void import("../ai/sshSetup").then((m) => m.openSshSetup(this.session, this.openSession)) }],
     );
     this.overlay = this.el.querySelector(".view-overlay")!;
     this.el.querySelector(".view-actions")!.addEventListener("click", (e) => {
@@ -89,6 +94,7 @@ export class VncView implements View {
       if (act === "scale") this.setScale(!this.scale);
       if (act === "viewonly") this.setViewOnly(!this.viewOnly);
       if (act === "ai") return this.ai.menu(this.el.querySelector<HTMLElement>('[data-act="ai"]')!);
+      if (act === "files") return this.transferFiles();
       if (act === "cad") this.rfb?.sendCtrlAltDel();
       if (act === "paste") this.pasteClipboard();
       if (act === "reconnect") this.reconnect();
@@ -370,6 +376,19 @@ export class VncView implements View {
   private syncToggles() {
     this.el.querySelector('[data-act="scale"]')!.classList.toggle("on", this.scale);
     this.el.querySelector('[data-act="viewonly"]')!.classList.toggle("on", this.viewOnly);
+  }
+
+  /** RFB itself has no file transfer (TightVNC and UltraVNC each add their
+   * own): files go over SFTP to the same PC, in a pane beside this one. */
+  private transferFiles() {
+    void import("../ai/sshSetup").then(({ sshSessionFor }) => {
+      try {
+        const { session } = sshSessionFor(this.session);
+        this.openFiles({ ...session, name: this.session.name || this.session.host }, this);
+      } catch (err) {
+        toast(errorText(err), "error");
+      }
+    });
   }
 
   private async pasteClipboard() {

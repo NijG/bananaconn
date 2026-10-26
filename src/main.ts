@@ -124,8 +124,8 @@ function open(s: Session) {
     if (kind === "terminal") view = new (await loadTerminal()).TerminalView(s, ws, openFiles);
     else if (kind === "files") view = new (await loadFiles()).FilesView(s, ws);
     else if (kind === "tftp") view = new (await import("./views/tftp")).TftpView(s, ws);
-    else if (kind === "vnc") view = new (await import("./views/vnc")).VncView(s, ws);
-    else view = new (await loadRdp()).RdpView(s, ws, launchRdp);
+    else if (kind === "vnc") view = new (await import("./views/vnc")).VncView(s, ws, open, openFiles);
+    else view = new (await loadRdp()).RdpView(s, ws, launchRdp, open);
     ws.add(s, view);
   });
 }

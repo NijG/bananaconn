@@ -42,7 +42,7 @@ It is written from scratch on public protocols and open-source libraries: a Rust
   (follows the Windows display language, can be changed in Settings)
 - **License:** MIT
 
-![BananaConn. in action: split panes, broadcast input, a blocked risky command and device monitoring](docs/demo.gif)
+![BananaConn in action: split panes and broadcast input, risky commands stopped, command colours and suggestions, ls colours on AIX, and the AI investigating a slow server by itself](docs/demo.gif)
 
 ## Why BananaConn.
 
@@ -104,7 +104,7 @@ command can take a site down:
 | **FTP / FTPS** | Passive and active mode, explicit (AUTH TLS) and implicit FTPS. TLS uses rustls with session resumption on data connections (which many FTPS servers require) and verifies certificates against the Windows trust store. |
 | **TFTP** | Get files from a TFTP server or send them: `blksize` and `tsize` options, automatic fallback to 512-byte blocks, images larger than 65535 blocks. |
 | **RDP** | A built-in remote desktop client (IronRDP, NLA/CredSSP) in a tab. The resolution follows the tab size and the Windows display scale; the clipboard works both ways for text, images, files and folders; the server certificate is pinned by its fingerprint. Optionally, a session can open in the Windows Remote Desktop client instead. |
-| **VNC** | A built-in noVNC viewer reached through a local WebSocket relay, including servers that need a user name (VeNCrypt Plain, MS-Logon style). |
+| **VNC** | A built-in noVNC viewer reached through a local WebSocket relay, including servers that need a user name (VeNCrypt Plain, MS-Logon style). File transfer opens SFTP to the same PC beside the screen (RFB itself has none). |
 
 ### Workspace
 
@@ -143,6 +143,9 @@ command can take a site down:
   for common devices is included.
 - **Output highlighting:** ERROR/FAIL in red, WARN in yellow, OK/SUCCESS in green — never inside programs that
   set their own colours or use the full screen.
+- **ls colours everywhere:** where the server's ls has none (AIX, HP-UX, Solaris), folders, programs, links and
+  archives are coloured as on Linux: `ls -l` and `ls -F` by their own output, a plain `ls` by reading the folder
+  once over the resource monitor's connection. Nothing is typed into your shell.
 - **Command line colours and suggestions:** the command being typed is coloured by commands, options, strings,
   paths and operators (network-gear syntax on switches and firewalls) and turns red before Enter when a risky-command
   rule matches. The rest of a command is suggested in grey from commands run before and from snippets; → or End
@@ -158,8 +161,11 @@ command can take a site down:
   (Ctrl+Shift+A), explain the selected output (Ctrl+Shift+E), chat beside the terminal (Ctrl+Shift+L), or review a
   configuration or log file. In a terminal the AI can also investigate by itself: read-only commands run at once,
   anything that could change the system waits for your approval, block rules never run, and every run is audited.
+  Each connection keeps its conversation across closing the panel and restarting the app.
   Attach images, PDFs and text files (📎, drag and drop, Ctrl+V); in RDP and VNC the AI explains a captured screen
-  (no commands run there). Before text goes to a cloud AI it is shown for confirmation; passwords, keys and
+  (no commands run there); one click there prepares SSH to the same PC instead (a script to turn on OpenSSH, then
+  an SSH session where the AI runs read-only PowerShell commands itself). The panel can be widened by dragging its
+  edge. Before text goes to a cloud AI it is shown for confirmation; passwords, keys and
   tokens are always masked, IP addresses and host names on request (and restored in the answer). API keys live in
   the credential vault; requests use Windows' proxy and certificate settings.
 - **Device keys mode:** sends Ctrl-D/A/E for Delete/Home/End so that Cisco IOS and similar CLIs do not print `~`.
@@ -282,7 +288,7 @@ The output names the workflow run and the commit it was built from; the build lo
 
 ## Updates
 
-BananaConn. checks for a new version at startup, every 30 minutes and whenever you ask
+BananaConn checks for a new version at startup, every 30 minutes and whenever you ask
 (*Settings → Updates → Check now*), and offers to install it. It looks in this order:
 
 1. this repository’s latest release (`https://github.com/NijG/bananaconn/releases/latest/download/`);

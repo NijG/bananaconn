@@ -144,6 +144,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
           </select></label>
         </div>
         ${check("cmdColor", "입력 중인 명령에 색 입히기", "명령어·옵션·문자열·경로·연결 기호를 색으로 구분합니다. 위험 명령 규칙에 걸리는 명령은 Enter를 누르기 전에 빨간색으로 보입니다. 서버가 직접 색을 입히는 셸(zsh 강조 등)에는 적용하지 않습니다.")}
+        ${check("lsColor", "ls 목록에 파일 종류별 색 입히기", "서버가 색을 입히지 않는 ls(AIX, HP-UX, Solaris 등)의 폴더·실행 파일·링크·압축 파일을 Linux처럼 색으로 구분합니다. ls -l과 ls -F는 출력만 보고, 그냥 ls는 리소스 모니터 연결로 폴더 내용을 따로 읽어 판단합니다. 터미널에는 아무 명령도 보내지 않습니다.")}
         ${check("cmdSuggest", "명령 자동 완성 제안", "전에 실행한 명령과 스니펫에서 나머지를 회색으로 보여 줍니다. → 또는 End로 모두, Ctrl+→로 한 단어씩 입력합니다. Tab은 서버의 자동 완성 그대로입니다. 위험 명령과 비밀번호·토큰이 든 명령은 기록하지도 제안하지도 않습니다.")}
         <div class="row"><button type="button" class="btn btn-sm" data-clear-history>${icon("Trash2", 14)}명령 기록 지우기</button></div>
         ${check("highlightKeywords", "출력 키워드 강조", "ERROR·FAIL은 빨강, WARN은 노랑, OK·SUCCESS는 초록으로 표시합니다. 색을 직접 쓰는 프로그램과 vim 같은 전체 화면 프로그램에는 적용하지 않습니다.")}
@@ -347,6 +348,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
       autoUpdate: bool("autoUpdate"),
       highlightKeywords: bool("highlightKeywords"),
       cmdColor: bool("cmdColor"),
+      lsColor: bool("lsColor"),
       cmdSuggest: bool("cmdSuggest"),
       aiPreview: bool("aiPreview"),
       aiMaskHosts: bool("aiMaskHosts"),

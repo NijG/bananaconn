@@ -321,6 +321,7 @@ export const api = {
   /** Running configuration of a monitored network device. */
   monitorBackup: (id: string) => call<string>("monitor_backup", { id }),
   monitorCommands: (id: string) => call<string[]>("monitor_commands", { id }),
+  monitorTypes: (id: string, folder: string) => call<string[]>("monitor_types", { id, folder }),
   // AI (ai.rs): the answer streams back as "ai-stream" events, then "ai-done".
   aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string; attachments?: { mime: string; data: string; name: string }[] }[]) => call<void>("ai_chat", { id, provider, system, messages }),
   aiCancel: (id: string) => call<void>("ai_cancel", { id }),

@@ -57,6 +57,7 @@ export class RdpView implements View {
     private session: Session,
     private ws: Workspace,
     private openExternal: (s: Session) => void,
+    private openSession: (s: Session) => void,
   ) {
     this.gateway = new GatewayLink(session, 3389);
     const p = PROTOCOLS.rdp;
@@ -92,12 +93,14 @@ export class RdpView implements View {
     this.ai = new ViewAi(
       this.el,
       desktopHost({
+        key: `rdp:${endpoint(session)}`,
         system: "a Windows computer seen through Remote Desktop (RDP); the engineer can attach screenshots of its screen",
         names: () => [session.host, session.name, session.username],
         canvas: () => (this.desktop.w ? this.canvas : null),
         focus: () => this.canvas.focus(),
       }),
       () => {},
+      () => [{ label: "AI가 명령을 실행하도록 SSH 연결…", icon: "SquareTerminal", action: () => void import("../ai/sshSetup").then((m) => m.openSshSetup(this.session, this.openSession)) }],
     );
     this.wireToolbar();
     this.wireInput();
