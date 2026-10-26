@@ -43,6 +43,11 @@ export class CmdAssist {
   /** The last prompt learnt (kept after Enter, for promptNames). */
   private lastPrompt = "";
 
+  /** The prompt learnt last ("" when none yet). */
+  knownPrompt(): string {
+    return this.prompt ?? this.lastPrompt;
+  }
+
   /** Host and user names the shell or device prompt shows: "root@web1",
    * "[root@web1 ~]#", "router(config)#", "<HUAWEI>", "FGT #". */
   promptNames(): string[] {

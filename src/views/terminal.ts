@@ -20,7 +20,7 @@ import type { AiHost, AiPanel } from "../ai/panel";
 
 /** The AI panel and command bar load on first use. */
 const aiModule = () => import("../ai/panel");
-import { hasRemoteCommands, setRemoteCommands } from "../cmdLine";
+import { hasRemoteCommands, PROMPT_END, setRemoteCommands } from "../cmdLine";
 import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands";
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
@@ -491,7 +491,88 @@ export class TerminalView implements View {
         this.sendInput(data);
       },
       focus: () => this.term.focus(),
+      run: (command, reason) => this.runForAi(command, reason),
+      network: () => !!this.device?.network || this.keyMode === "network",
     };
+  }
+
+  private aiRunning = false;
+
+  /** Run a command an AI chose in this terminal, in plain view, and return
+   * what it printed up to the next prompt. Interactive programs and pagers
+   * are left (q / space), a command still running after `timeoutMs` gets
+   * Ctrl+C. Every run is written to the risky-command audit log. */
+  private async runForAi(command: string, reason: string, timeoutMs = 30_000): Promise<{ output: string; timedOut: boolean }> {
+    if (this.state !== "connected") throw new Error("연결이 끊어져 실행하지 않았습니다");
+    if (this.aiRunning) throw new Error("다른 명령이 실행 중입니다");
+    if (this.term.buffer.active.type !== "normal") throw new Error("화면 전체를 쓰는 프로그램이 실행 중이라 실행하지 않았습니다");
+    this.aiRunning = true;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const marker = this.term.registerMarker(0);
+    try {
+      await api.riskAudit("AI RUN", this.session.name || endpoint(this.session), endpoint(this.session), reason, command).catch(() => {});
+      // The prompt this line started with: the next one looks like it ("[root@host /]#" → "[root@host tmp]#").
+      const prompt = this.assist.knownPrompt().trim();
+      const stem = prompt.slice(0, Math.min(6, prompt.length));
+      const data = (this.assist.typedText() ? "\x15" : "") + command.replace(/[\r\n]+/g, " ") + "\r";
+      this.assist.note(data);
+      this.sendInput(data);
+      const started = Date.now();
+      let seen = "";
+      let changed = Date.now();
+      let timedOut = false;
+      let interrupted = false;
+      for (;;) {
+        await sleep(150);
+        if (this.state !== "connected" || this.disposed) throw new Error("연결이 끊어졌습니다");
+        const buf = this.term.buffer.active;
+        const row = buf.baseY + buf.cursorY;
+        const left = buf.getLine(row)?.translateToString(true, 0, buf.cursorX) ?? "";
+        const now = `${buf.type}:${buf.length}:${row}:${buf.cursorX}:${left}`;
+        if (now !== seen) {
+          seen = now;
+          changed = Date.now();
+        }
+        const quiet = Date.now() - changed;
+        if (buf.type !== "normal") {
+          // A full-screen program (less, vi, top): leave it.
+          if (quiet > 500) (this.sendInput("q"), (changed = Date.now()));
+          continue;
+        }
+        if (quiet > 400 && /--More--|\(END\)|^:\s*$|<--- More --->|---- More ----/.test(left.trim())) {
+          this.sendInput(this.device?.network || this.keyMode === "network" ? " " : "q");
+          changed = Date.now();
+          continue;
+        }
+        const atPrompt = row > marker.line && PROMPT_END.test(left) && (!stem || left.trimStart().startsWith(stem));
+        if (atPrompt && quiet >= 500) break;
+        if (Date.now() - started > timeoutMs) {
+          if (interrupted) break;
+          timedOut = interrupted = true;
+          this.sendInput("\x03");
+          timeoutMs += 3000;
+        }
+      }
+      // From the line after the command (its wrapped rows skipped) to the prompt.
+      const buf = this.term.buffer.active;
+      const end = buf.baseY + buf.cursorY;
+      let y = marker.line + 1;
+      while (y < end && buf.getLine(y)?.isWrapped) y++;
+      const lines: string[] = [];
+      for (; y < end; y++) {
+        const line = buf.getLine(y);
+        if (!line) continue;
+        const text = line.translateToString(true);
+        if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+        else lines.push(text);
+      }
+      let output = lines.join("\n").replace(/\s+$/, "");
+      if (output.length > 12_000) output = `${output.slice(0, 4000)}\n…(${output.length - 12_000}자 생략)…\n${output.slice(-8000)}`;
+      return { output, timedOut };
+    } finally {
+      marker.dispose();
+      this.aiRunning = false;
+    }
   }
 
   private aiMenu() {
@@ -1230,6 +1311,7 @@ export class TerminalView implements View {
     const n = bytes.length;
     // The highlighter always follows the escape state (alternate screen,
     // program colours), so turning it on mid-session is right at once.
+    this.checkDelEcho(bytes);
     const shown = this.highlighter.process(bytes, state.settings.highlightKeywords);
     this.term.write(shown, () => this.ack(rid, n));
     if (!this.gotOutput) {
@@ -1544,6 +1626,25 @@ export class TerminalView implements View {
     ]);
   }
 
+  /** When a Backspace went out as DEL while the session has no choice yet. */
+  private delSentAt = 0;
+
+  /** The server echoed DEL as "^?": its erase key is ^H (AIX, HP-UX, many
+   * Telnet logins). Switch this session to ^H, and take the DEL character
+   * off the line, then erase what the user meant to. */
+  private checkDelEcho(bytes: Uint8Array) {
+    if (!this.delSentAt || Date.now() - this.delSentAt > 1500) return;
+    for (let i = 0; i + 1 < bytes.length; i++) {
+      if (bytes[i] === 0x5e && bytes[i + 1] === 0x3f) {
+        this.delSentAt = 0;
+        this.setKeyOption("backspace", "ctrl-h");
+        this.sendInput("\x08\x08");
+        toast("이 서버는 Backspace로 Ctrl-H(^H)를 씁니다. 이 세션을 ^H로 바꿨습니다 (툴바 \"키\"에서 바꿀 수 있음)", "info", 5000);
+        return;
+      }
+    }
+  }
+
   private setKeyOption(name: "keyMode" | "backspace", value: string) {
     this.session.options[name] = value;
     if (!this.session.id.startsWith("quick-")) patchSession(this.session.id, {}, { [name]: value }).catch(() => {});
@@ -1565,6 +1666,8 @@ export class TerminalView implements View {
       e.preventDefault();
       if (this.state === "connected" || this.state === "connecting") {
         const bytes = this.editKeyBytes(e.key as EditKey);
+        // Not chosen yet: watch whether the server takes DEL (receive()).
+        if (bytes === "\x7f" && !this.session.options.backspace) this.delSentAt = Date.now();
         this.sendInput(bytes);
         this.ws.mirrorInput(this, { editKey: e.key as EditKey });
         // Recorded as the key, not these bytes: replayed in another tab it

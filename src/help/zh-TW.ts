@@ -158,6 +158,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>產生指令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可取得一條適合所辨識裝置或系統的指令。再按一次 Enter 會放入輸入列（不會執行），由您自己按 Enter 執行。危險指令規則同樣適用：被封鎖的指令（修改時間、NTP 等）甚至不會放入輸入列。</li>
         <li><b>說明輸出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：說明所選文字（若未選取則為畫面上最近的輸出）的意義、可能原因與後續步驟。</li>
         <li><b>AI 對話</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在終端機右側開啟對話窗格。以「附加選取內容」一併傳送輸出；回答中每行指令旁的按鈕可將其放入輸入列。</li>
+        <li><b>AI 執行指令</b>：在 AI 對話中寫下要做的事，AI 會在此終端機中逐一執行指令，讀取結果並分析。每次執行都顯示在畫面上，並全部記錄在 <code>risky-commands.log</code> 中。唯讀指令（<code>df</code>、<code>free</code>、<code>systemctl status</code>、<code>show …</code>、<code>display …</code> 等）直接執行；可能變更系統的指令會等待您選擇「執行」或「略過」。符合封鎖規則的指令（修改時間、NTP 等）絕不執行。每個問題最多 8 個指令，每個指令 30 秒後以 Ctrl+C 停止。可用對話窗格下方的按鈕切換為「每個都確認」或「不執行」。</li>
         <li><b>設定與記錄分析</b>：對話窗格中的檔案按鈕可選擇設定或記錄檔案進行檢查（安全問題、危險設定）或分析（錯誤、異常跡象）。網路裝置可透過裝置按鈕 →「用 AI 檢查設定」直接檢查 running-config。</li>
         <li><b>傳送的內容</b>：傳送到雲端 AI 之前，會顯示將傳送的內容並請您確認（每個對話可選擇「不再詢問」）。密碼、金鑰與權杖（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私密金鑰等）一律會隱藏；開啟設定後，IP 位址與主機名稱也會替換為 IP_1、HOST_1 等再傳送，回答中會還原為實際值。本地 LLM 不會離開本機，因此不會詢問或隱藏。傳送公司設備資訊給外部 AI 之前，請確認公司的安全政策。</li>
         <li>訂閱 CLI：Claude Code 在關閉所有工具（不執行指令、不讀取檔案）的狀態下於空資料夾中執行，Codex 在唯讀沙箱中執行。應用程式不會處理您的登入資訊。</li>

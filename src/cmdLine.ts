@@ -102,7 +102,7 @@ function load(): History {
     const raw = JSON.parse(localStorage.getItem(KEY) || "{}");
     cache = {};
     if (raw && typeof raw === "object" && !Array.isArray(raw))
-      for (const [host, list] of Object.entries(raw)) if (Array.isArray(list)) cache[host] = list.filter((c): c is string => typeof c === "string").slice(-PER_HOST);
+      for (const [host, list] of Object.entries(raw)) if (Array.isArray(list)) cache[host] = list.filter((c): c is string => typeof c === "string" && !garbled(c)).slice(-PER_HOST);
   } catch {
     cache = {};
   }
@@ -133,6 +133,12 @@ if (typeof window !== "undefined") window.addEventListener("pagehide", () => sav
 const SECRET =
   /(?<![a-z])(pass(word|wd)?|pwd|token|secret|api[_-]?key|auth)\w*\s*[=:]\s*\S|--?(pass(word|wd)?|token|secret|api[_-]?key)\b|\bsshpass\b|\bmysql(dump|admin)?\b.*\s-p\S|\bcurl\b.*\s(-u|--user)\s*\S+:\S|:\/\/[^\s/:@]+:[^\s/@]+@|\bsnmp\S*\b.*\s(community|-c)\s|\bkey\s+\d\s+\S|\b(enable\s+)?secret\s+\d?\s*\S/i;
 
+/** A line with echoed control keys ("ls^?^?" when the server took DEL as a
+ * character, "^H", "^[[A"): what is on the screen is not what ran. */
+export function garbled(line: string): boolean {
+  return /\^[?H@[]|[\x00-\x08\x0b-\x1f\x7f]/.test(line);
+}
+
 /** A command line that holds a credential (never stored). */
 export function holdsSecret(command: string): boolean {
   return SECRET.test(command);
@@ -143,7 +149,7 @@ export function holdsSecret(command: string): boolean {
  * are lines with a password or token in them. */
 export function rememberCommand(host: string, command: string) {
   const cmd = command.trim();
-  if (!cmd || cmd.length > 500 || findTypedRisk(cmd) || holdsSecret(cmd)) return;
+  if (!cmd || cmd.length > 500 || garbled(cmd) || findTypedRisk(cmd) || holdsSecret(cmd)) return;
   const h = load();
   const list = (h[host] ?? []).filter((c) => c !== cmd);
   list.push(cmd);
@@ -205,7 +211,7 @@ function scan(host: string, typed: string, group: string | undefined): Candidate
   const out: Candidate[] = [];
   const seen = new Set<string>();
   const add = (c: string, source: Candidate["source"]) => {
-    if (c.length > typed.length && c.startsWith(typed) && !seen.has(c)) {
+    if (c.length > typed.length && c.startsWith(typed) && !seen.has(c) && !garbled(c)) {
       seen.add(c);
       out.push({ text: c, source });
     }

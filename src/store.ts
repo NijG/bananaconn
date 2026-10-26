@@ -54,6 +54,8 @@ export interface Settings {
   aiMaskHosts: boolean;
   /** Show what will be sent before it goes to a cloud AI. */
   aiPreview: boolean;
+  /** How the AI panel may run commands: read-only at once (auto), each after approval, or none. */
+  aiRunMode?: "auto" | "confirm" | "off";
   /** Lock after this many idle minutes when a master password is set (0 = never). */
   autoLockMinutes: number;
   /** Open the SFTP browser next to every new SSH session. */

@@ -68,8 +68,14 @@ export function currentProvider(id?: string | null): AiProvider | null {
   return list.find((p) => p.id === (id ?? state.settings.aiDefault)) ?? list[0] ?? null;
 }
 
+const SHORT: Record<AiKind, string> = { anthropic: "Claude API", openai: "OpenAI API", gemini: "Gemini API", compatible: "OpenAI 호환", ollama: "Ollama", cli: "CLI" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex CLI", gemini: "Gemini CLI" };
+
+/** The name shown for a provider, always made from the service and the
+ * model (a name typed in an earlier version is not used). */
 export function providerLabel(p: AiProvider): string {
-  return p.name || `${kindInfo(p.kind).label}${p.model ? ` · ${p.model}` : ""}`;
+  const what = p.kind === "cli" ? (CLI_NAMES[p.cli] ?? p.cli) : SHORT[p.kind];
+  return `${what} · ${p.model || "기본 모델"}`;
 }
 
 // ---- Masking ----
@@ -172,7 +178,7 @@ export class Masker {
 /** Ask the user before text goes to a cloud provider (Settings → AI decides).
  * Resolves to false when the user says no. `skip` remembers "don't ask again"
  * for the rest of the conversation. */
-export async function confirmSend(p: AiProvider, text: string, masker: Masker, skip: { skip: boolean }): Promise<boolean> {
+export async function confirmSend(p: AiProvider, text: string, masker: Masker, skip: { skip: boolean }, agent = false): Promise<boolean> {
   if (isLocal(p) || skip.skip || state.settings.aiPreview === false) return true;
   const shown = text.length > 6000 ? `${text.slice(0, 6000)}\n…(${text.length - 6000}자 더)` : text;
   return confirmDialog({
@@ -180,6 +186,7 @@ export async function confirmSend(p: AiProvider, text: string, masker: Masker, s
     icon: "Send",
     confirm: "AI에 보내기",
     message: `<p><b data-i18n-skip>${esc(providerLabel(p))}</b>에 아래 내용을 보냅니다. 이 PC 밖의 서비스입니다.</p>
+      ${agent ? `<p class="muted small">AI가 터미널에서 실행한 명령의 결과도 같은 방식으로 가린 뒤 이 대화에 보냅니다.</p>` : ""}
       ${
         masker.secrets || masker.masked
           ? `<p class="muted small">${masker.secrets ? `<span>비밀번호·키·토큰 ${masker.secrets}곳을 가렸습니다.</span>` : ""}${masker.masked ? ` <span>IP·호스트 이름 ${masker.masked}개를 IP_1, HOST_1 같은 이름으로 바꿨습니다 (답에서는 원래 값으로 보입니다).</span>` : ""}</p>`
@@ -251,15 +258,18 @@ export interface Target {
   network: boolean;
 }
 
-function base(target: Target): string {
+function base(target: Target, agent = false): string {
   const lang = LANG_NAMES[language()] ?? "English";
   return [
     "You are the assistant built into BananaConn, a remote terminal (SSH, Telnet, serial) used by system and network engineers.",
-    target.system ? `The connected system is: ${target.system}${target.network ? " (a network device CLI, not a Unix shell)" : ""}.` : "The connected system is unknown; assume a Linux shell unless the text shows otherwise.",
+    target.system ? `The connected system is: ${target.system}${target.network ? " (a network device CLI, not a Unix shell)" : ""}.` : "The connected system is unknown; find out with a first command (uname -a, or show version on network gear) when it matters.",
     `Answer in ${lang}. Be concise and practical.`,
-    "Commands you write are never run automatically: the engineer reviews them first. Never suggest changing the system clock, the time zone or NTP settings.",
+    agent ? "" : "Commands you write are never run automatically: the engineer reviews them first.",
+    "Never suggest changing the system clock, the time zone or NTP settings.",
     "Placeholders such as IP_1, HOST_1 and «SECRET» stand for hidden values; keep them exactly as they are in commands.",
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export const prompts = {
@@ -268,6 +278,19 @@ export const prompts = {
   explain: (t: Target) =>
     `${base(t)}\nExplain the terminal output or error the engineer selected: what it means, the most likely cause, and the next steps (with commands in code blocks where useful).`,
   chat: (t: Target) => `${base(t)}\nPut every command in its own code block so the engineer can insert it into the terminal.`,
+  /** The AI investigates by running commands in the engineer's terminal. */
+  agent: (t: Target, max: number) =>
+    [
+      base(t, true),
+      "You can run commands in the engineer's terminal to investigate. To run one, end your reply with exactly one block:",
+      "```run",
+      "<one command>",
+      "```",
+      "and write nothing after it. The command runs in plain view and its output comes back in the next message. Run one command at a time; you may combine quick checks with ; on one line.",
+      "Investigate with read-only commands. Do not change configuration, restart or stop services, kill processes, delete or move files, or change the time unless the engineer asked for exactly that; such commands need the engineer's approval and may be refused or blocked — never try to work around a refusal.",
+      "Never use interactive or endless commands (top without -b -n 1, less, more, vi, watch, tail -f, journalctl -f, ping without -c): use non-interactive forms, --no-pager, and limits such as | tail -n 50. On network devices turn paging off first if needed (terminal length 0, screen-length 0 temporary).",
+      `Use at most ${max} commands. When you know enough, reply with your findings and recommendations, without a run block.`,
+    ].join("\n"),
   analyse: (t: Target, what: "config" | "log") =>
     what === "config"
       ? `${base(t)}\nReview the device or server configuration the engineer attached. List security problems, risky or inconsistent settings and best-practice gaps, most important first, each with the line it concerns and how to fix it.`

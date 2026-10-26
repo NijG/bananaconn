@@ -325,6 +325,7 @@ export const api = {
   aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string }[]) => call<void>("ai_chat", { id, provider, system, messages }),
   aiCancel: (id: string) => call<void>("ai_cancel", { id }),
   aiModels: (provider: AiProviderWire) => call<string[]>("ai_models", { provider }),
+  aiCliModels: (cli: string) => call<{ default: string | null; models: [string, string][] }>("ai_cli_models", { cli }),
   aiDetectCli: () => call<{ name: string; path: string; version: string }[]>("ai_detect_cli"),
   /** Busiest processes and file systems of a monitored server. */
   monitorTop: (id: string) => call<{ title: string; lines: string[] }[]>("monitor_top", { id }),

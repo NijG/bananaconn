@@ -329,6 +329,9 @@ impl Line {
 /// Quiet time that ends a wait for the first prompt (banners, MOTD, profile).
 const FIRST_QUIET: Duration = Duration::from_secs(3);
 
+/// Longest a Telnet login may take, banners and login scripts included.
+const LOGIN_LIMIT: Duration = Duration::from_secs(60);
+
 /// HP-UX login scripts (tset): "TERM = (hp) " waits for an answer.
 fn is_term_question(line: &str) -> bool {
     let l = line.trim();
@@ -1163,7 +1166,15 @@ pub(crate) async fn run_telnet(
     proxy: Option<Route>,
 ) -> Result<(), String> {
     let mut t = Line::telnet(host, port, proxy.as_ref()).await?;
-    let prompt = login(&mut t, username, password, no_password).await?;
+    // Each wait has its own limit, but a login can keep going (banners, Enter
+    // after Enter): never leave the status bar at "checking" without a reason.
+    let prompt = match tokio::time::timeout(LOGIN_LIMIT, login(&mut t, username, password, no_password)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            let last = last_line(&t.text).chars().take(80).collect::<String>();
+            return Err(format!("로그인이 {}초 안에 끝나지 않았습니다 (마지막 화면: {})", LOGIN_LIMIT.as_secs(), if last.is_empty() { "없음".into() } else { last }));
+        }
+    };
     drive(t, prompt, report, queries).await
 }
 
@@ -1533,6 +1544,83 @@ mod device_tests {
         assert_eq!(stats["cpu"], 10.0, "{stats}");
         assert_eq!(stats["memTotal"].as_u64(), Some(4096 * 1024 * 1024));
         assert_eq!(stats["diskTotal"].as_u64(), Some(1048576 * 1024));
+    }
+
+    /// AIX 5.3 over Telnet, as a user's server greets: a "**" banner box
+    /// before "login:", "root's Password:", a "*" welcome box, last-login
+    /// lines with an address, then the prompt "pstcp:/# ".
+    #[tokio::test]
+    async fn monitors_aix_53_over_telnet() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let mut line = String::new();
+            let star = |t: &str| format!("**  {t:<56}**\r\n");
+            let banner = format!(
+                "\r\ntelnet (pstcp)\r\n\r\n\r\n{0}\r\n{1}{2}{1}{3}{4}{1}{5}{1}{0}\r\nlogin: ",
+                "*".repeat(62),
+                star(""),
+                star("              WARNING NOTICE !!!"),
+                star("YOU ARE CONNECTED TO A PRIVATE NETWORK."),
+                star("UNAUTHORIZED USE IS PROHIBITED."),
+                star("EXAMPLE CORP"),
+            );
+            let _ = s.write_all(banner.as_bytes()).await;
+            let mut stage = 0;
+            loop {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(i) = line.find('\r') {
+                    let cmd: String = line.drain(..=i).collect();
+                    match (stage, cmd.trim()) {
+                        (0, _) => {
+                            let _ = s.write_all(b"root\r\nroot's Password: ").await;
+                        }
+                        (1, "aix-pass") => {
+                            let welcome = format!(
+                                "\r\n{0}\r\n*{1}*\r\n*  Welcome to AIX Version 5.3!{2}*\r\n*{1}*\r\n{0}\r\nLast unsuccessful login: Wed Aug 17 14:53:49 PST 2022 on /dev/pts/49 from 192.0.2.199\r\nLast login: Tue Jun 23 17:53:43 PST 2026 on /dev/pts/1 from pstcs_per\r\n\r\n",
+                                "*".repeat(80),
+                                " ".repeat(78),
+                                " ".repeat(49)
+                            );
+                            fake_unix(
+                                s,
+                                &welcome,
+                                "pstcp:/# ".into(),
+                                vec![
+                                    ("uname -sr", "AIX 3"),
+                                    ("oslevel -s", "5300-12-04-1119"),
+                                    ("hostname", "pstcp"),
+                                    ("show version", "ksh: show:  not found."),
+                                    ("get system status", "ksh: get:  not found."),
+                                    ("vmstat 1 2", "\r\nSystem Configuration: lcpu=4 mem=7936MB\r\n\r\nkthr    memory              page              faults        cpu\r\n----- ----------- ------------------------ ------------ -----------\r\n r  b   avm   fre  re  pi  po  fr   sr  cy  in   sy  cs us sy id wa\r\n 1  0 1234567 456789   0   0   0   0    0   0  12  345  67  5  3 90  2\r\n 1  0 1234567 456700   0   0   0   0    0   0  20  400  80 12  8 78  2\r\n      2031616 memory pages\r\n       456700 free pages\r\nFilesystem    1024-blocks      Used Available Capacity Mounted on\r\n/dev/hd4          1048576    524288    524288      50% /"),
+                                ],
+                            )
+                            .await;
+                            return;
+                        }
+                        (1, _) => {
+                            let _ = s.write_all(b"\r\n3004-007 You entered an invalid login name or password.\r\nlogin: ").await;
+                        }
+                        _ => {}
+                    }
+                    stage += 1;
+                }
+            }
+        });
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let (_query, queries) = mpsc::channel(1);
+        let monitor = tokio::spawn(async move { run_telnet("127.0.0.1", port, "root", Some("aix-pass"), false, move |e| sink.lock().unwrap().push(e), queries, None).await });
+        let (device, stats) = first_sample(&events).await;
+        let ended = if monitor.is_finished() { format!("{:?}", monitor.await) } else { monitor.abort(); String::new() };
+        assert_eq!((device["kind"].as_str(), device["name"].as_str()), (Some("aix"), Some("pstcp")), "{stats} {ended}");
+        assert_eq!(stats["cpu"], 22.0, "{stats}");
     }
 
     /// RHEL over Telnet: bash's PROMPT_COMMAND sets the window title (an OSC

@@ -9,9 +9,10 @@
 import { api, pickOpenFile } from "../api";
 import { icon } from "../icons";
 import { findTypedRisk } from "../riskRules";
-import { state } from "../store";
+import { state, updateSettings } from "../store";
 import { errorText, esc, h, toast } from "../ui";
 import { tr } from "../i18n";
+import { judge } from "./policy";
 import { ask, confirmSend, currentProvider, isLocal, Masker, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type Asking, type Target } from "./core";
 
 /** What the panel needs from its terminal. */
@@ -26,6 +27,19 @@ export interface AiHost {
   /** Put a command on the input line, replacing what is typed there; not run. */
   insert(command: string): void;
   focus(): void;
+  /** Run a command in the terminal (in plain view) and return its output. */
+  run(command: string, reason: string): Promise<{ output: string; timedOut: boolean }>;
+  /** The terminal talks to network gear (device CLI rules apply). */
+  network(): boolean;
+}
+
+/** Commands an AI may run in one answer, at most. */
+const MAX_STEPS = 8;
+
+/** The command an answer asks to run (its ```run block), if any. */
+function runRequest(answer: string): string | null {
+  const block = /```run[ \t]*\r?\n([\s\S]*?)```/.exec(answer);
+  return block ? (commandLines(block[1])[0] ?? null) : null;
 }
 
 /** Characters of an attached file sent at most (about 40 k tokens). */
@@ -95,7 +109,21 @@ interface Turn {
   /** As sent (masked for cloud AI). */
   sent: string;
   error?: string;
+  /** An answer that asked to run a command, and what became of it. */
+  run?: { command: string; reason: string; status: "approve" | "running" | "done" | "skipped" | "blocked" | "failed" | "auto" };
+  /** A command's output sent back to the AI. */
+  output?: { command: string; text: string; timedOut: boolean };
 }
+
+const RUN_STATUS: Record<NonNullable<Turn["run"]>["status"], string> = {
+  auto: "자동 실행",
+  approve: "실행할까요?",
+  running: "실행 중…",
+  done: "실행함",
+  skipped: "실행하지 않음",
+  blocked: "차단됨",
+  failed: "실행 실패",
+};
 
 export class AiPanel {
   el: HTMLElement;
@@ -127,6 +155,7 @@ export class AiPanel {
         <textarea rows="2" placeholder="질문하거나 할 일을 적으세요 (Enter 보내기, Shift+Enter 줄 바꿈)"></textarea>
         <div class="ai-compose-row">
           <label class="check small"><input type="checkbox" data-attach /><span>선택 영역 첨부</span></label>
+          <button type="button" class="tool ai-mode" data-act="mode" title="AI가 터미널에서 명령을 실행하는 방식"></button>
           <span class="ai-where muted small"></span>
           <button class="btn btn-sm btn-primary" data-act="send">${icon("Send", 13)}질문하기</button>
         </div>
@@ -195,33 +224,85 @@ export class AiPanel {
       void navigator.clipboard.writeText(copy.dataset.copy!).then(() => toast("복사했습니다", "success", 1500));
       return;
     }
+    const decide = t.closest<HTMLElement>("[data-run]")?.dataset.run;
+    if (decide && this.approval) {
+      const resolve = this.approval;
+      this.approval = null;
+      resolve(decide === "yes");
+      return;
+    }
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (act === "close") this.onClose();
     else if (act === "new") this.newConversation();
-    else if (act === "send") void (this.asking ? this.stop() : this.send());
+    else if (act === "send") void (this.busy ? this.stop() : this.send());
     else if (act === "file") void this.analyseFile();
+    else if (act === "mode") void this.pickRunMode();
   }
 
+  /** Stop the answer, the waiting approval, and any further commands. */
   private stop() {
+    this.stopped = true;
     this.asking?.cancel();
+    const resolve = this.approval;
+    this.approval = null;
+    resolve?.(false);
+  }
+
+  private async pickRunMode() {
+    const { contextMenu } = await import("../ui");
+    const r = this.el.querySelector<HTMLElement>('[data-act="mode"]')!.getBoundingClientRect();
+    const set = (aiRunMode: "auto" | "confirm" | "off") => {
+      updateSettings({ aiRunMode });
+      this.draw();
+    };
+    const mark = (m: string) => (this.runMode === m ? "Check" : "Circle");
+    contextMenu(r.left, r.top - 4, [
+      { label: "읽기 전용 명령은 바로 실행, 나머지는 확인", icon: mark("auto"), action: () => set("auto") },
+      { label: "모든 명령을 실행 전에 확인", icon: mark("confirm"), action: () => set("confirm") },
+      { label: "명령을 실행하지 않음 (제안만)", icon: mark("off"), action: () => set("off") },
+    ]);
   }
 
   private draw() {
+    const btn = this.el.querySelector<HTMLElement>('[data-act="send"]')!;
+    btn.innerHTML = this.busy ? `${icon("Square", 13)}중지` : `${icon("Send", 13)}질문하기`;
+    const mode = this.el.querySelector<HTMLElement>('[data-act="mode"]');
+    if (mode) mode.innerHTML = `${icon(this.runMode === "off" ? "Ban" : "SquareTerminal", 13)}<span>${this.runMode === "auto" ? "읽기 전용 자동 실행" : this.runMode === "confirm" ? "실행 전 확인" : "실행 안 함"}</span>`;
     if (!this.provider) return noProvider(this.log);
     if (!this.turns.length) {
-      this.log.innerHTML = `<div class="ai-empty small"><p>터미널에서 텍스트를 선택하고 질문하면 함께 보냅니다. 답의 명령은 ${icon("CornerDownLeft", 12)} 버튼으로 입력 줄에 넣을 수 있고, 실행은 직접 Enter로 합니다.</p></div>`;
+      this.log.innerHTML = `<div class="ai-empty small"><p>${
+        this.runMode === "off"
+          ? `터미널에서 텍스트를 선택하고 질문하면 함께 보냅니다. 답의 명령은 ${icon("CornerDownLeft", 12)} 버튼으로 입력 줄에 넣을 수 있고, 실행은 직접 Enter로 합니다.`
+          : "할 일을 적으면 AI가 이 터미널에서 명령을 실행해 결과를 보고 분석합니다. 읽기 전용 명령은 바로 실행하고, 시스템을 바꿀 수 있는 명령은 실행 전에 묻습니다. 실행 방식은 아래 버튼에서 바꿉니다."
+      }</p></div>`;
       return;
     }
-    this.log.innerHTML = this.turns
-      .map((t) =>
-        t.role === "user"
-          ? `<div class="ai-msg user">${render(shortened(t.shown), false)}</div>`
-          : `<div class="ai-msg assistant">${t.shown ? render(t.shown) : t.error ? "" : `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>`}${t.error ? `<div class="ai-error">${esc(t.error)}</div>` : ""}</div>`,
-      )
-      .join("");
+    this.log.innerHTML = this.turns.map((t) => this.drawTurn(t)).join("");
     this.log.scrollTop = this.log.scrollHeight;
-    const btn = this.el.querySelector<HTMLElement>('[data-act="send"]')!;
-    btn.innerHTML = this.asking ? `${icon("Square", 13)}중지` : `${icon("Send", 13)}질문하기`;
+  }
+
+  private drawTurn(t: Turn): string {
+    if (t.output) {
+      // A command's output, folded: the AI reads it, the engineer may.
+      const lines = t.output.text ? t.output.text.split("\n").length : 0;
+      return `<details class="ai-output"><summary>${icon("SquareTerminal", 13)}<code data-i18n-skip>${esc(t.output.command)}</code><span class="muted">${lines}줄${t.output.timedOut ? " · 30초 후 중지" : ""}</span></summary><pre data-i18n-skip>${esc(t.output.text || "(출력 없음)")}</pre></details>`;
+    }
+    if (t.role === "user") {
+      // A note to the AI about a command that did not run.
+      if (this.turns[this.turns.indexOf(t) - 1]?.run) return "";
+      return `<div class="ai-msg user">${render(shortened(t.shown), false)}</div>`;
+    }
+    const body = (t.run ? t.shown.replace(/```run[ \t]*\r?\n[\s\S]*?```/, "") : t.shown).trim();
+    const run = t.run
+      ? `<div class="ai-run ${t.run.status}">${icon(t.run.status === "blocked" ? "Ban" : t.run.status === "running" ? "LoaderCircle" : "SquareTerminal", 14, t.run.status === "running" ? "spin" : "")}
+          <code data-i18n-skip>${esc(t.run.command)}</code>
+          <span class="ai-run-state">${RUN_STATUS[t.run.status]}</span>
+          <span class="muted small ai-run-why">${esc(t.run.reason)}</span>
+          ${t.run.status === "approve" ? `<span class="ai-run-buttons"><button class="btn btn-sm btn-primary" data-run="yes">${icon("Play", 13)}실행</button><button class="btn btn-sm" data-run="no">건너뛰기</button></span>` : ""}
+        </div>`
+      : "";
+    const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
+    return `<div class="ai-msg assistant">${body ? render(body) : waiting}${run}${t.error ? `<div class="ai-error">${esc(t.error)}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
@@ -257,10 +338,23 @@ export class AiPanel {
   }
 
   /** Send `typed` (or the text box), with the selection when asked for. */
+  /** How the AI's commands may run: settings → AI (auto: read-only ones at once). */
+  private get runMode(): "auto" | "confirm" | "off" {
+    return state.settings.aiRunMode ?? "auto";
+  }
+
+  private approval: ((ok: boolean) => void) | null = null;
+  private stopped = false;
+
+  /** Wait for the engineer's Run / Skip on the card. */
+  private approve(): Promise<boolean> {
+    return new Promise((resolve) => (this.approval = resolve));
+  }
+
   async send(typed?: string, internal = false) {
     const p = this.provider;
     if (!p) return void openAiSettings();
-    if (this.asking) return;
+    if (this.asking || this.busy) return;
     let text = (typed ?? this.input.value).trim();
     if (!text) return;
     const attach = this.el.querySelector<HTMLInputElement>("[data-attach]")!;
@@ -270,34 +364,83 @@ export class AiPanel {
       attach.checked = false;
     }
     this.masker ??= new Masker(!isLocal(p) && state.settings.aiMaskHosts, this.host.hostNames());
-    const sent = isLocal(p) ? text : this.masker.mask(text);
-    if (!(await confirmSend(p, sent, this.masker, this.skip))) return;
+    const masker = this.masker;
+    const mask = (s: string) => (isLocal(p) ? s : masker.mask(s));
+    const sent = mask(text);
+    // With commands allowed, the AI may look around in the terminal itself.
+    const agent = this.runMode !== "off" && (this.system === "chat" || this.system === "explain");
+    if (!(await confirmSend(p, sent, masker, this.skip, agent))) return;
     if (typed === undefined) this.input.value = "";
     this.turns.push({ role: "user", shown: text, sent });
-    const answer: Turn = { role: "assistant", shown: "", sent: "" };
-    this.turns.push(answer);
-    const history: AiMessage[] = this.turns.filter((t) => t !== answer && !t.error).map((t) => ({ role: t.role, content: t.sent }));
     const target = this.host.target();
-    const system = this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
-    let frame = 0;
-    const masker = this.masker;
-    this.asking = ask(p, system, history, (sofar) => {
-      answer.sent = sofar;
-      answer.shown = masker.unmask(sofar);
-      if (!frame) frame = requestAnimationFrame(() => ((frame = 0), this.draw()));
-    });
-    this.draw();
+    const system = agent ? prompts.agent(target, MAX_STEPS) : this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
+    this.busy = true;
+    this.stopped = false;
     try {
-      await this.asking.done;
-    } catch (err) {
-      const msg = errorText(err);
-      answer.error = msg === "CANCELLED" ? "중지했습니다" : msg;
+      for (let step = 0; ; step++) {
+        const answer: Turn = { role: "assistant", shown: "", sent: "" };
+        this.turns.push(answer);
+        const history: AiMessage[] = this.turns.filter((t) => t !== answer && !t.error).map((t) => ({ role: t.role, content: t.sent }));
+        let frame = 0;
+        this.asking = ask(p, system, history, (sofar) => {
+          answer.sent = sofar;
+          answer.shown = masker.unmask(sofar);
+          if (!frame) frame = requestAnimationFrame(() => ((frame = 0), this.draw()));
+        });
+        this.draw();
+        try {
+          await this.asking.done;
+        } catch (err) {
+          const msg = errorText(err);
+          answer.error = msg === "CANCELLED" ? "중지했습니다" : msg;
+        } finally {
+          this.asking = null;
+          cancelAnimationFrame(frame);
+        }
+        const command = agent && !answer.error && !this.stopped ? runRequest(answer.shown) : null;
+        if (!command) break;
+        if (step >= MAX_STEPS) {
+          answer.error = `명령을 ${MAX_STEPS}개까지 실행해 멈췄습니다. 더 알아보려면 이어서 질문하세요.`;
+          break;
+        }
+        const verdict = judge(command, this.host.network());
+        answer.run = { command, reason: verdict.reason, status: verdict.action === "block" ? "blocked" : verdict.action === "auto" && this.runMode === "auto" ? "auto" : "approve" };
+        this.draw();
+        let result: string;
+        let output: Turn["output"] | undefined;
+        if (answer.run.status === "blocked") {
+          result = `The command was blocked by the engineer's policy (${verdict.reason}) and did not run. Do not try to work around it.`;
+        } else if (answer.run.status === "approve" && !(await this.approve())) {
+          answer.run.status = "skipped";
+          result = "The engineer chose not to run this command. Continue without it, or explain what you would need.";
+        } else if (this.stopped) {
+          answer.run.status = "skipped";
+          break;
+        } else {
+          answer.run.status = "running";
+          this.draw();
+          try {
+            const r = await this.host.run(command, `AI · ${verdict.reason}`);
+            answer.run.status = "done";
+            output = { command, text: r.output, timedOut: r.timedOut };
+            result = `Output of \`${command}\`${r.timedOut ? " (it did not finish within 30 s and was stopped with Ctrl+C)" : ""}:\n\`\`\`\n${r.output || "(no output)"}\n\`\`\``;
+          } catch (err) {
+            answer.run.status = "failed";
+            result = `The command could not run: ${errorText(err)}`;
+          }
+        }
+        this.turns.push({ role: "user", shown: result, sent: mask(result), output });
+        this.draw();
+        if (this.stopped) break;
+      }
     } finally {
-      this.asking = null;
-      cancelAnimationFrame(frame);
+      this.busy = false;
+      this.approval = null;
       this.draw();
     }
   }
+
+  private busy = false;
 
   dispose() {
     this.asking?.cancel();

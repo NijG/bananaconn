@@ -124,6 +124,7 @@ pub fn run() {
             ai::ai_cancel,
             ai::ai_models,
             ai::ai_detect_cli,
+            ai::ai_cli_models,
             proxy::proxy_forward_close,
             term::term_paste_stop,
             term::term_set_logging,

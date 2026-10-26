@@ -269,6 +269,77 @@ pub async fn ai_detect_cli() -> Vec<CliInfo> {
     .unwrap_or_default()
 }
 
+#[derive(Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliModels {
+    /// The model the CLI uses when none is given (its own config), if known.
+    default: Option<String>,
+    /// Models the CLI offers this account, best first: [id, label].
+    models: Vec<(String, String)>,
+}
+
+/// `model = "…"` at the top level of a TOML file (before any [table]).
+fn toml_top_model(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            break;
+        }
+        if let Some(rest) = l.strip_prefix("model").map(str::trim_start).and_then(|r| r.strip_prefix('=')) {
+            let v = rest.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The models a CLI can use, read from its own files (never its sign-in):
+/// Codex keeps the account's list in models_cache.json and its default in
+/// config.toml; Claude Code takes model aliases; Gemini CLI its settings.
+fn cli_models_in(cli: &str, home: &std::path::Path) -> CliModels {
+    let read = |p: &str| std::fs::read_to_string(home.join(p)).ok();
+    match cli {
+        "codex" => {
+            let default = read(".codex/config.toml").and_then(|t| toml_top_model(&t));
+            let mut list: Vec<(i64, String, String)> = read(".codex/models_cache.json")
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| v["models"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m["visibility"].as_str() != Some("hide"))
+                .filter_map(|m| {
+                    let id = m["slug"].as_str()?.to_string();
+                    let label = m["display_name"].as_str().unwrap_or(&id).to_string();
+                    Some((m["priority"].as_i64().unwrap_or(99), id, label))
+                })
+                .collect();
+            list.sort_by_key(|(p, _, _)| *p);
+            CliModels { default, models: list.into_iter().map(|(_, id, label)| (id, label)).collect() }
+        }
+        "claude" => {
+            let default = read(".claude/settings.json").and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["model"].as_str().map(str::to_string));
+            let models = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+            CliModels { default, models }
+        }
+        "gemini" => {
+            let default = read(".gemini/settings.json").and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["model"]["name"].as_str().or_else(|| v["model"].as_str()).map(str::to_string));
+            CliModels { default, models: Vec::new() }
+        }
+        _ => CliModels::default(),
+    }
+}
+
+/// The models a subscription CLI offers (for the settings list).
+#[tauri::command]
+pub fn ai_cli_models(cli: String) -> CliModels {
+    match std::env::var_os("USERPROFILE") {
+        Some(home) => cli_models_in(&cli, std::path::Path::new(&home)),
+        None => CliModels::default(),
+    }
+}
+
 /// The conversation as one prompt (CLIs take a single input).
 fn cli_prompt(system: Option<&str>, messages: &[Message]) -> String {
     let mut out = String::new();
@@ -318,7 +389,9 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
             cli_prompt(None, messages)
         }
         "codex" => {
-            cmd.args(["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never"]);
+            // No MCP servers from the user's config: they are not needed for
+            // an answer, slow it down, fail noisily, and are tools.
+            cmd.args(["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", "-c", "mcp_servers={}"]);
             cli_prompt(Some(system), messages)
         }
         "gemini" => cli_prompt(Some(system), messages),
@@ -399,11 +472,35 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         return Ok(());
     }
     if !status.success() && !cancelled() {
-        let tail: String = stderr.lines().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" / ");
-        let hint = if tail.to_ascii_lowercase().contains("login") || tail.to_ascii_lowercase().contains("auth") { " (CLI에서 먼저 로그인하세요)" } else { "" };
-        return Err(format!("{name} CLI가 실패했습니다: {}{hint}", if tail.is_empty() { format!("종료 코드 {:?}", status.code()) } else { tail }));
+        return Err(cli_failure(name, &stderr, status.code()));
     }
     Ok(())
+}
+
+/// What went wrong in a CLI run, from its stderr: the service's own message
+/// when it printed one (a JSON error body), else the last lines; with a hint
+/// for the usual causes. Lines about MCP servers are the user's own tool
+/// setup, not this answer, and are left out.
+fn cli_failure(name: &str, stderr: &str, code: Option<i32>) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty() && !l.to_ascii_lowercase().contains("mcp")).collect();
+    let message = lines.iter().rev().find_map(|l| {
+        let json = &l[l.find('{')?..];
+        let v: Value = serde_json::from_str(json).ok()?;
+        v["error"]["message"].as_str().or_else(|| v["message"].as_str()).map(str::to_string)
+    });
+    let detail = message.unwrap_or_else(|| {
+        let tail: Vec<&str> = lines.iter().rev().take(3).rev().copied().collect();
+        if tail.is_empty() { format!("종료 코드 {code:?}") } else { tail.join(" / ").chars().take(400).collect() }
+    });
+    let low = lines.join("\n").to_ascii_lowercase();
+    let hint = if low.contains("model") && (low.contains("not supported") || low.contains("model_not_found") || low.contains("does not exist") || low.contains("unknown model")) {
+        " (설정 → AI에서 이 계정이 쓸 수 있는 모델을 적거나, CLI를 최신 버전으로 업데이트하세요)"
+    } else if ["not logged in", "please log in", "please login", "login required", "codex login", "/login", "unauthorized", "authentication required"].iter().any(|p| low.contains(p)) {
+        " (CLI에서 먼저 로그인하세요)"
+    } else {
+        ""
+    };
+    format!("{name} CLI가 실패했습니다: {detail}{hint}")
 }
 
 /// Ask a provider; the answer streams back as "ai-stream" events with this
@@ -657,6 +754,68 @@ mod tests {
         assert!(args.contains("--system-prompt-file") && args.contains("--model sonnet"), "{args}");
         assert!(args.contains("BananaConn\\ai-"), "runs in its own empty folder: {args}");
         assert_eq!(stdin.trim(), "list files");
+    }
+
+    #[test]
+    fn cli_models_come_from_the_clis_own_files() {
+        let home = std::env::temp_dir().join(format!("bx-cli-home-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".codex/config.toml"), "model = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"low\"\n\n[mcp_servers.x]\nmodel = \"no\"\n").unwrap();
+        std::fs::write(
+            home.join(".codex/models_cache.json"),
+            r#"{"models":[{"slug":"b","display_name":"B","visibility":"list","priority":5},{"slug":"hidden","visibility":"hide","priority":1},{"slug":"a","display_name":"A","visibility":"list","priority":0}]}"#,
+        )
+        .unwrap();
+        std::fs::write(home.join(".claude/settings.json"), r#"{"model":"opus"}"#).unwrap();
+        let codex = cli_models_in("codex", &home);
+        let claude = cli_models_in("claude", &home);
+        let gemini = cli_models_in("gemini", &home);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(codex, CliModels { default: Some("gpt-5.6-sol".into()), models: vec![("a".into(), "A".into()), ("b".into(), "B".into())] });
+        assert_eq!(claude.default.as_deref(), Some("opus"));
+        assert_eq!(claude.models.len(), 3);
+        assert_eq!(gemini, CliModels::default());
+    }
+
+    /// Codex runs read-only with no MCP servers; the arguments survive the
+    /// npm .cmd shim; the answer is its stdout.
+    #[test]
+    fn codex_cli_runs_read_only_without_mcp() {
+        let dir = std::env::temp_dir().join(format!("bx-fake-codex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("args.txt");
+        let script = dir.join("codex.cmd");
+        std::fs::write(&script, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\nmore > \"{log}.stdin\"\r\necho uptime\r\n", log = log.display())).unwrap();
+        let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "codex".into() };
+        let mut out = String::new();
+        let r = chat_cli_at(&script, &p, "SYS", &[Message { role: "user".into(), content: "load?".into() }], &|| false, &mut |t| {
+            out.push_str(t);
+            true
+        });
+        let args = std::fs::read_to_string(&log).unwrap_or_default();
+        let stdin = std::fs::read_to_string(dir.join("args.txt.stdin")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((r, out.trim()), (Ok(()), "uptime"));
+        // Rust quotes the braces for cmd; the program behind the shim gets mcp_servers={}.
+        assert!(args.contains("exec --sandbox read-only --skip-git-repo-check --color never -c \"mcp_servers={}\" -"), "{args}");
+        assert!(stdin.contains("<instructions>") && stdin.contains("SYS") && stdin.contains("load?"), "{stdin}");
+    }
+
+    /// A user's real Codex failure: an MCP server's auth noise must not read as
+    /// "log in", and the service's own message is what is shown.
+    #[test]
+    fn cli_failures_name_the_real_cause() {
+        let stderr = "warning: Model metadata for `gpt-5.5` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.\n\
+2026-10-26T01:32:48.754626Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: \"Bearer resource_metadata=...\", error=\"invalid_token\" })\n\
+ERROR: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.\",\"code\":\"model_not_found\"}}\n\
+ERROR: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.\",\"code\":\"model_not_found\"}}\n";
+        assert_eq!(
+            cli_failure("codex", stderr, Some(1)),
+            "codex CLI가 실패했습니다: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account. (설정 → AI에서 이 계정이 쓸 수 있는 모델을 적거나, CLI를 최신 버전으로 업데이트하세요)"
+        );
+        assert_eq!(cli_failure("codex", "Error: Not logged in. Run `codex login`.\n", Some(1)), "codex CLI가 실패했습니다: Error: Not logged in. Run `codex login`. (CLI에서 먼저 로그인하세요)");
+        assert_eq!(cli_failure("gemini", "", Some(2)), "gemini CLI가 실패했습니다: 종료 코드 Some(2)");
     }
 
     #[test]

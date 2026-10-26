@@ -158,6 +158,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>生成命令</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>）：用文字描述要做的事，即可得到一条适合所识别设备或系统的命令。再按一次 Enter 将其放入输入行（不会执行），由您自己按 Enter 执行。危险命令规则同样适用：被阻止的命令（修改时间、NTP 等）甚至不会放入输入行。</li>
         <li><b>解释输出</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>）：解释所选文本（若未选择则为屏幕上最近的输出）的含义、可能原因和后续步骤。</li>
         <li><b>AI 对话</b>（<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd>）：在终端右侧打开对话窗格。用“附加所选内容”一并发送输出；回答中每行命令旁的按钮可将其放入输入行。</li>
+        <li><b>AI 执行命令</b>：在 AI 对话中写下要做的事，AI 会在此终端中逐条执行命令，读取结果并分析。每次执行都显示在屏幕上，并全部记录在 <code>risky-commands.log</code> 中。只读命令（<code>df</code>、<code>free</code>、<code>systemctl status</code>、<code>show …</code>、<code>display …</code> 等）直接执行；可能更改系统的命令会等待您选择“执行”或“跳过”。符合阻止规则的命令（修改时间、NTP 等）绝不执行。每个问题最多 8 条命令，每条命令 30 秒后用 Ctrl+C 停止。可用对话窗格下方的按钮切换为“每条都确认”或“不执行”。</li>
         <li><b>配置与日志分析</b>：对话窗格中的文件按钮可选择配置或日志文件进行检查（安全问题、危险设置）或分析（错误、异常迹象）。网络设备可通过设备按钮 → “用 AI 检查配置”直接检查 running-config。</li>
         <li><b>发送的内容</b>：发送到云端 AI 之前，会显示将要发送的内容并请您确认（每个对话可选择“不再询问”）。密码、密钥和令牌（<code>password=…</code>、<code>-p…</code>、<code>enable secret</code>、<code>snmp-server community</code>、私钥等）始终会被隐藏；开启设置后，IP 地址和主机名也会替换为 IP_1、HOST_1 等再发送，回答中会还原为真实值。本地 LLM 不会离开本机，因此不会询问或隐藏。向外部 AI 发送公司设备信息前，请确认公司的安全策略。</li>
         <li>订阅 CLI：Claude Code 在关闭所有工具（不执行命令、不读取文件）的状态下于空文件夹中运行，Codex 在只读沙箱中运行。应用不会处理您的登录信息。</li>

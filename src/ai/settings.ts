@@ -59,9 +59,11 @@ export function wireAiSettings(root: HTMLElement) {
   });
 }
 
-/** Add or edit one provider. API keys go to the credential vault. */
+/** Add or edit one provider. API keys go to the credential vault. The name
+ * is made from the service and the model; the model is picked from what the
+ * service (or the CLI's own files) offers, never typed. */
 export function openProviderEditor(existing: AiProvider | null, saved: () => void) {
-  const p: AiProvider = existing ? { ...existing } : { id: crypto.randomUUID(), name: "", kind: "anthropic", baseUrl: "", model: "", credentialId: null, cli: "claude" };
+  const p: AiProvider = existing ? { ...existing, name: "" } : { id: crypto.randomUUID(), name: "", kind: "anthropic", baseUrl: "", model: "", credentialId: null, cli: "claude" };
   const m = modal({
     title: existing ? "AI 서비스 편집" : "AI 서비스 추가",
     icon: "Sparkles",
@@ -70,13 +72,25 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     footer: `<button class="btn" data-test>${icon("Send", 14)}연결 확인</button><span class="grow"></span><button class="btn" data-close>취소</button><button class="btn btn-primary" data-save>저장</button>`,
   });
   const form = m.root.querySelector<HTMLFormElement>("form")!;
-  let models: string[] = [];
+  /** Models to choose from: [id, label]; "" is the CLI's own default. */
+  let models: [string, string][] = [];
+  let modelsState: "loading" | "ready" | "error" = "loading";
+  let modelsError = "";
+  let loadSeq = 0;
   const keyCreds = () => state.credentials.filter((c) => c.kind === "password");
+  const modelField = () => {
+    if (modelsState === "loading") return `<select name="model" disabled><option>모델 목록을 불러오는 중…</option></select>`;
+    if (!models.length)
+      return `<div class="row"><select name="model" class="grow" disabled><option>${modelsState === "error" ? "모델 목록을 불러오지 못했습니다" : "고를 수 있는 모델이 없습니다"}</option></select>
+        <button type="button" class="tool" data-reload title="다시 불러오기">${icon("RefreshCw", 14)}</button></div>
+        ${modelsError ? `<div class="muted small ai-models-error" data-i18n-skip>${esc(modelsError)}</div>` : ""}`;
+    return `<div class="row"><select name="model" class="grow">${models.map(([id, label]) => `<option value="${esc(id)}" ${id === p.model ? "selected" : ""}>${esc(label)}</option>`).join("")}</select>
+      <button type="button" class="tool" data-reload title="다시 불러오기">${icon("RefreshCw", 14)}</button></div>`;
+  };
   const draw = () => {
     const info = kindInfo(p.kind);
     form.innerHTML = `<div class="grid-2">
       <label class="field span-2"><span>종류</span><select name="kind">${AI_KINDS.map((k) => `<option value="${k.kind}" ${k.kind === p.kind ? "selected" : ""}>${esc(k.label)}</option>`).join("")}</select></label>
-      <label class="field span-2"><span>이름 (목록에 보일 이름, 비우면 자동)</span><input name="name" value="${esc(p.name)}" spellcheck="false" /></label>
       ${
         p.kind === "cli"
           ? `<label class="field span-2"><span>CLI</span><select name="cli">${AI_CLIS.map(([v, l]) => `<option value="${v}" ${v === p.cli ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
@@ -87,16 +101,14 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
                info.key === "none"
                  ? ""
                  : `<label class="field span-2"><span>API 키${info.key === "optional" ? " (필요한 서버만)" : ""}</span>
-                    <div class="row"><select name="credentialId" class="grow"><option value="">${info.key === "optional" ? "사용 안 함" : "선택하세요"}</option>${keyCreds()
+                    <select name="credentialId"><option value="">${info.key === "optional" ? "사용 안 함" : "선택하세요"}</option>${keyCreds()
                       .map((c) => `<option value="${esc(c.id)}" ${c.id === p.credentialId ? "selected" : ""}>${esc(c.name)}</option>`)
-                      .join("")}</select></div></label>
+                      .join("")}</select></label>
                     <label class="field span-2"><span>새 API 키 입력 (자격 증명 보관함에 저장)</span><input name="newKey" type="password" placeholder="sk-…" autocomplete="new-password" spellcheck="false" /></label>`
              }`
       }
-      <label class="field span-2"><span>모델${p.kind === "cli" ? " (비우면 CLI 기본값)" : ""}</span>
-        <div class="row"><input name="model" class="grow" list="ai-models" value="${esc(p.model)}" spellcheck="false" placeholder="${p.kind === "ollama" ? "llama3.1:8b" : p.kind === "cli" ? "" : "모델 이름"}" />
-        ${p.kind === "cli" ? "" : `<button type="button" class="btn btn-sm" data-models>${icon("RefreshCw", 13)}목록 불러오기</button>`}</div>
-        <datalist id="ai-models">${models.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist></label>
+      <label class="field span-2"><span>모델</span>${modelField()}</label>
+      <div class="field span-2"><span>이름 (자동)</span><div class="ai-auto-name" data-i18n-skip>${esc(providerLabel({ ...p, name: "" }))}</div></div>
       <p class="span-2 muted small">${isLocal(p) ? "이 PC에서 처리합니다. 보낼 내용을 묻거나 가리지 않습니다." : "외부 서비스입니다. 보낼 내용은 설정에 따라 미리 보여 주고, 비밀번호·키·토큰은 항상 가립니다."}</p>
     </div>`;
     if (p.kind === "cli") void showCli();
@@ -104,9 +116,9 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
   const read = () => {
     const v = (n: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name=${n}]`)?.value ?? "";
     p.kind = (v("kind") as AiKind) || p.kind;
-    p.name = v("name").trim();
     p.baseUrl = v("baseUrl").trim();
-    p.model = v("model").trim();
+    const model = form.querySelector<HTMLSelectElement>("select[name=model]:not([disabled])");
+    if (model) p.model = model.value;
     p.credentialId = form.querySelector("[name=credentialId]") ? v("credentialId") || null : p.kind === "cli" || p.kind === "ollama" ? null : p.credentialId;
     if (p.kind === "cli") p.cli = v("cli") || p.cli;
   };
@@ -117,7 +129,37 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     const cred = await api.vaultSave({ id: crypto.randomUUID(), name: `${kindInfo(p.kind).label.split(" (")[0]} API 키`, username: "", kind: "password", keyPath: null, hasSecret: false }, key);
     await reloadCredentials();
     p.credentialId = cred.id;
-    form.querySelector<HTMLInputElement>("[name=newKey]")!.value = "";
+  };
+  /** Fill the model list from the service or the CLI's files. */
+  const loadModels = async () => {
+    const seq = ++loadSeq;
+    modelsState = "loading";
+    modelsError = "";
+    draw();
+    try {
+      if (p.kind === "cli") {
+        const r = await api.aiCliModels(p.cli);
+        models = [["", r.default ? `CLI 기본값 (${r.default})` : "CLI 기본값"], ...r.models.filter(([id]) => id !== r.default).map(([id, label]): [string, string] => [id, label === id ? id : `${label} (${id})`])];
+        if (r.default) models.splice(1, 0, [r.default, r.default]);
+      } else if (kindInfo(p.kind).key === "required" && !p.credentialId) {
+        models = [];
+        modelsError = "API 키를 고르거나 입력하면 모델 목록을 불러옵니다";
+      } else {
+        const list = await api.aiModels(p);
+        models = list.map((id): [string, string] => [id, id]);
+      }
+      if (seq !== loadSeq) return;
+      // Keep the saved model when the list no longer shows it.
+      if (p.model && !models.some(([id]) => id === p.model)) models.unshift([p.model, p.model]);
+      if (!models.some(([id]) => id === p.model)) p.model = models[0]?.[0] ?? "";
+      modelsState = "ready";
+    } catch (err) {
+      if (seq !== loadSeq) return;
+      models = p.model ? [[p.model, p.model]] : [];
+      modelsState = "error";
+      modelsError = errorText(err);
+    }
+    draw();
   };
   const showCli = async () => {
     const box = form.querySelector<HTMLElement>("[data-cli-status]");
@@ -128,30 +170,39 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
       ? `${icon("Check", 13)} <span data-i18n-skip>${esc(mine.version || mine.name)}</span> · <code data-i18n-skip>${esc(mine.path)}</code>`
       : `${icon("TriangleAlert", 13)} <span>이 PC에서 CLI를 찾지 못했습니다</span> (<code data-i18n-skip>${esc(p.cli)}</code>). <span>설치하고 터미널에서 한 번 실행해 로그인하세요.</span>`;
   };
-  form.addEventListener("change", (e) => {
+  form.addEventListener("change", async (e) => {
     const t = e.target as HTMLElement;
     if (t.matches("[name=kind]")) {
       read();
       p.baseUrl = "";
       p.model = "";
-      models = [];
-      draw();
+      p.credentialId = null;
+      void loadModels();
     } else if (t.matches("[name=cli]")) {
       read();
-      draw();
+      p.model = "";
+      void loadModels();
+    } else if (t.matches("[name=credentialId], [name=baseUrl]")) {
+      read();
+      void loadModels();
+    } else if (t.matches("[name=newKey]")) {
+      read();
+      try {
+        await storeKey();
+      } catch (err) {
+        return toast(errorText(err), "error");
+      }
+      void loadModels();
+    } else if (t.matches("[name=model]")) {
+      read();
+      const name = form.querySelector(".ai-auto-name");
+      if (name) name.textContent = providerLabel({ ...p, name: "" });
     }
   });
-  form.addEventListener("click", async (e) => {
-    if (!(e.target as HTMLElement).closest("[data-models]")) return;
-    read();
-    try {
-      await storeKey();
-      models = await api.aiModels(p);
-      if (!models.length) return toast("모델 목록이 비어 있습니다", "warn");
-      draw();
-      toast(`모델 ${models.length}개를 불러왔습니다. 모델 칸에서 고르세요`, "success");
-    } catch (err) {
-      toast(`모델 목록을 읽지 못했습니다: ${errorText(err)}`, "error", 6000);
+  form.addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest("[data-reload]")) {
+      read();
+      void loadModels();
     }
   });
   m.root.querySelector("[data-test]")!.addEventListener("click", async () => {
@@ -181,8 +232,9 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     } catch (err) {
       return toast(errorText(err), "error");
     }
-    if (p.kind !== "cli" && !p.model) return toast("모델을 지정하세요", "warn");
     if (kindInfo(p.kind).key === "required" && !p.credentialId) return toast("API 키를 고르거나 입력하세요", "warn");
+    if (p.kind !== "cli" && !p.model) return toast("모델 목록을 불러온 뒤 모델을 고르세요", "warn");
+    p.name = "";
     const list = providers();
     const at = list.findIndex((x) => x.id === p.id);
     const next = at < 0 ? [...list, p] : list.map((x) => (x.id === p.id ? p : x));
@@ -191,5 +243,5 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     saved();
     toast("AI 서비스를 저장했습니다", "success");
   });
-  draw();
+  void loadModels();
 }
