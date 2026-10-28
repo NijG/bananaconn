@@ -15,7 +15,7 @@ import { writeClipboard } from "../clipboard";
 import { tr } from "../i18n";
 import { judge } from "./policy";
 import { fromCanvas, fromFile, sizeLabel, type Attached } from "./attach";
-import { ask, confirmSend, currentProvider, isLocal, Masker, maskSecrets, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type Asking, type Target } from "./core";
+import { ask, cliLabel, confirmSend, currentProvider, isLocal, Masker, maskSecrets, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type AiUsage, type Asking, type Target } from "./core";
 
 /** What the panel needs from its terminal. */
 export interface AiHost {
@@ -61,6 +61,8 @@ interface SavedConversation {
   system: "chat" | "explain" | "config" | "log";
   providerId: string | null;
   at: number;
+  /** Token totals, kept so a reopened conversation still shows its usage. */
+  usage?: { input: number; output: number };
 }
 
 const storageKey = (key: string) => SAVED_PREFIX + key;
@@ -118,8 +120,23 @@ function storeConversation(key: string, c: SavedConversation | null) {
   localStorage.removeItem(sk);
   if (!c || !c.turns.length) return;
   const slim = { ...c, turns: c.turns.map((t) => ({ ...t, media: t.media?.map((m) => ({ ...m, data: undefined })) })) };
-  while (slim.turns.length > 2 && JSON.stringify(slim).length > SAVED_BYTES) slim.turns.splice(0, 2);
-  const data = JSON.stringify(slim);
+  // Drop the fewest oldest turns to fit, keeping the last two. Measure each turn
+  // once (re-stringifying the whole conversation per removed pair would be
+  // O(N^2)); a final check covers any small estimate error from array
+  // punctuation without re-measuring per pair.
+  let data = JSON.stringify(slim);
+  if (slim.turns.length > 2 && data.length > SAVED_BYTES) {
+    const sizes = slim.turns.map((t) => JSON.stringify(t).length + 1);
+    let total = data.length;
+    let drop = 0;
+    while (drop < slim.turns.length - 2 && total > SAVED_BYTES) total -= sizes[drop++];
+    slim.turns.splice(0, drop);
+    data = JSON.stringify(slim);
+    while (slim.turns.length > 2 && data.length > SAVED_BYTES) {
+      slim.turns.splice(0, 1);
+      data = JSON.stringify(slim);
+    }
+  }
   for (let tries = 0; tries < SAVED_MAX + 2; tries++) {
     const others = savedEntries()
       .filter((e) => e.sk !== sk)
@@ -156,11 +173,36 @@ async function openAiSettings() {
   openSettings("ai");
 }
 
-function noProvider(el: HTMLElement) {
-  el.innerHTML = `<div class="ai-empty">${icon("Sparkles", 28)}<p>AI를 쓰려면 먼저 설정에서 AI 서비스를 추가하세요.</p>
+// The subscription CLIs on this PC, detected once per session (spawns a probe).
+let cliProbe: Promise<{ name: string; path: string; version: string }[]> | null = null;
+const detectClis = () => (cliProbe ??= api.aiDetectCli().catch(() => []));
+
+/** The empty state when no AI service is set up. If a subscription CLI (Claude
+ * Code, Codex, Gemini CLI) is already installed and logged in, it offers to
+ * start with it in one click — no trip to settings, no API key. */
+function noProvider(el: HTMLElement, onEnabled?: () => void) {
+  el.innerHTML = `<div class="ai-empty">${icon("Sparkles", 28)}<p>AI를 쓰려면 AI 서비스가 필요합니다.</p>
+    <div class="ai-cli-quick" data-clis hidden></div>
     <p class="muted small">API 키(Anthropic·OpenAI·Gemini), 구독 CLI(Claude Code·Codex·Gemini CLI), 로컬 LLM(Ollama·LM Studio)을 쓸 수 있습니다.</p>
     <button class="btn btn-primary" data-ai-settings>${icon("Settings", 14)}AI 설정 열기</button></div>`;
   el.querySelector("[data-ai-settings]")!.addEventListener("click", openAiSettings);
+  void detectClis().then((clis) => {
+    const box = el.querySelector<HTMLElement>("[data-clis]");
+    if (!box || !clis.length) return;
+    box.hidden = false;
+    box.innerHTML =
+      `<p class="small muted">${tr("이미 설치된 CLI로 바로 시작할 수 있습니다")}</p>` +
+      clis.map((c) => `<button type="button" class="btn btn-primary" data-cli="${esc(c.name)}">${icon("Bot", 14)}<span data-i18n-skip>${esc(cliLabel(c.name))}</span> ${tr("사용")}</button>`).join("");
+    box.querySelectorAll<HTMLElement>("[data-cli]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const cli = b.dataset.cli!;
+        const provider: AiProvider = { id: crypto.randomUUID(), name: "", kind: "cli", baseUrl: "", model: "", credentialId: null, cli };
+        updateSettings({ aiProviders: [...providers(), provider], aiDefault: provider.id });
+        toast(`${cliLabel(cli)} ${tr("사용을 시작합니다")}`, "success");
+        onEnabled?.();
+      }),
+    );
+  });
 }
 
 /** Risk verdict for a command the AI proposed. */
@@ -196,6 +238,10 @@ function render(answer: string, insertable = true, insertTitle = "입력 줄에 
               })
               .join("")
           : "";
+      // Each runnable line has its own insert button, and the block copy button
+      // copies them all at once (newlines preserved) to paste and run. A single
+      // "insert all" onto the one-line terminal input can't work — the input is
+      // one command and the terminal collapses newlines — so it is not offered.
       return `<div class="ai-code"><pre>${esc(body.replace(/\s+$/, ""))}</pre><div class="ai-code-actions"><button class="tool" data-copy="${esc(body.trim())}" title="복사">${icon("Copy", 13)}</button></div>${actions}</div>`;
     })
     .join("");
@@ -300,6 +346,8 @@ export class AiPanel {
   private asking: Asking | null = null;
   private providerId: string | null = null;
   private system: "chat" | "explain" | "config" | "log" = "chat";
+  /** Tokens this conversation has used (summed over its requests). */
+  private usage = { input: 0, output: 0 };
 
   constructor(
     private host: AiHost,
@@ -320,6 +368,7 @@ export class AiPanel {
       <div class="ai-log" data-i18n-skip></div>
       <div class="ai-compose">
         <div class="ai-attach-row" data-pending hidden></div>
+        <div class="ai-queued" data-queued hidden></div>
         <textarea rows="2" placeholder="질문하거나 할 일을 적으세요 (Enter 보내기, Shift+Enter 줄 바꿈, Ctrl+V로 이미지 붙여넣기)"></textarea>
         <div class="ai-compose-row">
           <button type="button" class="tool" data-act="pick" title="이미지·PDF·텍스트 파일 첨부 (끌어다 놓아도 됩니다)">${icon("Paperclip", 15)}</button>
@@ -330,6 +379,7 @@ export class AiPanel {
           <button class="btn btn-sm btn-primary" data-act="send">${icon("Send", 13)}질문하기</button>
         </div>
         <input type="file" multiple hidden data-files accept="image/*,application/pdf,.pdf,.txt,.log,.conf,.cfg,.config,.ini,.json,.xml,.yml,.yaml,.csv,.md,.sh,.ps1,.py,.sql,.out" />
+        <div class="ai-usage" data-usage hidden></div>
       </div>`,
     );
     this.log = this.el.querySelector(".ai-log")!;
@@ -371,7 +421,10 @@ export class AiPanel {
         void this.send();
       } else if (e.key === "Escape") {
         e.preventDefault();
-        this.host.focus();
+        // While a run is in progress, Esc stops it; otherwise it returns focus
+        // to the terminal.
+        if (this.busy) this.stop();
+        else this.host.focus();
       }
     });
     this.el.querySelector<HTMLSelectElement>(".ai-provider")!.addEventListener("change", (e) => {
@@ -381,6 +434,7 @@ export class AiPanel {
     this.restore();
     this.refreshProviders();
     this.draw();
+    this.drawUsage();
   }
 
   /** Attachments waiting for the next message. */
@@ -436,7 +490,7 @@ export class AiPanel {
     sel.hidden = list.length < 2;
     const where = this.el.querySelector(".ai-where")!;
     where.textContent = cur ? (isLocal(cur) ? "이 PC에서 처리" : "외부 서비스로 전송") : "";
-    if (!cur) noProvider(this.log);
+    if (!cur) noProvider(this.log, () => (this.refreshProviders(), this.draw(), this.input.focus()));
   }
 
   private get provider(): AiProvider | null {
@@ -487,12 +541,26 @@ export class AiPanel {
   }
 
   newConversation() {
+    // Abandon any in-flight run (token), and end its stream and pending approval
+    // so it cannot keep talking to the provider or write into the new, empty
+    // conversation.
+    this.runSeq++;
     this.asking?.cancel();
     this.asking = null;
+    const approval = this.approval;
+    this.approval = null;
+    approval?.(false);
+    this.busy = false;
+    this.stopped = false;
+    this.interrupting = false;
     this.turns = [];
     this.masker = null;
     this.skip = { skip: false };
     this.system = "chat";
+    this.queued = null;
+    this.usage = { input: 0, output: 0 };
+    this.drawQueued();
+    this.drawUsage();
     this.persist();
     this.draw();
   }
@@ -518,7 +586,7 @@ export class AiPanel {
         ...(fixed.output ? { output: { ...fixed.output, command: maskSecrets(fixed.output.command), text: maskSecrets(fixed.output.text) } } : {}),
       };
     });
-    storeConversation(key, turns.length ? { turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now() } : null);
+    storeConversation(key, turns.length ? { turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now(), usage: this.usage } : null);
   }
 
   /** The conversation this connection had before (panel closed, app restarted). */
@@ -529,6 +597,7 @@ export class AiPanel {
     this.turns = saved.turns.map((t) => (t.run?.status === "running" || t.run?.status === "approve" ? { ...t, run: { ...t.run, status: "skipped" } } : t));
     this.masker = saved.masker ? Masker.restore(saved.masker) : null;
     this.system = saved.system ?? "chat";
+    if (saved.usage) this.usage = { input: saved.usage.input || 0, output: saved.usage.output || 0 };
     if (saved.providerId && providers().some((p) => p.id === saved.providerId)) this.providerId = saved.providerId;
   }
 
@@ -563,6 +632,15 @@ export class AiPanel {
       this.drawPending();
       return;
     }
+    if (t.closest("[data-queued-now]")) return void this.interruptNow();
+    if (t.closest("[data-queued-cancel]")) {
+      this.queued = null;
+      this.drawQueued();
+      return;
+    }
+    if (t.closest("[data-regen]")) return void this.regenerate();
+    const edit = t.closest<HTMLElement>("[data-edit]")?.dataset.edit;
+    if (edit !== undefined) return void this.editTurn(+edit);
     const act = t.closest<HTMLElement>("[data-act]")?.dataset.act;
     if (act === "pick") this.el.querySelector<HTMLInputElement>("[data-files]")!.click();
     else if (act === "capture") this.captureScreen();
@@ -574,13 +652,125 @@ export class AiPanel {
     else if (act === "mode") void this.pickRunMode();
   }
 
-  /** Stop the answer, the waiting approval, and any further commands. */
-  private stop() {
+  /** Stop the answer, the waiting approval, and any further commands. A plain
+   * stop also drops a queued interjection; an interrupt keeps it to send next. */
+  private stop(keepQueued = false) {
     this.stopped = true;
+    if (!keepQueued) {
+      this.queued = null;
+      this.drawQueued();
+    }
     this.asking?.cancel();
     const resolve = this.approval;
     this.approval = null;
     resolve?.(false);
+  }
+
+  /** Cut in now: end the current run but send the queued message right after. */
+  private interruptNow() {
+    if (!this.queued || !this.busy) return;
+    this.interrupting = true;
+    this.stop(true);
+  }
+
+  /** Hold what is in the compose box to send when the current run ends. Several
+   * notes pile onto one queued message; attachments are merged in. */
+  private queueFromCompose() {
+    const text = this.input.value.trim();
+    const pending = this.pending;
+    if (!text && !pending.length) return;
+    this.queued = {
+      text: [this.queued?.text, text].filter(Boolean).join("\n"),
+      pending: [...(this.queued?.pending ?? []), ...pending],
+    };
+    this.input.value = "";
+    this.pending = [];
+    this.drawPending();
+    this.drawQueued();
+    toast(tr("응답이 끝나면 보냅니다"), "success", 1800);
+  }
+
+  /** Send the queued interjection (after a run ends), reusing the normal path. */
+  private dequeue() {
+    const q = this.queued;
+    if (!q || this.disposed) return;
+    this.queued = null;
+    this.drawQueued();
+    this.input.value = q.text;
+    this.pending = q.pending;
+    this.drawPending();
+    void this.send();
+  }
+
+  /** The queued-message chip above the compose box, with send-now and cancel. */
+  private drawQueued() {
+    const row = this.el.querySelector<HTMLElement>("[data-queued]");
+    if (!row) return;
+    row.hidden = !this.queued;
+    if (!this.queued) return (row.innerHTML = "");
+    row.innerHTML = `<span class="ai-queued-label">${icon("CornerDownLeft", 13)}${tr("끼어들 메시지")}</span>
+      <span class="ai-queued-text" data-i18n-skip>${esc(this.queued.text || tr("(첨부만)"))}</span>
+      <button type="button" class="btn btn-sm btn-primary" data-queued-now>${tr("지금 보내기")}</button>
+      <button type="button" class="tool" data-queued-cancel title="${tr("취소")}">${icon("X", 13)}</button>`;
+  }
+
+  /** Add a request's reported tokens to the running total and show it. */
+  private addUsage(u: AiUsage) {
+    this.usage.input += u.input ?? 0;
+    this.usage.output += u.output ?? 0;
+    this.drawUsage();
+  }
+
+  /** The token-usage line at the bottom; hidden until a provider reports any. */
+  private drawUsage() {
+    const el = this.el.querySelector<HTMLElement>("[data-usage]");
+    if (!el) return;
+    const { input, output } = this.usage;
+    const total = input + output;
+    el.hidden = total === 0;
+    if (!total) return (el.innerHTML = "");
+    const n = (v: number) => v.toLocaleString();
+    el.innerHTML = `${icon("Sparkles", 12)}<span>${tr("토큰")}</span>
+      <span title="${tr("입력(프롬프트) 토큰")}">${icon("ArrowUp", 11)}${n(input)}</span>
+      <span title="${tr("출력(응답) 토큰")}">${icon("CornerDownLeft", 11)}${n(output)}</span>
+      <span class="ai-usage-total" title="${tr("이 대화 누적")}">${tr("합계")} ${n(total)}</span>`;
+  }
+
+  /** Whether a turn is a real user question (not a command result or app nudge).
+   * A command result is a user turn pushed right after an assistant turn that
+   * ran a command, so its predecessor has a `run`. */
+  private isQuestion(i: number): boolean {
+    const t = this.turns[i];
+    return !!t && t.role === "user" && !t.output && !t.nudge && !this.turns[i - 1]?.run;
+  }
+
+  /** Regenerate the last answer: drop it and re-ask the last question. */
+  private regenerate() {
+    if (this.busy) return;
+    let i = this.turns.length - 1;
+    while (i >= 0 && !this.isQuestion(i)) i--;
+    if (i < 0) return;
+    const userTurn = this.turns[i];
+    this.turns = this.turns.slice(0, i);
+    this.pending = (userTurn.media ?? []).filter((a) => a.data);
+    this.drawPending();
+    // internal: the stored text already holds any attached selection — don't
+    // append the current terminal selection again.
+    void this.send(userTurn.shown, true);
+  }
+
+  /** Load a past question back into the compose box to edit and send again;
+   * everything from that question onward is dropped first. */
+  private editTurn(i: number) {
+    if (this.busy || !this.isQuestion(i)) return;
+    const t = this.turns[i];
+    this.turns = this.turns.slice(0, i);
+    this.input.value = t.shown;
+    this.pending = (t.media ?? []).filter((a) => a.data);
+    this.drawPending();
+    this.persist();
+    this.draw();
+    this.input.focus();
   }
 
   private async pickRunMode() {
@@ -601,9 +791,13 @@ export class AiPanel {
   private draw() {
     const btn = this.el.querySelector<HTMLElement>('[data-act="send"]')!;
     btn.innerHTML = this.busy ? `${icon("Square", 13)}중지` : `${icon("Send", 13)}질문하기`;
+    // While answering, the box still takes input — hint that it will be queued.
+    this.input.placeholder = this.busy
+      ? tr("응답 중… 입력하면 끝난 뒤 이어서 보냅니다 (끼어들기)")
+      : tr("질문하거나 할 일을 적으세요 (Enter 보내기, Shift+Enter 줄 바꿈, Ctrl+V로 이미지 붙여넣기)");
     const mode = this.el.querySelector<HTMLElement>('[data-act="mode"]');
     if (mode) mode.innerHTML = `${icon(this.runMode === "off" ? "Ban" : "SquareTerminal", 13)}<span>${this.runMode === "auto" ? "읽기 전용 자동 실행" : this.runMode === "confirm" ? "실행 전 확인" : "실행 안 함"}</span>`;
-    if (!this.provider) return noProvider(this.log);
+    if (!this.provider) return noProvider(this.log, () => (this.refreshProviders(), this.draw(), this.input.focus()));
     if (!this.turns.length) {
       this.log.innerHTML = `<div class="ai-empty small"><p>${
         this.runMode === "off"
@@ -643,7 +837,9 @@ export class AiPanel {
       // A note to the AI about a command that did not run, or the app's own nudge.
       if (t.nudge || this.turns[this.turns.indexOf(t) - 1]?.run) return "";
       const media = t.media?.length ? `<div class="ai-attach-row">${t.media.map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip">${icon("FileText", 13)}<span data-i18n-skip>${esc(a.name)}</span></span>`)).join("")}</div>` : "";
-      return `<div class="ai-msg user" data-turn="${this.turns.indexOf(t)}">${media}${render(shortened(t.shown), false)}</div>`;
+      const ui = this.turns.indexOf(t);
+      const edit = this.busy ? "" : `<button type="button" class="tool ai-msg-edit" data-edit="${ui}" title="${tr("이 질문 수정")}">${icon("Pencil", 13)}</button>`;
+      return `<div class="ai-msg user" data-turn="${ui}">${edit}${media}${render(shortened(t.shown), false)}</div>`;
     }
     const body = (t.run ? t.shown.replace(/```run[ \t]*\r?\n[\s\S]*?```/, "") : t.shown).trim();
     const run = t.run
@@ -655,7 +851,12 @@ export class AiPanel {
         </div>`
       : "";
     const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
-    return `<div class="ai-msg assistant" data-turn="${this.turns.indexOf(t)}">${body ? `<button type="button" class="tool ai-msg-copy" data-copy-turn="${this.turns.indexOf(t)}" title="${tr("이 메시지 복사")}">${icon("Copy", 13)}</button>` : ""}${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
+    const ai = this.turns.indexOf(t);
+    const copyBtn = body ? `<button type="button" class="tool ai-msg-copy" data-copy-turn="${ai}" title="${tr("이 메시지 복사")}">${icon("Copy", 13)}</button>` : "";
+    // Regenerate only the latest answer (re-running a middle one would throw away
+    // everything the conversation did afterwards).
+    const regen = !this.busy && ai === this.turns.length - 1 && (body || t.error) ? `<button type="button" class="tool ai-msg-regen" data-regen title="${tr("이 답변 다시 생성")}">${icon("RefreshCw", 13)}</button>` : "";
+    return `<div class="ai-msg assistant" data-turn="${ai}">${regen}${copyBtn}${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
@@ -698,6 +899,10 @@ export class AiPanel {
 
   private approval: ((ok: boolean) => void) | null = null;
   private stopped = false;
+  /** A message typed while a run is in progress, sent when it ends (끼어들기). */
+  private queued: { text: string; pending: Attached[] } | null = null;
+  /** The queued message should go even though the run was stopped to make room. */
+  private interrupting = false;
 
   /** Wait for the engineer's Run / Skip on the card. */
   private approve(): Promise<boolean> {
@@ -707,7 +912,11 @@ export class AiPanel {
   async send(typed?: string, internal = false) {
     const p = this.provider;
     if (!p) return void openAiSettings();
-    if (this.asking || this.busy) return;
+    if (this.asking || this.busy) {
+      // A run is in progress: hold a composed message as an interjection (끼어들기).
+      if (typed === undefined) this.queueFromCompose();
+      return;
+    }
     let text = (typed ?? this.input.value).trim();
     const attached = this.pending;
     if (!text && !attached.length) return;
@@ -728,18 +937,25 @@ export class AiPanel {
     const sent = mask(text);
     // With commands allowed, the AI may look around in the terminal itself.
     const agent = this.host.canRun !== false && this.runMode !== "off" && (this.system === "chat" || this.system === "explain");
-    if (!(await confirmSend(p, sent, masker, this.skip, agent, attached))) return;
-    if (typed === undefined) this.input.value = "";
-    this.pending = [];
-    this.drawPending();
-    this.turns.push({ role: "user", shown: text, sent, media });
-    const target = this.host.target();
-    const system = agent ? prompts.agent(target, MAX_STEPS) : this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
+    // Claim the run before the confirm dialog's await so a second Enter/Send is
+    // queued rather than starting a parallel run; the run token lets a new
+    // conversation or provider switch mid-run abandon this one cleanly.
     this.busy = true;
     this.stopped = false;
+    const myRun = ++this.runSeq;
+    this.draw();
     try {
+      if (!(await confirmSend(p, sent, this.skip, agent, attached))) return;
+      if (myRun !== this.runSeq) return; // abandoned during the confirm dialog
+      if (typed === undefined) this.input.value = "";
+      this.pending = [];
+      this.drawPending();
+      this.turns.push({ role: "user", shown: text, sent, media });
+      const target = this.host.target();
+      const system = agent ? prompts.agent(target, MAX_STEPS) : this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
       let nudged = false;
       for (let step = 0; ; step++) {
+        if (myRun !== this.runSeq) return;
         const answer: Turn = { role: "assistant", shown: "", sent: "" };
         this.turns.push(answer);
         const history: AiMessage[] = this.turns
@@ -748,17 +964,23 @@ export class AiPanel {
           // of this message, not again on every agent step that re-sends history.
           .map((t) => ({ role: t.role, content: t.sent, ...(step === 0 && t.media?.some((a) => a.data) ? { attachments: t.media.filter((a) => a.data).map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
         let frame = 0;
-        this.asking = ask(p, system, history, (sofar) => {
-          answer.sent = sofar;
-          // Unmask once per animation frame, not per streamed delta: unmasking
-          // the whole accumulated answer on every delta is O(N²) over a long reply.
-          if (!frame)
-            frame = requestAnimationFrame(() => {
-              frame = 0;
-              answer.shown = masker.unmask(answer.sent);
-              this.updateTurn(answer);
-            });
-        });
+        this.asking = ask(
+          p,
+          system,
+          history,
+          (sofar) => {
+            answer.sent = sofar;
+            // Unmask once per animation frame, not per streamed delta: unmasking
+            // the whole accumulated answer on every delta is O(N²) over a long reply.
+            if (!frame)
+              frame = requestAnimationFrame(() => {
+                frame = 0;
+                answer.shown = masker.unmask(answer.sent);
+                this.updateTurn(answer);
+              });
+          },
+          (u) => this.addUsage(u),
+        );
         this.draw();
         try {
           await this.asking.done;
@@ -772,6 +994,7 @@ export class AiPanel {
           // for a short answer): bring `shown` fully up to date before it is read.
           answer.shown = masker.unmask(answer.sent);
         }
+        if (myRun !== this.runSeq) return;
         const command = agent && !answer.error && !this.stopped ? runRequest(answer.shown) : null;
         // Commands handed to the engineer instead of run: ask once to run them itself.
         if (!command && agent && !nudged && !answer.error && !this.stopped && /```[\w-]*\r?\n[\s\S]*?```/.test(answer.shown)) {
@@ -787,7 +1010,9 @@ export class AiPanel {
         }
         const verdict = judge(command, this.host.network(), !!target.windows);
         answer.run = { command, reason: verdict.reason, status: verdict.action === "block" ? "blocked" : verdict.action === "auto" && this.runMode === "auto" ? "auto" : "approve" };
-        this.draw();
+        // Only the answer turn changed (its run card) — update that one row, not
+        // the whole conversation.
+        this.updateTurn(answer);
         let result: string;
         let output: Turn["output"] | undefined;
         if (answer.run.status === "blocked") {
@@ -800,7 +1025,7 @@ export class AiPanel {
           break;
         } else {
           answer.run.status = "running";
-          this.draw();
+          this.updateTurn(answer);
           try {
             const r = await this.host.run(command, `AI · ${verdict.reason}`);
             answer.run.status = "done";
@@ -811,25 +1036,40 @@ export class AiPanel {
             result = `The command could not run: ${errorText(err)}`;
           }
         }
+        if (myRun !== this.runSeq) return;
         this.turns.push({ role: "user", shown: result, sent: mask(result), output });
         this.draw();
         if (this.stopped) break;
       }
     } finally {
-      this.busy = false;
-      this.approval = null;
-      // When disposed, dispose() has already saved; persisting here would write
-      // stale turns over a conversation that may have been reopened for the same
-      // connection, so skip it (and the panel is gone, so there is nothing to draw).
-      if (!this.disposed) {
-        this.persist();
-        this.draw();
+      // Only the active run cleans up. A run abandoned by a new conversation or
+      // provider switch (runSeq moved on) must not clear a newer run's busy flag
+      // or write its turns; that run already reset the state itself.
+      const active = myRun === this.runSeq;
+      // Send a queued interjection when the run finished on its own, or was
+      // stopped only to make room for it (지금 보내기); a plain stop cleared it.
+      const resume = active && !this.disposed && !!this.queued && (!this.stopped || this.interrupting);
+      this.interrupting = false;
+      if (active) {
+        this.busy = false;
+        this.approval = null;
+        // When disposed, dispose() has already saved; persisting here would write
+        // stale turns over a conversation that may have been reopened for the same
+        // connection, so skip it (the panel is gone, nothing to draw).
+        if (!this.disposed) {
+          this.persist();
+          this.draw();
+        }
       }
+      if (resume) this.dequeue();
     }
   }
 
   private busy = false;
   private disposed = false;
+  /** Bumped per run; a new conversation or provider switch bumps it to abandon
+   * an in-flight run so it stops writing into the fresh conversation. */
+  private runSeq = 0;
 
   dispose() {
     // Closing the panel must end the whole agent run, not just the current
@@ -870,7 +1110,11 @@ export function commandBar(container: HTMLElement, host: AiHost, initial = ""): 
   };
   if (!p0) {
     out.hidden = false;
-    noProvider(out);
+    noProvider(out, () => {
+      out.hidden = true;
+      out.innerHTML = "";
+      input.focus();
+    });
   }
   const insert = () => {
     if (!command) return;
@@ -885,7 +1129,7 @@ export function commandBar(container: HTMLElement, host: AiHost, initial = ""): 
     asked = input.value;
     const masker = new Masker(!isLocal(p) && state.settings.aiMaskHosts, host.hostNames());
     const sent = isLocal(p) ? task : masker.mask(task);
-    if (!(await confirmSend(p, sent, masker, { skip: false }))) return;
+    if (!(await confirmSend(p, sent, { skip: false }))) return;
     out.hidden = false;
     command = "";
     out.innerHTML = `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")} ${esc(providerLabel(p))}</div>`;

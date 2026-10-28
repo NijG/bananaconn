@@ -310,8 +310,12 @@ export class EditorView implements View {
             { value: "overwrite", label: "내 내용으로 덮어쓰기", kind: "danger" as const },
           ],
         });
-        if (choice === "overwrite") return this.save(true);
-        if (choice === "reload") return this.reload(true);
+        // Await the forced save/reload so the outer `finally` (which clears
+        // `saving`) runs only after it completes — otherwise `saving` is cleared
+        // while the forced write is still in flight, allowing a second concurrent
+        // write of the same file.
+        if (choice === "overwrite") return await this.save(true);
+        if (choice === "reload") return await this.reload(true);
         return;
       }
       toast(`저장하지 못했습니다: ${msg}`, "error", 8000);

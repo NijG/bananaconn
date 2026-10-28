@@ -48,6 +48,11 @@ export function kindInfo(kind: AiKind) {
   return AI_KINDS.find((k) => k.kind === kind) ?? AI_KINDS[0];
 }
 
+/** The short display name of a subscription CLI ("claude" → "Claude Code"). */
+export function cliLabel(cli: string): string {
+  return CLI_NAMES[cli] ?? cli;
+}
+
 /** The provider's model runs on this PC: nothing leaves it. */
 export function isLocal(p: AiProvider): boolean {
   if (p.kind !== "ollama" && p.kind !== "compatible") return false;
@@ -211,10 +216,16 @@ export class Masker {
 /** Ask the user before text goes to a cloud provider (Settings → AI decides).
  * Resolves to false when the user says no. `skip` remembers "don't ask again"
  * for the rest of the conversation. */
-export async function confirmSend(p: AiProvider, text: string, masker: Masker, skip: { skip: boolean }, agent = false, attached: Attached[] = []): Promise<boolean> {
+export async function confirmSend(p: AiProvider, text: string, skip: { skip: boolean }, agent = false, attached: Attached[] = []): Promise<boolean> {
   if (isLocal(p) || skip.skip || state.settings.aiPreview === false) return true;
   const media = attached.filter((a) => a.kind !== "text");
-  const shown = text.length > 6000 ? `${text.slice(0, 6000)}\n…(${text.length - 6000}자 더)` : text;
+  // Language-neutral truncation marker: it sits in a data-i18n-skip preview, so a
+  // "N자 더" phrase would never be translated for non-Korean users.
+  const shown = text.length > 6000 ? `${text.slice(0, 6000)}\n…(+${(text.length - 6000).toLocaleString()})` : text;
+  // Count what was hidden in THIS message (from the already-masked text), not the
+  // running conversation total, so the preview describes what is shown.
+  const secretsHere = text.split(SECRET).length - 1;
+  const hostsHere = new Set(text.match(/\b(?:IP|HOST|MAIL)_\d+\b/g) ?? []).size;
   return confirmDialog({
     title: "AI로 보낼 내용",
     icon: "Send",
@@ -222,8 +233,8 @@ export async function confirmSend(p: AiProvider, text: string, masker: Masker, s
     message: `<p><b data-i18n-skip>${esc(providerLabel(p))}</b>에 아래 내용을 보냅니다. 이 PC 밖의 서비스입니다.</p>
       ${agent ? `<p class="muted small">AI가 터미널에서 실행한 명령의 결과도 같은 방식으로 가린 뒤 이 대화에 보냅니다.</p>` : ""}
       ${
-        masker.secrets || masker.masked
-          ? `<p class="muted small">${masker.secrets ? `<span>비밀번호·키·토큰 ${masker.secrets}곳을 가렸습니다.</span>` : ""}${masker.masked ? ` <span>IP·호스트 이름 ${masker.masked}개를 IP_1, HOST_1 같은 이름으로 바꿨습니다 (답에서는 원래 값으로 보입니다).</span>` : ""}</p>`
+        secretsHere || hostsHere
+          ? `<p class="muted small">${secretsHere ? `<span>비밀번호·키·토큰 ${secretsHere}곳을 가렸습니다.</span>` : ""}${hostsHere ? ` <span>IP·호스트 이름 ${hostsHere}개를 IP_1, HOST_1 같은 이름으로 바꿨습니다 (답에서는 원래 값으로 보입니다).</span>` : ""}</p>`
           : ""
       }
       <pre class="ai-preview" data-i18n-skip>${esc(shown)}</pre>
@@ -241,16 +252,22 @@ export async function confirmSend(p: AiProvider, text: string, masker: Masker, s
 // ---- Asking ----
 
 let seq = 0;
-const listeners = new Map<string, { onText: (t: string) => void; done: (err: string | null, cancelled: boolean) => void }>();
+/** Token counts a provider reported for one request (absent when unknown). */
+export interface AiUsage {
+  input?: number;
+  output?: number;
+}
+
+const listeners = new Map<string, { onText: (t: string) => void; done: (err: string | null, cancelled: boolean, usage: AiUsage) => void }>();
 let wired = false;
 function wire() {
   if (wired) return;
   wired = true;
   void on<{ id: string; text: string }>("ai-stream", (e) => listeners.get(e.id)?.onText(e.text));
-  void on<{ id: string; error: string | null; cancelled: boolean }>("ai-done", (e) => {
+  void on<{ id: string; error: string | null; cancelled: boolean; input?: number; output?: number }>("ai-done", (e) => {
     const l = listeners.get(e.id);
     listeners.delete(e.id);
-    l?.done(e.error, e.cancelled);
+    l?.done(e.error, e.cancelled, { input: e.input, output: e.output });
   });
 }
 
@@ -267,8 +284,9 @@ export interface Asking {
   cancel(): void;
 }
 
-/** Ask a provider; `onText` gets the answer so far, piece by piece. */
-export function ask(p: AiProvider, system: string, messages: AiMessage[], onText: (sofar: string) => void): Asking {
+/** Ask a provider; `onText` gets the answer so far, piece by piece. `onUsage`,
+ * when given, gets the token counts once the provider reports them. */
+export function ask(p: AiProvider, system: string, messages: AiMessage[], onText: (sofar: string) => void, onUsage?: (u: AiUsage) => void): Asking {
   wire();
   const id = `ai-${Date.now()}-${++seq}`;
   let text = "";
@@ -280,7 +298,11 @@ export function ask(p: AiProvider, system: string, messages: AiMessage[], onText
       text += t;
       onText(text);
     },
-    done: (err, cancelled) => (err ? fail(new Error(err)) : cancelled ? fail(new Error("CANCELLED")) : finish(text)),
+    done: (err, cancelled, usage) => {
+      // Report usage even on cancel: tokens spent before the stop still count.
+      if (onUsage && (usage.input || usage.output)) onUsage(usage);
+      return err ? fail(new Error(err)) : cancelled ? fail(new Error("CANCELLED")) : finish(text);
+    },
   });
   const { id: _pid, name: _n, ...provider } = p;
   api.aiChat(id, { ...provider, credentialId: p.credentialId || null }, system, messages).catch((e) => {

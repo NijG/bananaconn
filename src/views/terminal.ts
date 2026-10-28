@@ -10,6 +10,7 @@ import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
+import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
 import { addMacro, snippetMenu } from "../snippets";
 import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit, type RiskRule } from "../riskRules";
 import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
@@ -258,7 +259,13 @@ export class TerminalView implements View {
            <span class="tool-sep"></span>
            <button class="tool" data-act="zoomout" title="글자 작게">${icon("ZoomOut", 15)}</button>
            <button class="tool" data-act="zoomin" title="글자 크게">${icon("ZoomIn", 15)}</button>
-           ${session.protocol === "ssh" ? `<span class="tool-sep"></span><button class="tool" data-act="sftp" title="같은 서버의 파일 브라우저 열기">${icon("FolderLock", 15)}<span>SFTP</span></button>` : ""}
+           ${
+             session.protocol === "ssh"
+               ? `<span class="tool-sep"></span><button class="tool" data-act="sftp" title="같은 서버의 파일 브라우저 열기">${icon("FolderLock", 15)}<span>SFTP</span></button>`
+               : session.protocol === "telnet"
+                 ? `<span class="tool-sep"></span><button class="tool" data-act="ftp" title="같은 서버의 FTP 파일 브라우저 열기 (접속 정보 재사용)">${icon("FolderLock", 15)}<span>FTP</span></button>`
+                 : ""
+           }
            <button class="tool" data-act="snippet" title="명령 스니펫·매크로 보내기">${icon("ClipboardType", 15)}<span>스니펫</span></button>
            <button class="tool" data-act="ai" title="AI: 명령 만들기·출력 설명·대화·파일 분석">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool device-tool" data-act="device" title="자동으로 인식한 장비: 자주 쓰는 명령, 설정 백업, 상위 프로세스" hidden>${icon("Server", 15)}<span data-device-label></span></button>
@@ -1523,7 +1530,9 @@ export class TerminalView implements View {
     // The SFTP browser opens next to a new SSH session (Settings).
     if (s === "connected" && this.state !== "connected" && !this.filesOpened && this.session.protocol === "ssh" && state.settings.sftpWithSsh) {
       this.filesOpened = true;
-      if (this.session.options.jumpHost) toast("점프 호스트를 쓰는 세션은 SFTP 창을 자동으로 열지 않습니다", "info");
+      // The file backend connects directly, so a jump-host/gateway session's
+      // SFTP cannot tunnel: say so instead of opening a window that just fails.
+      if (fileTransferBlockedReason(this.session)) toast("점프 호스트·게이트웨이를 쓰는 세션은 SFTP 창을 자동으로 열지 않습니다", "info");
       else queueMicrotask(() => !this.disposed && this.openFiles(this.session, this));
     }
     this.state = s;
@@ -1581,8 +1590,17 @@ export class TerminalView implements View {
         case "zoomin":
         case "zoomout":
           return this.zoom(act === "zoomin" ? 1 : -1);
-        case "sftp":
+        case "sftp": {
+          const blocked = fileTransferBlockedReason(this.session);
+          if (blocked) return void toast(blocked, "error", 7000);
           return this.openFiles(this.session, this);
+        }
+        case "ftp": {
+          // Telnet has no SFTP; reuse this session's host and login for FTP.
+          const blocked = fileTransferBlockedReason(this.session);
+          if (blocked) return void toast(blocked, "error", 7000);
+          return this.openFiles(fileSessionFor(this.session, "ftp"), this);
+        }
         case "reconnect":
           return this.reconnect();
         case "device":
@@ -1719,6 +1737,7 @@ export class TerminalView implements View {
     if (first && !hits.some((h) => h.rule === first.rule)) hits.unshift(first);
     if (hits.length) {
       const others = await this.riskGate(hits, file ? `텍스트 파일: <b data-i18n-skip>${esc(file)}</b>` : "붙여넣기", "(paste)");
+      if (this.disposed) return; // the tab may have been closed while the dialog was up
       this.term.focus();
       if (!others) return;
       this.pasteText(text);
@@ -1745,6 +1764,7 @@ export class TerminalView implements View {
         confirm: "보내기",
         dontAsk: () => updateSettings({ confirmMultiPaste: false }),
       });
+      if (this.disposed) return; // the tab may have been closed while the dialog was up
       this.term.focus();
       if (!ok) return;
     }

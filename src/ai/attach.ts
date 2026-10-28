@@ -66,7 +66,7 @@ export async function fromFile(file: File): Promise<Attached> {
     return { kind: "pdf", name, mime: "application/pdf", data, size: file.size };
   }
   if (file.type.startsWith("text/") || TEXT_EXT.test(name) || !file.type) {
-    if (file.size > TEXT_LIMIT * 4) throw new Error(`텍스트 파일이 너무 큽니다 (최대 1MB): ${name}`);
+    if (file.size > TEXT_LIMIT * 4) throw new Error(`텍스트 파일이 너무 큽니다 (최대 ${((TEXT_LIMIT * 4) / (1024 * 1024)).toFixed(1)}MB): ${name}`);
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (bytes.subarray(0, 4096).includes(0)) throw new Error(`텍스트가 아닌 파일은 보낼 수 없습니다: ${name}`);
     let text = new TextDecoder("utf-8").decode(bytes);

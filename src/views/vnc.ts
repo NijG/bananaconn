@@ -18,6 +18,8 @@ const ENCODING_NAMES: Record<number, string> = {
 };
 import { GatewayLink } from "../tunnels";
 import { desktopHost, ViewAi } from "../ai/viewAi";
+import { detectFileProtocol, fileSessionFor, fileTransferBlockedReason } from "../transfer";
+import { tr } from "../i18n";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 export class VncView implements View {
@@ -67,7 +69,7 @@ export class VncView implements View {
            <button class="tool" data-act="cad" title="Ctrl+Alt+Del 보내기">${icon("Keyboard", 15)}<span>Ctrl+Alt+Del</span></button>
            <button class="tool" data-act="quality" title="화질과 속도 (JPEG 화질·압축)">${icon("Sparkles", 15)}<span data-quality-label></span></button>
            <button class="tool" data-act="stats" title="전송 상태: 서버가 쓰는 인코딩, 초당 갱신, 받는 양">${icon("Activity", 15)}<span>상태</span></button>
-           <button class="tool" data-act="files" title="이 PC와 파일 주고받기 (SFTP · 원격 PC의 SSH 서버 필요)">${icon("FolderLock", 15)}<span>파일 전송</span></button>
+           <button class="tool" data-act="files" title="이 PC와 파일 주고받기 (원격 PC의 SSH는 SFTP, 아니면 FTP로 자동 연결)">${icon("FolderLock", 15)}<span>파일 전송</span></button>
            <button class="tool" data-act="ai" title="AI: 화면 설명·캡처·대화">${icon("Sparkles", 15)}<span>AI</span></button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
@@ -94,7 +96,7 @@ export class VncView implements View {
       if (act === "scale") this.setScale(!this.scale);
       if (act === "viewonly") this.setViewOnly(!this.viewOnly);
       if (act === "ai") return this.ai.menu(this.el.querySelector<HTMLElement>('[data-act="ai"]')!);
-      if (act === "files") return this.transferFiles();
+      if (act === "files") return void this.transferFiles();
       if (act === "cad") this.rfb?.sendCtrlAltDel();
       if (act === "paste") this.pasteClipboard();
       if (act === "reconnect") this.reconnect();
@@ -272,7 +274,7 @@ export class VncView implements View {
           this.showClosed(clean ? "연결이 종료되었습니다" : "연결이 예기치 않게 끊어졌습니다");
         }
       });
-      rfb.addEventListener("credentialsrequired", (e: Event) => live() && this.provideCredentials(e as CustomEvent<{ types: string[] }>));
+      rfb.addEventListener("credentialsrequired", (e: Event) => live() && void this.provideCredentials(rfb, e as CustomEvent<{ types: string[] }>));
       rfb.addEventListener("securityfailure", (e: Event) => {
         if (!live()) return;
         const reason = (e as CustomEvent<{ reason?: string }>).detail?.reason;
@@ -302,7 +304,12 @@ export class VncView implements View {
     }
   }
 
-  private async provideCredentials(e: CustomEvent<{ types: string[] }>) {
+  // `rfb` is the connection that asked for credentials. The dialogs below await,
+  // and a reconnect/teardown can replace this.rfb meanwhile, so act only on the
+  // requesting connection and bail if it is no longer the current one — otherwise
+  // a cancel would disconnect the new connection, or old credentials would be
+  // sent to a fresh one.
+  private async provideCredentials(rfb: RFB, e: CustomEvent<{ types: string[] }>) {
     const types = e.detail?.types ?? ["password"];
     // macOS Screen Sharing, VeNCrypt Plain and UltraVNC MS-Logon also want a
     // user name: the session's, else the stored credential's, else ask.
@@ -311,8 +318,9 @@ export class VncView implements View {
       username = this.session.username || state.credentials.find((c) => c.id === this.session.credentialId)?.username || "";
       if (!username) {
         const res = await promptDialog({ title: "VNC 사용자 이름", label: `${this.session.host} 의 사용자 이름`, icon: "User", confirm: "다음" });
+        if (rfb !== this.rfb) return;
         if (!res) {
-          this.rfb?.disconnect();
+          rfb.disconnect();
           return;
         }
         username = res.value.trim();
@@ -334,16 +342,18 @@ export class VncView implements View {
         icon: "KeyRound",
         confirm: "연결",
       });
+      if (rfb !== this.rfb) return;
       if (!res) {
-        this.rfb?.disconnect();
+        rfb.disconnect();
         return;
       }
       password = res.value;
     }
+    if (rfb !== this.rfb) return;
     const creds: { username?: string; password: string; target?: string } = { password };
     if (types.includes("username")) creds.username = username;
     if (types.includes("target")) creds.target = "";
-    this.rfb?.sendCredentials(creds);
+    rfb.sendCredentials(creds);
   }
 
   private fail(msg: string) {
@@ -378,17 +388,21 @@ export class VncView implements View {
     this.el.querySelector('[data-act="viewonly"]')!.classList.toggle("on", this.viewOnly);
   }
 
-  /** RFB itself has no file transfer (TightVNC and UltraVNC each add their
-   * own): files go over SFTP to the same PC, in a pane beside this one. */
-  private transferFiles() {
-    void import("../ai/sshSetup").then(({ sshSessionFor }) => {
-      try {
-        const { session } = sshSessionFor(this.session);
-        this.openFiles({ ...session, name: this.session.name || this.session.host }, this);
-      } catch (err) {
-        toast(errorText(err), "error");
-      }
-    });
+  /** RFB itself has no file transfer (TightVNC and UltraVNC each add their own).
+   * Files go to the same PC over SFTP when it runs SSH, or FTP when it runs an
+   * FTP server, reusing this session's account — no separate entry. The browser
+   * opens in a pane beside this one. A PC with neither is not covered. */
+  private async transferFiles() {
+    const blocked = fileTransferBlockedReason(this.session);
+    if (blocked) return toast(blocked, "error", 7000);
+    const host = this.session.host.trim();
+    toast(tr("파일 전송 서버를 찾는 중…"), "info", 1500);
+    const proto = await detectFileProtocol(host);
+    if (this.disposed) return;
+    if (!proto) {
+      return toast(tr("파일을 주고받을 방법을 찾지 못했습니다. 원격 PC에 SSH(22) 또는 FTP(21) 서버가 필요합니다."), "error", 7000);
+    }
+    this.openFiles(fileSessionFor(this.session, proto), this);
   }
 
   private async pasteClipboard() {

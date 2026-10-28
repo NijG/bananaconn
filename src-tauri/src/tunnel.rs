@@ -214,7 +214,16 @@ fn start(
                 emit(&id, "closed", "게이트웨이 SSH 연결이 끊어졌습니다".into());
                 break;
             }
-            let Some(Ok((mut local, peer))) = accepted else { continue };
+            let (mut local, peer) = match accepted {
+                Some(Ok(pair)) => pair,
+                // accept() failed (e.g. fd exhaustion): back off briefly instead of
+                // spinning the CPU while the condition persists.
+                Some(Err(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                None => continue, // the 2 s wake-up tick
+            };
             let _ = local.set_nodelay(true);
             let (handle, target_host, a, t, emit, id) = (handle.clone(), target_host.clone(), a.clone(), t.clone(), emit.clone(), id.clone());
             let relay = tauri::async_runtime::spawn(async move {

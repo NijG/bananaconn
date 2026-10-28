@@ -11,6 +11,7 @@ const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
 import { endpoint, PROTOCOLS, type Session } from "./model";
+import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
   adoptManualOrder,
@@ -48,8 +49,25 @@ interface FolderNode {
   sessions: Session[];
 }
 
-const collapsed = new Set<string>(JSON.parse(localStorage.getItem("bx.collapsed") ?? "[]") as string[]);
-const saveCollapsed = () => localStorage.setItem("bx.collapsed", JSON.stringify([...collapsed]));
+/** Collapsed folders, kept across restarts. Read defensively: this runs at
+ * module load (a static import of main.ts), so a corrupt or wrong-shaped value
+ * must not throw and blank the whole app. */
+function loadCollapsed(): Set<string> {
+  try {
+    const v = JSON.parse(localStorage.getItem("bx.collapsed") ?? "[]");
+    return new Set<string>(Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  } catch {
+    return new Set<string>();
+  }
+}
+const collapsed = loadCollapsed();
+const saveCollapsed = () => {
+  try {
+    localStorage.setItem("bx.collapsed", JSON.stringify([...collapsed]));
+  } catch {
+    // Storage full or blocked: the collapsed state just isn't remembered.
+  }
+};
 
 /** Where a dragged row would land: before/after a row, into a folder, or (no
  * row) at the top level. */
@@ -486,10 +504,19 @@ export class Sidebar {
     document.addEventListener("dragend", () => this.endDrag());
   }
 
+  /** Open the file browser for a session, warning when its route (jump host /
+   * SSH gateway) is one the file backend cannot use. */
+  private openFileBrowser(source: Session, fileSession: Session) {
+    const blocked = fileTransferBlockedReason(source);
+    if (blocked) return toast(blocked, "error", 7000);
+    this.actions.openFiles(fileSession);
+  }
+
   private sessionMenu(s: Session, x: number, y: number) {
     contextMenu(x, y, [
       { label: "연결", icon: "Play", hint: "Enter", action: () => this.actions.connect(s) },
-      ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.actions.openFiles(s) }] : []),
+      ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, s) }] : []),
+      ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
       "-",
       { label: "편집", icon: "Pencil", hint: "F2", action: () => this.actions.edit(s) },
       { label: "복사", icon: "Copy", hint: "Ctrl+C", action: () => this.copySession(s) },

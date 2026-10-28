@@ -318,17 +318,31 @@ export class RdpView implements View {
     this.ws.changed();
   }
 
+  /** Encoded cursors keyed by their bitmap, so switching among the handful of
+   * shapes a session uses (arrow/I-beam/resize/busy) does not re-encode a PNG
+   * on every pointer-shape event — a real source of jank during mouse movement. */
+  private pointerCache = new Map<string, string>();
+
   private setPointer(p: { width: number; height: number; hotX: number; hotY: number; rgba: string }) {
     if (!p.width || !p.height) {
       this.canvas.style.cursor = "none";
       return;
     }
-    const bytes = Uint8ClampedArray.from(atob(p.rgba), (c) => c.charCodeAt(0));
-    const c = document.createElement("canvas");
-    c.width = p.width;
-    c.height = p.height;
-    c.getContext("2d")!.putImageData(new ImageData(bytes, p.width, p.height), 0, 0);
-    this.canvas.style.cursor = `url(${c.toDataURL()}) ${p.hotX} ${p.hotY}, default`;
+    const key = `${p.width}x${p.height}:${p.hotX},${p.hotY}:${p.rgba}`;
+    let css = this.pointerCache.get(key);
+    if (css === undefined) {
+      const bytes = Uint8ClampedArray.from(atob(p.rgba), (c) => c.charCodeAt(0));
+      const c = document.createElement("canvas");
+      c.width = p.width;
+      c.height = p.height;
+      c.getContext("2d")!.putImageData(new ImageData(bytes, p.width, p.height), 0, 0);
+      css = `url(${c.toDataURL()}) ${p.hotX} ${p.hotY}, default`;
+      // Bound the cache: a session cycles through only a few shapes, but guard
+      // against an unusual server sending many one-off cursors.
+      if (this.pointerCache.size >= 64) this.pointerCache.clear();
+      this.pointerCache.set(key, css);
+    }
+    this.canvas.style.cursor = css;
   }
 
   private async askCertificate(fingerprint: string, previous: string | null) {

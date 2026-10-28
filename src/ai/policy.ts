@@ -218,12 +218,17 @@ const WIN_EXES: Record<string, RegExp | null> = {
   ipconfig: /\/(release6?|renew6?|flushdns|registerdns|setclassid6?)\b/i, systeminfo: null, tasklist: /\s\/(s|u|p)\b/i, netstat: null, whoami: null,
   hostname: /\s\S/, ver: null, getmac: null, driverquery: null, ping: /\s[-/]t\b|\s[-/]n\s+\d{5,}/i, tracert: null, pathping: null, nslookup: null,
   quser: null, qwinsta: null, findstr: null, more: null, "where.exe": null, route: /^(?!\s*print\b)/i, arp: /\s-[ds]\b/i,
-  sc: /^(?!\s*(query|queryex|qc|qdescription|qfailure|qtriggerinfo|qprivs|qsidtype|getdisplayname|getkeyname|enumdepend)\b)/i,
+  // Only the explicit sc.exe is the service tool; bare "sc" in PowerShell is the
+  // Set-Content alias (a write), so it must not be treated as read-only.
+  "sc.exe": /^(?!\s*(query|queryex|qc|qdescription|qfailure|qtriggerinfo|qprivs|qsidtype|getdisplayname|getkeyname|enumdepend)\b)/i,
   netsh: /^(?!.*\sshow\b)|\s(set|add|delete|reset|dump|exec|import|export|install|uninstall|start|stop)\b/i,
   reg: /^(?!\s*query\b)/i, schtasks: /^(?!\s*\/query\b)|\/(create|delete|run|end|change)\b/i,
   wmic: /\s(call|delete|set|create)\b|\/(output|append|record):/i, powercfg: /^(?!\s*\/(list|l|query|q|a|availablesleepstates|getactivescheme)\b)/i,
-  // Only the forms that list or show one thing: "net user bob pass" would set a password.
-  net: /^(?!\s*(?:(?:user|localgroup|group|share|use|session|view|accounts)(?:\s+(?:"[^"]*"|[^\s"/*]+))?|(?:statistics|config)(?:\s+(?:workstation|server))?|start)?\s*$)/i,
+  // Only the forms that list or show one thing. "net user bob pass" would set a
+  // password (two tokens → not matched → approve). "net share name=path" creates
+  // a share and "net use \\host\share" connects/maps, so the show-one token
+  // excludes "=", and "use" is read-only only when bare (any argument changes).
+  net: /^(?!\s*(?:(?:user|localgroup|group|share|session|view|accounts)(?:\s+(?:"[^"]*"|[^\s"/*=]+))?|(?:statistics|config)(?:\s+(?:workstation|server))?|use|start)?\s*$)/i,
 };
 /** .NET methods that only compute a value ((Get-Date).AddDays(-1), $s.Trim()). */
 const SAFE_METHODS = /^(AddDays|AddHours|AddMinutes|AddSeconds|AddMonths|ToString|ToLower|ToUpper|Trim|TrimStart|TrimEnd|Split|Substring|Contains|StartsWith|EndsWith|Replace|IndexOf|GetType|Equals|PadLeft|PadRight|ToShortDateString|ToLongDateString)$/i;

@@ -4,7 +4,15 @@
 import icon48 from "./assets/app-icon-48.png";
 import icon96 from "./assets/app-icon-96.png";
 import { icon } from "./icons";
-import { endpoint, PROTOCOL_ORDER, PROTOCOLS, type Protocol, type Session } from "./model";
+import { endpoint, PROTOCOLS, type Protocol, type Session } from "./model";
+
+/** New-connection cards grouped by what the user wants to do, so a first-time
+ * user picks by intent instead of memorizing protocol acronyms. */
+const PROTO_GROUPS: { label: string; protos: Protocol[] }[] = [
+  { label: "터미널", protos: ["ssh", "telnet", "serial"] },
+  { label: "파일 전송", protos: ["sftp", "ftp", "ftps", "tftp"] },
+  { label: "원격 화면", protos: ["rdp", "vnc"] },
+];
 import { ACTIONS, bindings } from "./keymap";
 import { state, subscribe } from "./store";
 
@@ -28,11 +36,17 @@ export function mountHome(
         </header>
         <section>
           <h3>새 연결</h3>
-          <div class="proto-cards">${PROTOCOL_ORDER.map((p) => {
-            const info = PROTOCOLS[p];
-            return `<button class="proto-card" data-create="${p}" style="--proto:${info.color}">
+          <p class="muted small home-quick-hint">맨 위 주소창에 user@host 를 입력하면 바로 연결됩니다. 아니면 아래에서 고르세요.</p>
+          ${PROTO_GROUPS.map(
+            (grp) => `<div class="proto-group"><h4 class="proto-group-title">${grp.label}</h4>
+            <div class="proto-cards">${grp.protos
+              .map((p) => {
+                const info = PROTOCOLS[p];
+                return `<button class="proto-card" data-create="${p}" style="--proto:${info.color}">
                 <span class="pc-icon">${icon(info.icon, 22)}</span><b>${info.label}</b><small>${info.desc}</small></button>`;
-          }).join("")}</div>
+              })
+              .join("")}</div></div>`,
+          ).join("")}
         </section>
         <div class="home-cols">
           <section>
@@ -44,7 +58,7 @@ export function mountHome(
                       const info = PROTOCOLS[s.protocol];
                       return `<button class="recent-item" data-id="${s.id}" style="--proto:${info.color}">
                         <span class="proto-ico">${icon(info.icon, 16)}</span>
-                        <span class="ri-text"><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
+                        <span class="ri-text" data-i18n-skip><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
                         <span class="ri-time">${relativeTime(s.lastUsed)}</span></button>`;
                     })
                     .join("")}</div>`
@@ -59,7 +73,7 @@ export function mountHome(
               return keys.length ? `<dt>${keys.map((k) => k.split("+").map((p) => `<kbd>${esc(p)}</kbd>`).join("+")).join(" · ")}</dt><dd>${esc(label)}</dd>` : "";
             }).join("")}</dl>
             <div class="row"><button class="btn" data-shortcuts>${icon("Keyboard", 14)}단축키 설정</button>
-              <button class="btn" data-vault>${icon("KeyRound", 14)}자격 증명 보관함</button></div>
+              <button class="btn" data-vault title="비밀번호·키를 안전하게 저장해 두고 접속할 때 다시 쓰기">${icon("KeyRound", 14)}자격 증명 보관함</button></div>
           </section>
         </div>
       </div>`;

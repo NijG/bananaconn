@@ -2042,10 +2042,18 @@ async fn remote_stamp(remote: &Arc<Remote>, path: &str) -> Result<(u64, u64), St
                 // MDTM has second resolution (LIST often only minutes); fall
                 // back to the listing for servers without it.
                 let size = ftp.size(&path).ok().map(|s| s as u64);
+                // MDTM is "YYYYMMDDHHMMSS" (UTC); convert to epoch seconds so it
+                // shares the LIST fallback's unit. Otherwise reading via MDTM and
+                // rechecking via LIST (a server that supports MDTM only sometimes)
+                // would compare unlike numbers and report a false conflict, or miss
+                // a real change.
                 let mdtm = ftp
                     .command(&format!("MDTM {path}"), &[suppaftp::Status::File])
                     .ok()
-                    .and_then(|body| body.split_whitespace().last().and_then(|t| t.get(..14)?.parse::<u64>().ok()));
+                    .and_then(|body| {
+                        let t = body.split_whitespace().last()?.get(..14)?.to_string();
+                        chrono::NaiveDateTime::parse_from_str(&t, "%Y%m%d%H%M%S").ok().map(|d| d.and_utc().timestamp().max(0) as u64)
+                    });
                 if let (Some(t), Some(s)) = (mdtm, size) {
                     return Ok((t, s));
                 }

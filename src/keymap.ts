@@ -38,6 +38,7 @@ export const ACTIONS: ActionDef[] = [
   // App
   g("app.help", "도움말", ["F1"], { note: "터미널 안에서는 원격 프로그램으로 보냄", terminalKeeps: true }),
   g("app.newSession", "새 세션", ["Ctrl+Shift+N"]),
+  g("app.commandPalette", "명령 팔레트", ["Ctrl+K"], { note: "명령·세션 빠른 검색" }),
   g("app.quickConnect", "빠른 연결 칸으로", ["Ctrl+Shift+K"]),
   g("app.toggleSidebar", "사이드바 접기·펴기", ["Ctrl+Shift+B"]),
   g("app.searchSessions", "세션 검색", ["Ctrl+F"], { note: "열린 탭이 없을 때", terminalKeeps: true }),

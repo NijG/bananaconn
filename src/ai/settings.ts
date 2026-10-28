@@ -5,13 +5,14 @@ import { api } from "../api";
 import { icon } from "../icons";
 import { reloadCredentials, state, updateSettings } from "../store";
 import { confirmDialog, errorText, esc, modal, toast } from "../ui";
-import { AI_CLIS, AI_KINDS, ask, isLocal, kindInfo, providerLabel, providers, type AiKind, type AiProvider } from "./core";
+import { AI_CLIS, AI_KINDS, ask, cliLabel, isLocal, kindInfo, providerLabel, providers, type AiKind, type AiProvider } from "./core";
 
 /** The AI page of the settings form (its two checkboxes are saved with the form). */
 export function aiSettingsSection(check: (name: "aiPreview" | "aiMaskHosts", label: string, hint: string) => string): string {
   return `<h4 data-section="ai">AI</h4>
     <p class="muted small">터미널 툴바의 "AI"와 단축키(Ctrl+Shift+A 명령 만들기, Ctrl+Shift+E 출력 설명, Ctrl+Shift+L 대화)에서 씁니다. AI의 답은 실행되지 않습니다. 명령은 버튼으로 입력 줄에 넣은 뒤 직접 Enter를 눌러야 실행되고, 위험 명령 규칙도 그대로 적용됩니다.</p>
     <div class="ai-providers" data-ai-providers></div>
+    <div class="ai-cli-detected" data-ai-detected hidden></div>
     <div class="row"><button type="button" class="btn btn-sm" data-ai-add>${icon("Plus", 14)}AI 서비스 추가</button></div>
     ${check("aiPreview", "클라우드 AI로 보내기 전에 보낼 내용 보여 주기", "보낼 내용을 매번 보여 주고 확인을 받습니다. 로컬 LLM(이 PC의 Ollama·LM Studio 등)은 묻지 않습니다. 비밀번호·키·토큰은 이 설정과 관계없이 항상 가립니다.")}
     ${check("aiMaskHosts", "클라우드 AI로 보낼 때 IP 주소·호스트 이름 가리기", "IP 주소, 메일 주소, 접속한 서버의 이름을 IP_1, HOST_1 같은 이름으로 바꿔 보냅니다. 답에서는 원래 값으로 바꿔 보여 줍니다.")}`;
@@ -35,22 +36,49 @@ function drawList(root: HTMLElement) {
     : `<p class="muted small">추가된 AI 서비스가 없습니다.</p>`;
 }
 
+/** Show subscription CLIs installed on this PC but not yet added, each with a
+ * one-click "add" — the same quick start the AI panel's empty state offers. */
+async function drawDetected(root: HTMLElement) {
+  const box = root.querySelector<HTMLElement>("[data-ai-detected]");
+  if (!box) return;
+  const found = await api.aiDetectCli().catch(() => []);
+  const have = new Set(providers().filter((p) => p.kind === "cli").map((p) => p.cli));
+  const add = found.filter((c) => !have.has(c.name));
+  box.hidden = !add.length;
+  box.innerHTML = add.length
+    ? `<p class="muted small">이 PC에 설치된 CLI (한 번 클릭으로 추가):</p><div class="row">${add
+        .map((c) => `<button type="button" class="btn btn-sm btn-primary" data-cli-add="${esc(c.name)}">${icon("Plus", 13)}<span data-i18n-skip>${esc(cliLabel(c.name))}</span> 추가</button>`)
+        .join("")}</div>`
+    : "";
+}
+
 /** Wire the AI page of an open settings dialog. */
 export function wireAiSettings(root: HTMLElement) {
   drawList(root);
-  root.querySelector("[data-ai-add]")?.addEventListener("click", () => openProviderEditor(null, () => drawList(root)));
+  void drawDetected(root);
+  root.querySelector("[data-ai-add]")?.addEventListener("click", () => openProviderEditor(null, () => (drawList(root), void drawDetected(root))));
+  root.querySelector("[data-ai-detected]")?.addEventListener("click", (e) => {
+    const name = (e.target as HTMLElement).closest<HTMLElement>("[data-cli-add]")?.dataset.cliAdd;
+    if (!name) return;
+    const provider: AiProvider = { id: crypto.randomUUID(), name: "", kind: "cli", baseUrl: "", model: "", credentialId: null, cli: name };
+    updateSettings({ aiProviders: [...providers(), provider], aiDefault: state.settings.aiDefault ?? provider.id });
+    drawList(root);
+    void drawDetected(root);
+    toast(`${cliLabel(name)} 사용을 시작합니다`, "success");
+  });
   root.querySelector("[data-ai-providers]")?.addEventListener("click", async (e) => {
     const t = e.target as HTMLElement;
     const id = t.closest<HTMLElement>("[data-id]")?.dataset.id;
     const p = providers().find((x) => x.id === id);
     if (!p) return;
-    if (t.closest("[data-ai-edit]")) openProviderEditor(p, () => drawList(root));
+    if (t.closest("[data-ai-edit]")) openProviderEditor(p, () => (drawList(root), void drawDetected(root)));
     else if (t.closest("[data-ai-delete]")) {
       const ok = await confirmDialog({ title: "AI 서비스 삭제", danger: true, confirm: "삭제", focusCancel: true, message: `<p><b data-i18n-skip>${esc(providerLabel(p))}</b>을(를) 목록에서 지웁니다. 보관함의 API 키는 그대로 둡니다.</p>` });
       if (!ok) return;
       const rest = providers().filter((x) => x.id !== p.id);
       updateSettings({ aiProviders: rest, aiDefault: state.settings.aiDefault === p.id ? (rest[0]?.id ?? null) : state.settings.aiDefault });
       drawList(root);
+      void drawDetected(root);
     }
   });
   root.querySelector("[data-ai-providers]")?.addEventListener("change", (e) => {

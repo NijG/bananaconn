@@ -7,7 +7,7 @@ import { allFolders, state, upsertSession } from "./store";
 import { api } from "./api";
 import { errorText, esc, modal, toast } from "./ui";
 import { gatewayField } from "./tunnels";
-import { logFields, wireLogBrowse } from "./logOptions";
+import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
 import { openVault } from "./vault";
 
 const VNC_QUALITY: [string, string][] = [
@@ -240,7 +240,12 @@ export function editSession(
             <input name="host" value="${esc(s.host)}" placeholder="192.168.0.10 또는 server.example.com" spellcheck="false" required /></label>
           <label class="field"><span>포트</span>
             <input name="port" type="number" min="1" max="65535" value="${esc(s.port ?? info.port)}" /></label>
-          <label class="field"><span>사용자 이름</span>
+          ${
+            // TFTP has no login, so Username/Credential would do nothing — hide
+            // them (the options help already says TFTP uses no account).
+            s.protocol === "tftp"
+              ? ""
+              : `<label class="field"><span>사용자 이름</span>
             <input name="username" value="${esc(s.username)}" placeholder="${s.protocol === "ftp" || s.protocol === "ftps" ? "비우면 anonymous" : s.protocol === "rdp" ? "Administrator 또는 DOMAIN\\사용자" : "root"}" spellcheck="false" /></label>
           <label class="field span-2"><span>자격 증명</span>
             <div class="inline">
@@ -249,7 +254,8 @@ export function editSession(
                 ${creds.map((c) => `<option value="${c.id}" title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
               </select>
               <button type="button" class="btn" data-vault>${icon("KeyRound", 14)}관리</button>
-            </div></label>
+            </div></label>`
+          }
           <label class="field span-2"><span>폴더</span>
             <input name="folder" value="${esc(s.folder)}" list="folder-list" placeholder="예: 운영/웹서버 (슬래시로 하위 폴더)" />
             <datalist id="folder-list">${allFolders().map((f) => `<option value="${esc(f)}">`).join("")}</datalist></label>
@@ -341,8 +347,13 @@ export function editSession(
         const next = b.dataset.proto as Protocol;
         // Swap a default port (including FTPS implicit 990) for the new protocol's default.
         if (s.port === defaultPort(s.protocol, s.options)) s.port = PROTOCOLS[next].port;
-        // The proxy is not tied to the protocol: it stays.
-        if (next !== s.protocol) s.options = proxyOptions(s.options);
+        // The proxy and the SSH gateway are not tied to the protocol (the gateway
+        // is shared by RDP/VNC/Telnet): keep both across a protocol switch.
+        if (next !== s.protocol) {
+          const kept = proxyOptions(s.options);
+          if (s.options.gateway !== undefined) kept.gateway = s.options.gateway;
+          s.options = kept;
+        }
         s.protocol = next;
         render();
       }),
@@ -375,6 +386,13 @@ export function editSession(
       if (!s.host) {
         toast("호스트를 입력하세요", "warn");
         form.querySelector<HTMLInputElement>("[name=host]")?.focus();
+        return;
+      }
+      // A per-session log path must pass the same runnable-extension guard as the
+      // global one in Settings, so logging can't be used to write a .bat/.exe.
+      if (s.options.logCustom === "session" && runnableLogName(String(s.options.logPath ?? ""))) {
+        toast("로그 파일 이름에 실행되는 확장자(.bat, .exe 등)는 쓸 수 없습니다", "warn");
+        form.querySelector<HTMLInputElement>("[name='opt.logPath']")?.focus();
         return;
       }
       if (!s.name) s.name = s.host;

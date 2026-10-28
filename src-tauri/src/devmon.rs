@@ -209,6 +209,15 @@ impl Line {
         self.write_raw(&data).await
     }
 
+    /// Send a secret (the password) without recording it in `doing`, which is
+    /// surfaced in timeout error text — so a credential can never leak there.
+    async fn send_secret(&mut self, line: &str) -> Result<(), String> {
+        self.doing = "(password)".into();
+        let mut data = line.as_bytes().to_vec();
+        data.push(b'\r');
+        self.write_raw(&data).await
+    }
+
     /// Read until `done(text)` holds after a short quiet period, or time out.
     /// Pagers are answered with a space on the way. Once the text ends in the
     /// device's own prompt, a much shorter pause ends the wait (every command
@@ -416,7 +425,7 @@ async fn login(t: &mut Line, username: &str, password: Option<&str>, no_password
             sent = true;
         } else if l.ends_with("password:") {
             let Some(pw) = password else { return Err("NEED_PASSWORD".into()) };
-            t.send(pw).await?;
+            t.send_secret(pw).await?;
             // A shell prompt means success even when a banner says "Last failed
             // login"; only another login prompt means the password was rejected.
             // Login scripts may ask for TERM, and the prompt may be custom.

@@ -137,6 +137,62 @@ struct Done {
     id: String,
     error: Option<String>,
     cancelled: bool,
+    /// Prompt and completion tokens, when the provider reports them (CLIs and
+    /// some servers do not): omitted when unknown so the UI shows nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<u32>,
+}
+
+/// Token counts a streamed answer reported.
+#[derive(Default, Clone, Copy)]
+struct Usage {
+    input: u32,
+    output: u32,
+}
+
+/// Pull token counts out of a streamed event, where the provider includes them.
+/// The last value seen wins (Anthropic and Gemini resend a growing total; OpenAI
+/// and Ollama send the final count once), so this is called for every event.
+fn update_usage(kind: &str, v: &Value, u: &mut Usage) {
+    let n = |x: &Value| x.as_u64().map(|v| v as u32);
+    match kind {
+        "anthropic" => {
+            // input in message_start, output growing in message_delta.
+            if let Some(x) = n(&v["message"]["usage"]["input_tokens"]).or_else(|| n(&v["usage"]["input_tokens"])) {
+                u.input = x;
+            }
+            if let Some(x) = n(&v["usage"]["output_tokens"]) {
+                u.output = x;
+            }
+        }
+        "gemini" => {
+            if let Some(x) = n(&v["usageMetadata"]["promptTokenCount"]) {
+                u.input = x;
+            }
+            if let Some(x) = n(&v["usageMetadata"]["candidatesTokenCount"]) {
+                u.output = x;
+            }
+        }
+        "ollama" => {
+            if let Some(x) = n(&v["prompt_eval_count"]) {
+                u.input = x;
+            }
+            if let Some(x) = n(&v["eval_count"]) {
+                u.output = x;
+            }
+        }
+        // OpenAI and compatible servers: a final chunk with "usage".
+        _ => {
+            if let Some(x) = n(&v["usage"]["prompt_tokens"]) {
+                u.input = x;
+            }
+            if let Some(x) = n(&v["usage"]["completion_tokens"]) {
+                u.output = x;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -230,8 +286,9 @@ fn delta(kind: &str, event: &Value) -> Result<Option<String>, String> {
     })
 }
 
-/// One chat over HTTP, streamed. `on_text` gets each piece; false stops.
-fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+/// One chat over HTTP, streamed. `on_text` gets each piece; false stops. Returns
+/// the token usage the provider reported (zero when it reports none).
+fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String> {
     if p.model.trim().is_empty() {
         return Err("모델을 지정하세요 (설정 → AI)".into());
     }
@@ -285,7 +342,8 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
             let mut msgs = vec![json!({ "role": "system", "content": system })];
             msgs.extend(messages.iter().map(|m| json!({ "role": m.role, "content": openai_content(m) })));
             let default = if p.kind == "openai" { "https://api.openai.com/v1" } else { "http://127.0.0.1:1234/v1" };
-            (format!("{}/chat/completions", base(p, default)), json!({ "model": model, "messages": msgs, "stream": true }))
+            // include_usage adds a final chunk with the token counts.
+            (format!("{}/chat/completions", base(p, default)), json!({ "model": model, "messages": msgs, "stream": true, "stream_options": { "include_usage": true } }))
         }
         other => return Err(format!("알 수 없는 AI 종류입니다: {other}")),
     };
@@ -293,6 +351,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
     let mut lines = Lines { pending: Vec::new() };
     let mut failure: Option<String> = None;
     let mut error_body = Vec::new();
+    let mut usage = Usage::default();
     let kind = p.kind.clone();
     let status = http::send(
         &http::Request { method: "POST", url: &url, headers: &headers, body: Some(body.as_bytes()), receive_timeout_ms: RECEIVE_TIMEOUT_MS },
@@ -313,13 +372,19 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
                     return;
                 }
                 match serde_json::from_str::<Value>(payload) {
-                    Ok(v) => match delta(&kind, &v) {
-                        Ok(Some(t)) => go = on_text(&t),
-                        Ok(None) => {}
-                        Err(e) => failure = Some(e),
-                    },
-                    // A non-JSON line in a stream: an error page or a proxy's notice.
-                    Err(_) if !line.starts_with("data:") => error_body.extend_from_slice(line.as_bytes()),
+                    Ok(v) => {
+                        update_usage(&kind, &v, &mut usage);
+                        match delta(&kind, &v) {
+                            Ok(Some(t)) => go = on_text(&t),
+                            Ok(None) => {}
+                            Err(e) => failure = Some(e),
+                        }
+                    }
+                    // A non-JSON line in a 2xx stream: an error page or a proxy's
+                    // notice. Cap the total so a misbehaving/hostile endpoint that
+                    // streams endless non-JSON cannot grow this without bound (it
+                    // is only read on a non-2xx status anyway).
+                    Err(_) if !line.starts_with("data:") && error_body.len() < 64 * 1024 => error_body.extend_from_slice(line.as_bytes()),
                     Err(_) => {}
                 }
             });
@@ -331,7 +396,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
     }
     match failure {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(usage),
     }
 }
 
@@ -778,14 +843,32 @@ pub fn ai_chat(app: AppHandle, state: State<'_, AiState>, id: String, provider: 
             let _ = app.emit("ai-stream", Chunk { id: id.clone(), text: text.to_string() });
             true
         };
-        let r = if provider.kind == "cli" { chat_cli(&provider, &system, &messages, &is_cancelled, &mut emit) } else { api_key(&app, &provider).and_then(|key| chat_http(key, &provider, &system, &messages, &mut emit)) };
+        // CLIs stream only text (no token counts); HTTP providers report usage.
+        let r: Result<Usage, String> = if provider.kind == "cli" {
+            chat_cli(&provider, &system, &messages, &is_cancelled, &mut emit).map(|()| Usage::default())
+        } else {
+            api_key(&app, &provider).and_then(|key| chat_http(key, &provider, &system, &messages, &mut emit))
+        };
         // Lock `running` first, then `cancelled` (same order as ai_cancel), so a
         // concurrent cancel either marks this chat before it ends or sees it gone.
         let mut run = running.lock().unwrap();
         run.remove(&id);
         let was_cancelled = cancelled.lock().unwrap().remove(&id);
         drop(run);
-        let _ = app.emit("ai-done", Done { id: id.clone(), error: if was_cancelled { None } else { r.err() }, cancelled: was_cancelled });
+        let (error, usage) = match r {
+            Ok(u) => (None, u),
+            Err(e) => (Some(e), Usage::default()),
+        };
+        let _ = app.emit(
+            "ai-done",
+            Done {
+                id: id.clone(),
+                error: if was_cancelled { None } else { error },
+                cancelled: was_cancelled,
+                input: (usage.input > 0).then_some(usage.input),
+                output: (usage.output > 0).then_some(usage.output),
+            },
+        );
     });
 }
 
@@ -926,7 +1009,8 @@ mod tests {
         let r = chat_http(key.into(), &p, "SYS", &[Message { role: "user".into(), content: "Q".into(), attachments: vec![] }], &mut |t| {
             out.push_str(t);
             true
-        });
+        })
+        .map(|_usage| ());
         (r, out)
     }
 

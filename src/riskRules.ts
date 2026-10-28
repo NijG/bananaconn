@@ -39,7 +39,7 @@ export const DEFAULT_RISK_RULES: RiskRule[] = [
   block(String.raw`^\s*w32tm\s+/(config|resync|register|unregister)\b`, "Windows 시간 설정 변경"),
   block(String.raw`^\s*Set-Date\b`, "Windows 시간 변경"),
   // Destructive or disruptive: ask, then log.
-  warn(String.raw`\brm\s+-[a-z]*[rf][a-z]*\b`, "파일 강제·재귀 삭제"),
+  warn(String.raw`\brm\s+(?:-\S*[rRf]|--(?:recursive|force))`, "파일 강제·재귀 삭제"),
   warn(SUDO + String.raw`(reboot|shutdown|halt|poweroff|init\s+[06])\b`, "재부팅·종료 (장비에서는 포트 끄기)"),
   warn(String.raw`\b(mkfs(\.\w+)?|fdisk|parted|wipefs)\b`, "디스크 포맷·파티션 변경"),
   warn(String.raw`\bdd\s+.*\bof=`, "디스크에 직접 쓰기"),
@@ -120,7 +120,7 @@ const WRAPPER = new RegExp(
     String.raw`su(?:\s+-\w*)*(?:\s+[\w.-]+)?\s+-c\s+`,
     // Shell keywords and wrappers in front of a command: if/for bodies, eval.
     String.raw`(?:then|do|else|elif|eval|pkexec|xargs|watch|--)\s+`,
-    String.raw`(?:nohup|time|exec|command|builtin|stdbuf(?:\s+-\S+)*|nice(?:\s+-n)?(?:\s+-?\d+)?|timeout(?:\s+-\S+)*\s+\S+)\s+`,
+    String.raw`(?:nohup|setsid(?:\s+-\w+)*|time|exec|command|builtin|stdbuf(?:\s+-\S+)*|nice(?:\s+-n)?(?:\s+-?\d+)?|timeout(?:\s+-\S+)*\s+\S+)\s+`,
     String.raw`["'(]+`,
   ]
     .map((p) => `(?:${p})`)
@@ -132,7 +132,9 @@ const WRAPPER = new RegExp(
  * and stripped of wrappers, its directory and ".exe". */
 function commands(line: string): string[] {
   return line
-    .split(/;|&&|\|\||\||&|`|\$\(|\)/)
+    // Also split on brace groups ({ cmd; }) so a grouped command can't hide from
+    // the anchored rules; the pieces are tested individually.
+    .split(/;|&&|\|\||\||&|`|\$\(|\)|\{|\}/)
     .map((part) => {
       let cmd = part.trim();
       for (let i = 0; i < 8; i++) {

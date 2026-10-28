@@ -1747,6 +1747,31 @@ kbd.word {
   gap: 10px;
   margin-bottom: 34px;
 }
+/* New-connection cards grouped by intent (터미널 / 파일 전송 / 원격 화면). */
+.home-quick-hint {
+  margin: -6px 0 16px;
+}
+.proto-group {
+  margin-bottom: 22px;
+}
+.proto-group-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.proto-group-title::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.proto-group .proto-cards {
+  margin-bottom: 0;
+}
 .proto-card {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -3701,6 +3726,23 @@ code.fp {
 .ai-empty .btn {
   margin-top: 8px;
 }
+/* One-click "start with an installed CLI" buttons in the empty state. */
+.ai-cli-quick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0;
+  align-items: center;
+}
+.ai-cli-quick p {
+  margin: 0 0 2px;
+}
+.ai-cli-quick .btn {
+  width: 100%;
+  max-width: 260px;
+  margin-top: 0;
+  justify-content: center;
+}
 .ai-compose {
   flex: none;
   padding: 8px 10px 10px;
@@ -3956,13 +3998,40 @@ code.fp {
   outline-offset: -6px;
 }
 
-/* RDP → SSH setup dialog */
-.ssh-setup-steps { margin: 8px 0 10px; padding-left: 20px; line-height: 1.6; }
-.ssh-setup-script { position: relative; margin: 8px 0; }
-.ssh-setup-script pre { margin: 0; padding: 10px 12px; max-height: 220px; overflow: auto; border-radius: 6px; background: var(--bg-2, rgba(127,127,127,.12)); font: 12px/1.5 var(--mono, Consolas, monospace); white-space: pre; user-select: text; }
+/* RDP/VNC → SSH setup dialog: each target type and the progress are their own
+   bordered, colour-coded cards so the sections read as clearly separate. */
+.kit-card { margin: 12px 0; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-1); overflow: hidden; }
+.kit-card__head { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--bg-2); }
+.kit-card__head .ico { flex: none; }
+.kit-card__head b { display: block; font-size: 13px; line-height: 1.3; }
+.kit-card__head small { color: var(--muted); font-size: 11px; }
+.kit-card__body { padding: 12px 14px; }
+/* Windows is accent (yellow), Linux/Unix is cyan, the log is neutral. */
+.kit-card--win { border-color: #f5c51866; }
+.kit-card--win .kit-card__head { background: var(--accent-soft); color: var(--accent); }
+.kit-card--win .kit-card__head small { color: var(--text-2); }
+.kit-card--nix { border-color: #22d3ee40; }
+.kit-card--nix .kit-card__head { background: #22d3ee14; color: #67e8f9; }
+.kit-card--nix .kit-card__head small { color: var(--text-2); }
+.kit-card--nix .ssh-setup-script pre { border-left-color: #22d3ee; }
+.kit-card--log .kit-card__head { background: var(--bg-3); color: var(--text-2); }
+
+/* Numbered steps inside the Windows card. */
+.kit-steps { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 8px; }
+.kit-steps li { display: flex; align-items: flex-start; gap: 10px; line-height: 1.55; }
+.kit-step-no { flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 700; display: grid; place-items: center; margin-top: 1px; }
+
+.kit-note { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.kit-firewall { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.kit-firewall__note { margin: 0; flex: 1 1 240px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.kit-firewall__note:empty { display: none; }
+
+.ssh-setup-script { position: relative; margin: 4px 0 0; }
+.ssh-setup-script pre { margin: 0; padding: 10px 34px 10px 12px; max-height: 220px; overflow: auto; border-radius: var(--radius); background: var(--bg-0); border: 1px solid var(--line); border-left: 3px solid var(--accent); font: 12px/1.5 var(--mono, Consolas, monospace); white-space: pre-wrap; word-break: break-all; user-select: text; color: var(--text); }
 .ssh-setup-script .btn { position: absolute; top: 6px; right: 6px; }
-.ssh-setup-status { margin: 8px 0 0; }
+.ssh-setup-status { margin: 8px 0 0; font-size: 12px; }
 .ssh-setup-status[data-kind="error"] { color: var(--danger, #e5484d); }
+.ssh-setup-status[data-kind="info"] { color: var(--text-2); }
 
 /* AI panel width: drag its left edge. */
 .ai-grip {
@@ -3992,25 +4061,183 @@ body.ai-resizing .xterm {
 .ai-log {
   user-select: text;
 }
-.ai-msg.assistant {
+.ai-msg.assistant,
+.ai-msg.user {
   position: relative;
 }
-.ai-msg-copy {
+.ai-msg-copy,
+.ai-msg-regen,
+.ai-msg-edit {
   position: absolute;
   top: 2px;
   right: 2px;
   opacity: 0;
   transition: opacity 0.15s;
 }
+/* Regenerate sits just left of the copy button on the latest answer. */
+.ai-msg-regen {
+  right: 26px;
+}
 .ai-msg.assistant:hover .ai-msg-copy,
-.ai-msg-copy:focus-visible {
+.ai-msg.assistant:hover .ai-msg-regen,
+.ai-msg.user:hover .ai-msg-edit,
+.ai-msg-copy:focus-visible,
+.ai-msg-regen:focus-visible,
+.ai-msg-edit:focus-visible {
   opacity: 1;
 }
-.ssh-setup-more { margin: 4px 0 8px; }
-.ssh-setup-more summary { cursor: pointer; color: var(--muted, #94a3b8); }
-.ssh-setup-log { margin: 6px 0; padding-left: 20px; max-height: 140px; overflow: auto; font: 12px/1.5 var(--mono); user-select: text; }
+
+/* Queued interjection: a message held while the AI is still answering. */
+.ai-queued {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+.ai-queued-label {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ai-queued-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* Token usage, a thin line at the bottom of the panel. */
+.ai-usage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.ai-usage .ico {
+  opacity: 0.75;
+}
+.ai-usage span {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.ai-usage-total {
+  margin-left: auto;
+  color: var(--text-2);
+}
+.ssh-setup-more { margin: 10px 0 0; }
+.ssh-setup-more summary { cursor: pointer; color: var(--text-2); font-size: 12px; }
+.ssh-setup-more[open] summary { margin-bottom: 6px; }
+.ssh-setup-log { margin: 0; padding-left: 18px; max-height: 160px; overflow: auto; font: 12px/1.55 var(--mono); user-select: text; }
 .ssh-setup-log:empty { display: none; }
 .ssh-setup-log li[data-kind="local"] { color: var(--muted, #94a3b8); }
 .ssh-setup-log li[data-kind="error"] { color: var(--danger); }
 .ssh-setup-log li[data-kind="ok"] { color: var(--ok, #4ade80); }
-.ssh-setup-script pre { white-space: pre-wrap; word-break: break-all; }
+
+/* Command palette (Ctrl+K): find and run any command or open any session. */
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 12vh 16px 16px;
+  background: rgba(4, 6, 10, 0.5);
+  backdrop-filter: blur(3px);
+}
+.cmdk {
+  width: 100%;
+  max-width: 560px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+.cmdk-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.cmdk-input .ico {
+  color: var(--muted);
+  flex: none;
+}
+.cmdk-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  outline: none;
+}
+.cmdk-list {
+  overflow-y: auto;
+  padding: 6px;
+}
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.cmdk-item.sel {
+  background: var(--bg-4);
+}
+.cmdk-item .ico {
+  flex: none;
+  color: var(--text-2);
+}
+.cmdk-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cmdk-text b {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmdk-text small {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmdk-keys {
+  flex: none;
+  color: var(--muted);
+}
+.cmdk-empty {
+  padding: 20px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}

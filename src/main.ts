@@ -7,6 +7,8 @@ import { ftpServer, ftpServerBadge, initFtpServer, openFtpServer } from "./ftpSe
 import { mountHome } from "./home";
 import { appLock, initLock, lockNow } from "./lock";
 import { openNetworkTools } from "./nettools";
+import { openCommandPalette } from "./palette";
+import { fileSessionFor } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
 import { icon } from "./icons";
 import { endpoint, newSession, parseTarget, PROTOCOLS, type Protocol, type Session } from "./model";
@@ -65,9 +67,17 @@ function addWhenLoaded(make: () => Promise<void>) {
   opening = opening.then(make).catch((err) => toast(errorText(err), "error"));
 }
 
-/** SFTP file browser for an SSH session; next to its terminal when `beside` is given. */
+/** File browser for a session; next to its terminal/screen when `beside` is
+ * given. A session already on a file protocol (SFTP/FTP/FTPS — e.g. one built by
+ * fileSessionFor) is opened as it is; any other (an SSH session) defaults to SFTP. */
 function openFiles(s: Session, beside?: View) {
-  const files: Session = { ...s, id: `quick-${crypto.randomUUID()}`, protocol: "sftp", name: `${s.name || s.host} · 파일`, options: {} };
+  const fileProto = s.protocol === "sftp" || s.protocol === "ftp" || s.protocol === "ftps";
+  // A file-protocol session (built by fileSessionFor, or a saved SFTP/FTP one)
+  // opens as it is; anything else (an SSH session) becomes an SFTP session that
+  // keeps the account and proxy via fileSessionFor.
+  const files: Session = fileProto
+    ? { ...s, id: s.id.startsWith("quick-") ? s.id : `quick-${crypto.randomUUID()}`, name: s.name || `${s.host} · 파일` }
+    : fileSessionFor(s, "sftp");
   if (!beside) return open(files);
   addWhenLoaded(async () => {
     const { FilesView } = await loadFiles();
@@ -86,7 +96,14 @@ async function launchRdp(s: Session) {
     // stays open while the app runs (mstsc reconnects on its own).
     // Rebuilt whenever the target or the gateway changed since it was made.
     const gw = state.sessions.find((x) => x.id === s.options.gateway);
-    const key = JSON.stringify([s.host, s.port, s.options.gateway ?? null, gw?.host, gw?.port, gw?.username, gw?.credentialId]);
+    const o2 = s.options;
+    // Include the proxy settings: a proxied (no-gateway) session's forward also
+    // depends on them, so editing the proxy must rebuild the reused tunnel.
+    const key = JSON.stringify([
+      s.host, s.port, s.options.gateway ?? null, gw?.host, gw?.port, gw?.username, gw?.credentialId,
+      o2.proxyType ?? null, o2.proxyHost ?? null, o2.proxyPort ?? null, o2.proxyLocal ?? null, o2.proxyDns ?? null,
+      o2.proxyCredentialId ?? null, o2.proxyExclude ?? null, o2.proxyTelnetCommand ?? null, o2.proxyLocalCommand ?? null,
+    ]);
     let entry = externalLinks.get(s.id);
     if (entry?.key !== key) {
       entry?.link.close();
@@ -200,7 +217,7 @@ function rememberQuick(proto: string, target: string) {
 }
 renderQuickHistory();
 const quickPlaceholder = () =>
-  (quickTarget.placeholder = quickProto.value === "serial" ? "빠른 연결  ·  COM3 또는 COM3:115200" : "빠른 연결  ·  user@host:port");
+  (quickTarget.placeholder = quickProto.value === "serial" ? "빠른 연결  ·  COM3 또는 COM3:115200" : "빠른 연결  ·  예: root@192.168.0.10:22");
 quickPlaceholder();
 quickProto.addEventListener("change", () => {
   quickPlaceholder();
@@ -326,7 +343,16 @@ $("#statusbar").addEventListener("click", (e) => {
   } else if (target.closest("[data-monitor]")) tab?.view.monitorAction?.();
   else if (target.closest("[data-update]")) installUpdate(ws.tabs.filter((t) => t.view.state === "connected").length);
 });
-subscribe("sessions", () => !ws.activeTab && renderStatus());
+subscribe("sessions", () => {
+  // Close the kept mstsc tunnel of any session that was deleted, so it does not
+  // linger open for the rest of the app's life.
+  for (const [id, entry] of externalLinks)
+    if (!state.sessions.some((x) => x.id === id)) {
+      entry.link.close();
+      externalLinks.delete(id);
+    }
+  if (!ws.activeTab) renderStatus();
+});
 onUpdateChange(renderStatus);
 loadVersion();
 // Screen language: the user's pick wins; until they pick, the Windows display language
@@ -406,6 +432,15 @@ $("#statusbar").addEventListener("click", (e) => {
 const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.help": () => void openHelp(),
   "app.newSession": () => void edit(null),
+  "app.commandPalette": () =>
+    openCommandPalette({
+      // A global action returns false when it doesn't apply right now (no tab,
+      // etc.) — tell the user instead of the pick doing nothing silently.
+      runAction: (id) => {
+        if (GLOBAL_ACTIONS[id]?.() === false) toast("지금은 쓸 수 없는 명령입니다", "info", 2500);
+      },
+      openSession: open,
+    }),
   "app.quickConnect": () => quickTarget.focus(),
   "app.toggleSidebar": () => toggleSidebar(),
   "app.searchSessions": () => (ws.activeTab ? false : sidebar.focusSearch()),
@@ -420,15 +455,18 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "tab.prev": () => ws.cycle(-1),
   "tab.close": () => {
     const t = ws.activeTab;
-    if (t) ws.close(t.id);
+    if (!t) return false;
+    ws.close(t.id);
   },
   "tab.closeOthers": () => {
     const t = ws.activeTab;
-    if (t) void ws.closeOthers(t.id);
+    if (!t) return false;
+    void ws.closeOthers(t.id);
   },
   "tab.duplicate": () => {
     const t = ws.activeTab;
-    if (t) ws.duplicateHandler?.(t.session);
+    if (!t) return false;
+    ws.duplicateHandler?.(t.session);
   },
   "tab.reconnect": () => {
     const v = ws.activeTab?.view;
@@ -452,7 +490,8 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "broadcast.toggle": () => $("#btn-broadcast").click(),
 };
 window.addEventListener("keydown", (e) => {
-  if (document.querySelector(".modal-backdrop") || appLock.locked) return;
+  // The command palette is open: it handles its own keys (capture phase).
+  if (document.querySelector(".modal-backdrop") || document.querySelector(".cmdk-backdrop") || appLock.locked) return;
   const id = actionFor(e, "global");
   const run = id && GLOBAL_ACTIONS[id];
   if (!run) return;

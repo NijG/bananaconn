@@ -233,9 +233,9 @@ class Pane {
     this.el.querySelector('[data-p="hidden"]')!.classList.toggle("on", Pane.showHidden);
   }
 
-  private sorted(): FileEntry[] {
+  private sorted(vis: FileEntry[]): FileEntry[] {
     const k = this.sortKey;
-    return this.visible().sort((a, b) => {
+    return vis.sort((a, b) => {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
       const av = k === "name" ? a.name.toLowerCase() : (a[k] ?? 0);
       const bv = k === "name" ? b.name.toLowerCase() : (b[k] ?? 0);
@@ -244,9 +244,12 @@ class Pane {
   }
 
   render() {
+    // Compute the visible set once and reuse it (filter, foot count, sort) — a
+    // big folder otherwise filters the whole list several times per render.
+    const vis = this.visible();
     // What the filter or hidden-file toggle hides can no longer be selected:
     // it must never be deleted or transferred without being seen.
-    const shown = new Set(this.visible().map((e) => e.path));
+    const shown = new Set(vis.map((e) => e.path));
     for (const p of [...this.selected]) if (!shown.has(p)) this.selected.delete(p);
     if (this.anchor && !shown.has(this.anchor)) this.anchor = null;
     this.pathInput.value = this.path || (this.side === "local" ? "내 PC (드라이브)" : "/");
@@ -254,7 +257,7 @@ class Pane {
       b.classList.toggle("sorted", b.dataset.sort === this.sortKey);
       b.dataset.dir = this.sortDir > 0 ? "asc" : "desc";
     });
-    this.rows = this.sorted();
+    this.rows = this.sorted(vis);
     this.drawn = null;
     if (!this.rows.length) {
       this.listEl.innerHTML = `<div class="file-empty">${icon("FolderOpen", 26)}<p>${this.entries.length ? "조건에 맞는 항목이 없습니다" : "빈 폴더입니다"}</p></div>`;
@@ -263,7 +266,7 @@ class Pane {
     } else {
       this.drawWindow();
     }
-    this.renderFoot();
+    this.renderFoot(this.entries.length - vis.length);
   }
 
   private rowHtml(e: FileEntry): string {
@@ -303,12 +306,11 @@ class Pane {
       `<div class="file-spacer" style="height:${(n - last) * ROW_H}px"></div>`;
   }
 
-  private renderFoot() {
+  private renderFoot(hidden = this.entries.length - this.visible().length) {
     const files = this.entries.filter((e) => !e.isDir).length;
     const dirs = this.entries.length - files;
     const sel = this.selection();
     const selSize = sel.filter((e) => !e.isDir).reduce((n, e) => n + e.size, 0);
-    const hidden = this.entries.length - this.visible().length;
     this.el.querySelector(".pane-foot")!.textContent = sel.length
       ? `${sel.length}개 선택 · ${formatBytes(selSize)}`
       : `폴더 ${dirs}개 · 파일 ${files}개${hidden ? ` · ${hidden}개 숨김` : ""}`;
@@ -325,7 +327,7 @@ class Pane {
   private select(path: string, e: MouseEvent) {
     // The sorted order is needed for Shift ranges only (a full sort per click
     // is slow in folders with thousands of entries).
-    const order = e.shiftKey && this.anchor ? this.sorted().map((x) => x.path) : [];
+    const order = e.shiftKey && this.anchor ? this.sorted(this.visible()).map((x) => x.path) : [];
     if (e.shiftKey && this.anchor && order.includes(this.anchor)) {
       const [a, b] = [order.indexOf(this.anchor), order.indexOf(path)].sort((x, y) => x - y);
       if (!e.ctrlKey) this.selected.clear();
@@ -649,7 +651,7 @@ export class FilesView implements View, EditorHost {
       });
       this.updateCount();
     });
-    this.init();
+    void this.init();
   }
 
   pane(side: Side) {
@@ -894,9 +896,15 @@ export class FilesView implements View, EditorHost {
   }
 
   private async init() {
-    this.localHome = await api.localHome();
-    await this.localPane.load(this.localHome);
-    await this.connect({});
+    // connect() handles its own errors; this guards localHome()/local load so a
+    // failure there shows the retry overlay instead of a silently dead tab.
+    try {
+      this.localHome = await api.localHome();
+      await this.localPane.load(this.localHome);
+      await this.connect({});
+    } catch (err) {
+      if (!this.disposed) this.fail(errorText(err));
+    }
   }
 
   private setState(s: ViewState) {
@@ -1213,10 +1221,29 @@ export class FilesView implements View, EditorHost {
       this.renderJob(job);
       // The next transfer starts at once; the folder is re-read once things calm down.
       this.refreshSoon(job.direction === "download" ? "local" : "remote");
+      this.trimFinished();
       this.updateCount();
     }
     this.running = false;
     this.ws.changed();
+  }
+
+  /** Keep only the most recent finished rows, so a long session of many small
+   * transfers (never cleared by hand) doesn't grow the queue and DOM without
+   * bound. Queued/running jobs are always kept. */
+  private trimFinished() {
+    const MAX_DONE = 50;
+    const finished = this.queue.filter((j) => j.status === "done" || j.status === "cancelled" || j.status === "error");
+    const excess = finished.length - MAX_DONE;
+    if (excess <= 0) return;
+    // queue keeps insertion order, so the first `excess` finished are the oldest.
+    const drop = new Set(finished.slice(0, excess));
+    this.queue = this.queue.filter((j) => {
+      if (!drop.has(j)) return true;
+      j.el.remove();
+      jobs.delete(j.id);
+      return false;
+    });
   }
 
   private refreshTimers: Partial<Record<"local" | "remote", number>> = {};
@@ -1265,7 +1292,12 @@ export class FilesView implements View, EditorHost {
       jobs.delete(j.id);
       this.renderJob(j);
       this.updateCount();
-    } else if (j.status === "running") api.transferCancel(j.id);
+    } else if (j.status === "running") {
+      // Clear a pending requeue (set by reconnect()) so an explicit cancel during
+      // a reconnect window actually cancels instead of re-running the transfer.
+      j.requeue = false;
+      api.transferCancel(j.id);
+    }
   }
 
   private updateCount() {

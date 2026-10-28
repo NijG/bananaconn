@@ -399,8 +399,10 @@ export class Workspace {
     tab.el.addEventListener("drop", (e) => {
       if (!this.dragTab || this.dragTab === tab.id) return;
       e.preventDefault();
-      // Reorder: move the dragged tab before this one.
+      // Reorder: move the dragged tab before this one. Guard a stale drag source
+      // (findIndex === -1), or splice(-1, 1) would remove the wrong (last) tab.
       const from = this.tabs.findIndex((t) => t.id === this.dragTab);
+      if (from < 0) return;
       const [moved] = this.tabs.splice(from, 1);
       this.tabs.splice(this.tabs.indexOf(tab), 0, moved);
       this.renderTabs();

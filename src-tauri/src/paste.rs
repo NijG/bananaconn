@@ -169,7 +169,7 @@ impl Job {
             *self.seen.lock().unwrap() = Seen::default();
             let started = Instant::now();
             let ok = match mode {
-                Mode::Fixed { char_ms, .. } if char_ms > 0 => line.chunks(1).all(|c| self.send_all(&send, c) && self.pause(Duration::from_millis(char_ms.into()))),
+                Mode::Fixed { char_ms, .. } if char_ms > 0 => utf8_chunks(&line).all(|c| self.send_all(&send, c) && self.pause(Duration::from_millis(char_ms.into()))),
                 _ => self.send_all(&send, &line),
             };
             if !ok {
@@ -264,6 +264,27 @@ impl Job {
             s = self.cv.wait_timeout(s, wait.min(on_wire + MAX_WAIT - since)).unwrap().0;
         }
     }
+}
+
+/// A byte slice taken one UTF-8 character at a time, so a fixed "character
+/// delay" waits once per character rather than once per byte: a Korean (or
+/// other multi-byte) character would otherwise be split across several delays
+/// and sent a partial byte at a time. A byte that is not a UTF-8 lead byte is
+/// joined to the one before it; a stray continuation byte (invalid UTF-8) goes
+/// on its own.
+fn utf8_chunks(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        if i >= line.len() {
+            return None;
+        }
+        let start = i;
+        i += 1;
+        while i < line.len() && line[i] & 0xC0 == 0x80 {
+            i += 1;
+        }
+        Some(&line[start..i])
+    })
 }
 
 /// The end of a prompt: `Router#`, `Router(config-if)#`, `switch>`, `$ `,
@@ -408,6 +429,24 @@ mod tests {
         assert_eq!(log.len(), 6, "one write per character");
         assert!(log[3].0 - log[2].0 >= Duration::from_millis(60), "line delay");
         assert!(log[1].0 - log[0].0 >= Duration::from_millis(10), "character delay");
+    }
+
+    #[test]
+    fn fixed_mode_paces_whole_characters_not_bytes() {
+        // Korean (and other multi-byte UTF-8) must go one character per
+        // character delay, not one byte: "가나\r" is two three-byte characters
+        // and a CR, so three writes, each a whole character in order.
+        let job = Arc::new(Job::new());
+        job.add("가나\r".as_bytes());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let rec = log.clone();
+        let send = move |d: &[u8]| {
+            rec.lock().unwrap().push(d.to_vec());
+            Ok(())
+        };
+        assert_eq!(job.run(Mode::Fixed { line_ms: 0, char_ms: 5 }, Duration::ZERO, send, || {}), End::Done);
+        let log = log.lock().unwrap();
+        assert_eq!(*log, ["가".as_bytes().to_vec(), "나".as_bytes().to_vec(), b"\r".to_vec()]);
     }
 
     #[test]
