@@ -13,7 +13,7 @@ import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
 import { addMacro, snippetMenu } from "../snippets";
 import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit, type RiskRule } from "../riskRules";
-import { patchSession, state, subscribe, updateSettings, type Snippet } from "../store";
+import { patchSession, state, subscribe, updateSettings, type Snippet, type TriggerRule } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
 import { CmdAssist } from "../cmdAssist";
@@ -33,7 +33,7 @@ import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
  * order; each tab turns them into its own key mode's bytes. */
 const MARKED_KEYS: EditKey[] = ["Delete", "Home", "End", "Backspace"];
 
-import { confirmDialog, contextMenu, errorText, esc, h, modal, promptDialog, timestamp, toast } from "../ui";
+import { beep, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, modal, osNotify, promptDialog, timestamp, toast } from "../ui";
 import type { BroadcastInput, EditKey, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
 
 
@@ -230,6 +230,27 @@ export class TerminalView implements View {
   private filesOpened = false;
   /** Keystrokes captured while a macro is being recorded. */
   private recording: string[] | null = null;
+  /** Auto-reconnect (ssh/telnet): the connection is being closed on purpose
+   * (user reconnect or tab close), so an unexpected-drop reconnect must not fire. */
+  private closing = false;
+  /** The session's startup commands have been sent for this connection. */
+  private startupSent = false;
+  /** Auto-reconnect attempt count, countdown timer, and "don't reconnect" choice. */
+  private reAttempts = 0;
+  private reTimer = 0;
+  private reDeclined = false;
+  /** "Notify when the task finishes" is on for this tab, with its silence timer
+   * and whether output has been seen since it was armed. */
+  private notifyDone = false;
+  private notifyTimer = 0;
+  private notifySaw = false;
+  /** Output since the last newline, for matching trigger rules line by line. */
+  private triggerBuf = "";
+  /** An OS guessed from the login banner when the resource monitor has not
+   * recognised the device — enough for OS snippets and Up/Down history recall. */
+  private osGuess?: string;
+  private osSniff = "";
+  private sniffDecoder = new TextDecoder();
 
   /** Telnet only: tunnel through the session's SSH gateway, if it has one. */
   private gateway: GatewayLink;
@@ -273,6 +294,7 @@ export class TerminalView implements View {
            <button class="tool" data-act="sendfile" title="텍스트 파일 보내기 (설정 파일을 붙여넣듯이)">${icon("FileText", 15)}</button>
            ${session.protocol === "serial" ? `<button class="tool" data-act="break" title="Break 신호 보내기 (장비 ROMMON 진입 등)">${icon("Zap", 15)}<span>Break</span></button>` : ""}
            <button class="tool" data-act="record" title="매크로 기록 시작/끝">${icon("Circle", 15)}<span>기록</span></button>
+           <button class="tool" data-act="notify" title="작업 완료 알림: 출력이 멈추면(명령이 끝나면) 알립니다. 다른 탭을 보고 있을 때만 알림이 옵니다">${icon("Bell", 15)}</button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
        </div>
@@ -311,7 +333,7 @@ export class TerminalView implements View {
     this.assist = new CmdAssist(
       this.term,
       () => this.historyKey,
-      () => this.device,
+      () => this.effectiveDevice(),
       () => termTheme(state.settings.terminalTheme),
     );
     this.lsColors = new LsColors(
@@ -448,6 +470,15 @@ export class TerminalView implements View {
    * for network gear unless this session already chose a mode. */
   deviceDetected(d: DeviceInfo) {
     if (this.disposed) return;
+    // Remember the OS the first time so later connections skip re-detecting it:
+    // the monitor reuses it, and snippets, history recall and key mode apply at
+    // once without waiting. Cleared if the monitor later finds it no longer fits.
+    if (!this.session.id.startsWith("quick-") && this.session.options.osKind !== d.kind) {
+      this.session.options.osKind = d.kind;
+      this.session.options.osLabel = d.label ?? "";
+      this.session.options.osName = d.name ?? "";
+      patchSession(this.session.id, {}, { osKind: d.kind, osLabel: d.label ?? "", osName: d.name ?? "" }).catch(() => {});
+    }
     // A Unix server's command names for suggestions, read once per server and
     // app run over the monitor's own connection (never typed into this tab).
     const key = this.historyKey;
@@ -1350,6 +1381,14 @@ export class TerminalView implements View {
   private async connect() {
     this.setState("connecting");
     this.gotOutput = false;
+    // A fresh connection: it is not being closed on purpose, and its startup
+    // commands have not run yet.
+    this.closing = false;
+    this.startupSent = false;
+    this.triggerBuf = "";
+    // Reuse the OS detected on an earlier connection (no re-sniff, no re-detect).
+    this.osGuess = String(this.session.options.osKind ?? "") || undefined;
+    this.osSniff = "";
     // A new connection starts on the normal screen with default colours.
     this.highlighter = new KeywordHighlighter();
     // Keys typed into the old connection are not on the new one's line.
@@ -1424,6 +1463,12 @@ export class TerminalView implements View {
   }
 
   async reconnect() {
+    // A reconnect the user asked for: suppress the dropped-connection
+    // auto-reconnect for the old connection, and allow it again afterwards.
+    this.closing = true;
+    this.stopAutoReconnect();
+    this.reDeclined = false;
+    this.reAttempts = 0;
     this.stopPortWait();
     this.portWaitDeclined = false;
     this.stopPaste(true);
@@ -1452,9 +1497,152 @@ export class TerminalView implements View {
     // An ls listing being coloured (lsColors.ts) is left as the server sent it.
     const shown = this.highlighter.process(bytes, state.settings.highlightKeywords && !this.lsColors.listing);
     this.term.write(shown, () => this.ack(rid, n));
+    this.sniffOs(bytes);
+    this.onOutput(bytes);
     if (!this.gotOutput) {
       this.gotOutput = true;
       if (this.state === "connecting") this.setState("connected");
+    }
+  }
+
+  /** Operating systems that are not network gear (so the key mode and AI target
+   * treat them as a general-purpose host). */
+  private static UNIX_KINDS = ["linux", "aix", "hpux", "solaris", "windows"];
+
+  /** The device the monitor recognised, or, failing that, an OS guessed from the
+   * login banner — used for OS snippets, key mode and client-side history recall. */
+  private effectiveDevice(): { kind: string; network: boolean } | undefined {
+    if (this.device) return this.device;
+    if (!this.osGuess) return undefined;
+    return { kind: this.osGuess, network: !TerminalView.UNIX_KINDS.includes(this.osGuess) };
+  }
+
+  /** The resource monitor will detect this session's device (ssh/telnet, direct,
+   * monitor on). When it will not — Serial, or a jump-host/gateway session, or
+   * the monitor turned off — the banner sniff is the only OS source. */
+  private monitorWillRun(): boolean {
+    const p = this.session.protocol;
+    return (p === "ssh" || p === "telnet") && state.settings.remoteMonitor && !this.session.options.jumpHost && !this.session.options.gateway;
+  }
+
+  /** Guess the device from the first output (login banner, prompt) when the
+   * monitor has not recognised it — for Serial and network gear on a serial
+   * console especially. Best-effort and cheap; when no monitor will run, the
+   * guess is remembered on the session so later connections skip it. */
+  private sniffOs(bytes: Uint8Array) {
+    if (this.osGuess || this.device || this.osSniff.length > 8192) return;
+    this.osSniff += this.sniffDecoder.decode(bytes, { stream: true });
+    const t = this.osSniff;
+    const kind = /HP-?UX|Hewlett-Packard/i.test(t)
+      ? "hpux"
+      : /\bAIX\b/.test(t)
+        ? "aix"
+        : /SunOS|Solaris/i.test(t)
+          ? "solaris"
+          : /NX-OS|Nexus/i.test(t)
+            ? "cisco-nxos"
+            : /Adaptive Security Appliance|ASA Version/i.test(t)
+              ? "cisco-asa"
+              : /Cisco IOS|IOS[ -]?XE|Cisco Systems|Cisco Internetwork/i.test(t)
+                ? "cisco-ios"
+                : /FortiGate|FortiOS|\bFGT\b/i.test(t)
+                  ? "fortigate"
+                  : /JUNOS|Juniper/i.test(t)
+                    ? "juniper-junos"
+                    : /Huawei|\bVRP\b/i.test(t)
+                      ? "huawei-vrp"
+                      : /ArubaOS|\bAruba\b/i.test(t)
+                        ? "aruba-cx"
+                        : /\bLinux\b/.test(t)
+                          ? "linux"
+                          : undefined;
+    if (!kind) return;
+    this.osGuess = kind;
+    // No monitor will detect this one (Serial, gateway, or monitor off): the
+    // sniff is the only source, so remember it for next time.
+    if (!this.monitorWillRun()) this.cacheOs(kind);
+  }
+
+  /** Remember an OS guessed by the sniff on the session (kind only; the monitor,
+   * when it runs, caches the fuller device in deviceDetected). */
+  private cacheOs(kind: string) {
+    if (this.session.id.startsWith("quick-") || this.session.options.osKind === kind) return;
+    this.session.options.osKind = kind;
+    patchSession(this.session.id, {}, { osKind: kind }).catch(() => {});
+  }
+
+  private decoder = new TextDecoder();
+  /** React to server output: arm the "done" notification, and match trigger
+   * rules line by line. Only decodes when one of those is actually in use. */
+  private onOutput(bytes: Uint8Array) {
+    if (this.notifyDone) this.armNotify();
+    const rules = state.settings.triggers;
+    if (!this.notifyDone && !(rules && rules.length)) return;
+    const text = this.decoder.decode(bytes, { stream: true });
+    if (rules && rules.length) this.matchTriggers(text, rules);
+  }
+
+  /** Output arrived: restart the silence timer. When it has been quiet for a
+   * few seconds after output — the command finished — notify, but only when
+   * this tab is not the one on screen (no alert for what you are watching). */
+  private armNotify() {
+    this.notifySaw = true;
+    clearTimeout(this.notifyTimer);
+    this.notifyTimer = window.setTimeout(() => {
+      if (!this.notifyDone || !this.notifySaw || this.disposed) return;
+      this.notifySaw = false;
+      if (this.isOnScreen() && document.hasFocus()) return; // you are watching it
+      osNotify(tr("작업 완료"), this.title(), () => this.ws.focusView(this));
+    }, 4000);
+  }
+
+  /** This tab is shown in a visible slot right now. */
+  private isOnScreen(): boolean {
+    return this.ws.visibleTabs().some((t) => t.view === (this as View));
+  }
+
+  /** Match each enabled trigger rule against new output, line by line. The tail
+   * after the last newline is kept for the next chunk so a rule can match a line
+   * split across reads. */
+  private matchTriggers(text: string, rules: TriggerRule[]) {
+    this.triggerBuf += text.replace(/\r/g, "");
+    const parts = this.triggerBuf.split("\n");
+    this.triggerBuf = parts.pop() ?? "";
+    // Keep the running tail bounded (a program printing no newlines).
+    if (this.triggerBuf.length > 4096) this.triggerBuf = this.triggerBuf.slice(-4096);
+    for (const line of parts) {
+      if (!line) continue;
+      for (const rule of rules) {
+        if (!rule.enabled || !rule.pattern) continue;
+        let re: RegExp;
+        try {
+          re = new RegExp(rule.pattern);
+        } catch {
+          continue; // a malformed pattern never matches
+        }
+        if (!re.test(line)) continue;
+        this.fireTrigger(rule, line);
+      }
+    }
+  }
+
+  private fireTrigger(rule: TriggerRule, line: string) {
+    if (rule.action === "alert") toast(`${this.title()}: ${line.trim().slice(0, 200)}`, "warn", 6000);
+    else if (rule.action === "beep") beep();
+    else if (rule.action === "send" && rule.value && this.state === "connected") this.sendInput(rule.value.replace(/\\n/g, "\r").replace(/\\t/g, "\t"));
+  }
+
+  /** Toggle "notify when the task finishes" for this tab. */
+  private toggleNotify() {
+    this.notifyDone = !this.notifyDone;
+    this.el.querySelector('[data-act="notify"]')!.classList.toggle("on", this.notifyDone);
+    if (this.notifyDone) {
+      ensureNotifyPermission();
+      toast("작업이 끝나면 알립니다 (다른 탭을 보고 있을 때)", "info", 2500);
+    } else {
+      clearTimeout(this.notifyTimer);
+      this.notifySaw = false;
+      toast("작업 완료 알림을 껐습니다", "info", 2000);
     }
   }
 
@@ -1486,7 +1674,74 @@ export class TerminalView implements View {
     this.term.write(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
     // A serial line ends with an error only when the port went away.
     if (code && this.waitForPort("연결이 끊어졌습니다.")) return;
+    // SSH/Telnet dropped unexpectedly (non-zero exit): reconnect on its own.
+    if (code && this.scheduleAutoReconnect()) return;
     this.showOverlay("연결이 종료되었습니다", "다시 연결하거나 탭을 닫을 수 있습니다.");
+  }
+
+  /** Auto-reconnect an SSH/Telnet session that dropped unexpectedly, after a
+   * short backing-off wait shown as a countdown the user can cancel. False when
+   * this tab does not auto-reconnect (not ssh/telnet, closing on purpose, turned
+   * off in Settings, or the user chose not to). */
+  private scheduleAutoReconnect(): boolean {
+    const p = this.session.protocol;
+    if ((p !== "ssh" && p !== "telnet") || this.closing || this.disposed || this.reDeclined || !state.settings.autoReconnect) return false;
+    const delays = [2, 4, 8, 15, 30];
+    let left = delays[Math.min(this.reAttempts, delays.length - 1)];
+    this.reAttempts++;
+    this.stopAutoReconnect();
+    const rid = this.runtimeId;
+    const show = () => this.showReconnectOverlay(left);
+    show();
+    const tick = () => {
+      if (!this.reTimer || this.disposed || rid !== this.runtimeId) return;
+      if (--left <= 0) {
+        this.stopAutoReconnect();
+        if (!this.disposed && rid === this.runtimeId) this.reconnect();
+        return;
+      }
+      show();
+      this.reTimer = window.setTimeout(tick, 1000);
+    };
+    this.reTimer = window.setTimeout(tick, 1000);
+    return true;
+  }
+
+  private stopAutoReconnect() {
+    clearTimeout(this.reTimer);
+    this.reTimer = 0;
+  }
+
+  /** The overlay shown while waiting to auto-reconnect: a countdown, reconnect
+   * now, or stop auto-reconnecting. */
+  private showReconnectOverlay(secs: number) {
+    this.overlay.hidden = false;
+    this.overlay.innerHTML = `<div class="overlay-card">
+      ${icon("Unlink", 26)}
+      <h3>${esc(tr("연결이 끊어졌습니다"))}</h3>
+      <p>${esc(tr(`${secs}초 후 자동으로 다시 연결합니다`))}</p>
+      <div class="row"><button class="btn btn-primary" data-o="re">${icon("RotateCw", 15)}${tr("지금 다시 연결")}</button>
+      <button class="btn" data-o="stop">${tr("자동 재연결 끄기")}</button></div></div>`;
+    this.overlay.querySelector('[data-o="re"]')!.addEventListener("click", () => this.reconnect());
+    this.overlay.querySelector('[data-o="stop"]')!.addEventListener("click", () => {
+      this.stopAutoReconnect();
+      this.reDeclined = true;
+      this.showOverlay("연결이 종료되었습니다", "다시 연결하거나 탭을 닫을 수 있습니다.");
+    });
+  }
+
+  /** Run the session's startup commands once the shell is ready (sent like a
+   * paste, so each line runs; device consoles are paced). */
+  private runStartupCommands() {
+    if (this.startupSent) return;
+    const raw = String(this.session.options.onConnectCmds ?? "").trim();
+    if (!raw) return;
+    this.startupSent = true;
+    const text = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join("\r") + "\r";
+    // A short wait lets the login banner and first prompt settle first.
+    window.setTimeout(() => {
+      if (!this.disposed && this.state === "connected") this.pasteText(text);
+    }, 600);
   }
 
   /** Timer of the wait for a serial port to come back (0: not waiting). */
@@ -1526,7 +1781,12 @@ export class TerminalView implements View {
   }
 
   private setState(s: ViewState) {
-    if (s === "connected" && this.state !== "connected") queueMicrotask(() => this.startMonitor());
+    if (s === "connected" && this.state !== "connected") {
+      queueMicrotask(() => this.startMonitor());
+      // A successful connection clears the backoff and runs startup commands.
+      this.reAttempts = 0;
+      this.runStartupCommands();
+    }
     // The SFTP browser opens next to a new SSH session (Settings).
     if (s === "connected" && this.state !== "connected" && !this.filesOpened && this.session.protocol === "ssh" && state.settings.sftpWithSsh) {
       this.filesOpened = true;
@@ -1618,9 +1878,11 @@ export class TerminalView implements View {
         case "ai":
           return this.aiMenu();
         case "snippet":
-          return snippetMenu(this.el.querySelector('[data-act="snippet"]')!, (s) => this.sendSnippet(s), this.device?.kind);
+          return snippetMenu(this.el.querySelector('[data-act="snippet"]')!, (s) => this.sendSnippet(s), this.device?.kind ?? this.osGuess);
         case "record":
           return this.toggleRecording();
+        case "notify":
+          return this.toggleNotify();
       }
     });
     const input = this.findBar.querySelector("input")!;
@@ -1928,6 +2190,9 @@ export class TerminalView implements View {
 
   dispose() {
     this.disposed = true;
+    this.closing = true;
+    this.stopAutoReconnect();
+    clearTimeout(this.notifyTimer);
     this.stopPortWait();
     this.resizer.disconnect();
     clearInterval(this.blinkTimer);

@@ -10,7 +10,7 @@ import { api, pickOpenFile } from "../api";
 import { icon } from "../icons";
 import { findTypedRisk } from "../riskRules";
 import { state, updateSettings } from "../store";
-import { contextMenu, errorText, esc, h, toast } from "../ui";
+import { confirmDialog, contextMenu, errorText, esc, h, promptDialog, toast } from "../ui";
 import { writeClipboard } from "../clipboard";
 import { tr } from "../i18n";
 import { judge } from "./policy";
@@ -153,6 +153,65 @@ function storeConversation(key: string, c: SavedConversation | null) {
       if (!others.length) return; // nothing left to drop: this session only
       localStorage.removeItem(others[0].sk);
     }
+  }
+}
+
+// ---- AI chat sessions (several named conversations per connection) ----
+//
+// A connection keeps a list of named chat sessions. Each session's turns live
+// under its own conversation key `<conn>#<id>` (storeConversation above); this
+// index, one per connection, holds their names and which one is current.
+
+const SESS_PREFIX = "bx.aiSess.";
+const SESS_SEP = "#";
+
+interface SessMeta {
+  id: string;
+  name: string;
+  at: number;
+}
+interface SessIndex {
+  current: string;
+  /** Last id handed out, so a new session's number never repeats after deletes. */
+  seq: number;
+  list: SessMeta[];
+}
+
+/** The default name for the nth session, in the screen language. */
+function sessDefault(n: number): string {
+  return `${tr("대화")} ${n}`;
+}
+
+/** The session list for a connection. The first time it is read it adopts a
+ * single pre-sessions conversation (stored under the bare connection key) as
+ * session 1, so existing chats are not lost. */
+function loadSessions(conn: string): SessIndex {
+  try {
+    const idx = JSON.parse(localStorage.getItem(SESS_PREFIX + conn) || "null");
+    if (idx && Array.isArray(idx.list) && idx.list.length && typeof idx.current === "string")
+      return { current: idx.current, seq: idx.seq || idx.list.length, list: idx.list };
+  } catch {
+    // A corrupt index is rebuilt below.
+  }
+  const legacy = localStorage.getItem(storageKey(conn));
+  if (legacy) {
+    try {
+      localStorage.setItem(storageKey(conn + SESS_SEP + "1"), legacy);
+      localStorage.removeItem(storageKey(conn));
+    } catch {
+      // Out of room: the legacy conversation stays where it is (just unused).
+    }
+  }
+  const idx: SessIndex = { current: "1", seq: 1, list: [{ id: "1", name: sessDefault(1), at: Date.now() }] };
+  saveSessions(conn, idx);
+  return idx;
+}
+
+function saveSessions(conn: string, idx: SessIndex) {
+  try {
+    localStorage.setItem(SESS_PREFIX + conn, JSON.stringify(idx));
+  } catch {
+    // The index is a convenience; losing it only forgets session names.
   }
 }
 
@@ -348,6 +407,17 @@ export class AiPanel {
   private system: "chat" | "explain" | "config" | "log" = "chat";
   /** Tokens this conversation has used (summed over its requests). */
   private usage = { input: 0, output: 0 };
+  /** The connection these chat sessions belong to (null for a keyless host). */
+  private conn: string | null = null;
+  /** The chat session shown now, and the connection's session list. */
+  private sessionId = "1";
+  private sessions: SessMeta[] = [];
+
+  /** The storage key of the conversation shown now (its session of its
+   * connection); null when the host has no connection key. */
+  private convKey(): string | null {
+    return this.conn ? this.conn + SESS_SEP + this.sessionId : null;
+  }
 
   constructor(
     private host: AiHost,
@@ -360,11 +430,23 @@ export class AiPanel {
       <div class="ai-head">${icon("Sparkles", 15)}<b>AI</b>
         <select class="ai-provider" title="AI 서비스"></select>
         <span class="ai-head-actions">
+          <button class="tool" data-act="search" title="대화 내 검색">${icon("Search", 15)}</button>
           <button class="tool" data-act="file" title="파일 분석 (설정·로그)">${icon("FileSearch", 15)}</button>
           <button class="tool" data-act="copy-all" title="대화 전체 복사">${icon("Copy", 15)}</button>
-          <button class="tool" data-act="new" title="새 대화">${icon("MessageSquarePlus", 15)}</button>
           <button class="tool" data-act="close" title="닫기">${icon("X", 15)}</button>
         </span></div>
+      <div class="ai-sessions" data-sessions hidden>
+        <select class="ai-session" data-i18n-skip title="대화 세션"></select>
+        <button class="tool" data-act="new" title="새 대화 세션">${icon("MessageSquarePlus", 15)}</button>
+        <button class="tool" data-act="sess-rename" title="세션 이름 바꾸기">${icon("Pencil", 14)}</button>
+        <button class="tool" data-act="sess-del" title="세션 삭제">${icon("Trash2", 14)}</button>
+      </div>
+      <div class="ai-search" data-search hidden>
+        ${icon("Search", 14)}
+        <input type="text" placeholder="대화 내 검색" spellcheck="false" />
+        <span class="ai-search-count muted small" data-i18n-skip></span>
+        <button class="tool" data-act="search-close" title="검색 닫기">${icon("X", 14)}</button>
+      </div>
       <div class="ai-log" data-i18n-skip></div>
       <div class="ai-compose">
         <div class="ai-attach-row" data-pending hidden></div>
@@ -431,8 +513,22 @@ export class AiPanel {
       this.providerId = (e.target as HTMLSelectElement).value;
       this.newConversation();
     });
+    this.el.querySelector<HTMLSelectElement>(".ai-session")!.addEventListener("change", (e) => {
+      this.switchSession((e.target as HTMLSelectElement).value);
+    });
+    this.el.querySelector<HTMLInputElement>(".ai-search input")!.addEventListener("input", (e) => {
+      this.filterLog((e.target as HTMLInputElement).value);
+    });
+    // The connection's chat sessions: the current one is restored below.
+    this.conn = this.host.conversationKey?.() ?? null;
+    if (this.conn) {
+      const idx = loadSessions(this.conn);
+      this.sessions = idx.list;
+      this.sessionId = idx.current;
+    }
     this.restore();
     this.refreshProviders();
+    this.drawSessions();
     this.draw();
     this.drawUsage();
   }
@@ -565,13 +661,161 @@ export class AiPanel {
     this.draw();
   }
 
+  // ---- chat sessions (several named conversations per connection) ----
+
+  /** Draw the session switcher; hidden for a host with no connection key. */
+  private drawSessions() {
+    const bar = this.el.querySelector<HTMLElement>("[data-sessions]");
+    if (!bar) return;
+    bar.hidden = !this.conn;
+    if (!this.conn) return;
+    const sel = bar.querySelector<HTMLSelectElement>(".ai-session")!;
+    sel.innerHTML = this.sessions
+      .map((s) => `<option value="${esc(s.id)}" ${s.id === this.sessionId ? "selected" : ""}>${esc(s.name)}</option>`)
+      .join("");
+  }
+
+  /** Show the current session: abandon any in-flight run, then load its saved
+   * conversation (empty when it has none). Shared by switch, create and delete. */
+  private loadCurrent() {
+    this.runSeq++;
+    this.asking?.cancel();
+    this.asking = null;
+    const approval = this.approval;
+    this.approval = null;
+    approval?.(false);
+    this.busy = false;
+    this.stopped = false;
+    this.interrupting = false;
+    this.queued = null;
+    this.turns = [];
+    this.masker = null;
+    this.skip = { skip: false };
+    this.system = "chat";
+    this.usage = { input: 0, output: 0 };
+    this.pending = [];
+    this.restore();
+    this.drawPending();
+    this.drawSessions();
+    this.drawQueued();
+    this.drawUsage();
+    this.refreshProviders();
+    this.draw();
+    this.input.focus();
+  }
+
+  private switchSession(id: string) {
+    if (!this.conn || id === this.sessionId) return;
+    this.persist();
+    const idx = loadSessions(this.conn);
+    if (!idx.list.some((s) => s.id === id)) return;
+    idx.current = id;
+    saveSessions(this.conn, idx);
+    this.sessions = idx.list;
+    this.sessionId = id;
+    this.loadCurrent();
+  }
+
+  /** Start a new, empty named session beside the current one. */
+  private createSession() {
+    if (!this.conn) return this.newConversation();
+    this.persist();
+    const idx = loadSessions(this.conn);
+    idx.seq += 1;
+    const id = String(idx.seq);
+    idx.list.push({ id, name: sessDefault(idx.seq), at: Date.now() });
+    idx.current = id;
+    saveSessions(this.conn, idx);
+    this.sessions = idx.list;
+    this.sessionId = id;
+    this.loadCurrent();
+  }
+
+  /** Rename the current session. */
+  private async renameSession() {
+    if (!this.conn) return;
+    const cur = this.sessions.find((s) => s.id === this.sessionId);
+    const res = await promptDialog({ title: tr("세션 이름 바꾸기"), label: tr("세션 이름"), value: cur?.name ?? "", confirm: tr("저장") });
+    if (this.disposed || !res) return;
+    const name = res.value.trim();
+    if (!name) return;
+    const idx = loadSessions(this.conn);
+    const m = idx.list.find((s) => s.id === this.sessionId);
+    if (!m) return;
+    m.name = name;
+    saveSessions(this.conn, idx);
+    this.sessions = idx.list;
+    this.drawSessions();
+  }
+
+  /** Delete the current session and its saved conversation. The connection
+   * always keeps at least one session, so deleting the last starts a fresh one. */
+  private async deleteSession() {
+    if (!this.conn) return;
+    const cur = this.sessions.find((s) => s.id === this.sessionId);
+    const ok = await confirmDialog({
+      title: tr("대화 세션 삭제"),
+      icon: "Trash2",
+      danger: true,
+      message: `<p>${esc(tr("이 대화 세션을 삭제할까요? 되돌릴 수 없습니다."))}</p><p class="muted small" data-i18n-skip>${esc(cur?.name ?? "")}</p>`,
+      confirm: tr("삭제"),
+      cancel: tr("취소"),
+      focusCancel: true,
+    });
+    if (this.disposed || !ok) return;
+    storeConversation(this.convKey()!, null);
+    const idx = loadSessions(this.conn);
+    idx.list = idx.list.filter((s) => s.id !== this.sessionId);
+    if (!idx.list.length) {
+      idx.seq += 1;
+      idx.list.push({ id: String(idx.seq), name: sessDefault(idx.seq), at: Date.now() });
+    }
+    idx.current = idx.list[idx.list.length - 1].id;
+    saveSessions(this.conn, idx);
+    this.sessions = idx.list;
+    this.sessionId = idx.current;
+    this.loadCurrent();
+  }
+
+  // ---- search within the conversation ----
+
+  /** Show or hide the find box. Hiding (or opening) clears any active filter. */
+  private toggleSearch(show?: boolean) {
+    const bar = this.el.querySelector<HTMLElement>("[data-search]");
+    if (!bar) return;
+    const open = show ?? bar.hidden;
+    bar.hidden = !open;
+    const input = bar.querySelector<HTMLInputElement>("input")!;
+    if (open) {
+      input.focus();
+      input.select();
+    } else {
+      input.value = "";
+      this.filterLog("");
+    }
+  }
+
+  /** Dim the turns that do not contain the query; show how many match. */
+  private filterLog(query: string) {
+    const q = query.trim().toLowerCase();
+    let hits = 0;
+    for (const el of Array.from(this.log.children) as HTMLElement[]) {
+      if (el.classList.contains("ai-empty")) continue;
+      const match = !q || (el.textContent ?? "").toLowerCase().includes(q);
+      el.classList.toggle("ai-search-hidden", !!q && !match);
+      if (q && match) hits++;
+    }
+    const count = this.el.querySelector<HTMLElement>(".ai-search-count");
+    if (count) count.textContent = q ? tr(`${hits}개 일치`) : "";
+  }
+
   /** Save this conversation under its connection, to come back after closing.
    * Secrets are masked out of the saved copy so they never reach localStorage,
    * and an answer still streaming when we save (closed mid-run) is marked so a
    * restored conversation shows the interruption instead of a stuck spinner and
    * never sends an empty assistant turn back to the provider. */
   private persist() {
-    const key = this.host.conversationKey?.();
+    const key = this.convKey();
     if (!key) return;
     const turns: Turn[] = this.turns.map((t) => {
       const fixed: Turn =
@@ -591,7 +835,7 @@ export class AiPanel {
 
   /** The conversation this connection had before (panel closed, app restarted). */
   private restore() {
-    const key = this.host.conversationKey?.();
+    const key = this.convKey();
     const saved = key ? loadConversation(key) : null;
     if (!saved) return;
     this.turns = saved.turns.map((t) => (t.run?.status === "running" || t.run?.status === "approve" ? { ...t, run: { ...t.run, status: "skipped" } } : t));
@@ -645,7 +889,11 @@ export class AiPanel {
     if (act === "pick") this.el.querySelector<HTMLInputElement>("[data-files]")!.click();
     else if (act === "capture") this.captureScreen();
     else if (act === "close") this.onClose();
-    else if (act === "new") this.newConversation();
+    else if (act === "new") this.createSession();
+    else if (act === "sess-rename") void this.renameSession();
+    else if (act === "sess-del") void this.deleteSession();
+    else if (act === "search") this.toggleSearch();
+    else if (act === "search-close") this.toggleSearch(false);
     else if (act === "copy-all") this.copy(this.conversationText());
     else if (act === "send") void (this.busy ? this.stop() : this.send());
     else if (act === "file") void this.analyseFile();

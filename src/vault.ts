@@ -8,6 +8,22 @@ import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
 import { confirmDialog, errorText, esc, modal, toast } from "./ui";
 
+/** A strong random password: at least one upper, lower, digit and symbol, the
+ * rest mixed, shuffled. Ambiguous characters (O/0, l/1) are left out. */
+function generatePassword(len = 20): string {
+  const sets = ["ABCDEFGHJKLMNPQRSTUVWXYZ", "abcdefghijkmnopqrstuvwxyz", "23456789", "!@#$%^&*()-_=+?"];
+  const rand = (n: number) => crypto.getRandomValues(new Uint32Array(1))[0] % n;
+  const pick = (s: string) => s[rand(s.length)];
+  const all = sets.join("");
+  const out = sets.map(pick); // one of each kind to start
+  while (out.length < len) out.push(pick(all));
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = rand(i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out.join("");
+}
+
 export function openVault(): Promise<void> {
   return new Promise((resolve) => {
     let selected: string | null = state.credentials[0]?.id ?? null;
@@ -83,7 +99,10 @@ export function openVault(): Promise<void> {
                  <div class="pubkey" hidden><span>공개 키 (서버의 ~/.ssh/authorized_keys 에 추가)</span>
                    <div class="inline"><code></code><button type="button" class="btn" data-copy>${icon("Copy", 14)}복사</button></div></div>`
               : `<label class="field"><span>비밀번호 ${c.hasSecret ? '<em class="ok">저장됨</em>' : ""}</span>
-                   <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "비밀번호"}" /></label>`
+                   <div class="inline">
+                     <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "비밀번호"}" />
+                     <button type="button" class="btn" data-genpass title="강력한 비밀번호를 만들어 넣고 복사합니다">${icon("Sparkles", 14)}생성</button>
+                   </div></label>`
           }
           <div class="row end">
             ${!isNew ? `<button type="button" class="btn btn-danger-ghost" data-del>${icon("Trash2", 14)}삭제</button>` : ""}
@@ -124,6 +143,14 @@ export function openVault(): Promise<void> {
       form.querySelector("[data-copy]")?.addEventListener("click", () => {
         writeClipboard(detailEl.querySelector(".pubkey code")!.textContent ?? "");
         toast("공개 키를 복사했습니다", "success");
+      });
+      form.querySelector("[data-genpass]")?.addEventListener("click", () => {
+        const pw = generatePassword();
+        const el = field("secret")!;
+        el.type = "text"; // show it so it can be checked before saving
+        el.value = pw;
+        writeClipboard(pw);
+        toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000);
       });
       form.querySelector("[data-del]")?.addEventListener("click", async () => {
         const used = state.sessions.filter((s) => s.credentialId === c.id).length;

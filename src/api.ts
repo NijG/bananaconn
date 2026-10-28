@@ -410,6 +410,8 @@ export const api = {
   netPorts: (host: string, ports: number[]) =>
     call<{ port: number; open: boolean; ms: number | null; detail: string }[]>("net_ports", { host, ports }),
   netDns: (host: string) => call<{ addresses: string[]; ms: number }>("net_dns", { host }),
+  /** Send a Wake-on-LAN magic packet to a MAC (optionally a subnet broadcast address and port). */
+  wakeOnLan: (mac: string, broadcast?: string, port?: number) => call<void>("wake_on_lan", { mac, broadcast: broadcast ?? null, port: port ?? null }),
 
   fileServerStart: (config: { kind: FileServerKind; root: string; port: number; lan: boolean; readOnly: boolean; username: string; password: string }) =>
     call<FileServerStatus>("file_server_start", { config }),

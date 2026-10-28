@@ -90,6 +90,59 @@ export function errorText(err: unknown): string {
   return JSON.stringify(err);
 }
 
+// ---- desktop notification & beep -----------------------------------------------
+
+/** Ask for OS-notification permission, once, from a user gesture (a toggle). */
+export function ensureNotifyPermission() {
+  try {
+    if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
+  } catch {
+    // No Notification API (or blocked): osNotify falls back to a toast.
+  }
+}
+
+/** Show an OS notification when allowed, otherwise an in-app toast. `onClick`
+ * (focus the tab that finished) runs when the notification is clicked. */
+export function osNotify(title: string, body: string, onClick?: () => void) {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      const n = new Notification(title, { body });
+      n.onclick = () => {
+        try {
+          window.focus();
+        } catch {
+          // ignore
+        }
+        onClick?.();
+        n.close();
+      };
+      return;
+    }
+  } catch {
+    // Fall through to the toast.
+  }
+  toast(`${title} — ${body}`, "info", 5000);
+}
+
+/** A short beep (trigger rules). Best-effort: silent when audio is unavailable. */
+export function beep() {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    gain.gain.value = 0.05;
+    osc.start();
+    osc.stop(ctx.currentTime + 0.15);
+    osc.onended = () => void ctx.close();
+  } catch {
+    // No audio: a trigger beep is best-effort.
+  }
+}
+
 // ---- modal ---------------------------------------------------------------------
 
 // Open modals, topmost last. Only the topmost one reacts to Escape, and

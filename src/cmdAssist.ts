@@ -9,7 +9,7 @@
 // the output stream itself is never changed.
 
 import type { IBufferCell, IDecoration, IMarker, ITheme, Terminal } from "@xterm/xterm";
-import { candidates, colorSpans, forgetCommand, PROMPT_END, rememberCommand, suggest, type Candidate, type WordKind } from "./cmdLine";
+import { candidates, colorSpans, forgetCommand, PROMPT_END, recentCommands, rememberCommand, suggest, type Candidate, type WordKind } from "./cmdLine";
 import { findCommandRisk } from "./riskRules";
 import { state } from "./store";
 import { esc } from "./ui";
@@ -66,6 +66,10 @@ export class CmdAssist {
   ghost = "";
   /** The candidates list (Ctrl+Space) while it is open. */
   private list: { el: HTMLElement; items: Candidate[]; at: number } | null = null;
+  /** Up/Down history recall for shells with no server-side history (AIX, HP-UX,
+   * Solaris): the commands (newest first), where we are in them, and the line
+   * the user had typed before recall started. */
+  private recall: { items: string[]; at: number; stash: string } | null = null;
   private cell: IBufferCell | undefined;
   private disposers: { dispose(): void }[] = [];
 
@@ -127,8 +131,36 @@ export class CmdAssist {
 
   private reset() {
     this.prompt = null;
+    this.recall = null;
     this.clear();
     this.closeList();
+  }
+
+  /** This shell keeps no command history of its own, so Up/Down must recall it
+   * here instead of being sent to a server that ignores them. */
+  private clientHistory(): boolean {
+    if (!state.settings.cmdSuggest) return false;
+    const kind = this.device()?.kind;
+    return kind === "aix" || kind === "hpux" || kind === "solaris";
+  }
+
+  /** Move through this host's history and put the command on the line (clearing
+   * it first with Ctrl-U). Returns false when there is nothing to recall, so the
+   * arrow key falls through to the server. */
+  private recallStep(up: boolean): boolean {
+    if (!this.recall) {
+      if (!up) return false; // Down with no recall under way: leave the line alone
+      const items = recentCommands(this.host());
+      if (!items.length) return false;
+      this.recall = { items, at: -1, stash: this.typedText() };
+    }
+    const r = this.recall;
+    r.at = up ? Math.min(r.at + 1, r.items.length - 1) : Math.max(r.at - 1, -1);
+    const target = r.at < 0 ? r.stash : r.items[r.at];
+    // Kill the current line (Ctrl-U, the tty kill character) and type the command.
+    this.term.input(`\x15${target}`, true);
+    if (r.at < 0) this.recall = null; // back at the original line: recall ends
+    return true;
   }
 
   /** Keys while a suggestion or the candidates list is shown: false when the
@@ -170,6 +202,16 @@ export class CmdAssist {
       // Anything else is typed on; the list follows the line (render).
       return undefined;
     }
+    // Up/Down recalls earlier commands on a shell that keeps no history of its
+    // own (AIX, HP-UX, Solaris), where the arrow keys otherwise do nothing.
+    if (this.clientHistory() && plain && !e.ctrlKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      if (this.recallStep(e.key === "ArrowUp")) {
+        e.preventDefault();
+        return false;
+      }
+    }
+    // Any other key ends the recall run, so the next Up starts from the newest.
+    if (this.recall && e.key !== "ArrowUp" && e.key !== "ArrowDown") this.recall = null;
     // → or End takes all of the suggestion, Ctrl+→ the next word. It is typed
     // like keys, so broadcast and macro recording see it too.
     if (this.ghost && plain && (e.key === "ArrowRight" || (e.key === "End" && !e.ctrlKey))) {

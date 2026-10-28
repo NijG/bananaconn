@@ -9,6 +9,17 @@ import { SNIPPET_LIBRARY, SNIPPET_LIBRARY_VERSION } from "./snippetLibrary";
 import { normalizeFolder, normalizeSession, type Session } from "./model";
 import { errorText, toast } from "./ui";
 
+/** A trigger rule: when a line of terminal output matches `pattern` (a regular
+ * expression), do `action` — show an alert toast, beep, or send `value` back to
+ * the terminal (an auto-response; `\n` becomes Enter, `\t` a tab). */
+export interface TriggerRule {
+  pattern: string;
+  action: "alert" | "beep" | "send";
+  /** The text to send, for the "send" action. */
+  value?: string;
+  enabled: boolean;
+}
+
 export interface Settings {
   fontSize: number;
   fontFamily: string;
@@ -35,6 +46,11 @@ export interface Settings {
   /** Wait for a serial port that went away (USB adapter unplugged) or is not
    * there yet, and connect when it shows up. */
   serialAutoReconnect: boolean;
+  /** Auto-reconnect an SSH/Telnet session that drops unexpectedly (with a
+   * short, backing-off, cancellable countdown). */
+  autoReconnect: boolean;
+  /** Output trigger rules (pattern → alert / beep / auto-response). */
+  triggers: TriggerRule[];
   autoLog: boolean;
   confirmClose: boolean;
   terminalTheme: string;
@@ -109,6 +125,8 @@ const DEFAULT_SETTINGS: Settings = {
   pasteCharDelay: 0,
   serialIo: "fast",
   serialAutoReconnect: true,
+  autoReconnect: true,
+  triggers: [],
   sessionSort: "name",
   folderOrder: [],
   autoLog: false,

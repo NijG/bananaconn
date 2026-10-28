@@ -21,6 +21,14 @@ const RESOLUTIONS = ["", "1280x720", "1366x768", "1600x900", "1920x1080", "2560x
 function optionsFields(p: Protocol, o: Record<string, unknown>): string {
   const check = (name: string, label: string, on: boolean) =>
     `<label class="check"><input type="checkbox" name="opt.${name}" ${on ? "checked" : ""}/> ${label}</label>`;
+  // Commands run automatically right after this session connects (one per line).
+  const startup = () =>
+    `<label class="field"><span>접속 후 자동 실행 명령 (한 줄에 하나)</span>
+      <textarea name="opt.onConnectCmds" rows="3" spellcheck="false" placeholder="예: sudo su -&#10;cd /var/log&#10;export TERM=xterm">${esc(o.onConnectCmds ?? "")}</textarea></label>`;
+  // Wake-on-LAN: the PC's network card MAC, so it can be powered on before connecting.
+  const wol = () =>
+    `<label class="field"><span>Wake-on-LAN MAC 주소 (선택) — 꺼진 PC를 켠 뒤 접속</span>
+      <input name="opt.wolMac" value="${esc(o.wolMac ?? "")}" placeholder="AA:BB:CC:DD:EE:FF" spellcheck="false" autocomplete="off"/></label>`;
   switch (p) {
     case "ssh":
       return `${keyModeField(o.keyMode, o.backspace)}<div class="grid-2">
@@ -34,7 +42,9 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
         <div class="check-grid">
           ${check("compression", "압축 사용 (느린 회선)", !!o.compression)}
           ${check("agentForward", "SSH 에이전트 전달", !!o.agentForward)}
-        </div>`;
+        </div>
+        ${startup()}
+        ${wol()}`;
     case "sftp":
     case "ftp":
     case "ftps":
@@ -77,6 +87,7 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
                </div>`
             : `<p class="muted small">내장 모드는 탭 크기가 바뀌면 원격 해상도도 따라 바뀝니다. 클립보드는 툴바의 "클립보드 입력"으로 텍스트를 보낼 수 있습니다.</p>`
         }
+        ${wol()}
         ${gatewayField(o.gateway)}`;
     }
     case "vnc":
@@ -87,10 +98,13 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
         <label class="field"><span>화질</span><select name="opt.vncQuality">
           ${VNC_QUALITY.map(([v, l]) => `<option value="${v}" ${v === (o.vncQuality ?? "fast") ? "selected" : ""}>${l}</option>`).join("")}
         </select></label>
+        ${wol()}
         ${gatewayField(o.gateway)}`;
     case "telnet":
       return `${keyModeField(o.keyMode, o.backspace)}
         ${check("pacedPaste", "콘솔 서버 연결 (여러 줄을 장비가 받아들이는 대로 한 줄씩 보냄)", !!o.pacedPaste)}
+        ${startup()}
+        ${wol()}
         ${gatewayField(o.gateway)}`;
     case "tftp":
       return `<p class="muted small">TFTP는 로그인과 폴더 목록이 없습니다. 탭에서 서버의 파일 이름을 적어 받거나 보냅니다. 사용자 이름은 쓰지 않습니다.</p>`;
@@ -106,6 +120,7 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
           <label class="field span-2"><span>흐름 제어</span>${sel("flow", [["none", "없음 (대부분의 장비 콘솔)"], ["hardware", "하드웨어 (RTS/CTS)"], ["software", "소프트웨어 (XON/XOFF)"]], st.flow)}</label>
         </div>
         ${keyModeField(o.keyMode ?? "network", o.backspace)}
+        ${startup()}
         <p class="muted small">Cisco 등 장비 콘솔의 일반 설정은 9600 · 8 · 없음 · 1 · 흐름 제어 없음입니다. 툴바의 Break 버튼으로 Break 신호를 보낼 수 있습니다.</p>`;
     }
     default:

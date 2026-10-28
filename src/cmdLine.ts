@@ -187,6 +187,15 @@ export function commandHistoryCount(): number {
   return Object.values(load()).reduce((n, l) => n + (Array.isArray(l) ? l.length : 0), 0);
 }
 
+/** This host's command history, newest first, for Up/Down recall on shells that
+ * do not keep their own (AIX, HP-UX, Solaris). */
+export function recentCommands(host: string, limit = 200): string[] {
+  const mine = load()[host] ?? [];
+  const out: string[] = [];
+  for (let i = mine.length - 1; i >= 0 && out.length < limit; i--) out.push(mine[i]);
+  return out;
+}
+
 // Programs on each server's PATH (monitor_commands), for this app run only.
 const remote = new Map<string, string[]>();
 

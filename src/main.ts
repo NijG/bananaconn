@@ -447,6 +447,7 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.settings": () => void openSettings(),
   "app.shortcuts": () => void import("./shortcuts").then((m) => m.openShortcuts()),
   "app.vault": () => void openVault(),
+  "app.clipboardHistory": () => void import("./clipHistory").then((m) => m.openClipboardHistory()),
   "app.tunnels": () => openTunnelManager(),
   "app.netTools": () => openNetworkTools(),
   "app.lock": () => (appLock.enabled ? void lockNow() : false),

@@ -2,7 +2,7 @@
 
 import { api, revealInExplorer } from "./api";
 import { icon } from "./icons";
-import { state, updateSettings, type Settings } from "./store";
+import { state, updateSettings, type Settings, type TriggerRule } from "./store";
 import { appLock, openMasterPassword } from "./lock";
 import { LIGHT_THEMES, TERM_THEMES } from "./themes";
 import { confirmDialog, esc, modal, toast } from "./ui";
@@ -45,6 +45,7 @@ const PAGES: { id: string; label: string; icon: string }[] = [
   { id: "security", label: "보안", icon: "LockKeyhole" },
   { id: "session", label: "세션", icon: "Server" },
   { id: "risk", label: "위험 명령", icon: "ShieldAlert" },
+  { id: "trigger", label: "트리거", icon: "Bell" },
   { id: "ai", label: "AI", icon: "Sparkles" },
   { id: "log", label: "로그", icon: "ScrollText" },
   { id: "update", label: "업데이트", icon: "RefreshCw" },
@@ -160,6 +161,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
         </div>
         <p class="muted small">권장 방식은 한 줄을 보낸 뒤 장비가 그 줄을 되돌려 보내고 프롬프트를 다시 띄우면 바로 다음 줄을 보냅니다. 빠른 장비에는 빠르게, 느린 장비에는 기다렸다가 보내므로 글자가 빠지지 않습니다. 줄 지연과 글자 지연은 "정해진 지연으로"를 고를 때 쓰입니다 (입력을 되돌려 보내지 않는 장비용).</p>
         ${check("serialAutoReconnect", "시리얼 포트가 빠지면 다시 꽂힐 때까지 기다렸다가 자동으로 연결", "USB 시리얼 어댑터를 뽑았다 꽂거나, 연결할 때 아직 꽂혀 있지 않으면 포트가 나타나는 대로 연결합니다.")}
+        ${check("autoReconnect", "SSH·Telnet 연결이 끊기면 자동으로 다시 연결", "네트워크가 끊기거나 세션이 예기치 않게 종료되면 잠시 기다렸다가 자동으로 다시 연결합니다. 기다리는 동안 취소할 수 있고, 사용자가 종료한 연결은 다시 연결하지 않습니다.")}
         <label class="field"><span>시리얼 포트 입출력</span><select name="serialIo">
           ${[["fast", "빠르게 (권장) — 키 입력이 읽기 대기에 막히지 않음"], ["compat", "호환 모드 — 이전 방식 (드라이버에 문제가 있을 때)"]].map(([v, l]) => `<option value="${v}" ${v === s.serialIo ? "selected" : ""}>${l}</option>`).join("")}
         </select></label>
@@ -184,6 +186,12 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
           <button type="button" class="btn btn-sm" data-risk-add>${icon("Plus", 14)}규칙 추가</button>
           <button type="button" class="btn btn-sm" data-risk-reset>${icon("RefreshCw", 14)}기본 규칙으로</button>
           <button type="button" class="btn btn-sm" data-risk-log>${icon("FolderOpen", 14)}위험 명령 기록 보기</button>
+        </div>
+        <h4 data-section="trigger">트리거</h4>
+        <p class="muted small">터미널 출력을 줄마다 정규식으로 검사해, 맞으면 동작을 실행합니다. 알림은 토스트로 알리고, 소리는 짧은 소리를 내며, 자동 응답은 정해 둔 텍스트를 터미널로 보냅니다(줄바꿈은 \\n, 탭은 \\t). 예를 들어 묻는 말에 자동으로 응답을 보낼 수 있습니다.</p>
+        <div class="risk-rules" data-trigger-rules></div>
+        <div class="row">
+          <button type="button" class="btn btn-sm" data-trigger-add>${icon("Plus", 14)}트리거 추가</button>
         </div>
         ${aiSettingsSection(check)}
         <h4 data-section="log">로그 (기본값 · 세션마다 따로 정할 수도 있습니다)</h4>
@@ -264,6 +272,57 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
     rules = DEFAULT_RISK_RULES.map((r) => ({ ...r }));
     renderRules();
   });
+  // Output trigger rules: edited here, saved with the other settings.
+  let trigs: TriggerRule[] = (s.triggers ?? []).map((t) => ({ ...t }));
+  const trigEl = m.root.querySelector<HTMLElement>("[data-trigger-rules]")!;
+  const safeRe = (p: string) => {
+    try {
+      new RegExp(p);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const renderTrigs = () => {
+    trigEl.innerHTML = trigs.length
+      ? trigs
+          .map(
+            (t, i) => `<div class="risk-rule trigger-rule" data-i="${i}">
+              <input type="checkbox" data-k="enabled" ${t.enabled ? "checked" : ""} title="사용" />
+              <input data-k="pattern" class="mono${t.pattern && !safeRe(t.pattern) ? " invalid" : ""}" value="${esc(t.pattern)}" spellcheck="false" placeholder="정규식, 예: \\(yes/no\\)" />
+              <select data-k="action"><option value="alert" ${t.action === "alert" ? "selected" : ""}>알림</option><option value="beep" ${t.action === "beep" ? "selected" : ""}>소리</option><option value="send" ${t.action === "send" ? "selected" : ""}>자동 응답</option></select>
+              <input data-k="value" value="${esc(t.value ?? "")}" placeholder="보낼 텍스트 (자동 응답, 예: yes\\n)" ${t.action === "send" ? "" : "disabled"} />
+              <button type="button" class="icon-btn" data-del title="삭제">${icon("Trash2", 14)}</button></div>`,
+          )
+          .join("")
+      : `<p class="muted small">트리거가 없습니다.</p>`;
+  };
+  trigEl.addEventListener("input", (e) => {
+    const el = e.target as HTMLInputElement | HTMLSelectElement;
+    const i = Number(el.closest<HTMLElement>("[data-i]")?.dataset.i);
+    const k = el.dataset.k as keyof TriggerRule | undefined;
+    if (!k || !trigs[i]) return;
+    if (k === "enabled") trigs[i].enabled = (el as HTMLInputElement).checked;
+    else if (k === "action") {
+      trigs[i].action = el.value as TriggerRule["action"];
+      renderTrigs(); // the "send" text box enables/disables
+    } else if (k === "pattern") {
+      trigs[i].pattern = el.value;
+      el.classList.toggle("invalid", !!el.value && !safeRe(el.value));
+    } else if (k === "value") trigs[i].value = el.value;
+  });
+  trigEl.addEventListener("click", (e) => {
+    const del = (e.target as HTMLElement).closest("[data-del]");
+    if (!del) return;
+    trigs.splice(Number(del.closest<HTMLElement>("[data-i]")!.dataset.i), 1);
+    renderTrigs();
+  });
+  m.root.querySelector("[data-trigger-add]")!.addEventListener("click", () => {
+    trigs.push({ pattern: "", action: "alert", value: "", enabled: true });
+    renderTrigs();
+    trigEl.querySelector<HTMLInputElement>(".trigger-rule:last-child [data-k=pattern]")?.focus();
+  });
+  renderTrigs();
   wireAiSettings(m.root);
   m.root.querySelector("[data-clear-history]")!.addEventListener("click", async () => {
     const n = commandHistoryCount();
@@ -331,6 +390,9 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
       pasteLineDelay: Math.max(0, Math.min(5000, Math.trunc(Number(val("pasteLineDelay").value)) || 0)),
       pasteCharDelay: Math.max(0, Math.min(200, Math.trunc(Number(val("pasteCharDelay").value)) || 0)),
       serialAutoReconnect: bool("serialAutoReconnect"),
+      autoReconnect: bool("autoReconnect"),
+      // Keep enabled rules and any with a pattern; a blank-pattern rule is dropped.
+      triggers: trigs.filter((t) => t.pattern.trim()).map((t) => ({ pattern: t.pattern.trim(), action: t.action, value: t.action === "send" ? (t.value ?? "") : undefined, enabled: t.enabled })),
       serialIo: val("serialIo").value === "compat" ? "compat" : "fast",
       autoLog: bool("log.auto"),
       logTemplate: val("log.path").value.trim() || "%S_%Y%M%D_%h%m%s.log",

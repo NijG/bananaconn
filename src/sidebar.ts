@@ -34,6 +34,7 @@ import {
   upsertSession,
   upsertSessions,
 } from "./store";
+import { api } from "./api";
 import { confirmDialog, contextMenu, errorText, esc, modal, promptDialog, toast } from "./ui";
 
 export interface SidebarActions {
@@ -517,6 +518,7 @@ export class Sidebar {
       { label: "연결", icon: "Play", hint: "Enter", action: () => this.actions.connect(s) },
       ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, s) }] : []),
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
+      ...(String(s.options.wolMac ?? "").trim() ? [{ label: "Wake-on-LAN (전원 켜기)", icon: "Power", action: () => void this.wake(s) }] : []),
       "-",
       { label: "편집", icon: "Pencil", hint: "F2", action: () => this.actions.edit(s) },
       { label: "복사", icon: "Copy", hint: "Ctrl+C", action: () => this.copySession(s) },
@@ -525,6 +527,18 @@ export class Sidebar {
       "-",
       { label: "삭제", icon: "Trash2", hint: "Del", danger: true, action: () => this.deleteSession(s) },
     ]);
+  }
+
+  /** Send a Wake-on-LAN magic packet to the session's saved MAC address. */
+  private async wake(s: Session) {
+    const mac = String(s.options.wolMac ?? "").trim();
+    if (!mac) return;
+    try {
+      await api.wakeOnLan(mac);
+      toast(`${s.name || s.host}에 Wake-on-LAN 신호를 보냈습니다`, "success", 3000);
+    } catch (err) {
+      toast(errorText(err), "error");
+    }
   }
 
   /** Menu for a multi-selection. */

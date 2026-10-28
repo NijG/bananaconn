@@ -182,6 +182,72 @@ pub async fn net_dns(host: String) -> Result<DnsResult, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Parse a MAC address — "AA:BB:CC:DD:EE:FF", "aa-bb-...", or 12 bare hex
+/// digits — into its six bytes.
+fn parse_mac(mac: &str) -> Option<[u8; 6]> {
+    let hex: String = mac.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The Wake-on-LAN magic packet for a MAC: six 0xFF bytes then the MAC sixteen
+/// times (102 bytes).
+fn magic_packet(mac: &[u8; 6]) -> Vec<u8> {
+    let mut packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(mac);
+    }
+    packet
+}
+
+/// Send a Wake-on-LAN magic packet to wake a PC that is off but still powered
+/// (BIOS Wake-on-LAN enabled). `broadcast` defaults to the limited broadcast
+/// address; a subnet-directed broadcast (e.g. 192.168.1.255) reaches another
+/// subnet when the network forwards it. Standard WoL ports are 9 and 7.
+#[tauri::command]
+pub fn wake_on_lan(mac: String, broadcast: Option<String>, port: Option<u16>) -> Result<(), String> {
+    let bytes = parse_mac(&mac).ok_or("MAC 주소가 올바르지 않습니다 (예: AA:BB:CC:DD:EE:FF)")?;
+    let packet = magic_packet(&bytes);
+    let target = broadcast.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("255.255.255.255");
+    let port = port.unwrap_or(9);
+    let addr: SocketAddr = format!("{target}:{port}").parse().map_err(|_| "브로드캐스트 주소가 올바르지 않습니다".to_string())?;
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_broadcast(true).map_err(|e| e.to_string())?;
+    sock.send_to(&packet, addr).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod wol_tests {
+    use super::{magic_packet, parse_mac};
+
+    #[test]
+    fn parses_mac_in_several_forms() {
+        let want = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF"), Some(want));
+        assert_eq!(parse_mac("aa-bb-cc-dd-ee-ff"), Some(want));
+        assert_eq!(parse_mac("AABBCCDDEEFF"), Some(want));
+        assert_eq!(parse_mac("AA:BB:CC:DD:EE"), None);
+        assert_eq!(parse_mac("not a mac"), None);
+    }
+
+    #[test]
+    fn magic_packet_is_six_ff_then_mac_sixteen_times() {
+        let mac = [1u8, 2, 3, 4, 5, 6];
+        let p = magic_packet(&mac);
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[6..12], &mac);
+        assert_eq!(&p[96..102], &mac);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::valid_host;

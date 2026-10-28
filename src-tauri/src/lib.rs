@@ -152,6 +152,7 @@ pub fn run() {
             nettools::net_ping_cancel,
             nettools::net_ports,
             nettools::net_dns,
+            nettools::wake_on_lan,
             fileservers::file_server_start,
             fileservers::file_server_stop,
             fileservers::file_server_status,

@@ -3622,6 +3622,25 @@ code.fp {
   display: flex;
   margin-left: auto;
 }
+.ai-sessions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.ai-sessions .ai-session {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  height: 26px;
+  font-size: 12px;
+}
+.ai-sessions .tool {
+  flex: none;
+}
 .ai-log {
   flex: 1;
   min-height: 0;

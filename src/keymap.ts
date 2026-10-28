@@ -45,6 +45,7 @@ export const ACTIONS: ActionDef[] = [
   g("app.settings", "설정 열기"),
   g("app.shortcuts", "단축키 설정 열기"),
   g("app.vault", "자격 증명 보관함"),
+  g("app.clipboardHistory", "클립보드 히스토리", [], { note: "최근 복사한 내용에서 골라 붙여넣기" }),
   g("app.tunnels", "SSH 터널 관리자"),
   g("app.netTools", "네트워크 도구"),
   g("app.lock", "앱 잠그기", [], { note: "마스터 비밀번호를 설정했을 때" }),

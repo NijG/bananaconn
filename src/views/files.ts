@@ -1014,18 +1014,44 @@ export class FilesView implements View, EditorHost {
     }
     if (msg === "NEED_PASSWORD" || /인증에 실패|로그인에 실패/.test(msg)) {
       const retry = msg !== "NEED_PASSWORD";
-      const res = await promptDialog({
-        title: retry ? "비밀번호가 올바르지 않습니다" : "비밀번호 입력",
-        label: `${this.session.username || "사용자"}@${this.session.host} 의 비밀번호`,
-        type: "password",
-        icon: "KeyRound",
-        confirm: "연결",
-        extra: `<label class="check"><input type="checkbox" name="save" /> 자격 증명 보관함에 저장하고 이 세션에 연결</label>`,
-      });
-      if (!res) return this.fail("비밀번호 입력을 취소했습니다.");
-      const save = res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked;
-      this.pendingCredential = save ? res.value : null;
-      return this.connect({ ...extra, password: res.value });
+      // Telnet (and other) sessions have no stored username (you log in at the
+      // prompt), so a reused FTP/SFTP connection must ask for the account too —
+      // otherwise it tries to log in with an empty user. For FTP an empty name
+      // means anonymous.
+      const ftp = this.session.protocol === "ftp" || this.session.protocol === "ftps";
+      const saveRow = `<label class="check"><input type="checkbox" name="save" /> 자격 증명 보관함에 저장하고 이 세션에 연결</label>`;
+      let password: string;
+      if (!this.session.username) {
+        const res = await promptDialog({
+          title: retry ? "로그인 정보가 올바르지 않습니다" : "로그인 정보 입력",
+          label: `사용자 이름${ftp ? " (비우면 anonymous)" : ""}`,
+          value: "",
+          icon: "KeyRound",
+          confirm: "연결",
+          extra: `<label class="field"><span>${esc(this.session.host)} 의 비밀번호</span>
+                    <input name="pw" type="password" autocomplete="off" /></label>
+                  ${saveRow}`,
+        });
+        if (!res) return this.fail("로그인 정보 입력을 취소했습니다.");
+        this.session.username = res.value.trim();
+        password = res.form.querySelector<HTMLInputElement>("input[name=pw]")!.value;
+        const save = res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked;
+        this.pendingCredential = save ? password : null;
+      } else {
+        const res = await promptDialog({
+          title: retry ? "비밀번호가 올바르지 않습니다" : "비밀번호 입력",
+          label: `${this.session.username}@${this.session.host} 의 비밀번호`,
+          type: "password",
+          icon: "KeyRound",
+          confirm: "연결",
+          extra: saveRow,
+        });
+        if (!res) return this.fail("비밀번호 입력을 취소했습니다.");
+        password = res.value;
+        const save = res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked;
+        this.pendingCredential = save ? password : null;
+      }
+      return this.connect({ ...extra, password });
     }
     this.fail(msg);
   }
