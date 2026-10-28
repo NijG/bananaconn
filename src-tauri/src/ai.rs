@@ -280,9 +280,29 @@ fn delta(kind: &str, event: &Value) -> Result<Option<String>, String> {
             let parts = event["candidates"][0]["content"]["parts"].as_array();
             parts.map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect::<String>()).filter(|s| !s.is_empty())
         }
-        "ollama" => event["message"]["content"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
-        // OpenAI and compatible servers.
-        _ => event["choices"][0]["delta"]["content"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+        // Reasoning models stream their reasoning in `thinking` with `content`
+        // empty until the end; show that too, so the panel is not blank while the
+        // model thinks (and the answer still follows in `content`).
+        "ollama" => {
+            let m = &event["message"];
+            m["content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| m["thinking"].as_str().filter(|s| !s.is_empty()))
+                .map(str::to_string)
+        }
+        // OpenAI and compatible servers. Some reasoning models (and proxies)
+        // stream the answer under `reasoning_content` or `reasoning` until the
+        // final `content`; show it so the panel is not blank meanwhile.
+        _ => {
+            let d = &event["choices"][0]["delta"];
+            d["content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| d["reasoning_content"].as_str().filter(|s| !s.is_empty()))
+                .or_else(|| d["reasoning"].as_str().filter(|s| !s.is_empty()))
+                .map(str::to_string)
+        }
     })
 }
 
@@ -724,6 +744,9 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
     let mut streamed = false;
     let mut result: Option<String> = None;
     let mut cli_error: Option<String> = None;
+    // A sign-in prompt appears only at the very start; checking just the first
+    // few lines keeps a real answer that happens to contain "[y/n]" from aborting.
+    let mut head_lines = 0u32;
     let finished = std::sync::atomic::AtomicBool::new(false);
     let timed_out = std::sync::atomic::AtomicBool::new(false);
     let status = std::thread::scope(|scope| {
@@ -744,6 +767,16 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         for line in BufReader::new(out).lines() {
             let Ok(line) = line else { break };
             if !stream_json {
+                // A CLI that is not logged in prints an interactive sign-in
+                // prompt and waits on stdin (where our prompt is, which it then
+                // eats as the answer) — it can never finish headlessly. Stop and
+                // tell the user to log in once in a terminal.
+                head_lines += 1;
+                if head_lines <= 5 && needs_login(&line) {
+                    cli_error = Some(login_hint(name));
+                    end_run(job.as_ref(), pid);
+                    break;
+                }
                 if !on_text(&format!("{line}\n")) {
                     end_run(job.as_ref(), pid);
                     break;
@@ -798,6 +831,34 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
         return Err(cli_failure(name, &stderr, status.code()));
     }
     Ok(())
+}
+
+/// An interactive sign-in / confirmation prompt from a CLI that is not logged
+/// in. Headless, it waits on stdin forever (or eats our prompt as the answer),
+/// so the run can never finish — detect it and stop with guidance.
+fn needs_login(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("opening authentication page")
+        || l.contains("do you want to continue?")
+        || l.contains("[y/n]")
+        || l.contains("please log in")
+        || l.contains("please login")
+        || l.contains("not logged in")
+        || l.contains("login required")
+        || l.contains("sign in to")
+        || l.contains("press enter to")
+        || l.contains("waiting for auth")
+        || l.contains("authenticate in your browser")
+}
+
+/// Advice for a CLI that is not logged in.
+fn login_hint(name: &str) -> String {
+    match name {
+        "gemini" => "Gemini CLI에 로그인되어 있지 않습니다. 터미널에서 `gemini`를 한 번 실행해 Google 계정으로 로그인한 뒤 다시 시도하세요. (또는 설정 → AI에서 Gemini API 키 방식을 쓰세요.)".into(),
+        "codex" => "Codex CLI에 로그인되어 있지 않습니다. 터미널에서 `codex login`으로 로그인한 뒤 다시 시도하세요.".into(),
+        "claude" => "Claude Code CLI에 로그인되어 있지 않습니다. 터미널에서 `claude`를 한 번 실행해 로그인한 뒤 다시 시도하세요.".into(),
+        _ => format!("{name} CLI에 로그인되어 있지 않습니다. 터미널에서 로그인한 뒤 다시 시도하세요."),
+    }
 }
 
 /// What went wrong in a CLI run, from its stderr: the service's own message
@@ -954,6 +1015,23 @@ mod tests {
         assert_eq!(delta("anthropic", &e).unwrap_err(), "Overloaded");
         let oe: Value = serde_json::from_str(r#"{"error":"model 'x' not found"}"#).unwrap();
         assert_eq!(delta("ollama", &oe).unwrap_err(), "model 'x' not found");
+        // Reasoning models: thinking (Ollama) / reasoning_content (OpenAI-compatible)
+        // show while content is still empty, and content wins once it arrives.
+        let lt: Value = serde_json::from_str(r#"{"message":{"role":"assistant","content":"","thinking":"hmm"},"done":false}"#).unwrap();
+        assert_eq!(delta("ollama", &lt).unwrap().as_deref(), Some("hmm"));
+        let lc: Value = serde_json::from_str(r#"{"message":{"content":"answer","thinking":"hmm"}}"#).unwrap();
+        assert_eq!(delta("ollama", &lc).unwrap().as_deref(), Some("answer"));
+        let orc: Value = serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"why"}}]}"#).unwrap();
+        assert_eq!(delta("compatible", &orc).unwrap().as_deref(), Some("why"));
+    }
+
+    #[test]
+    fn spots_a_sign_in_prompt() {
+        assert!(needs_login("Opening authentication page in your browser. Do you want to continue? [Y/n]:"));
+        assert!(needs_login("Please log in to continue"));
+        assert!(needs_login("You are not logged in"));
+        assert!(!needs_login("Here is the answer to your question."));
+        assert!(!needs_login("Run df -h to see disk usage"));
     }
 
     #[test]
