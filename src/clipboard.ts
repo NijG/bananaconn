@@ -45,6 +45,16 @@ export function clearClipboardHistory() {
   }
 }
 
+/** Drop one entry (e.g. a password copied by mistake) without clearing the rest. */
+export function removeClipboardHistory(text: string) {
+  history = history.filter((t) => t !== text);
+  try {
+    localStorage.setItem(HIST_KEY, JSON.stringify(history));
+  } catch {
+    // best-effort
+  }
+}
+
 export async function writeClipboard(text: string) {
   record(text);
   try {

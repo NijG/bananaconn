@@ -258,12 +258,12 @@ export interface AiUsage {
   output?: number;
 }
 
-const listeners = new Map<string, { onText: (t: string) => void; done: (err: string | null, cancelled: boolean, usage: AiUsage) => void }>();
+const listeners = new Map<string, { onText: (t: string, reasoning: boolean) => void; done: (err: string | null, cancelled: boolean, usage: AiUsage) => void }>();
 let wired = false;
 function wire() {
   if (wired) return;
   wired = true;
-  void on<{ id: string; text: string }>("ai-stream", (e) => listeners.get(e.id)?.onText(e.text));
+  void on<{ id: string; text: string; reasoning?: boolean }>("ai-stream", (e) => listeners.get(e.id)?.onText(e.text, e.reasoning ?? false));
   void on<{ id: string; error: string | null; cancelled: boolean; input?: number; output?: number }>("ai-done", (e) => {
     const l = listeners.get(e.id);
     listeners.delete(e.id);
@@ -285,16 +285,24 @@ export interface Asking {
 }
 
 /** Ask a provider; `onText` gets the answer so far, piece by piece. `onUsage`,
- * when given, gets the token counts once the provider reports them. */
-export function ask(p: AiProvider, system: string, messages: AiMessage[], onText: (sofar: string) => void, onUsage?: (u: AiUsage) => void): Asking {
+ * when given, gets the token counts once the provider reports them. `onReasoning`,
+ * when given, gets the model's thinking so far (reasoning models) — shown live
+ * but kept out of the answer `done` resolves with. */
+export function ask(p: AiProvider, system: string, messages: AiMessage[], onText: (sofar: string) => void, onUsage?: (u: AiUsage) => void, onReasoning?: (sofar: string) => void): Asking {
   wire();
   const id = `ai-${Date.now()}-${++seq}`;
   let text = "";
+  let reasoning = "";
   let finish!: (v: string) => void;
   let fail!: (e: Error) => void;
   const done = new Promise<string>((res, rej) => ((finish = res), (fail = rej)));
   listeners.set(id, {
-    onText: (t) => {
+    onText: (t, isReasoning) => {
+      if (isReasoning) {
+        reasoning += t;
+        onReasoning?.(reasoning);
+        return;
+      }
       text += t;
       onText(text);
     },

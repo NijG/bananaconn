@@ -95,7 +95,7 @@ export function proxyFields(s: Session): string {
         <label class="field"><span>포트</span><input name="opt.proxyPort" type="number" min="0" max="65535" value="${esc(o.proxyPort ?? defaultPort(kind ?? "socks5"))}" /></label>
         <label class="field span-2"><span>프록시 로그인 (자격 증명)</span><select name="opt.proxyCredentialId">
           <option value="">사용 안 함</option>
-          ${creds.map((c) => `<option value="${c.id}" ${c.id === o.proxyCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
+          ${creds.map((c) => `<option value="${c.id}" data-i18n-skip ${c.id === o.proxyCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
         </select></label>
         <label class="field span-2"><span>DNS 이름 조회</span>${sel(
           "proxyDns",

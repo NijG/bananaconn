@@ -533,8 +533,9 @@ export class Sidebar {
   private async wake(s: Session) {
     const mac = String(s.options.wolMac ?? "").trim();
     if (!mac) return;
+    const broadcast = String(s.options.wolBroadcast ?? "").trim() || undefined;
     try {
-      await api.wakeOnLan(mac);
+      await api.wakeOnLan(mac, broadcast);
       toast(`${s.name || s.host}에 Wake-on-LAN 신호를 보냈습니다`, "success", 3000);
     } catch (err) {
       toast(errorText(err), "error");
@@ -718,7 +719,7 @@ export class Sidebar {
             "credentialId",
             "자격 증명",
             `<select name="credentialId" disabled><option value="">사용 안 함 (접속할 때 입력)</option>${creds
-              .map((c) => `<option value="${c.id}" title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}">${esc(c.name)}</option>`)
+              .map((c) => `<option value="${c.id}" data-i18n-skip title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}">${esc(c.name)}</option>`)
               .join("")}</select>`,
           )}
           ${row("folder", "폴더", `<input name="folder" list="bx-folders-edit" autocomplete="off" spellcheck="false" placeholder="비우면 최상위" disabled/>`)}

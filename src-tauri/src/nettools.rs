@@ -206,26 +206,54 @@ fn magic_packet(mac: &[u8; 6]) -> Vec<u8> {
     packet
 }
 
+/// Ports a Wake-on-LAN packet goes to: the caller's one when given, else both
+/// standard ports (9 and 7). Some NICs listen on only one, so sending to both
+/// makes the wake more reliable.
+fn wol_ports(port: Option<u16>) -> Vec<u16> {
+    match port {
+        Some(p) => vec![p],
+        None => vec![9, 7],
+    }
+}
+
 /// Send a Wake-on-LAN magic packet to wake a PC that is off but still powered
 /// (BIOS Wake-on-LAN enabled). `broadcast` defaults to the limited broadcast
 /// address; a subnet-directed broadcast (e.g. 192.168.1.255) reaches another
-/// subnet when the network forwards it. Standard WoL ports are 9 and 7.
+/// subnet when the network forwards it. With no port it is sent to both standard
+/// WoL ports (9 and 7); it succeeds if any send goes out.
 #[tauri::command]
 pub fn wake_on_lan(mac: String, broadcast: Option<String>, port: Option<u16>) -> Result<(), String> {
     let bytes = parse_mac(&mac).ok_or("MAC 주소가 올바르지 않습니다 (예: AA:BB:CC:DD:EE:FF)")?;
     let packet = magic_packet(&bytes);
     let target = broadcast.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("255.255.255.255");
-    let port = port.unwrap_or(9);
-    let addr: SocketAddr = format!("{target}:{port}").parse().map_err(|_| "브로드캐스트 주소가 올바르지 않습니다".to_string())?;
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     sock.set_broadcast(true).map_err(|e| e.to_string())?;
-    sock.send_to(&packet, addr).map_err(|e| e.to_string())?;
-    Ok(())
+    let mut sent = false;
+    let mut last_err = None;
+    for p in wol_ports(port) {
+        let addr: SocketAddr = format!("{target}:{p}").parse().map_err(|_| "브로드캐스트 주소가 올바르지 않습니다".to_string())?;
+        match sock.send_to(&packet, addr) {
+            Ok(_) => sent = true,
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+    if sent {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| "매직 패킷을 보내지 못했습니다".to_string()))
+    }
 }
 
 #[cfg(test)]
 mod wol_tests {
-    use super::{magic_packet, parse_mac};
+    use super::{magic_packet, parse_mac, wol_ports};
+
+    #[test]
+    fn defaults_to_both_standard_ports() {
+        assert_eq!(wol_ports(None), vec![9, 7]);
+        assert_eq!(wol_ports(Some(9)), vec![9]);
+        assert_eq!(wol_ports(Some(12287)), vec![12287]);
+    }
 
     #[test]
     fn parses_mac_in_several_forms() {

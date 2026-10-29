@@ -133,7 +133,7 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
                  ? ""
                  : `<label class="field span-2"><span>API 키${info.key === "optional" ? " (필요한 서버만)" : ""}</span>
                     <select name="credentialId"><option value="">${info.key === "optional" ? "사용 안 함" : "선택하세요"}</option>${keyCreds()
-                      .map((c) => `<option value="${esc(c.id)}" ${c.id === p.credentialId ? "selected" : ""}>${esc(c.name)}</option>`)
+                      .map((c) => `<option value="${esc(c.id)}" data-i18n-skip ${c.id === p.credentialId ? "selected" : ""}>${esc(c.name)}</option>`)
                       .join("")}</select></label>
                     <label class="field span-2"><span>새 API 키 입력 (자격 증명 보관함에 저장)</span><input name="newKey" type="password" placeholder="sk-…" autocomplete="new-password" spellcheck="false" /></label>`
              }`

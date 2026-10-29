@@ -1009,6 +1009,8 @@ kbd.word {
   display: flex;
   align-items: center;
   gap: 4px;
+  /* Stay inside the pane so the toggles do not spill past a narrow split. */
+  max-width: calc(100% - 36px);
   padding: 4px 4px 4px 10px;
   background: var(--bg-2);
   border: 1px solid var(--line-2);
@@ -1017,11 +1019,65 @@ kbd.word {
   color: var(--muted);
 }
 .find-bar input {
-  width: 200px;
+  /* 200px by default, but shrink when the pane is narrow rather than overflow. */
+  flex: 0 1 200px;
+  min-width: 60px;
   border: 0;
   outline: 0;
   background: transparent;
   padding: 4px;
+}
+/* Buttons and the count keep their size; only the input gives up space. */
+.find-bar .tool,
+.find-bar .find-count {
+  flex: none;
+}
+.find-count {
+  min-width: 2.5em;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+/* Clipboard history picker: a list of earlier copies, each pickable or removable. */
+.clip-hist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 50vh;
+  overflow: auto;
+}
+.clip-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+.clip-item {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--term-bg);
+  color: inherit;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.clip-item:hover {
+  border-color: var(--line-2);
+}
+.clip-text {
+  display: block;
+  white-space: pre-wrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-height: 3.2em;
+}
+.clip-del {
+  flex: 0 0 auto;
+  align-self: center;
 }
 
 /* ---- files ----------------------------------------------------------------- */
@@ -3954,6 +4010,30 @@ code.fp {
   border-top: 1px solid var(--line);
   font-family: var(--mono);
   font-size: 11.5px;
+}
+/* A reasoning model's thinking: a dim, folded block above the answer. */
+.ai-reasoning {
+  margin-bottom: 6px;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--radius);
+  background: var(--term-bg);
+}
+.ai-reasoning summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.ai-reasoning-body {
+  max-height: 220px;
+  overflow: auto;
+  padding: 6px 10px;
+  border-top: 1px dashed var(--line-2);
+  color: var(--text-2);
+  font-size: 12px;
 }
 .ai-mode {
   gap: 4px;

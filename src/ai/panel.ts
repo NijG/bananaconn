@@ -313,6 +313,16 @@ function shortened(text: string): string {
   return (cut.split("```").length - 1) % 2 ? `${cut}\n\`\`\`` : cut;
 }
 
+/** A command's output trimmed for the model: a huge output (cat of a big file,
+ * dmesg, find /) would overflow the context window and cost — and it is re-sent
+ * on every agent step. The head and tail carry the command's start and its
+ * result or error; the middle is elided. The UI still keeps the full output. */
+function clampForAi(text: string, max = 24_000): string {
+  if (text.length <= max) return text;
+  const half = Math.floor(max / 2);
+  return `${text.slice(0, half)}\n…(${text.length - max} characters omitted)…\n${text.slice(-half)}`;
+}
+
 interface Turn {
   role: "user" | "assistant";
   /** As shown (real hosts). */
@@ -328,6 +338,11 @@ interface Turn {
   media?: Attached[];
   /** A note from the app to the AI, not shown. */
   nudge?: boolean;
+  /** A reasoning model's thinking: unmasked for display (`reasoning`) and as the
+   *  masked stream so far (`reasoningSent`). Shown live in a collapsed block and
+   *  kept out of the answer, the copy and the history sent back to the model. */
+  reasoning?: string;
+  reasoningSent?: string;
 }
 
 const RUN_STATUS: Record<NonNullable<Turn["run"]>["status"], string> = {
@@ -509,8 +524,16 @@ export class AiPanel {
         else this.host.focus();
       }
     });
-    this.el.querySelector<HTMLSelectElement>(".ai-provider")!.addEventListener("change", (e) => {
-      this.providerId = (e.target as HTMLSelectElement).value;
+    this.el.querySelector<HTMLSelectElement>(".ai-provider")!.addEventListener("change", async (e) => {
+      const sel = e.target as HTMLSelectElement;
+      // Switching service starts a fresh conversation (a local chat's unmasked
+      // hosts must not carry over to a cloud service). Confirm first so a misclick
+      // does not throw away the current chat.
+      if (this.turns.length && !(await confirmDialog({ title: "AI 서비스 바꾸기", message: "AI 서비스를 바꾸면 지금 대화를 정리하고 새 대화를 시작합니다. 계속할까요?", confirm: "바꾸기" }))) {
+        sel.value = this.providerId ?? sel.value; // keep the current service
+        return;
+      }
+      this.providerId = sel.value;
       this.newConversation();
     });
     this.el.querySelector<HTMLSelectElement>(".ai-session")!.addEventListener("change", (e) => {
@@ -824,6 +847,10 @@ export class AiPanel {
         ...fixed,
         shown: maskSecrets(fixed.shown),
         sent: maskSecrets(fixed.sent),
+        // Reasoning may echo secrets too; mask it like the answer, and drop the
+        // live-only stream accumulator so it never reaches localStorage.
+        ...(fixed.reasoning ? { reasoning: maskSecrets(fixed.reasoning) } : {}),
+        reasoningSent: undefined,
         // The command strings carry the same secrets as `shown` (mysql -p…,
         // net user … pw, curl -u a:pw): mask them too, not only the output.
         ...(fixed.run ? { run: { ...fixed.run, command: maskSecrets(fixed.run.command) } } : {}),
@@ -1098,13 +1125,19 @@ export class AiPanel {
           ${t.run.status === "approve" ? `<span class="ai-run-buttons"><button class="btn btn-sm btn-primary" data-run="yes">${icon("Play", 13)}${tr("실행")}</button><button class="btn btn-sm" data-run="no">${tr("건너뛰기")}</button></span>` : ""}
         </div>`
       : "";
-    const waiting = !t.shown && !t.error ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
     const ai = this.turns.indexOf(t);
+    // A reasoning model's thinking: a folded block, open while it is still the
+    // only thing we have, collapsed once the answer begins.
+    const thought = t.reasoning?.trim();
+    const reasoning = thought
+      ? `<details class="ai-reasoning" data-turn="${ai}"${body ? "" : " open"}><summary>${icon("Brain", 13)}<span class="muted">${tr("추론 과정")}</span></summary><div class="ai-reasoning-body" data-i18n-skip>${render(thought, false)}</div></details>`
+      : "";
+    const waiting = !t.shown && !t.error && !thought ? `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")}</div>` : "";
     const copyBtn = body ? `<button type="button" class="tool ai-msg-copy" data-copy-turn="${ai}" title="${tr("이 메시지 복사")}">${icon("Copy", 13)}</button>` : "";
     // Regenerate only the latest answer (re-running a middle one would throw away
     // everything the conversation did afterwards).
     const regen = !this.busy && ai === this.turns.length - 1 && (body || t.error) ? `<button type="button" class="tool ai-msg-regen" data-regen title="${tr("이 답변 다시 생성")}">${icon("RefreshCw", 13)}</button>` : "";
-    return `<div class="ai-msg assistant" data-turn="${ai}">${regen}${copyBtn}${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
+    return `<div class="ai-msg assistant" data-turn="${ai}">${regen}${copyBtn}${reasoning}${body ? render(body, true, this.host.insertTitle) : waiting}${run}${t.error ? `<div class="ai-error">${esc(tr(t.error))}</div>` : ""}</div>`;
   }
 
   /** Start a conversation that explains `text` (a selection, or the screen). */
@@ -1212,6 +1245,7 @@ export class AiPanel {
           // of this message, not again on every agent step that re-sends history.
           .map((t) => ({ role: t.role, content: t.sent, ...(step === 0 && t.media?.some((a) => a.data) ? { attachments: t.media.filter((a) => a.data).map((a) => ({ mime: a.mime!, data: a.data!, name: a.name })) } : {}) }));
         let frame = 0;
+        let rframe = 0;
         this.asking = ask(
           p,
           system,
@@ -1228,6 +1262,17 @@ export class AiPanel {
               });
           },
           (u) => this.addUsage(u),
+          // Reasoning-model thinking: shown live in a folded block, batched per
+          // frame like the answer, and kept out of the answer itself.
+          (sofar) => {
+            answer.reasoningSent = sofar;
+            if (!rframe)
+              rframe = requestAnimationFrame(() => {
+                rframe = 0;
+                answer.reasoning = masker.unmask(answer.reasoningSent ?? "");
+                this.updateTurn(answer);
+              });
+          },
         );
         this.draw();
         try {
@@ -1238,9 +1283,11 @@ export class AiPanel {
         } finally {
           this.asking = null;
           cancelAnimationFrame(frame);
+          cancelAnimationFrame(rframe);
           // The per-frame unmask may not have run for the last delta (or at all
           // for a short answer): bring `shown` fully up to date before it is read.
           answer.shown = masker.unmask(answer.sent);
+          if (answer.reasoningSent) answer.reasoning = masker.unmask(answer.reasoningSent);
         }
         if (myRun !== this.runSeq) return;
         const command = agent && !answer.error && !this.stopped ? runRequest(answer.shown) : null;
@@ -1278,7 +1325,7 @@ export class AiPanel {
             const r = await this.host.run(command, `AI · ${verdict.reason}`);
             answer.run.status = "done";
             output = { command, text: r.output, timedOut: r.timedOut };
-            result = `Output of \`${command}\`${r.timedOut ? " (it did not finish within 30 s and was stopped with Ctrl+C)" : ""}:\n\`\`\`\n${r.output || "(no output)"}\n\`\`\``;
+            result = `Output of \`${command}\`${r.timedOut ? " (it did not finish within 30 s and was stopped with Ctrl+C)" : ""}:\n\`\`\`\n${clampForAi(r.output) || "(no output)"}\n\`\`\``;
           } catch (err) {
             answer.run.status = "failed";
             result = `The command could not run: ${errorText(err)}`;

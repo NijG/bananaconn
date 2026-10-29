@@ -57,7 +57,7 @@ export function openVault(): Promise<void> {
             .map(
               (c) => `<button class="vault-item${c.id === selected && !draft ? " on" : ""}" data-id="${c.id}">
                 ${icon(c.kind === "key" ? "Key" : "Lock", 15)}
-                <span><b>${esc(c.name)}</b><small>${c.kind === "key" ? "SSH 키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}</small></span>
+                <span><b data-i18n-skip>${esc(c.name)}</b><small>${c.kind === "key" ? "SSH 키" : "비밀번호"}${c.username ? `<span data-i18n-skip> · ${esc(c.username)}</span>` : ""}</small></span>
               </button>`,
             )
             .join("")
@@ -101,6 +101,8 @@ export function openVault(): Promise<void> {
               : `<label class="field"><span>비밀번호 ${c.hasSecret ? '<em class="ok">저장됨</em>' : ""}</span>
                    <div class="inline">
                      <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "비밀번호"}" />
+                     <button type="button" class="icon-btn" data-reveal title="비밀번호 보기/숨기기">${icon("Eye", 14)}</button>
+                     <select name="pwlen" title="비밀번호 길이">${[12, 16, 20, 24, 32].map((n) => `<option value="${n}"${n === 20 ? " selected" : ""}>${n}</option>`).join("")}</select>
                      <button type="button" class="btn" data-genpass title="강력한 비밀번호를 만들어 넣고 복사합니다">${icon("Sparkles", 14)}생성</button>
                    </div></label>`
           }
@@ -144,11 +146,22 @@ export function openVault(): Promise<void> {
         writeClipboard(detailEl.querySelector(".pubkey code")!.textContent ?? "");
         toast("공개 키를 복사했습니다", "success");
       });
+      form.querySelector("[data-reveal]")?.addEventListener("click", (e) => {
+        const el = field("secret")!;
+        const reveal = el.type === "password";
+        el.type = reveal ? "text" : "password";
+        // Eye = hidden (click to show), EyeOff = shown (click to hide).
+        (e.currentTarget as HTMLElement).innerHTML = icon(reveal ? "EyeOff" : "Eye", 14);
+      });
       form.querySelector("[data-genpass]")?.addEventListener("click", () => {
-        const pw = generatePassword();
+        const len = Math.max(8, Math.min(64, Number(form.querySelector<HTMLSelectElement>("[name=pwlen]")?.value) || 20));
+        const pw = generatePassword(len);
         const el = field("secret")!;
         el.type = "text"; // show it so it can be checked before saving
         el.value = pw;
+        // Keep the reveal toggle's icon in step with the now-visible field.
+        const reveal = form.querySelector("[data-reveal]");
+        if (reveal) reveal.innerHTML = icon("EyeOff", 14);
         writeClipboard(pw);
         toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000);
       });

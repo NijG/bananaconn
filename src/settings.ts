@@ -216,7 +216,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
           <input name="updateFolder" value="${esc(s.updateFolder)}" spellcheck="false" autocomplete="off" placeholder="\\\\서버\\공유\\BananaConn"/></label>
         <label class="field"><span>NAS 계정 (공유 폴더가 Windows 계정을 받아 주지 않을 때 이 계정으로 로그인)</span><select name="updateCredentialId">
             <option value="">사용 안 함 (Windows 계정·저장된 자격 증명)</option>
-            ${passwords.map((c) => `<option value="${esc(c.id)}" title="${esc(c.username)}" ${c.id === s.updateCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
+            ${passwords.map((c) => `<option value="${esc(c.id)}" data-i18n-skip title="${esc(c.username)}" ${c.id === s.updateCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
           </select>${passwords.length ? "" : `<small class="muted">자격 증명 보관함에 NAS 계정(비밀번호 방식)을 먼저 추가하세요.</small>`}</label>
         ${check("autoUpdate", "새 버전 자동 확인 (시작할 때와 30분마다)", `새 버전이 있으면 설치할지 묻고, 상태 표시줄에도 업데이트 버튼이 나타납니다. 서명이 맞는 공식 빌드만 설치합니다.`)}
         <div class="row"><button type="button" class="btn" data-update-check>${icon("RefreshCw", 14)}지금 확인</button></div>

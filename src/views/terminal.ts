@@ -301,6 +301,9 @@ export class TerminalView implements View {
        <div class="find-bar" hidden>
          ${icon("Search", 14)}
          <input placeholder="터미널에서 찾기" spellcheck="false" />
+         <span class="find-count" data-i18n-skip></span>
+         <button class="tool find-case" data-find="case" title="대소문자 구분">Aa</button>
+         <button class="tool find-regex" data-find="regex" title="정규식">.*</button>
          <button class="tool" data-find="prev" title="이전">${icon("ArrowUp", 14)}</button>
          <button class="tool" data-find="next" title="다음">${icon("ArrowUp", 14, "flip")}</button>
          <button class="tool" data-find="close" title="닫기">${icon("X", 14)}</button>
@@ -1386,6 +1389,9 @@ export class TerminalView implements View {
     this.closing = false;
     this.startupSent = false;
     this.triggerBuf = "";
+    // A new TextDecoder so a partial multibyte character left over from a dropped
+    // connection does not corrupt the first trigger line of this one.
+    this.decoder = new TextDecoder();
     // Reuse the OS detected on an earlier connection (no re-sniff, no re-detect).
     this.osGuess = String(this.session.options.osKind ?? "") || undefined;
     this.osSniff = "";
@@ -1462,13 +1468,17 @@ export class TerminalView implements View {
     }
   }
 
-  async reconnect() {
-    // A reconnect the user asked for: suppress the dropped-connection
-    // auto-reconnect for the old connection, and allow it again afterwards.
+  async reconnect(userInitiated = true) {
+    // Suppress the dropped-connection auto-reconnect for the old connection and
+    // clear any countdown. A reconnect the user asked for also starts the backoff
+    // over and clears an earlier "stop reconnecting" choice; an automatic retry
+    // must keep the backoff count so the wait grows while the server stays down.
     this.closing = true;
     this.stopAutoReconnect();
-    this.reDeclined = false;
-    this.reAttempts = 0;
+    if (userInitiated) {
+      this.reDeclined = false;
+      this.reAttempts = 0;
+    }
     this.stopPortWait();
     this.portWaitDeclined = false;
     this.stopPaste(true);
@@ -1572,6 +1582,12 @@ export class TerminalView implements View {
   }
 
   private decoder = new TextDecoder();
+  /** Trigger patterns compiled once and cached by source, so a busy stream does
+   *  not rebuild the same regex for every output line. null = malformed pattern. */
+  private triggerRe = new Map<string, RegExp | null>();
+  /** When each "send" trigger last auto-sent, to rate-limit it and stop a rule
+   *  that matches its own echo from looping. Keyed by pattern. */
+  private sendTriggerAt = new Map<string, number>();
   /** React to server output: arm the "done" notification, and match trigger
    * rules line by line. Only decodes when one of those is actually in use. */
   private onOutput(bytes: Uint8Array) {
@@ -1614,13 +1630,16 @@ export class TerminalView implements View {
       if (!line) continue;
       for (const rule of rules) {
         if (!rule.enabled || !rule.pattern) continue;
-        let re: RegExp;
-        try {
-          re = new RegExp(rule.pattern);
-        } catch {
-          continue; // a malformed pattern never matches
+        let re = this.triggerRe.get(rule.pattern);
+        if (re === undefined) {
+          try {
+            re = new RegExp(rule.pattern);
+          } catch {
+            re = null; // a malformed pattern never matches
+          }
+          this.triggerRe.set(rule.pattern, re);
         }
-        if (!re.test(line)) continue;
+        if (!re || !re.test(line)) continue;
         this.fireTrigger(rule, line);
       }
     }
@@ -1629,7 +1648,15 @@ export class TerminalView implements View {
   private fireTrigger(rule: TriggerRule, line: string) {
     if (rule.action === "alert") toast(`${this.title()}: ${line.trim().slice(0, 200)}`, "warn", 6000);
     else if (rule.action === "beep") beep();
-    else if (rule.action === "send" && rule.value && this.state === "connected") this.sendInput(rule.value.replace(/\\n/g, "\r").replace(/\\t/g, "\t"));
+    else if (rule.action === "send" && rule.value && this.state === "connected") {
+      // A send writes to the terminal; its echo and the server's reply can match
+      // the same rule again, so an unguarded "send" rule can loop and flood the
+      // server. Let one rule auto-send at most once a second to break the loop.
+      const now = Date.now();
+      if (now - (this.sendTriggerAt.get(rule.pattern) ?? 0) < 1000) return;
+      this.sendTriggerAt.set(rule.pattern, now);
+      this.sendInput(rule.value.replace(/\\n/g, "\r").replace(/\\t/g, "\t"));
+    }
   }
 
   /** Toggle "notify when the task finishes" for this tab. */
@@ -1697,7 +1724,9 @@ export class TerminalView implements View {
       if (!this.reTimer || this.disposed || rid !== this.runtimeId) return;
       if (--left <= 0) {
         this.stopAutoReconnect();
-        if (!this.disposed && rid === this.runtimeId) this.reconnect();
+        // Keep the backoff count (userInitiated = false) so a server that stays
+        // down is retried after 2, 4, 8, 15, then 30s, not every 2s.
+        if (!this.disposed && rid === this.runtimeId) this.reconnect(false);
         return;
       }
       show();
@@ -1886,8 +1915,15 @@ export class TerminalView implements View {
       }
     });
     const input = this.findBar.querySelector("input")!;
+    const count = this.findBar.querySelector<HTMLElement>(".find-count")!;
+    // Show how many matches there are and which one is active ("3/12").
+    this.search.onDidChangeResults(({ resultIndex, resultCount }) => {
+      count.textContent = resultCount === 0 ? (input.value ? tr("결과 없음") : "") : `${resultIndex >= 0 ? resultIndex + 1 : "–"}/${resultCount}`;
+    });
+    const caseBtn = this.findBar.querySelector<HTMLElement>('[data-find="case"]')!;
+    const regexBtn = this.findBar.querySelector<HTMLElement>('[data-find="regex"]')!;
     const find = (dir: "next" | "prev") => {
-      const opts = { decorations: { matchOverviewRuler: "#f5c518", activeMatchColorOverviewRuler: "#f5c518", activeMatchBackground: "#f5c51866", matchBackground: "#f5c51833" } };
+      const opts = { caseSensitive: caseBtn.classList.contains("on"), regex: regexBtn.classList.contains("on"), decorations: { matchOverviewRuler: "#f5c518", activeMatchColorOverviewRuler: "#f5c518", activeMatchBackground: "#f5c51866", matchBackground: "#f5c51833" } };
       if (dir === "next") this.search.findNext(input.value, opts);
       else this.search.findPrevious(input.value, opts);
     };
@@ -1899,7 +1935,10 @@ export class TerminalView implements View {
     this.findBar.addEventListener("click", (e) => {
       const f = (e.target as HTMLElement).closest<HTMLElement>("[data-find]")?.dataset.find;
       if (f === "close") this.toggleFind(false);
-      else if (f === "next" || f === "prev") find(f);
+      else if (f === "case" || f === "regex") {
+        (f === "case" ? caseBtn : regexBtn).classList.toggle("on");
+        find("next"); // re-run with the new case/regex setting
+      } else if (f === "next" || f === "prev") find(f);
     });
   }
 
@@ -1910,8 +1949,12 @@ export class TerminalView implements View {
       if (this.term.hasSelection()) input.value = this.term.getSelection();
       input.focus();
       input.select();
+      // Highlight matches at once when opening on a selection or a kept query,
+      // instead of waiting for the next keystroke.
+      if (input.value) input.dispatchEvent(new Event("input"));
     } else {
       this.search.clearDecorations();
+      this.findBar.querySelector<HTMLElement>(".find-count")!.textContent = "";
       this.term.focus();
     }
     this.layout();

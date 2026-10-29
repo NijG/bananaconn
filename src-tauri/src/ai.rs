@@ -127,9 +127,13 @@ fn openai_content(m: &Message) -> Value {
 }
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct Chunk {
     id: String,
     text: String,
+    /// The model thinking out loud, not the answer itself: shown live but kept
+    /// out of the saved answer.
+    reasoning: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -269,46 +273,47 @@ impl Lines {
     }
 }
 
-/// The text a streamed event adds, for each wire format.
-fn delta(kind: &str, event: &Value) -> Result<Option<String>, String> {
+/// The text a streamed event adds, for each wire format, and whether it is the
+/// model's reasoning (thinking out loud) rather than the answer. Reasoning is
+/// shown live so the panel is not blank, but kept out of the saved answer.
+fn delta(kind: &str, event: &Value) -> Result<Option<(String, bool)>, String> {
     if let Some(e) = event.get("error").filter(|e| !e.is_null()) {
         return Err(e["message"].as_str().or_else(|| e.as_str()).unwrap_or("알 수 없는 오류").to_string());
     }
+    let answer = |s: &str| (!s.is_empty()).then(|| (s.to_string(), false));
+    let reasoning = |s: &str| (!s.is_empty()).then(|| (s.to_string(), true));
     Ok(match kind {
-        "anthropic" => (event["type"] == "content_block_delta").then(|| event["delta"]["text"].as_str().map(str::to_string)).flatten(),
+        "anthropic" => (event["type"] == "content_block_delta")
+            .then(|| event["delta"]["text"].as_str().and_then(answer))
+            .flatten(),
         "gemini" => {
             let parts = event["candidates"][0]["content"]["parts"].as_array();
-            parts.map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect::<String>()).filter(|s| !s.is_empty())
+            parts.map(|p| p.iter().filter_map(|x| x["text"].as_str()).collect::<String>()).and_then(|s| answer(&s))
         }
         // Reasoning models stream their reasoning in `thinking` with `content`
-        // empty until the end; show that too, so the panel is not blank while the
-        // model thinks (and the answer still follows in `content`).
+        // empty until the end; surface that as reasoning so the panel is not
+        // blank while the model thinks (the answer still follows in `content`).
         "ollama" => {
             let m = &event["message"];
-            m["content"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| m["thinking"].as_str().filter(|s| !s.is_empty()))
-                .map(str::to_string)
+            m["content"].as_str().and_then(answer).or_else(|| m["thinking"].as_str().and_then(reasoning))
         }
         // OpenAI and compatible servers. Some reasoning models (and proxies)
-        // stream the answer under `reasoning_content` or `reasoning` until the
-        // final `content`; show it so the panel is not blank meanwhile.
+        // stream the thinking under `reasoning_content` or `reasoning` before the
+        // final `content`; surface it as reasoning so the panel is not blank.
         _ => {
             let d = &event["choices"][0]["delta"];
             d["content"]
                 .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| d["reasoning_content"].as_str().filter(|s| !s.is_empty()))
-                .or_else(|| d["reasoning"].as_str().filter(|s| !s.is_empty()))
-                .map(str::to_string)
+                .and_then(answer)
+                .or_else(|| d["reasoning_content"].as_str().and_then(reasoning))
+                .or_else(|| d["reasoning"].as_str().and_then(reasoning))
         }
     })
 }
 
 /// One chat over HTTP, streamed. `on_text` gets each piece; false stops. Returns
 /// the token usage the provider reported (zero when it reports none).
-fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String> {
+fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_text: &mut dyn FnMut(&str, bool) -> bool) -> Result<Usage, String> {
     if p.model.trim().is_empty() {
         return Err("모델을 지정하세요 (설정 → AI)".into());
     }
@@ -395,7 +400,7 @@ fn chat_http(key: String, p: &Provider, system: &str, messages: &[Message], on_t
                     Ok(v) => {
                         update_usage(&kind, &v, &mut usage);
                         match delta(&kind, &v) {
-                            Ok(Some(t)) => go = on_text(&t),
+                            Ok(Some((t, reasoning))) => go = on_text(&t, reasoning),
                             Ok(None) => {}
                             Err(e) => failure = Some(e),
                         }
@@ -647,12 +652,12 @@ const CLI_LIMIT: Duration = Duration::from_secs(600);
 /// One answer from a subscription CLI. It runs in an empty folder of its own;
 /// Claude Code gets no tools at all (nothing it says can run or read
 /// anything), Codex a read-only sandbox.
-fn chat_cli(p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+fn chat_cli(p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str, bool) -> bool) -> Result<(), String> {
     let path = find_cli(&p.cli).ok_or_else(|| format!("{} CLI를 찾을 수 없습니다. 설치하고 로그인한 뒤 다시 시도하세요", p.cli))?;
     chat_cli_at(&path, p, system, messages, cancelled, on_text)
 }
 
-fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[Message], cancelled: &(dyn Fn() -> bool + Sync), on_text: &mut dyn FnMut(&str, bool) -> bool) -> Result<(), String> {
     let name = p.cli.as_str();
     let dir = std::env::temp_dir().join("BananaConn").join(format!("ai-{}-{}", std::process::id(), crate::wsutil::random_token()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -777,7 +782,7 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
                     end_run(job.as_ref(), pid);
                     break;
                 }
-                if !on_text(&format!("{line}\n")) {
+                if !on_text(&format!("{line}\n"), false) {
                     end_run(job.as_ref(), pid);
                     break;
                 }
@@ -789,7 +794,7 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
                 Some("stream_event") if v["event"]["type"] == "content_block_delta" => {
                     if let Some(t) = v["event"]["delta"]["text"].as_str() {
                         streamed = true;
-                        if !on_text(t) {
+                        if !on_text(t, false) {
                             end_run(job.as_ref(), pid);
                             break;
                         }
@@ -824,7 +829,7 @@ fn chat_cli_at(path: &std::path::Path, p: &Provider, system: &str, messages: &[M
     }
     // Partial messages off (older CLI): the whole answer comes in the result.
     if let (true, false, Some(r)) = (stream_json, streamed, result) {
-        on_text(&r);
+        on_text(&r, false);
         return Ok(());
     }
     if !status.success() && !cancelled() {
@@ -897,11 +902,11 @@ pub fn ai_chat(app: AppHandle, state: State<'_, AiState>, id: String, provider: 
     running.lock().unwrap().insert(id.clone());
     std::thread::spawn(move || {
         let is_cancelled = || cancelled.lock().unwrap().contains(&id);
-        let mut emit = |text: &str| {
+        let mut emit = |text: &str, reasoning: bool| {
             if is_cancelled() {
                 return false;
             }
-            let _ = app.emit("ai-stream", Chunk { id: id.clone(), text: text.to_string() });
+            let _ = app.emit("ai-stream", Chunk { id: id.clone(), text: text.to_string(), reasoning });
             true
         };
         // CLIs stream only text (no token counts); HTTP providers report usage.
@@ -1002,15 +1007,15 @@ mod tests {
     #[test]
     fn reads_each_stream_format() {
         let a: Value = serde_json::from_str(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#).unwrap();
-        assert_eq!(delta("anthropic", &a).unwrap().as_deref(), Some("Hel"));
+        assert_eq!(delta("anthropic", &a).unwrap(), Some(("Hel".to_string(), false)));
         let start: Value = serde_json::from_str(r#"{"type":"message_start","message":{}}"#).unwrap();
         assert_eq!(delta("anthropic", &start).unwrap(), None);
         let o: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":"lo"}}]}"#).unwrap();
-        assert_eq!(delta("openai", &o).unwrap().as_deref(), Some("lo"));
+        assert_eq!(delta("openai", &o).unwrap(), Some(("lo".to_string(), false)));
         let g: Value = serde_json::from_str(r#"{"candidates":[{"content":{"parts":[{"text":"a"},{"text":"b"}]}}]}"#).unwrap();
-        assert_eq!(delta("gemini", &g).unwrap().as_deref(), Some("ab"));
+        assert_eq!(delta("gemini", &g).unwrap(), Some(("ab".to_string(), false)));
         let l: Value = serde_json::from_str(r#"{"message":{"role":"assistant","content":"x"},"done":false}"#).unwrap();
-        assert_eq!(delta("ollama", &l).unwrap().as_deref(), Some("x"));
+        assert_eq!(delta("ollama", &l).unwrap(), Some(("x".to_string(), false)));
         let e: Value = serde_json::from_str(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#).unwrap();
         assert_eq!(delta("anthropic", &e).unwrap_err(), "Overloaded");
         let oe: Value = serde_json::from_str(r#"{"error":"model 'x' not found"}"#).unwrap();
@@ -1018,11 +1023,13 @@ mod tests {
         // Reasoning models: thinking (Ollama) / reasoning_content (OpenAI-compatible)
         // show while content is still empty, and content wins once it arrives.
         let lt: Value = serde_json::from_str(r#"{"message":{"role":"assistant","content":"","thinking":"hmm"},"done":false}"#).unwrap();
-        assert_eq!(delta("ollama", &lt).unwrap().as_deref(), Some("hmm"));
+        assert_eq!(delta("ollama", &lt).unwrap(), Some(("hmm".to_string(), true)));
         let lc: Value = serde_json::from_str(r#"{"message":{"content":"answer","thinking":"hmm"}}"#).unwrap();
-        assert_eq!(delta("ollama", &lc).unwrap().as_deref(), Some("answer"));
+        assert_eq!(delta("ollama", &lc).unwrap(), Some(("answer".to_string(), false)));
         let orc: Value = serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"why"}}]}"#).unwrap();
-        assert_eq!(delta("compatible", &orc).unwrap().as_deref(), Some("why"));
+        assert_eq!(delta("compatible", &orc).unwrap(), Some(("why".to_string(), true)));
+        let oc: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi","reasoning_content":"why"}}]}"#).unwrap();
+        assert_eq!(delta("compatible", &oc).unwrap(), Some(("hi".to_string(), false)));
     }
 
     #[test]
@@ -1084,7 +1091,7 @@ mod tests {
     fn ask(kind: &str, url: &str, key: &str) -> (Result<(), String>, String) {
         let p = Provider { kind: kind.into(), base_url: url.into(), model: "m-1".into(), credential_id: None, cli: String::new() };
         let mut out = String::new();
-        let r = chat_http(key.into(), &p, "SYS", &[Message { role: "user".into(), content: "Q".into(), attachments: vec![] }], &mut |t| {
+        let r = chat_http(key.into(), &p, "SYS", &[Message { role: "user".into(), content: "Q".into(), attachments: vec![] }], &mut |t, _| {
             out.push_str(t);
             true
         })
@@ -1148,7 +1155,7 @@ mod tests {
     fn images_reach_every_api_in_its_format() {
         let ask_with = |kind: &str, url: &str| {
             let p = Provider { kind: kind.into(), base_url: url.into(), model: "m".into(), credential_id: None, cli: String::new() };
-            chat_http("k".into(), &p, "S", &[with_image("what is on screen?")], &mut |_| true)
+            chat_http("k".into(), &p, "S", &[with_image("what is on screen?")], &mut |_, _| true)
         };
         let (url, h) = fake_api("200 OK", "text/event-stream", vec!["data: {\"type\":\"message_stop\"}\n\n".into()]);
         ask_with("anthropic", &url).unwrap();
@@ -1190,7 +1197,7 @@ mod tests {
         std::fs::write(&claude, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\nmore > \"{log}.stdin\"\r\necho {{\"type\":\"result\",\"is_error\":false,\"result\":\"a dialog\"}}\r\n", log = log.display())).unwrap();
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "claude".into() };
         let mut out = String::new();
-        let r = chat_cli_at(&claude, &p, "S", &[with_image("what is this?")], &|| false, &mut |t| {
+        let r = chat_cli_at(&claude, &p, "S", &[with_image("what is this?")], &|| false, &mut |t, _| {
             out.push_str(t);
             true
         });
@@ -1206,7 +1213,7 @@ mod tests {
         // The fake copies the image it was given, to show the file existed during the run.
         std::fs::write(&codex, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\ncopy /y \"%CD%\\image-0.png\" \"{dir}\\seen.png\" >nul\r\nmore > nul\r\necho ok\r\n", log = log.display(), dir = dir.display())).unwrap();
         let p = Provider { cli: "codex".into(), ..p };
-        let r = chat_cli_at(&codex, &p, "S", &[with_image("what is this?")], &|| false, &mut |_| true);
+        let r = chat_cli_at(&codex, &p, "S", &[with_image("what is this?")], &|| false, &mut |_, _| true);
         let args = std::fs::read_to_string(&log).unwrap_or_default();
         let seen = std::fs::read(dir.join("seen.png")).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1250,7 +1257,7 @@ mod tests {
         .unwrap();
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: "sonnet".into(), credential_id: None, cli: "claude".into() };
         let mut out = String::new();
-        let r = chat_cli_at(&script, &p, "SYSTEM RULES", &[Message { role: "user".into(), content: "list files".into(), attachments: vec![] }], &|| false, &mut |t| {
+        let r = chat_cli_at(&script, &p, "SYSTEM RULES", &[Message { role: "user".into(), content: "list files".into(), attachments: vec![] }], &|| false, &mut |t, _| {
             out.push_str(t);
             true
         });
@@ -1297,7 +1304,7 @@ mod tests {
         std::fs::write(&script, format!("@echo off\r\n> \"{log}\" echo ARGS %*\r\nmore > \"{log}.stdin\"\r\necho uptime\r\n", log = log.display())).unwrap();
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "codex".into() };
         let mut out = String::new();
-        let r = chat_cli_at(&script, &p, "SYS", &[Message { role: "user".into(), content: "load?".into(), attachments: vec![] }], &|| false, &mut |t| {
+        let r = chat_cli_at(&script, &p, "SYS", &[Message { role: "user".into(), content: "load?".into(), attachments: vec![] }], &|| false, &mut |t, _| {
             out.push_str(t);
             true
         });
@@ -1324,7 +1331,7 @@ mod tests {
         let p = Provider { kind: "cli".into(), base_url: String::new(), model: String::new(), credential_id: None, cli: "codex".into() };
         let start = Instant::now();
         let cancel = move || start.elapsed() > Duration::from_millis(1500);
-        let r = chat_cli_at(&script, &p, "S", &[Message { role: "user".into(), content: "q".into(), attachments: vec![] }], &cancel, &mut |_| true);
+        let r = chat_cli_at(&script, &p, "S", &[Message { role: "user".into(), content: "q".into(), attachments: vec![] }], &cancel, &mut |_, _| true);
         let took = start.elapsed();
         let cwd = std::fs::read_to_string(&log).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);

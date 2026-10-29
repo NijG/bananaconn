@@ -28,7 +28,9 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
   // Wake-on-LAN: the PC's network card MAC, so it can be powered on before connecting.
   const wol = () =>
     `<label class="field"><span>Wake-on-LAN MAC 주소 (선택) — 꺼진 PC를 켠 뒤 접속</span>
-      <input name="opt.wolMac" value="${esc(o.wolMac ?? "")}" placeholder="AA:BB:CC:DD:EE:FF" spellcheck="false" autocomplete="off"/></label>`;
+      <input name="opt.wolMac" value="${esc(o.wolMac ?? "")}" placeholder="AA:BB:CC:DD:EE:FF" spellcheck="false" autocomplete="off"/></label>
+    <label class="field"><span>브로드캐스트 주소 (선택, 다른 서브넷이면 지정)</span>
+      <input name="opt.wolBroadcast" value="${esc(o.wolBroadcast ?? "")}" placeholder="192.168.1.255" spellcheck="false" autocomplete="off"/></label>`;
   switch (p) {
     case "ssh":
       return `${keyModeField(o.keyMode, o.backspace)}<div class="grid-2">
@@ -266,7 +268,7 @@ export function editSession(
             <div class="inline">
               <select name="credentialId">
                 <option value="">사용 안 함 (접속할 때 입력)</option>
-                ${creds.map((c) => `<option value="${c.id}" title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
+                ${creds.map((c) => `<option value="${c.id}" data-i18n-skip title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
               </select>
               <button type="button" class="btn" data-vault>${icon("KeyRound", 14)}관리</button>
             </div></label>`

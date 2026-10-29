@@ -1,8 +1,9 @@
 // Network tools dialog: ping, TCP port check and DNS lookup (backend: nettools.rs).
 
 import { api } from "./api";
+import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
-import { errorText, esc, modal } from "./ui";
+import { errorText, esc, modal, toast } from "./ui";
 
 type Tool = "ping" | "ports" | "dns";
 
@@ -46,7 +47,7 @@ export function openNetworkTools(initialHost = "") {
         </form>
         <div class="nettools-out" role="log"><p class="muted">결과가 여기에 표시됩니다.</p></div>
       </div>`,
-    footer: `<button class="btn" data-close>닫기</button>`,
+    footer: `<button class="btn" data-close>닫기</button><button class="btn" data-copy-result hidden>${icon("Copy", 14)}결과 복사</button>`,
     onClose: () => void stopPing(),
   });
   const form = m.root.querySelector<HTMLFormElement>(".nettools-form")!;
@@ -54,6 +55,13 @@ export function openNetworkTools(initialHost = "") {
   const extra = form.querySelector<HTMLInputElement>("[name=extra]")!;
   const out = m.root.querySelector<HTMLElement>(".nettools-out")!;
   const run = m.root.querySelector<HTMLButtonElement>("[data-run]")!;
+  const copyBtn = m.root.querySelector<HTMLButtonElement>("[data-copy-result]")!;
+  copyBtn.addEventListener("click", () => {
+    const text = out.innerText.trim();
+    if (!text) return;
+    void writeClipboard(text);
+    toast("결과를 복사했습니다", "success", 1500);
+  });
 
   const setTool = (t: Tool) => {
     tool = t;
@@ -81,6 +89,7 @@ export function openNetworkTools(initialHost = "") {
     const target = host.value.trim();
     if (!target) return void host.focus();
     busy = true;
+    copyBtn.hidden = true;
     const label = run.innerHTML;
     if (tool === "ping") run.innerHTML = `${icon("Square", 14)}중지`;
     else run.disabled = true;
@@ -96,7 +105,8 @@ export function openNetworkTools(initialHost = "") {
         const ports = parsePorts(extra.value);
         if (!ports) throw new Error("포트 형식: 22, 80, 8000-8010 (1~65535, 한 번에 64개까지)");
         const res = await api.netPorts(target, ports);
-        out.innerHTML = `<table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th></tr></thead><tbody>${res
+        const openCount = res.filter((r) => r.open).length;
+        out.innerHTML = `<p class="muted small">${esc(`${res.length}개 중 ${openCount}개 열림`)}</p><table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th></tr></thead><tbody>${res
           .map(
             (r) => `<tr class="${r.open ? "open" : "closed"}"><td class="mono">${r.port}</td>
               <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td></tr>`,
@@ -116,6 +126,9 @@ export function openNetworkTools(initialHost = "") {
       pingId = null;
       run.innerHTML = label;
       run.disabled = false;
+      // Offer "copy result" only when there is an actual result, not a spinner,
+      // an error or the "cancelled" note.
+      copyBtn.hidden = !out.querySelector("pre, table.nettools-table, ul.nettools-list");
     }
   });
   setTool("ping");
