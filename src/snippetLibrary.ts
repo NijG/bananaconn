@@ -85,6 +85,9 @@ const GROUPS: [group: string, entries: Entry[]][] = [
       ["win-ip", "IP 설정", "ipconfig /all"],
       ["win-ports", "열린 포트·연결", "netstat -ano"],
       ["win-tasks", "실행 중인 프로세스", "tasklist"],
+      ["win-topcpu", "CPU 상위 프로세스", "powershell -NoProfile -Command \"Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,Id,CPU,WS\""],
+      ["win-mem", "메모리 사용량", "powershell -NoProfile -Command \"Get-CimInstance Win32_OperatingSystem | Select-Object @{N='FreeGB';E={[math]::Round($_.FreePhysicalMemory/1MB,1)}},@{N='TotalGB';E={[math]::Round($_.TotalVisibleMemorySize/1MB,1)}}\""],
+      ["win-uptime", "가동 시간", "powershell -NoProfile -Command \"(Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime\""],
       ["win-route", "라우팅 테이블", "route print"],
       ["win-disk", "디스크 여유 공간 (PowerShell)", "powershell -NoProfile -Command \"Get-PSDrive -PSProvider FileSystem\""],
       ["win-services", "실행 중인 서비스 (PowerShell)", "powershell -NoProfile -Command \"Get-Service | Where-Object Status -eq Running\""],
@@ -213,4 +216,4 @@ export function groupForKind(kind: string | undefined): string | undefined {
 }
 
 /** Version of the library above; raise it when entries are added (store.ts adds the new ones once). */
-export const SNIPPET_LIBRARY_VERSION = 1;
+export const SNIPPET_LIBRARY_VERSION = 2;

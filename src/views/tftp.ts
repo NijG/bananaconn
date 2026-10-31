@@ -42,7 +42,7 @@ export class TftpView implements View {
       { class: "view tftp-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
-         <span class="view-endpoint">${esc(endpoint(session))}</span>
+         <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state>연결 없이 파일 단위로 주고받음</span>
        </div>
        <div class="tftp-body">

@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Với cổng nối tiếp, nhập <code>COM3</code> hoặc <code>COM3:115200</code>.</li>
       </ol>
       <h4>Lưu thành phiên</h4>
-      <p>Lưu thông tin kết nối bằng nút ${icon("Plus", 13)} trong danh sách phiên (${kbd("Ctrl+Shift+N")}), sau đó kết nối bằng cách nhấp đúp hoặc nhấn ${kbd("Enter")}. Các kết nối đã lưu trong chương trình khác có thể chuyển sang một lần bằng <a data-goto="import">Nhập</a>.</p>
+      <p>Lưu thông tin kết nối bằng nút ${icon("Plus", 13)} trong danh sách phiên (${kbd("Ctrl+Shift+N")}), sau đó kết nối bằng cách nhấp đúp hoặc nhấn ${kbd("Enter")}. Các kết nối đã lưu trong chương trình khác có thể chuyển sang một lần bằng <a data-goto="import">Nhập</a>. Trong trình sửa phiên, <b>Kiểm tra kết nối</b> cho biết cổng của máy chủ có mở không trước khi lưu. Phiên đã lưu có thể kiểm tra từ menu chuột phải; nhiều phiên hoặc cả thư mục thì chọn chúng hoặc nhấp chuột phải vào thư mục để kiểm tra một lần.</p>
       <h4>Ngôn ngữ giao diện</h4>
       <p><b>Ngôn ngữ</b> ở đầu Cài đặt chuyển giao diện sang 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français hoặc Deutsch (ngay lập tức, không ngắt kết nối; hướng dẫn và ghi chú cập nhật cũng đổi theo). Cho đến khi bạn chọn, ứng dụng theo ngôn ngữ hiển thị của Windows; khi đã chọn, lựa chọn của bạn luôn được ưu tiên.</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>Đọc trực tiếp cài đặt trên PC này</td></tr>
         <tr><td>WinSCP</td><td>Cài đặt trên PC này, hoặc <code>WinSCP.ini</code> nếu không có</td></tr>
         <tr><td>Xshell</td><td>Thư mục <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
+        <tr><td>OpenSSH</td><td>Tệp <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; bỏ qua ký tự đại diện như <code>Host *</code>)</td></tr>
         <tr><td>RDCMan</td><td>Tệp <code>.rdg</code></td></tr>
         <tr><td>Remote Desktop</td><td>Thư mục chứa tệp <code>.rdp</code> (bao gồm thư mục con)</td></tr>
-        <tr><td>CSV</td><td>Tên cột ở dòng đầu: Name, Protocol, Host, Port, Username, Folder (phân tách bằng dấu phẩy, dấu chấm phẩy hoặc tab)</td></tr>
+        <tr><td>CSV</td><td>Tên cột ở dòng đầu: Name, Protocol, Host, Port, Username, Folder, Domain (phân tách bằng dấu phẩy, dấu chấm phẩy hoặc tab). <b>Xuất danh sách phiên (CSV)</b> trong cùng menu ghi theo định dạng này.</td></tr>
       </table>
       <p>Giữa các bản cài BananaConn, dùng <b>Xuất/Nhập bản sao lưu phiên (JSON)</b> trong cùng menu. Bản sao lưu gồm các phiên cùng với thư mục trống, đoạn lệnh/macro và đường hầm SSH. Khi khôi phục trên cùng một PC, liên kết với thông tin đăng nhập vẫn được giữ nguyên, và kể cả khi mọi phiên đã có sẵn, bạn vẫn có thể chỉ khôi phục các thư mục, đoạn lệnh và đường hầm còn thiếu. Đường hầm SSH và các tùy chọn liên quan đến bảo mật (bỏ qua lỗi chứng chỉ, chuyển tiếp cổng, vị trí tệp nhật ký, v.v.) chỉ được nhập khi bật "Nhập cả các tùy chọn liên quan đến bảo mật".</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Sao chép &amp; dán</b>: Kéo để chọn sẽ sao chép ngay, nhấp chuột phải để dán (có thể đổi trong Cài đặt). ${kbd("Ctrl+C")} chỉ sao chép khi có vùng chọn; nếu không, nó được gửi tới thiết bị.</li>
+        <li><b>Liên kết</b>: ${kbd("Ctrl")}+nhấp vào địa chỉ trong đầu ra để mở bằng trình duyệt (nhấp thường dùng để chọn và lấy tiêu điểm). Trong Cài đặt → Terminal có thể cho phép nhấp thường để mở liên kết.</li>
         <li><b>Cỡ chữ</b>: ${kbd("Ctrl")}+cuộn chuột, hoặc ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)} trên thanh công cụ.</li>
         <li><b>Tìm</b>: ${kbd("Ctrl+Shift+F")}.</li>
         <li><b>Chế độ phím</b>: Nếu Delete, Home hoặc End in ra <code>~</code> trên thiết bị như Cisco IOS, hãy chuyển thanh công cụ sang "Phím: Thiết bị" (Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E). Có thể đặt mặc định trong trình sửa phiên.</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>Chuyển tới Kết nối nhanh</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>Tab tiếp theo / trước</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>Đóng tab</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>Mở lại tab đã đóng</td></tr>
         <tr><td>Nhấp đúp vào tab</td><td>Mở lại cùng phiên</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>Tìm trong terminal</td></tr>
         <tr><td>${kbd("Ctrl")}+cuộn chuột</td><td>Cỡ chữ terminal</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>Đặt lại cỡ chữ terminal</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>Thu gọn thanh bên</td></tr>
         <tr><td colspan="2"><b>Trong danh sách phiên</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>Kết nối / Sửa / Xóa (áp dụng cho tất cả khi chọn nhiều mục)</td></tr>

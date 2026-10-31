@@ -29,7 +29,7 @@ const KO_SECTIONS: HelpSection[] = [
         <li>시리얼은 <code>COM3</code> 또는 <code>COM3:115200</code>처럼 입력합니다.</li>
       </ol>
       <h4>세션으로 저장해 두기</h4>
-      <p>왼쪽 세션 목록의 ${icon("Plus", 13)} 버튼(${kbd("Ctrl+Shift+N")})으로 접속 정보를 저장하면, 더블클릭이나 ${kbd("Enter")}로 접속합니다. 다른 프로그램에 저장해 둔 접속 정보는 <a data-goto="import">가져오기</a>로 한 번에 옮길 수 있습니다.</p>
+      <p>왼쪽 세션 목록의 ${icon("Plus", 13)} 버튼(${kbd("Ctrl+Shift+N")})으로 접속 정보를 저장하면, 더블클릭이나 ${kbd("Enter")}로 접속합니다. 다른 프로그램에 저장해 둔 접속 정보는 <a data-goto="import">가져오기</a>로 한 번에 옮길 수 있습니다. 세션 편집 창의 <b>연결 확인</b>을 누르면 저장하기 전에 호스트의 포트가 열려 있는지 바로 확인합니다. 저장된 세션은 오른쪽 클릭 메뉴에서, 여러 세션이나 폴더는 선택하거나 폴더를 오른쪽 클릭해 한꺼번에 확인할 수 있습니다.</p>
       <h4>화면 언어</h4>
       <p>설정 맨 위의 <b>화면 언어</b>에서 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français, Deutsch 중 하나를 고릅니다(연결을 끊지 않고 바로 바뀌며, 도움말과 업데이트 안내도 그 언어로 나옵니다). 고르기 전에는 Windows 표시 언어를 따르고, 한 번 고르면 그 선택이 항상 우선합니다.</p>`,
   },
@@ -62,9 +62,10 @@ const KO_SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>이 PC의 설정을 바로 읽습니다</td></tr>
         <tr><td>WinSCP</td><td>이 PC의 설정, 없으면 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>문서\\NetSarang Computer\\&lt;버전&gt;\\Xshell\\Sessions</code> 폴더</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 파일 (Host·HostName·User·Port·ProxyJump; <code>Host *</code> 같은 와일드카드는 건너뜀)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 파일</td></tr>
         <tr><td>원격 데스크톱</td><td><code>.rdp</code> 파일이 있는 폴더 (하위 폴더 포함)</td></tr>
-        <tr><td>CSV</td><td>첫 줄에 열 이름: Name, Protocol, Host, Port, Username, Folder (쉼표·세미콜론·탭 구분)</td></tr>
+        <tr><td>CSV</td><td>첫 줄에 열 이름: Name, Protocol, Host, Port, Username, Folder, Domain (쉼표·세미콜론·탭 구분). 같은 메뉴의 <b>세션 목록 내보내기(CSV)</b>가 이 형식으로 씁니다.</td></tr>
       </table>
       <p>BananaConn끼리는 같은 메뉴의 <b>세션 백업 내보내기/가져오기(JSON)</b>를 씁니다. 백업에는 세션과 함께 빈 폴더, 스니펫·매크로, SSH 터널이 들어갑니다. 같은 PC에서 복원하면 자격 증명 연결도 그대로 살아나고, 세션이 모두 이미 있어도 없는 폴더·스니펫·터널만 복원할 수 있습니다. SSH 터널과 보안 관련 옵션(인증서 오류 무시, 포트 포워딩, 로그 파일 위치 등)은 "보안 관련 옵션도 가져오기"를 켰을 때만 가져옵니다.</p>`,
   },
@@ -88,6 +89,7 @@ const KO_SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>복사·붙여넣기</b>: 드래그로 선택하면 바로 복사되고, 오른쪽 클릭으로 붙여넣습니다(설정에서 바꿀 수 있음). ${kbd("Ctrl+C")}는 선택 영역이 있을 때만 복사, 없으면 장비로 전달됩니다.</li>
+        <li><b>링크</b>: 출력에 보이는 주소는 ${kbd("Ctrl")}+클릭으로 브라우저에서 엽니다(그냥 클릭은 선택·포커스용). 설정 → 터미널에서 그냥 클릭으로 열도록 바꿀 수 있습니다.</li>
         <li><b>글자 크기</b>: ${kbd("Ctrl")}+마우스 휠, 또는 툴바의 ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)}.</li>
         <li><b>찾기</b>: ${kbd("Ctrl+Shift+F")}.</li>
         <li><b>키 입력 방식</b>: Cisco IOS 같은 장비에서 Delete·Home·End가 <code>~</code>로 찍히면 툴바의 "키: 장비"로 바꿉니다(Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E). 세션 편집에서 기본값을 정해 둘 수 있습니다.</li>
@@ -270,9 +272,11 @@ const KO_SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>빠른 연결 칸으로</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>다음 / 이전 탭</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>탭 닫기</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>닫은 탭 다시 열기</td></tr>
         <tr><td>탭 더블클릭</td><td>같은 세션 하나 더 열기</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>터미널에서 찾기</td></tr>
         <tr><td>${kbd("Ctrl")}+휠</td><td>터미널 글자 크기</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>터미널 글자 크기 기본값</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>사이드바 접기</td></tr>
         <tr><td colspan="2"><b>세션 목록에서</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>연결 / 편집 / 삭제 (여러 개 선택 시 한꺼번에)</td></tr>

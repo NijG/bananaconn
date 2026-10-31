@@ -9,6 +9,7 @@ import { errorText, esc, modal, toast } from "./ui";
 import { gatewayField } from "./tunnels";
 import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
 import { openVault } from "./vault";
+import { checkReachable } from "./nettools";
 
 const VNC_QUALITY: [string, string][] = [
   ["fast", "빠르게 (기본: 화질을 낮추고 최대한 압축)"],
@@ -219,7 +220,9 @@ export function editSession(
           }).join("")}</nav>
           <form class="form editor-form" autocomplete="off"></form>
         </div>`,
-      footer: `<button class="btn" data-close>취소</button>
+      footer: `<button class="btn" data-check title="이 PC에서 호스트의 포트에 바로 접속해 봅니다">${icon("Activity", 14)}연결 확인</button>
+               <span class="grow"></span>
+               <button class="btn" data-close>취소</button>
                <button class="btn" data-save>저장</button>
                <button class="btn btn-primary" data-connect>${icon("Play", 14)}저장 후 연결</button>`,
       onClose: () => resolve(result),
@@ -433,6 +436,20 @@ export function editSession(
     form.addEventListener("submit", (e) => {
       e.preventDefault();
       save(true);
+    });
+    // Reachability before saving: a direct TCP connect to host:port (the network
+    // tools' port check). Not for serial/TFTP (no TCP port), and not through a
+    // proxy, jump host or gateway, where a direct check would mislead.
+    const checkBtn = m.root.querySelector<HTMLButtonElement>("[data-check]")!;
+    checkBtn.addEventListener("click", async () => {
+      collect();
+      if (badPort) return toast("포트는 1부터 65535 사이의 정수여야 합니다", "warn");
+      checkBtn.disabled = true;
+      try {
+        await checkReachable(s);
+      } finally {
+        checkBtn.disabled = false;
+      }
     });
     m.root.querySelector("[data-save]")!.addEventListener("click", () => save(false));
     m.root.querySelector("[data-connect]")!.addEventListener("click", () => save(true));

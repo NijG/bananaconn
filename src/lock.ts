@@ -118,14 +118,16 @@ export function openMasterPassword() {
         <label class="field"><span>${enabled ? "새 마스터 비밀번호 (해제하려면 비우기)" : "마스터 비밀번호 (8자 이상)"}</span><input type="password" name="next" autocomplete="new-password"/></label>
         <label class="field"><span>한 번 더 입력</span><input type="password" name="again" autocomplete="new-password"/></label>
       </form>`,
-    footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>${icon("Check", 14)}${enabled ? "바꾸기" : "설정"}</button>`,
+    footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>${icon("Check", 14)}${enabled ? "변경" : "설정"}</button>`,
   });
   const val = (n: string) => m.root.querySelector<HTMLInputElement>(`[name=${n}]`)?.value ?? "";
   const ok = m.root.querySelector<HTMLButtonElement>("[data-ok]")!;
   ok.addEventListener("click", async () => {
     const next = val("next");
     if (next !== val("again")) return toast("두 번 입력한 비밀번호가 다릅니다", "warn");
-    if (!enabled && next.length < 8) return toast("마스터 비밀번호는 8자 이상이어야 합니다", "warn");
+    // A password being set or changed must be at least 8 characters; an empty
+    // "new" while enabled means "remove it", which is allowed.
+    if (next.length < 8 && (next || !enabled)) return toast("마스터 비밀번호는 8자 이상이어야 합니다", "warn");
     ok.disabled = true;
     try {
       await api.lockSet(enabled ? val("current") : null, next ? next : null);

@@ -11,7 +11,7 @@ import { aiSettingsSection, wireAiSettings } from "./ai/settings";
 import { checkForUpdate } from "./updates";
 import { compile, DEFAULT_RISK_RULES, riskRules, type RiskRule } from "./riskRules";
 import { isLanguage, LANGUAGES, language as shownLanguage } from "./i18n";
-import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
+import { logFields, previewDefaultPath, runnableLogName, wireLogBrowse } from "./logOptions";
 
 const FONTS = [
   ["'Cascadia Mono', Consolas, 'D2Coding', monospace", "Cascadia Mono"],
@@ -150,6 +150,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
         <div class="row"><button type="button" class="btn btn-sm" data-clear-history>${icon("Trash2", 14)}명령 기록 지우기</button></div>
         ${check("highlightKeywords", "출력 키워드 강조", "ERROR·FAIL은 빨강, WARN은 노랑, OK·SUCCESS는 초록으로 표시합니다. 색을 직접 쓰는 프로그램과 vim 같은 전체 화면 프로그램에는 적용하지 않습니다.")}
         ${check("copyOnSelect", "선택하면 바로 복사", "PuTTY처럼 드래그로 선택한 글자를 클립보드에 복사합니다.")}
+        ${check("linkNeedsCtrl", "링크는 Ctrl+클릭으로 열기", "끄면 출력에 보이는 주소를 그냥 클릭해도 브라우저에서 엽니다.")}
         ${check("rightClickPaste", "오른쪽 클릭으로 붙여넣기", "터미널에서 오른쪽 버튼을 누르면 클립보드 내용을 붙여넣습니다.")}
         ${check("confirmMultiPaste", "여러 줄을 붙여넣기 전에 확인", "두 줄 이상을 붙여넣거나 텍스트 파일을 보낼 때 내용을 미리 보여 주고 보낼지 묻습니다.")}
         <div class="grid-2">
@@ -208,6 +209,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
           (k) => `log.${k}`,
           "모든 터미널 세션을 연결하면 자동으로 기록",
         )}
+        <p class="muted small">저장되는 파일 이름 예시: <b data-log-preview data-i18n-skip>${esc(previewDefaultPath(s.logTemplate))}</b></p>
         ${check("logPrompt", "툴바의 로그 버튼으로 시작할 때 파일 이름 묻기", "SecureCRT의 Prompt for filename처럼 시작 전에 이름을 확인·수정할 수 있습니다.")}
         <div class="row"><button type="button" class="btn" data-logs>${icon("FolderOpen", 14)}기본 로그 폴더 열기</button></div>
         <h4 data-section="update">업데이트</h4>
@@ -232,6 +234,15 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
     if (isLanguage(value)) updateSettings({ uiLanguage: value });
   });
   wireLogBrowse(m.root, (k) => `log.${k}`);
+  // Keep the "example file name" in step with the template field (the Browse
+  // button also dispatches an input event, so it updates on folder pick too).
+  const logPathInput = m.root.querySelector<HTMLInputElement>('[name="log.path"]');
+  const logPreview = m.root.querySelector<HTMLElement>("[data-log-preview]");
+  if (logPathInput && logPreview) {
+    logPathInput.addEventListener("input", () => {
+      logPreview.textContent = previewDefaultPath(logPathInput.value.trim() || s.logTemplate);
+    });
+  }
   // Risky-command rules: edited here, saved with the other settings.
   let rules: RiskRule[] = riskRules().map((r) => ({ ...r }));
   const rulesEl = m.root.querySelector<HTMLElement>("[data-risk-rules]")!;
@@ -384,6 +395,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
       scrollback: Math.max(1000, Math.min(200000, Number(val("scrollback").value) || 10000)),
       renderer: val("renderer").value as Settings["renderer"],
       copyOnSelect: bool("copyOnSelect"),
+      linkNeedsCtrl: bool("linkNeedsCtrl"),
       rightClickPaste: bool("rightClickPaste"),
       confirmMultiPaste: bool("confirmMultiPaste"),
       pasteMode: val("pasteMode").value === "fixed" ? "fixed" : "echo",

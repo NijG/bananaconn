@@ -12,6 +12,7 @@ const TREE_MARGIN = 40;
 
 import { endpoint, PROTOCOLS, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
+import { checkReachable, checkReachableMany } from "./nettools";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
   adoptManualOrder,
@@ -123,13 +124,14 @@ export class Sidebar {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const mod = await import("./importExport").catch((err) => void toast(errorText(err), "error"));
       if (!mod) return;
-      const { exportBackup, importFromBackup, importMenuItems } = mod;
+      const { exportBackup, exportCsv, importFromBackup, importMenuItems } = mod;
       contextMenu(r.left, r.bottom + 4, [
         ...importMenuItems(),
         "-",
         { label: "세션 백업 가져오기(JSON)…", icon: "Upload", action: () => importFromBackup() },
         "-",
         { label: "세션 백업 내보내기(JSON)…", icon: "Save", action: () => exportBackup() },
+        { label: "세션 목록 내보내기(CSV)…", icon: "Save", action: () => exportCsv() },
       ]);
     });
     // Re-filter once typing pauses, not on every key (thousands of sessions).
@@ -206,10 +208,12 @@ export class Sidebar {
 
   private matches(s: Session) {
     if (!this.query) return true;
-    return [s.name, s.host, s.username, s.folder, PROTOCOLS[s.protocol].label, s.notes]
+    const hay = [s.name, s.host, s.username, s.folder, PROTOCOLS[s.protocol].label, s.notes]
       .join(" ")
-      .toLowerCase()
-      .includes(this.query);
+      .toLowerCase();
+    // Each whitespace-separated term must appear somewhere, so "web prod"
+    // matches a "prod" session on a "web…" host regardless of field order.
+    return this.query.split(/\s+/).every((term) => hay.includes(term));
   }
 
   private build(): FolderNode {
@@ -443,6 +447,11 @@ export class Sidebar {
         contextMenu(e.clientX, e.clientY, [
           ...(n ? [{ label: `선택한 세션 ${n}개를 여기로 이동`, icon: "FolderSync", action: () => this.moveTo([...this.picked], path) }, "-" as const] : []),
           { label: "이 폴더에 새 세션", icon: "Plus", action: () => this.actions.edit(null, { folder: path }) },
+          {
+            label: "이 폴더의 세션 연결 확인",
+            icon: "Activity",
+            action: () => void checkReachableMany(state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/"))),
+          },
           { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession(path) },
           { label: "하위 폴더 만들기", icon: "FolderPlus", action: () => this.newFolder(path) },
           { label: "이 폴더 안을 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "name") },
@@ -518,6 +527,7 @@ export class Sidebar {
       { label: "연결", icon: "Play", hint: "Enter", action: () => this.actions.connect(s) },
       ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, s) }] : []),
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
+      ...(s.protocol !== "serial" && s.protocol !== "tftp" ? [{ label: "연결 확인", icon: "Activity", action: () => void checkReachable(s) }] : []),
       ...(String(s.options.wolMac ?? "").trim() ? [{ label: "Wake-on-LAN (전원 켜기)", icon: "Power", action: () => void this.wake(s) }] : []),
       "-",
       { label: "편집", icon: "Pencil", hint: "F2", action: () => this.actions.edit(s) },
@@ -548,6 +558,7 @@ export class Sidebar {
     contextMenu(x, y, [
       { label: `${list.length}개 세션 연결`, icon: "Play", hint: "Enter", action: () => list.forEach((s) => this.actions.connect(s)) },
       "-",
+      { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: "F2", action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
       "-",
@@ -863,6 +874,20 @@ export class Sidebar {
     if (e.target !== this.tree) return;
     const s = this.selected ? this.session(this.selected) : undefined;
     const ids = this.visibleIds();
+    // The Menu key (or Shift+F10) opens the same context menu a right-click does,
+    // at the selected row, so the keyboard reaches every row action. The menu
+    // itself is arrow-navigable (ui.ts contextMenu).
+    if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+      e.preventDefault();
+      if (this.picked.size > 1) {
+        const r = this.tree.getBoundingClientRect();
+        return this.bulkMenu(r.left + 24, r.top + 24);
+      }
+      if (!s) return;
+      const row = this.tree.querySelector<HTMLElement>(`.session-row[data-session="${CSS.escape(s.id)}"]`);
+      const r = (row ?? this.tree).getBoundingClientRect();
+      return this.sessionMenu(s, r.left + 24, row ? r.bottom : r.top + 24);
+    }
     // Shortcuts of the tree (keymap.ts; the user can change them). Arrows and Esc are fixed.
     const act = actionFor(e, "tree");
     if (act === "tree.moveUp" || act === "tree.moveDown") {

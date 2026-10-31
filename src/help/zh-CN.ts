@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>串口请输入 <code>COM3</code> 或 <code>COM3:115200</code>。</li>
       </ol>
       <h4>保存为会话</h4>
-      <p>使用会话列表中的 ${icon("Plus", 13)} 按钮 (${kbd("Ctrl+Shift+N")}) 保存连接信息，之后双击或按 ${kbd("Enter")} 即可连接。在其他程序中保存的连接可以通过<a data-goto="import">导入</a>一次性迁移过来。</p>
+      <p>使用会话列表中的 ${icon("Plus", 13)} 按钮 (${kbd("Ctrl+Shift+N")}) 保存连接信息，之后双击或按 ${kbd("Enter")} 即可连接。在其他程序中保存的连接可以通过<a data-goto="import">导入</a>一次性迁移过来。在会话编辑窗口中点击 <b>测试连接</b>，可在保存前确认主机端口是否开放。已保存的会话可从右键菜单测试，多个会话或整个文件夹可选中后或右键文件夹一次性测试。</p>
       <h4>界面语言</h4>
       <p>设置顶部的<b>语言</b>可将界面切换为 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français 或 Deutsch (立即生效，不会断开连接；指南和更新说明也会随之切换)。在您选择之前，应用跟随 Windows 显示语言；一旦选择，始终以您的选择为准。</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>直接读取本机设置</td></tr>
         <tr><td>WinSCP</td><td>本机设置，没有时选择 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 文件夹</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 文件（Host、HostName、User、Port、ProxyJump；跳过 <code>Host *</code> 等通配符）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 文件</td></tr>
         <tr><td>远程桌面</td><td>包含 <code>.rdp</code> 文件的文件夹 (包括子文件夹)</td></tr>
-        <tr><td>CSV</td><td>第一行为列名：Name, Protocol, Host, Port, Username, Folder (以逗号、分号或制表符分隔)</td></tr>
+        <tr><td>CSV</td><td>第一行为列名：Name, Protocol, Host, Port, Username, Folder, Domain (以逗号、分号或制表符分隔)。同一菜单中的 <b>导出会话列表 (CSV)</b> 按此格式写出。</td></tr>
       </table>
       <p>在不同的 BananaConn 安装之间，请使用同一菜单中的<b>导出/导入会话备份 (JSON)</b>。备份中除会话外，还包含空文件夹、片段/宏和 SSH 隧道。在同一台电脑上恢复时，凭据关联也会保留；即使所有会话都已存在，也可以只恢复缺少的文件夹、片段和隧道。SSH 隧道和安全相关选项 (忽略证书错误、端口转发、日志文件位置等) 仅在开启“同时导入安全相关选项”时才会导入。</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>复制 &amp; 粘贴</b>：拖动选中即立即复制，右键粘贴 (可在设置中更改)。${kbd("Ctrl+C")} 仅在有选中内容时复制，否则会发送到设备。</li>
+        <li><b>链接</b>：按住 ${kbd("Ctrl")} 单击输出中的地址，在浏览器中打开（普通单击用于选择和聚焦）。可在设置 → 终端中改为直接单击即可打开。</li>
         <li><b>字号</b>：${kbd("Ctrl")}+鼠标滚轮，或工具栏中的 ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)}。</li>
         <li><b>查找</b>：${kbd("Ctrl+Shift+F")}。</li>
         <li><b>按键模式</b>：如果在 Cisco IOS 等设备上按 Delete、Home 或 End 会输出 <code>~</code>，请将工具栏切换为“按键：设备”(Delete=Ctrl-D、Home=Ctrl-A、End=Ctrl-E)。默认值可在会话编辑器中设置。</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>转到快速连接</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>下一个 / 上一个标签页</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>关闭标签页</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>重新打开已关闭的标签页</td></tr>
         <tr><td>双击标签页</td><td>再次打开同一会话</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>在终端中查找</td></tr>
         <tr><td>${kbd("Ctrl")}+滚轮</td><td>终端字号</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>恢复终端默认字号</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>折叠侧边栏</td></tr>
         <tr><td colspan="2"><b>在会话列表中</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>连接 / 编辑 / 删除 (选中多个时应用于全部)</td></tr>

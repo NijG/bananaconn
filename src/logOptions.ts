@@ -6,7 +6,7 @@
 
 import { pickSavePath } from "./api";
 import { icon } from "./icons";
-import type { Session } from "./model";
+import { newSession, type Session } from "./model";
 import { state } from "./store";
 import { esc } from "./ui";
 
@@ -100,6 +100,14 @@ export function previewPath(template: string, s: Session, now = new Date()): str
     t: String(now.getMilliseconds()).padStart(3, "0"),
   };
   return fillSession(template, s, true).replace(/%([YMDhmst%])/g, (_m, k: string) => (k === "%" ? "%" : time[k]));
+}
+
+/** A stand-in session so Settings can preview the default template. */
+const SAMPLE_SESSION: Session = { ...newSession("ssh"), name: "myserver", host: "10.0.0.5", username: "admin", port: 22 };
+
+/** Preview the app-wide default template (Settings) with placeholder values. */
+export function previewDefaultPath(template: string): string {
+  return previewPath(template, SAMPLE_SESSION);
 }
 
 /** Form fields for log settings; `name` maps a field key to its form name. */

@@ -3,9 +3,82 @@
 import { api } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
+import { PROTOCOLS, type Session } from "./model";
 import { errorText, esc, modal, toast } from "./ui";
 
 type Tool = "ping" | "ports" | "dns";
+
+/** Sessions a direct TCP check can say something about (see checkReachable). */
+const directlyCheckable = (s: Pick<Session, "protocol" | "host" | "options">) =>
+  !!s.host.trim() && s.protocol !== "serial" && s.protocol !== "tftp" && !s.options.proxyType && !String(s.options.jumpHost ?? "").trim() && !s.options.gateway;
+
+/** Check many saved sessions at once (8 at a time) and show one table. */
+export async function checkReachableMany(list: Session[]): Promise<void> {
+  if (!list.length) return void toast("확인할 세션이 없습니다", "info");
+  const todo = list.filter(directlyCheckable);
+  const results = new Map<string, { open: boolean; text: string }>();
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const s = todo[next++];
+      const port = s.port || PROTOCOLS[s.protocol].port;
+      try {
+        const [r] = await api.netPorts(s.host.trim(), [port]);
+        results.set(s.id, r?.open ? { open: true, text: `열려 있음 (${r.ms ?? 0}ms)` } : { open: false, text: r?.detail ?? "응답 없음" });
+      } catch (err) {
+        results.set(s.id, { open: false, text: errorText(err) });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, todo.length) }, worker));
+  const open = [...results.values()].filter((r) => r.open).length;
+  // Problems first: failed, then not tested, then open (stable within each).
+  const rank = (s: Session) => {
+    const r = results.get(s.id);
+    return r ? (r.open ? 2 : 0) : 1;
+  };
+  const rows = [...list]
+    .sort((a, b) => rank(a) - rank(b))
+    .map((s) => {
+      const r = results.get(s.id);
+      const port = s.port || PROTOCOLS[s.protocol].port;
+      return `<tr><td data-i18n-skip><b>${esc(s.name || s.host)}</b></td><td class="mono" data-i18n-skip>${esc(`${s.host}:${port}`)}</td>
+        <td class="${r ? (r.open ? "ok" : "bad") : "muted"}">${esc(r ? r.text : "확인하지 않음 (프록시·점프 호스트·게이트웨이·시리얼·TFTP)")}</td></tr>`;
+    })
+    .join("");
+  const m = modal({
+    title: "연결 확인 결과",
+    icon: "Activity",
+    width: 640,
+    body: `<p class="muted small">${esc(`${todo.length}개 중 ${open}개 열림`)}</p><table class="reach-table">${rows}</table>`,
+    footer: `<button class="btn" data-copy-result>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
+  });
+  // The table as shown (in the screen language), one tab-separated line per row.
+  m.root.querySelector("[data-copy-result]")!.addEventListener("click", () => {
+    const lines = [...m.root.querySelectorAll<HTMLTableRowElement>(".reach-table tr")].map((tr) => [...tr.cells].map((c) => c.innerText.trim()).join("\t"));
+    void writeClipboard(lines.join("\n"));
+    toast("결과를 복사했습니다", "success", 1500);
+  });
+}
+
+/** Can this PC reach the session's host:port directly? Reported as a toast.
+ * Not for serial/TFTP (no TCP port), and not through a proxy, jump host or
+ * gateway, where a direct connect would not tell how the session connects. */
+export async function checkReachable(s: Pick<Session, "protocol" | "host" | "port" | "options">): Promise<void> {
+  const host = s.host.trim();
+  if (!host) return void toast("호스트를 입력하세요", "warn");
+  if (s.protocol === "serial" || s.protocol === "tftp") return void toast("시리얼과 TFTP는 연결 확인을 할 수 없습니다", "info");
+  if (s.options.proxyType || String(s.options.jumpHost ?? "").trim() || s.options.gateway)
+    return void toast("프록시·점프 호스트·게이트웨이를 거치는 세션은 직접 확인할 수 없습니다", "info");
+  const port = s.port || PROTOCOLS[s.protocol].port;
+  try {
+    const [r] = await api.netPorts(host, [port]);
+    if (r?.open) toast(`${host}:${port} 포트가 열려 있습니다 (${r.ms ?? 0}ms)`, "success");
+    else toast(`${host}:${port} — ${r?.detail ?? "응답 없음"}`, "warn", 6000);
+  } catch (err) {
+    toast(errorText(err), "error");
+  }
+}
 
 /** "22, 80, 8000-8010" → ports; null if any part is invalid. */
 export function parsePorts(text: string): number[] | null {
@@ -109,7 +182,7 @@ export function openNetworkTools(initialHost = "") {
         out.innerHTML = `<p class="muted small">${esc(`${res.length}개 중 ${openCount}개 열림`)}</p><table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th></tr></thead><tbody>${res
           .map(
             (r) => `<tr class="${r.open ? "open" : "closed"}"><td class="mono">${r.port}</td>
-              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td></tr>`,
+              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.open ? "열려 있음" : r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td></tr>`,
           )
           .join("")}</tbody></table>`;
       } else {

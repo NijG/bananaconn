@@ -458,6 +458,64 @@ function csvRecords(text: string, sep: string): string[][] {
   return rows.filter((r) => r.some((c) => c));
 }
 
+// ---- OpenSSH client config (~/.ssh/config) ---------------------------------------------------
+
+/** OpenSSH client config: "Host alias" lines, then keywords (HostName, User,
+ * Port, ProxyJump), case-insensitive, "#" starting a comment. Wildcard patterns
+ * ("Host *", "web?"), negations ("!host") and "Match" blocks are defaults, not
+ * connectable hosts, so they are skipped. Keys and other secrets are never
+ * imported (ProxyJump maps to the jump-host option, which the import surfaces). */
+export function parseSshConfig(text: string): ParsedImport {
+  const out = empty();
+  let aliases: string[] = [];
+  let fields: Record<string, string> = {};
+  // A Match block's settings are conditional, so they are not folded into a host.
+  let inMatch = false;
+
+  const flush = () => {
+    for (const alias of aliases) {
+      const proxy = fields.proxyjump && !/^none$/i.test(fields.proxyjump) ? fields.proxyjump : "";
+      add(out, "OpenSSH", {
+        protocol: "ssh",
+        name: alias,
+        host: fields.hostname || alias,
+        port: fields.port,
+        username: fields.user,
+        folder: "OpenSSH",
+        options: proxy ? { jumpHost: proxy } : {},
+      });
+    }
+    aliases = [];
+    fields = {};
+  };
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    // "Keyword value" or "Keyword=value"; a value may be quoted.
+    const m = /^(\S+?)[\s=]+(.*)$/.exec(line);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    let value = m[2].trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+    if (key === "host") {
+      flush();
+      inMatch = false;
+      aliases = value.split(/\s+/).filter((p) => p && !/[*?]/.test(p) && !p.startsWith("!"));
+    } else if (key === "match") {
+      flush();
+      inMatch = true;
+    } else if (!inMatch && aliases.length) {
+      if (key === "hostname") fields.hostname = value;
+      else if (key === "user") fields.user = value;
+      else if (key === "port") fields.port = value;
+      else if (key === "proxyjump") fields.proxyjump = value;
+    }
+  }
+  flush();
+  return out;
+}
+
 const CSV_PROTOCOLS: Record<string, Protocol> = {
   ssh: "ssh", ssh2: "ssh", ssh1: "ssh", telnet: "telnet", rdp: "rdp", vnc: "vnc", sftp: "sftp", ftp: "ftp", ftps: "ftps", serial: "serial",
 };
@@ -475,7 +533,8 @@ export function parseCsv(text: string): ParsedImport {
   const at = { name: col("name", "이름", "sessionname"), host: col("host", "hostname", "address", "ip", "호스트"), port: col("port", "포트"), user: col("username", "user", "사용자"), proto: col("protocol", "type", "프로토콜"), folder: col("folder", "group", "path", "panel", "폴더"), domain: col("domain", "도메인") };
   if (at.host < 0) throw new Error("CSV 첫 줄에 호스트 열(Host, Hostname, Address 중 하나)이 있어야 합니다");
   for (const c of records.slice(1)) {
-    const get = (i: number) => (i >= 0 ? c[i] ?? "" : "");
+    // "'=x": the formula guard exportCsv (and other tools) put in front.
+    const get = (i: number) => (i >= 0 ? c[i] ?? "" : "").replace(/^'(?=[=+\-@])/, "");
     const proto = get(at.proto).toLowerCase() || "ssh";
     const protocol = CSV_PROTOCOLS[proto] ?? null;
     add(

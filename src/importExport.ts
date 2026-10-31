@@ -10,6 +10,7 @@ import {
   parseRdpFiles,
   parseSecureCrtFiles,
   parseSecureCrtXml,
+  parseSshConfig,
   parseWinScp,
   parseXshellFiles,
 } from "./importers";
@@ -310,8 +311,14 @@ export const importRdpFiles = () =>
 
 export const importCsv = () =>
   runImport("CSV에서 세션 가져오기", "CSV 파일", async () => {
-    const text = await readChosenFile("CSV 선택 (첫 줄: Name, Protocol, Host, Port, Username, Folder)");
+    const text = await readChosenFile("CSV 선택 (첫 줄: Name, Protocol, Host, Port, Username, Folder, Domain)");
     return text === null ? null : parseCsv(text);
+  });
+
+export const importSshConfig = () =>
+  runImport("OpenSSH 설정 가져오기", "OpenSSH 설정 파일", async () => {
+    const text = await readChosenFile("OpenSSH 설정 파일 선택 (보통 .ssh 폴더의 config)");
+    return text === null ? null : parseSshConfig(text);
   });
 
 /** Menu of every import source (sidebar, home screen). */
@@ -325,6 +332,7 @@ export function importMenuItems(): MenuItem[] {
     { label: "KiTTY (이 PC)", icon: "Download", action: () => importPutty("KiTTY") },
     { label: "WinSCP (이 PC 또는 WinSCP.ini)", icon: "Download", action: () => importWinScp() },
     { label: "Xshell (세션 폴더)…", icon: "Download", action: () => importXshell() },
+    { label: "OpenSSH (~/.ssh/config)…", icon: "Download", action: () => importSshConfig() },
     { label: "RDCMan (.rdg)…", icon: "Download", action: () => importRdcMan() },
     { label: "원격 데스크톱 파일 (.rdp 폴더)…", icon: "Download", action: () => importRdpFiles() },
     { label: "CSV…", icon: "Download", action: () => importCsv() },
@@ -431,6 +439,33 @@ export async function exportBackup() {
   };
   try {
     await api.saveTextFile(path, JSON.stringify(payload, null, 2));
+    toast(`세션 ${state.sessions.length}개를 내보냈습니다`, "success");
+  } catch (err) {
+    toast(errorText(err), "error");
+  }
+}
+
+/** Export the session list as CSV (the columns parseCsv reads back), for editing
+ * in a spreadsheet or sharing. No secrets — passwords live only in the vault. */
+export async function exportCsv() {
+  if (!state.sessions.length) return toast("내보낼 세션이 없습니다", "warn");
+  const path = await pickSavePath(`BananaConn-세션-${timestamp()}.csv`, [{ name: "CSV", extensions: ["csv"] }]);
+  if (!path) return;
+  const field = (v: unknown) => {
+    // A leading = + - @ makes a spreadsheet run the cell as a formula: the
+    // usual "'" guard keeps it text (parseCsv drops it again on import).
+    const s = String(v ?? "").replace(/^(?=[=+\-@])/, "'");
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  // Domain: an RDP session's Windows domain, which parseCsv reads back.
+  const header = ["Name", "Protocol", "Host", "Port", "Username", "Folder", "Domain"];
+  const rows = state.sessions.map((s) =>
+    [s.name, s.protocol, s.host, s.port ?? "", s.username, s.folder, s.protocol === "rdp" ? (s.options.domain ?? "") : ""].map(field).join(","),
+  );
+  // A UTF-8 BOM so Excel reads Korean names correctly; parseCsv strips it on import.
+  const csv = `﻿${[header.join(","), ...rows].join("\r\n")}\r\n`;
+  try {
+    await api.saveTextFile(path, csv);
     toast(`세션 ${state.sessions.length}개를 내보냈습니다`, "success");
   } catch (err) {
     toast(errorText(err), "error");

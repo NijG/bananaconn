@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>For serial, type <code>COM3</code> or <code>COM3:115200</code>.</li>
       </ol>
       <h4>Save it as a session</h4>
-      <p>Save connection details with the ${icon("Plus", 13)} button in the session list (${kbd("Ctrl+Shift+N")}), then connect by double-clicking or pressing ${kbd("Enter")}. Connections saved in other programs can be moved over in one go with <a data-goto="import">Import</a>.</p>
+      <p>Save connection details with the ${icon("Plus", 13)} button in the session list (${kbd("Ctrl+Shift+N")}), then connect by double-clicking or pressing ${kbd("Enter")}. Connections saved in other programs can be moved over in one go with <a data-goto="import">Import</a>. In the session editor, <b>Test connection</b> checks before saving whether the host's port is open. Saved sessions can be tested from their right-click menu, and several sessions or a whole folder at once by selecting them or right-clicking the folder.</p>
       <h4>Screen language</h4>
       <p><b>Language</b> at the top of Settings switches the screen to 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français or Deutsch (at once, without disconnecting; the guide and update notes follow it too). Until you choose, the app follows the Windows display language; once you choose, your choice always wins.</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>Reads this PC's settings directly</td></tr>
         <tr><td>WinSCP</td><td>This PC's settings, or <code>WinSCP.ini</code> if none</td></tr>
         <tr><td>Xshell</td><td>The <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> folder</td></tr>
+        <tr><td>OpenSSH</td><td>The <code>.ssh\\config</code> file (Host, HostName, User, Port, ProxyJump; wildcards such as <code>Host *</code> are skipped)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> file</td></tr>
         <tr><td>Remote Desktop</td><td>A folder containing <code>.rdp</code> files (subfolders included)</td></tr>
-        <tr><td>CSV</td><td>Column names on the first line: Name, Protocol, Host, Port, Username, Folder (comma, semicolon or tab separated)</td></tr>
+        <tr><td>CSV</td><td>Column names on the first line: Name, Protocol, Host, Port, Username, Folder, Domain (comma, semicolon or tab separated). <b>Export session list (CSV)</b> in the same menu writes this format.</td></tr>
       </table>
       <p>Between BananaConn installs, use <b>Export/Import session backup (JSON)</b> in the same menu. Backups contain your sessions plus empty folders, snippets/macros and SSH tunnels. Restoring on the same PC keeps the links to credentials, and even if every session already exists you can restore just the missing folders, snippets and tunnels. SSH tunnels and security-related options (ignore certificate errors, port forwarding, log file location, etc.) are imported only when "Also import security-related options" is turned on.</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Copy &amp; paste</b>: Selecting by dragging copies immediately, and right-click pastes (configurable in Settings). ${kbd("Ctrl+C")} copies only when there is a selection; otherwise it is sent to the device.</li>
+        <li><b>Links</b>: ${kbd("Ctrl")}+click an address in the output to open it in the browser (a plain click is for selection and focus). Settings → Terminal can make a plain click open links.</li>
         <li><b>Font size</b>: ${kbd("Ctrl")}+mouse wheel, or ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)} in the toolbar.</li>
         <li><b>Find</b>: ${kbd("Ctrl+Shift+F")}.</li>
         <li><b>Key mode</b>: If Delete, Home or End print <code>~</code> on devices such as Cisco IOS, switch the toolbar to "Keys: device" (Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E). You can set the default in the session editor.</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>Go to Quick connect</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>Next / previous tab</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>Close tab</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>Reopen closed tab</td></tr>
         <tr><td>Double-click tab</td><td>Open the same session again</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>Find in terminal</td></tr>
         <tr><td>${kbd("Ctrl")}+wheel</td><td>Terminal font size</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>Reset terminal font size</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>Collapse sidebar</td></tr>
         <tr><td colspan="2"><b>In the session list</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>Connect / Edit / Delete (applies to all when several are selected)</td></tr>

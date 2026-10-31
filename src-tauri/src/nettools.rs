@@ -110,6 +110,16 @@ pub struct PortResult {
     detail: String,
 }
 
+/// When a port is closed on several addresses of one host, decide whether a
+/// newly seen failure should replace the one kept so far. The first failure is
+/// always kept; after that, only a definitive "refused" (the host answered: the
+/// port is closed) replaces a less certain timeout or other error. This keeps
+/// the reported reason stable and informative no matter which address of a
+/// dual-stack host resolved first.
+fn prefer_failure(have_refused: bool, have_any: bool, new_refused: bool) -> bool {
+    !have_any || (new_refused && !have_refused)
+}
+
 #[tauri::command]
 pub async fn net_ports(host: String, ports: Vec<u16>) -> Result<Vec<PortResult>, String> {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
@@ -133,24 +143,26 @@ pub async fn net_ports(host: String, ports: Vec<u16>) -> Result<Vec<PortResult>,
     }
     let ips = &ips;
     let checks = ports.into_iter().map(|port| async move {
-        let mut result = None;
+        let mut best: Option<PortResult> = None;
+        let mut have_refused = false;
         for ip in ips {
             let started = Instant::now();
-            let r = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect({
-                let mut a = *ip;
-                a.set_port(port);
-                a
-            })).await {
+            let mut a = *ip;
+            a.set_port(port);
+            let (refused, r) = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(a)).await {
                 Ok(Ok(_)) => return PortResult { port, open: true, ms: Some(started.elapsed().as_millis() as u64), detail: "열림".into() },
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    PortResult { port, open: false, ms: None, detail: "닫힘 (연결 거부)".into() }
+                    (true, PortResult { port, open: false, ms: None, detail: "닫힘 (연결 거부)".into() })
                 }
-                Ok(Err(e)) => PortResult { port, open: false, ms: None, detail: format!("연결 실패: {e}") },
-                Err(_) => PortResult { port, open: false, ms: None, detail: "응답 없음 (방화벽에서 막혔을 수 있음)".into() },
+                Ok(Err(e)) => (false, PortResult { port, open: false, ms: None, detail: format!("연결 실패: {e}") }),
+                Err(_) => (false, PortResult { port, open: false, ms: None, detail: "응답 없음 (방화벽에서 막혔을 수 있음)".into() }),
             };
-            result.get_or_insert(r);
+            if prefer_failure(have_refused, best.is_some(), refused) {
+                best = Some(r);
+                have_refused = refused;
+            }
         }
-        result.expect("at least one address")
+        best.expect("at least one address")
     });
     Ok(futures_util::future::join_all(checks).await)
 }
@@ -278,7 +290,21 @@ mod wol_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_host;
+    use super::{prefer_failure, valid_host};
+
+    #[test]
+    fn refused_is_preferred_over_less_certain_failures() {
+        // The first failure is always taken.
+        assert!(prefer_failure(false, false, false));
+        assert!(prefer_failure(false, false, true));
+        // A definitive "refused" replaces a kept timeout/other error...
+        assert!(prefer_failure(false, true, true));
+        // ...but nothing replaces a refused already kept, and a non-refused
+        // never displaces an earlier non-refused (the first one stays).
+        assert!(!prefer_failure(true, true, true));
+        assert!(!prefer_failure(true, true, false));
+        assert!(!prefer_failure(false, true, false));
+    }
 
     #[test]
     fn rejects_hosts_that_could_be_options() {

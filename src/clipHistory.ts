@@ -27,7 +27,7 @@ export function openClipboardHistory() {
     list.innerHTML = items
       .map(
         (t, i) =>
-          `<div class="clip-row" data-i="${i}"><button type="button" class="clip-item" data-pick="${i}" title="${esc(t)}"><span class="clip-text">${esc(t.length > 300 ? `${t.slice(0, 300)}…` : t)}</span></button><button type="button" class="icon-btn clip-del" data-del="${i}" title="이 항목 삭제">${icon("Trash2", 13)}</button></div>`,
+          `<div class="clip-row" data-i="${i}"><button type="button" class="clip-item" data-pick="${i}" title="${esc(t.length > 1000 ? `${t.slice(0, 1000)}…` : t)}"><span class="clip-text">${esc(t.length > 300 ? `${t.slice(0, 300)}…` : t)}</span></button><button type="button" class="icon-btn clip-del" data-del="${i}" title="이 항목 삭제">${icon("Trash2", 13)}</button></div>`,
       )
       .join("");
   };

@@ -10,7 +10,7 @@
 
 // One pass over the text: the group that matched picks the colour.
 const RULE =
-  /\b(?:(errors?|fail(?:ed|ure|s)?|fatal|critical|panic|denied|refused|exception|unreachable|timed out|timeout)|(warn(?:ing|ings)?|deprecated|retry(?:ing)?)|(ok|success(?:ful(?:ly)?)?|succeeded|passed|enabled|active|running))\b/gi;
+  /\b(?:(errors?|fail(?:ed|ure|s)?|fatal|critical|panic|denied|refused|exception|unreachable|timed out|timeout|offline|disconnected|rejected|aborted|invalid|unavailable|unhealthy)|(warn(?:ing|ings)?|deprecated|retry(?:ing)?)|(ok|success(?:ful(?:ly)?)?|succeeded|passed|enabled|active|running|online|connected|healthy))\b/gi;
 const bytesOf = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 const COLORS = ["\x1b[1;31m", "\x1b[1;33m", "\x1b[1;32m"].map(bytesOf);
 const RESET = bytesOf("\x1b[22;39m");

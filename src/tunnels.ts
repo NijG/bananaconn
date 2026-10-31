@@ -6,7 +6,7 @@
 import { api, on, type ProxyLogEvent, type TunnelInfo } from "./api";
 import { proxyOf } from "./proxy";
 import { icon } from "./icons";
-import { endpoint, type Session } from "./model";
+import { endpoint, parseTarget, type Session } from "./model";
 import { state } from "./store";
 import { confirmDialog, errorText, esc, modal, promptDialog, toast } from "./ui";
 
@@ -281,13 +281,24 @@ export function openTunnelManager() {
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     const val = (n: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name=${n}]`)!.value.trim();
+    // "db.internal:5432", "[fe80::1]:22" or "http://db:8080/" pasted into the
+    // host field: split off the port (the port field, if filled, wins), as
+    // the SSH server would otherwise be asked for a host named "db.internal:5432".
+    // A "user@" there is not a target this form has: left for the server to refuse.
+    let targetHost = val("targetHost");
+    let targetPort = val("targetPort");
+    const parsed = parseTarget(targetHost);
+    if (parsed && !parsed.username) {
+      targetHost = parsed.host;
+      targetPort ||= parsed.port ? String(parsed.port) : "";
+    }
     const t: SavedTunnel = {
       id: crypto.randomUUID(),
       name: val("name"),
       gatewayId: val("gateway"),
       localPort: Number(val("localPort")),
-      targetHost: val("targetHost"),
-      targetPort: Number(val("targetPort")),
+      targetHost,
+      targetPort: Number(targetPort),
     };
     if (!t.gatewayId) return toast("먼저 SSH 세션을 저장하세요", "warn");
     if (!validPort(t.localPort) || !validPort(t.targetPort)) return toast("포트는 1부터 65535 사이의 정수여야 합니다", "warn");

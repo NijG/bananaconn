@@ -447,10 +447,21 @@ export const api = {
 
 // ---- native dialogs / shell (with browser fallbacks) ----------------------------
 
+/** Make a suggested save name valid on Windows: a session name or remote file
+ * name can hold characters (":" "/" "*" …) a Windows file name cannot. Callers
+ * pass a bare file name (no directory), so the whole string is cleaned. */
+function safeSaveName(name: string): string {
+  const safe = name
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/[ .]+$/, ""); // Windows drops trailing spaces and dots.
+  return safe || "file";
+}
+
 export async function pickSavePath(defaultPath: string, filters?: { name: string; extensions: string[] }[]) {
-  if (!isTauri) return `C:\\preview\\${defaultPath}`;
+  const safe = safeSaveName(defaultPath);
+  if (!isTauri) return `C:\\preview\\${safe}`;
   const { save } = await import("@tauri-apps/plugin-dialog");
-  return save({ defaultPath, filters });
+  return save({ defaultPath: safe, filters });
 }
 
 export async function pickOpenFile(title: string, defaultPath?: string) {

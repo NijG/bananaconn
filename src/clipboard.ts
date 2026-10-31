@@ -55,8 +55,11 @@ export function removeClipboardHistory(text: string) {
   }
 }
 
-export async function writeClipboard(text: string) {
-  record(text);
+/** `secret`: do not keep this in the clipboard history (a generated password
+ * must not be left in localStorage or shown in the history picker). */
+export async function writeClipboard(text: string, opts?: { secret?: boolean }) {
+  if (opts?.secret) removeClipboardHistory(text);
+  else record(text);
   try {
     if (isTauri) {
       const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");

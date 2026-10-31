@@ -33,7 +33,7 @@ import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
  * order; each tab turns them into its own key mode's bytes. */
 const MARKED_KEYS: EditKey[] = ["Delete", "Home", "End", "Backspace"];
 
-import { beep, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, modal, osNotify, promptDialog, timestamp, toast } from "../ui";
+import { beep, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, modal, osNotify, promptDialog, timestamp, toast, setPressed } from "../ui";
 import type { BroadcastInput, EditKey, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
 
 
@@ -183,6 +183,8 @@ function showTopProcesses(id: string, title: string) {
 }
 
 const allViews = new Set<TerminalView>();
+/** The "Ctrl+click opens a link" hint is shown once per app run. */
+let linkHintShown = false;
 subscribe("settings", () => allViews.forEach((v) => v.applySettings()));
 
 /** Terminal shortcut -> the toolbar button it presses. */
@@ -274,7 +276,7 @@ export class TerminalView implements View {
          <span class="view-state" data-state></span>
          <div class="view-actions">
            <button class="tool" data-act="find" title="찾기 (Ctrl+Shift+F)">${icon("Search", 15)}</button>
-           <button class="tool" data-act="log" title="로그 기록 켜기/끄기">${icon("ScrollText", 15)}<span>로그</span></button>
+           <button class="tool" data-act="log" title="로그 기록 켜기/끄기" aria-pressed="false">${icon("ScrollText", 15)}<span>로그</span></button>
            <button class="tool" data-act="save" title="출력 내용을 파일로 저장">${icon("Save", 15)}</button>
            <button class="tool" data-act="clear" title="화면 지우기">${icon("Eraser", 15)}</button>
            <span class="tool-sep"></span>
@@ -294,7 +296,7 @@ export class TerminalView implements View {
            <button class="tool" data-act="sendfile" title="텍스트 파일 보내기 (설정 파일을 붙여넣듯이)">${icon("FileText", 15)}</button>
            ${session.protocol === "serial" ? `<button class="tool" data-act="break" title="Break 신호 보내기 (장비 ROMMON 진입 등)">${icon("Zap", 15)}<span>Break</span></button>` : ""}
            <button class="tool" data-act="record" title="매크로 기록 시작/끝">${icon("Circle", 15)}<span>기록</span></button>
-           <button class="tool" data-act="notify" title="작업 완료 알림: 출력이 멈추면(명령이 끝나면) 알립니다. 다른 탭을 보고 있을 때만 알림이 옵니다">${icon("Bell", 15)}</button>
+           <button class="tool" data-act="notify" title="작업 완료 알림: 출력이 멈추면(명령이 끝나면) 알립니다. 다른 탭을 보고 있을 때만 알림이 옵니다" aria-pressed="false">${icon("Bell", 15)}</button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
          </div>
        </div>
@@ -302,8 +304,8 @@ export class TerminalView implements View {
          ${icon("Search", 14)}
          <input placeholder="터미널에서 찾기" spellcheck="false" />
          <span class="find-count" data-i18n-skip></span>
-         <button class="tool find-case" data-find="case" title="대소문자 구분">Aa</button>
-         <button class="tool find-regex" data-find="regex" title="정규식">.*</button>
+         <button class="tool find-case" data-find="case" title="대소문자 구분" aria-pressed="false">Aa</button>
+         <button class="tool find-regex" data-find="regex" title="정규식" aria-pressed="false">.*</button>
          <button class="tool" data-find="prev" title="이전">${icon("ArrowUp", 14)}</button>
          <button class="tool" data-find="next" title="다음">${icon("ArrowUp", 14, "flip")}</button>
          <button class="tool" data-find="close" title="닫기">${icon("X", 14)}</button>
@@ -329,7 +331,17 @@ export class TerminalView implements View {
     });
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.search);
-    this.term.loadAddon(new WebLinksAddon((_e, uri) => openExternal(uri)));
+    // Ctrl+click opens a link (as Windows Terminal does): a plain click in a
+    // terminal is for focus and selection, and output comes from the server.
+    this.term.loadAddon(
+      new WebLinksAddon((e, uri) => {
+        if (e.ctrlKey || !state.settings.linkNeedsCtrl) return void openExternal(uri);
+        if (!linkHintShown) {
+          linkHintShown = true;
+          toast("링크는 Ctrl+클릭으로 엽니다", "info", 3000);
+        }
+      }),
+    );
     this.term.open(this.host);
     this.applyThemeBackground();
     this.wireBlink();
@@ -745,6 +757,21 @@ export class TerminalView implements View {
     this.zoomed = size;
     this.term.options.fontSize = size;
     this.layout();
+    this.showZoom(size);
+  }
+
+  /** Back to the font size from Settings; this tab then follows that setting again. */
+  private zoomReset() {
+    const size = state.settings.fontSize;
+    this.zoomed = null;
+    if (size !== this.term.options.fontSize) {
+      this.term.options.fontSize = size;
+      this.layout();
+    }
+    this.showZoom(size);
+  }
+
+  private showZoom(size: number) {
     let badge = this.el.querySelector<HTMLElement>(".zoom-badge");
     if (!badge) {
       badge = h("div", { class: "zoom-badge" });
@@ -1491,7 +1518,7 @@ export class TerminalView implements View {
     // (still owed if an earlier reconnect failed before it could).
     this.relog ||= !!this.logPath;
     this.logPath = null;
-    this.el.querySelector('[data-act="log"]')!.classList.remove("on");
+    setPressed(this.el.querySelector('.view-actions [data-act="log"]'), false);
     this.term.write(`\r\n\x1b[90m──────── ${tr("다시 연결")} ────────\x1b[0m\r\n`);
     this.connect();
   }
@@ -1662,7 +1689,7 @@ export class TerminalView implements View {
   /** Toggle "notify when the task finishes" for this tab. */
   private toggleNotify() {
     this.notifyDone = !this.notifyDone;
-    this.el.querySelector('[data-act="notify"]')!.classList.toggle("on", this.notifyDone);
+    setPressed(this.el.querySelector('.view-actions [data-act="notify"]'), this.notifyDone);
     if (this.notifyDone) {
       ensureNotifyPermission();
       toast("작업이 끝나면 알립니다 (다른 탭을 보고 있을 때)", "info", 2500);
@@ -1936,7 +1963,8 @@ export class TerminalView implements View {
       const f = (e.target as HTMLElement).closest<HTMLElement>("[data-find]")?.dataset.find;
       if (f === "close") this.toggleFind(false);
       else if (f === "case" || f === "regex") {
-        (f === "case" ? caseBtn : regexBtn).classList.toggle("on");
+        const btn = f === "case" ? caseBtn : regexBtn;
+        setPressed(btn, !btn.classList.contains("on"));
         find("next"); // re-run with the new case/regex setting
       } else if (f === "next" || f === "prev") find(f);
     });
@@ -1987,7 +2015,7 @@ export class TerminalView implements View {
         options = backendLogOptions(c, this.session);
       }
       this.logPath = await api.termSetLogging(this.runtimeId, options);
-      this.el.querySelector('[data-act="log"]')!.classList.toggle("on", !!this.logPath);
+      setPressed(this.el.querySelector('.view-actions [data-act="log"]'), !!this.logPath);
       if (this.logPath) toast(`로그 기록을 시작했습니다: ${this.logPath}`, "success");
       else toast("로그 기록을 중지했습니다");
       this.ws.changed();
@@ -2086,7 +2114,7 @@ export class TerminalView implements View {
     const label = this.el.querySelector<HTMLElement>("[data-keys-label]");
     const bs = this.session.options.backspace === "ctrl-h" ? " · ^H" : "";
     if (label) label.textContent = (this.keyMode === "network" ? "키: 장비" : "키: 표준") + bs;
-    this.el.querySelector('[data-act="keys"]')?.classList.toggle("on", this.keyMode === "network");
+    setPressed(this.el.querySelector('[data-act="keys"]'), this.keyMode === "network");
   }
 
   /** Key options for this tab, remembered in the saved session. */
@@ -2212,6 +2240,9 @@ export class TerminalView implements View {
       case "term.complete":
         if (!this.assist.openList()) break;
         e.preventDefault();
+        return false;
+      case "term.zoomReset":
+        this.zoomReset();
         return false;
       default: {
         // The rest do what their toolbar button does (hidden buttons do not apply here).

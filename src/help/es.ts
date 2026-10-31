@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Para serie, escriba <code>COM3</code> o <code>COM3:115200</code>.</li>
       </ol>
       <h4>Guardarla como sesión</h4>
-      <p>Guarde los datos de conexión con el botón ${icon("Plus", 13)} de la lista de sesiones (${kbd("Ctrl+Shift+N")}) y luego conéctese con doble clic o pulsando ${kbd("Enter")}. Las conexiones guardadas en otros programas se pueden traer de una sola vez con <a data-goto="import">Importar</a>.</p>
+      <p>Guarde los datos de conexión con el botón ${icon("Plus", 13)} de la lista de sesiones (${kbd("Ctrl+Shift+N")}) y luego conéctese con doble clic o pulsando ${kbd("Enter")}. Las conexiones guardadas en otros programas se pueden traer de una sola vez con <a data-goto="import">Importar</a>. En el editor de sesiones, <b>Probar conexión</b> comprueba antes de guardar si el puerto del host está abierto. Las sesiones guardadas se prueban desde su menú contextual, y varias sesiones o una carpeta entera a la vez seleccionándolas o con clic derecho en la carpeta.</p>
       <h4>Idioma de la interfaz</h4>
       <p><b>Idioma</b>, en la parte superior de Configuración, cambia la interfaz a 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français o Deutsch (al instante, sin desconectar; la guía y las notas de actualización también lo siguen). Hasta que elija uno, la aplicación sigue el idioma de visualización de Windows; una vez elegido, siempre prevalece su elección.</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>Lee directamente la configuración de este PC</td></tr>
         <tr><td>WinSCP</td><td>La configuración de este PC o, si no hay, <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td>La carpeta <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
+        <tr><td>OpenSSH</td><td>El archivo <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; se omiten comodines como <code>Host *</code>)</td></tr>
         <tr><td>RDCMan</td><td>Archivo <code>.rdg</code></td></tr>
         <tr><td>Escritorio remoto</td><td>Una carpeta que contenga archivos <code>.rdp</code> (incluidas las subcarpetas)</td></tr>
-        <tr><td>CSV</td><td>Nombres de columna en la primera línea: Name, Protocol, Host, Port, Username, Folder (separados por comas, punto y coma o tabulaciones)</td></tr>
+        <tr><td>CSV</td><td>Nombres de columna en la primera línea: Name, Protocol, Host, Port, Username, Folder, Domain (separados por comas, punto y coma o tabulaciones). <b>Exportar lista de sesiones (CSV)</b> en el mismo menú escribe este formato.</td></tr>
       </table>
       <p>Entre instalaciones de BananaConn, use <b>Exportar/Importar copia de seguridad de sesiones (JSON)</b> en el mismo menú. La copia de seguridad incluye, además de las sesiones, las carpetas vacías, los fragmentos/macros y los túneles SSH. Si la restaura en el mismo PC, se conservan los vínculos con las credenciales, y aunque todas las sesiones ya existan puede restaurar solo las carpetas, los fragmentos y los túneles que falten. Los túneles SSH y las opciones relacionadas con la seguridad (ignorar errores de certificado, reenvío de puertos, ubicación del archivo de registro, etc.) solo se importan si activa "Importar también las opciones relacionadas con la seguridad".</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Copiar y pegar</b>: al seleccionar arrastrando se copia de inmediato, y el clic derecho pega (configurable en Configuración). ${kbd("Ctrl+C")} solo copia cuando hay una selección; si no, se envía al dispositivo.</li>
+        <li><b>Enlaces</b>: ${kbd("Ctrl")}+clic en una dirección de la salida para abrirla en el navegador (un clic normal sirve para seleccionar y enfocar). En Configuración → Terminal se puede hacer que un clic normal abra los enlaces.</li>
         <li><b>Tamaño de fuente</b>: ${kbd("Ctrl")}+rueda del ratón, o ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)} en la barra de herramientas.</li>
         <li><b>Buscar</b>: ${kbd("Ctrl+Shift+F")}.</li>
         <li><b>Modo de teclas</b>: si Delete, Home o End imprimen <code>~</code> en dispositivos como Cisco IOS, cambie la barra de herramientas a "Teclas: Dispositivo" (Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E). Puede definir el valor predeterminado en el editor de sesiones.</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>Ir a Conexión rápida</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>Pestaña siguiente / anterior</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>Cerrar pestaña</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>Reabrir pestaña cerrada</td></tr>
         <tr><td>Doble clic en la pestaña</td><td>Volver a abrir la misma sesión</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>Buscar en el terminal</td></tr>
         <tr><td>${kbd("Ctrl")}+rueda</td><td>Tamaño de fuente del terminal</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>Restablecer tamaño de fuente del terminal</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>Contraer barra lateral</td></tr>
         <tr><td colspan="2"><b>En la lista de sesiones</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>Conectar / Editar / Eliminar (se aplica a todas cuando hay varias seleccionadas)</td></tr>

@@ -7,7 +7,7 @@ import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession, reloadCredentials } from "../store";
-import { confirmDialog, errorText, esc, h, modal, toast } from "../ui";
+import { confirmDialog, errorText, esc, h, modal, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import { GatewayLink } from "../tunnels";
 import { desktopHost, ViewAi } from "../ai/viewAi";
@@ -453,7 +453,7 @@ export class RdpView implements View {
   // ---- display ----------------------------------------------------------------
 
   private syncFit() {
-    this.el.querySelector('[data-act="fit"]')!.classList.toggle("on", this.fit);
+    setPressed(this.el.querySelector('[data-act="fit"]'), this.fit);
     this.screen.classList.toggle("actual", !this.fit);
     this.applyCanvasSize();
   }
@@ -778,7 +778,7 @@ export class RdpView implements View {
       this.keyLog = h("div", { class: "rdp-keylog" }, "<b>키 확인</b>: 원격 화면을 누른 뒤 키를 눌러 보세요");
       this.screen.appendChild(this.keyLog);
     }
-    this.el.querySelector('[data-act="keytest"]')!.classList.toggle("on", !!this.keyLog);
+    setPressed(this.el.querySelector('[data-act="keytest"]'), !!this.keyLog);
     this.canvas.focus();
   }
 

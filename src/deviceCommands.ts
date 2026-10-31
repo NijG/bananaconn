@@ -158,6 +158,10 @@ const COMMANDS: Record<string, Command[]> = {
     ["라우팅 테이블", "show route summary"],
     ["장비 알람", "show chassis alarms"],
     ["하드웨어", "show chassis hardware"],
+    ["CPU 사용률", "show chassis routing-engine"],
+    ["하드웨어 상태", "show chassis environment"],
+    ["가동 시간", "show system uptime"],
+    ["저장소 사용량", "show system storage"],
     ["로그 최근 50줄", "show log messages | last 50"],
   ],
   "huawei-vrp": [
@@ -166,6 +170,9 @@ const COMMANDS: Record<string, Command[]> = {
     ["인터페이스 요약", "display interface brief"],
     ["라우팅 테이블", "display ip routing-table"],
     ["CPU 사용률", "display cpu-usage"],
+    ["메모리", "display memory-usage"],
+    ["ARP 테이블", "display arp"],
+    ["이웃 장비 (LLDP)", "display lldp neighbor brief"],
     ["로그", "display logbuffer"],
   ],
 };

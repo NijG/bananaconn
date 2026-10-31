@@ -507,7 +507,11 @@ impl russh::server::Handler for ShellServer {
     async fn exec_request(&mut self, channel: russh::ChannelId, data: &[u8], session: &mut russh::server::Session) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data).replace("/proc/", &self.fake_proc);
         session.channel_success(channel)?;
+        // Git's tools (df) first on PATH, as in Git Bash: run from PowerShell
+        // or cmd, the inherited PATH has no df and the sample has no disk.
+        let path = format!(r"C:\Program Files\Git\usr\bin;{}", std::env::var("PATH").unwrap_or_default());
         let mut child = std::process::Command::new(r"C:\Program Files\Git\usr\bin\sh.exe")
+            .env("PATH", path)
             .arg("-c")
             .arg(cmd)
             .stdin(std::process::Stdio::piped())

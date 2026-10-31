@@ -202,6 +202,9 @@ export class Workspace {
       });
       if (!ok) return;
     }
+    // Remember the session so the tab can be reopened (Ctrl+Shift+T).
+    this.closedStack.push(tab.session);
+    if (this.closedStack.length > 20) this.closedStack.shift();
     tab.view.dispose();
     tab.view.el.remove();
     tab.el.remove();
@@ -422,10 +425,28 @@ export class Workspace {
   /** Set by the app to reopen a session from the tab menu. */
   duplicateHandler: ((s: Session) => void) | null = null;
 
+  /** Sessions of recently closed tabs, for "reopen closed tab" (Ctrl+Shift+T). */
+  private closedStack: Session[] = [];
+
+  /** Reopen the most recently closed tab; false when there is none to reopen. */
+  reopenLastClosed(): boolean {
+    const session = this.closedStack.pop();
+    if (!session) return false;
+    this.duplicateHandler?.(session);
+    return true;
+  }
+
   private renderTabs() {
     const active = this.slots[this.focused];
+    // The same session opened twice shows the same title: number the later
+    // ones, in tab order ("web", "web (2)"), so they can be told apart.
+    const seen = new Map<string, number>();
     for (const t of this.tabs) {
       const p = PROTOCOLS[t.session.protocol];
+      const base = t.view.title();
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      const title = n > 1 ? `${base} (${n})` : base;
       const shownElsewhere = this.slots.includes(t.id) && t.id !== active;
       const receives = this.broadcast && !!t.view.receiveBroadcast && t.view.state === "connected";
       t.el.className = `tab state-${t.view.state}${t.id === active ? " active" : ""}${shownElsewhere ? " visible" : ""}${receives ? " broadcasting" : ""}`;
@@ -434,7 +455,7 @@ export class Workspace {
       // The protocol shows as the dot's color and in the tooltip; the label
       // itself cost too much width with many tabs open.
       const html = `<span class="tab-dot"></span>
-        <span class="tab-title" data-i18n-skip>${esc(t.view.title())}</span>
+        <span class="tab-title" data-i18n-skip>${esc(title)}</span>
         <button class="tab-close" data-close title="닫기">${icon("X", 13)}</button>`;
       if (t.el.dataset.html !== html) {
         t.el.innerHTML = html;

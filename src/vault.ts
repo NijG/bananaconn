@@ -6,7 +6,7 @@ import { api, pickOpenFile, type Credential } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
-import { confirmDialog, errorText, esc, modal, toast } from "./ui";
+import { confirmDialog, errorText, esc, listKeys, modal, toast } from "./ui";
 
 /** A strong random password: at least one upper, lower, digit and symbol, the
  * rest mixed, shuffled. Ambiguous characters (O/0, l/1) are left out. */
@@ -39,6 +39,7 @@ export function openVault(): Promise<void> {
       body: `<div class="vault">
           <aside class="vault-list">
             <button class="btn btn-primary btn-block" data-new>${icon("Plus", 14)}새 자격 증명</button>
+            <input type="search" class="list-search" placeholder="이름·사용자 검색" spellcheck="false" autocomplete="off" />
             <div class="vault-items"></div>
           </aside>
           <section class="vault-detail"></section>
@@ -50,8 +51,14 @@ export function openVault(): Promise<void> {
     const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
     const detailEl = m.root.querySelector<HTMLElement>(".vault-detail")!;
 
+    const search = m.root.querySelector<HTMLInputElement>(".list-search")!;
+    /** Search terms: each must appear in the name or user name. */
+    let terms: string[] = [];
     const renderList = () => {
-      const items = state.credentials;
+      const items = state.credentials.filter((c) => {
+        const hay = `${c.name} ${c.username}`.toLowerCase();
+        return terms.every((t) => hay.includes(t));
+      });
       listEl.innerHTML = items.length
         ? items
             .map(
@@ -61,7 +68,7 @@ export function openVault(): Promise<void> {
               </button>`,
             )
             .join("")
-        : `<p class="muted small pad">저장된 자격 증명이 없습니다.</p>`;
+        : `<p class="muted small pad">${state.credentials.length ? "일치하는 자격 증명이 없습니다." : "저장된 자격 증명이 없습니다."}</p>`;
       listEl.querySelectorAll<HTMLElement>("[data-id]").forEach((b) =>
         b.addEventListener("click", () => {
           selected = b.dataset.id!;
@@ -162,7 +169,7 @@ export function openVault(): Promise<void> {
         // Keep the reveal toggle's icon in step with the now-visible field.
         const reveal = form.querySelector("[data-reveal]");
         if (reveal) reveal.innerHTML = icon("EyeOff", 14);
-        writeClipboard(pw);
+        writeClipboard(pw, { secret: true }); // keep the generated password out of clipboard history
         toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000);
       });
       form.querySelector("[data-del]")?.addEventListener("click", async () => {
@@ -229,7 +236,14 @@ export function openVault(): Promise<void> {
       }
     };
 
+    listKeys(search, listEl, "[data-id]");
+    search.addEventListener("input", () => {
+      terms = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+      renderList();
+    });
     m.root.querySelector("[data-new]")!.addEventListener("click", () => {
+      search.value = "";
+      terms = [];
       draft = { id: crypto.randomUUID(), name: "", username: "", kind: "password", keyPath: null, hasSecret: false };
       renderList();
       renderDetail();

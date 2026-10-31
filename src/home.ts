@@ -102,5 +102,19 @@ export function mountHome(
   new MutationObserver(() => {
     if (!root.hidden) render();
   }).observe(root, { attributes: true, attributeFilter: ["hidden"] });
+  // While the home screen stays open (no tabs), keep the "N분 전" times honest.
+  // Only the time text is touched — order and focus are left alone; the i18n
+  // walker translates the new Korean text as it does on a full render.
+  setInterval(() => {
+    if (root.hidden) return;
+    const recent = [...state.sessions]
+      .filter((s) => s.lastUsed)
+      .sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0))
+      .slice(0, 6);
+    root.querySelectorAll<HTMLElement>(".recent-item .ri-time").forEach((el, i) => {
+      const t = relativeTime(recent[i]?.lastUsed ?? null);
+      if (el.textContent !== t) el.textContent = t;
+    });
+  }, 60000);
   render();
 }

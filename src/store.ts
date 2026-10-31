@@ -31,6 +31,8 @@ export interface Settings {
    * the app then follows the Windows display language. */
   uiLanguage?: Language;
   copyOnSelect: boolean;
+  /** Open a link in terminal output only with Ctrl+click (false: a plain click). */
+  linkNeedsCtrl: boolean;
   rightClickPaste: boolean;
   /** Ask before pasting more than one line into a terminal. */
   confirmMultiPaste: boolean;
@@ -118,6 +120,7 @@ const DEFAULT_SETTINGS: Settings = {
   scrollback: 10000,
   renderer: "auto",
   copyOnSelect: true,
+  linkNeedsCtrl: true,
   rightClickPaste: true,
   confirmMultiPaste: true,
   pasteMode: "echo",

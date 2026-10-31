@@ -7,8 +7,9 @@ import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { actionFor } from "../keymap";
 import { endpoint, PROTOCOLS, type Session } from "../model";
+import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials } from "../store";
-import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, modal, promptDialog, toast } from "../ui";
+import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, modal, promptDialog, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
 
@@ -223,22 +224,29 @@ class Pane {
 
   /** Entries after the hidden-file and name filters. */
   private visible(): FileEntry[] {
-    const q = this.filter.toLowerCase();
-    return this.entries.filter(
-      (e) => (Pane.showHidden || !e.name.startsWith(".")) && (!q || e.name.toLowerCase().includes(q)),
-    );
+    // Every whitespace-separated term must appear ("log 2025" finds
+    // "app-2025-10.log"), like the session and command-palette searches.
+    const terms = this.filter.toLowerCase().split(/\s+/).filter(Boolean);
+    return this.entries.filter((e) => {
+      if (!Pane.showHidden && e.name.startsWith(".")) return false;
+      const name = e.name.toLowerCase();
+      return terms.every((t) => name.includes(t));
+    });
   }
 
   syncHiddenButton() {
-    this.el.querySelector('[data-p="hidden"]')!.classList.toggle("on", Pane.showHidden);
+    setPressed(this.el.querySelector('[data-p="hidden"]'), Pane.showHidden);
   }
 
   private sorted(vis: FileEntry[]): FileEntry[] {
     const k = this.sortKey;
     return vis.sort((a, b) => {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      const av = k === "name" ? a.name.toLowerCase() : (a[k] ?? 0);
-      const bv = k === "name" ? b.name.toLowerCase() : (b[k] ?? 0);
+      // Natural, locale-aware order (shared with the session tree): "log2"
+      // before "log10", Korean and accented names in dictionary order.
+      if (k === "name") return natural.compare(a.name, b.name) * this.sortDir;
+      const av = a[k] ?? 0;
+      const bv = b[k] ?? 0;
       return (av < bv ? -1 : av > bv ? 1 : 0) * this.sortDir;
     });
   }
@@ -610,7 +618,7 @@ export class FilesView implements View, EditorHost {
       { class: "view files-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
-         <span class="view-endpoint">${esc(endpoint(session))}</span>
+         <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state></span>
          <div class="editing" hidden></div>
          <div class="view-actions">

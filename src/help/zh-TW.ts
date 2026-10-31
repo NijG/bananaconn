@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>序列連線請輸入 <code>COM3</code> 或 <code>COM3:115200</code>。</li>
       </ol>
       <h4>儲存為工作階段</h4>
-      <p>使用工作階段清單中的 ${icon("Plus", 13)} 按鈕 (${kbd("Ctrl+Shift+N")}) 儲存連線資訊，之後按兩下或按 ${kbd("Enter")} 即可連線。其他程式中儲存的連線，可以透過<a data-goto="import">匯入</a>一次搬過來。</p>
+      <p>使用工作階段清單中的 ${icon("Plus", 13)} 按鈕 (${kbd("Ctrl+Shift+N")}) 儲存連線資訊，之後按兩下或按 ${kbd("Enter")} 即可連線。其他程式中儲存的連線，可以透過<a data-goto="import">匯入</a>一次搬過來。在工作階段編輯視窗中按 <b>測試連線</b>，可在儲存前確認主機連接埠是否開放。已儲存的工作階段可從右鍵選單測試，多個工作階段或整個資料夾可選取後或在資料夾上按右鍵一次測試。</p>
       <h4>介面語言</h4>
       <p>設定最上方的<b>介面語言</b>可將畫面切換為 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français 或 Deutsch (立即生效且不會中斷連線；使用說明與更新說明也會一併切換)。在您選擇之前，應用程式會依照 Windows 顯示語言；選擇之後，一律以您的選擇為準。</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>直接讀取這台電腦的設定</td></tr>
         <tr><td>WinSCP</td><td>這台電腦的設定，若沒有則選擇 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 資料夾</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 檔案（Host、HostName、User、Port、ProxyJump；略過 <code>Host *</code> 等萬用字元）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 檔案</td></tr>
         <tr><td>遠端桌面</td><td>含有 <code>.rdp</code> 檔案的資料夾 (包含子資料夾)</td></tr>
-        <tr><td>CSV</td><td>第一行為欄位名稱：Name, Protocol, Host, Port, Username, Folder (以逗號、分號或 Tab 分隔)</td></tr>
+        <tr><td>CSV</td><td>第一行為欄位名稱：Name, Protocol, Host, Port, Username, Folder, Domain (以逗號、分號或 Tab 分隔)。同一選單中的 <b>匯出工作階段清單 (CSV)</b> 會以此格式寫出。</td></tr>
       </table>
       <p>在不同的 BananaConn 安裝之間，請使用同一選單中的<b>匯出/匯入工作階段備份 (JSON)</b>。備份中除了工作階段，還包含空資料夾、片段/巨集與 SSH 通道。在同一台電腦上還原時，認證的關聯也會保留；即使所有工作階段都已存在，也可以只還原缺少的資料夾、片段與通道。SSH 通道與安全性相關選項 (忽略憑證錯誤、連接埠轉送、記錄檔位置等) 只有在開啟「一併匯入安全性相關選項」時才會匯入。</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>複製與貼上</b>：拖曳選取即會立即複製，按右鍵即可貼上 (可在設定中變更)。${kbd("Ctrl+C")} 只有在有選取內容時才會複製，否則會傳送給設備。</li>
+        <li><b>連結</b>：按住 ${kbd("Ctrl")} 並按一下輸出中的位址，即可在瀏覽器中開啟（一般按一下用於選取與聚焦）。可在設定 → 終端機中改為直接按一下即可開啟。</li>
         <li><b>字型大小</b>：${kbd("Ctrl")}+滑鼠滾輪，或工具列中的 ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)}。</li>
         <li><b>尋找</b>：${kbd("Ctrl+Shift+F")}。</li>
         <li><b>按鍵輸入方式</b>：若在 Cisco IOS 等設備上按 Delete、Home 或 End 會出現 <code>~</code>，請將工具列切換為「按鍵：設備」(Delete=Ctrl-D、Home=Ctrl-A、End=Ctrl-E)。預設值可在編輯工作階段中設定。</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>移至快速連線</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>下一個 / 上一個分頁</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>關閉分頁</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>重新開啟已關閉的分頁</td></tr>
         <tr><td>在分頁上按兩下</td><td>再開啟一次相同的工作階段</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>在終端機中尋找</td></tr>
         <tr><td>${kbd("Ctrl")}+滾輪</td><td>終端機字型大小</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>還原終端機預設字型大小</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>摺疊側邊欄</td></tr>
         <tr><td colspan="2"><b>在工作階段清單中</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>連線 / 編輯 / 刪除 (選取多個時套用到全部)</td></tr>

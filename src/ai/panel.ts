@@ -529,7 +529,7 @@ export class AiPanel {
       // Switching service starts a fresh conversation (a local chat's unmasked
       // hosts must not carry over to a cloud service). Confirm first so a misclick
       // does not throw away the current chat.
-      if (this.turns.length && !(await confirmDialog({ title: "AI 서비스 바꾸기", message: "AI 서비스를 바꾸면 지금 대화를 정리하고 새 대화를 시작합니다. 계속할까요?", confirm: "바꾸기" }))) {
+      if (this.turns.length && !(await confirmDialog({ title: "AI 서비스 바꾸기", message: "AI 서비스를 바꾸면 지금 대화를 정리하고 새 대화를 시작합니다. 계속할까요?", confirm: "전환" }))) {
         sel.value = this.providerId ?? sel.value; // keep the current service
         return;
       }

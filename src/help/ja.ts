@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>シリアルの場合は <code>COM3</code> または <code>COM3:115200</code> と入力します。</li>
       </ol>
       <h4>セッションとして保存する</h4>
-      <p>セッション一覧の ${icon("Plus", 13)} ボタン (${kbd("Ctrl+Shift+N")}) で接続情報を保存し、ダブルクリックまたは ${kbd("Enter")} で接続します。他のプログラムに保存した接続は <a data-goto="import">インポート</a> でまとめて移行できます。</p>
+      <p>セッション一覧の ${icon("Plus", 13)} ボタン (${kbd("Ctrl+Shift+N")}) で接続情報を保存し、ダブルクリックまたは ${kbd("Enter")} で接続します。他のプログラムに保存した接続は <a data-goto="import">インポート</a> でまとめて移行できます。セッション編集画面の <b>接続を確認</b> で、保存前にホストのポートが開いているかすぐ確認できます。保存済みのセッションは右クリックメニューから、複数のセッションやフォルダーは選択するかフォルダーを右クリックしてまとめて確認できます。</p>
       <h4>表示言語</h4>
       <p>設定の一番上にある <b>表示言語</b> で、画面を 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français、Deutsch に切り替えられます (切断せずにすぐ反映され、ガイドと更新内容も追従します)。選択するまでは Windows の表示言語に従い、一度選ぶと常にその選択が優先されます。</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>この PC の設定を直接読み込みます</td></tr>
         <tr><td>WinSCP</td><td>この PC の設定、なければ <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> フォルダー</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> ファイル (Host・HostName・User・Port・ProxyJump。<code>Host *</code> などのワイルドカードは除外)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> ファイル</td></tr>
         <tr><td>リモートデスクトップ</td><td><code>.rdp</code> ファイルがあるフォルダー (サブフォルダーを含む)</td></tr>
-        <tr><td>CSV</td><td>1 行目に列名: Name, Protocol, Host, Port, Username, Folder (カンマ、セミコロン、タブ区切り)</td></tr>
+        <tr><td>CSV</td><td>1 行目に列名: Name, Protocol, Host, Port, Username, Folder, Domain (カンマ、セミコロン、タブ区切り)。同じメニューの <b>セッション一覧をエクスポート (CSV)</b> がこの形式で書き出します。</td></tr>
       </table>
       <p>BananaConn 同士で移行するときは、同じメニューの <b>セッションのバックアップのエクスポート/インポート (JSON)</b> を使います。バックアップにはセッションのほか、空のフォルダー、スニペット・マクロ、SSH トンネルが含まれます。同じ PC で復元すると資格情報との関連付けもそのまま残り、セッションがすべて既にある場合でも、足りないフォルダー・スニペット・トンネルだけを復元できます。SSH トンネルとセキュリティ関連のオプション (証明書エラーを無視、ポートフォワーディング、ログファイルの場所など) は、「セキュリティ関連のオプションもインポート」をオンにしたときだけインポートされます。</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>コピーと貼り付け</b>: ドラッグで選択するとすぐにコピーされ、右クリックで貼り付けます (設定で変更可)。${kbd("Ctrl+C")} は選択範囲があるときだけコピーし、ないときは機器に送信されます。</li>
+        <li><b>リンク</b>: 出力中のアドレスは ${kbd("Ctrl")}+クリックでブラウザーで開きます (通常のクリックは選択・フォーカス用)。設定 → ターミナルで通常のクリックで開くように変更できます。</li>
         <li><b>文字サイズ</b>: ${kbd("Ctrl")}+マウスホイール、またはツールバーの ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)}。</li>
         <li><b>検索</b>: ${kbd("Ctrl+Shift+F")}。</li>
         <li><b>キー入力方式</b>: Cisco IOS などの機器で Delete、Home、End を押すと <code>~</code> が表示される場合は、ツールバーを「キー: 機器」(Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E) に切り替えます。既定値はセッションの編集で設定できます。</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>クイック接続へ移動</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>次 / 前のタブ</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>タブを閉じる</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>閉じたタブを再度開く</td></tr>
         <tr><td>タブをダブルクリック</td><td>同じセッションをもう一度開く</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>ターミナル内を検索</td></tr>
         <tr><td>${kbd("Ctrl")}+ホイール</td><td>ターミナルの文字サイズ</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>ターミナルの文字サイズを既定に戻す</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>サイドバーを折りたたむ</td></tr>
         <tr><td colspan="2"><b>セッション一覧で</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>接続 / 編集 / 削除 (複数選択時はすべてに適用)</td></tr>

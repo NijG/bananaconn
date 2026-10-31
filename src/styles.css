@@ -2109,12 +2109,29 @@ code.fp {
   font-weight: 500;
   margin-left: 6px;
 }
+/* Bulk "test connection" results. */
+.reach-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.reach-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.reach-table td.ok {
+  color: var(--ok);
+}
+.reach-table td.bad {
+  color: var(--danger);
+}
 .field input,
 .field select,
 .field textarea,
 .risk-rule input,
 .risk-rule select,
-.lang-select {
+.lang-select,
+.list-search {
   width: 100%;
   min-width: 0;
   height: 34px;
@@ -2138,6 +2155,7 @@ code.fp {
 .field input:focus,
 .field select:focus,
 .field textarea:focus,
+.list-search:focus,
 .risk-rule input:focus,
 .risk-rule select:focus,
 .lang-select:focus {
@@ -2892,6 +2910,20 @@ code.fp {
   font-size: 12px;
   margin-right: 6px;
   white-space: nowrap;
+}
+/* The cursor position doubles as a "go to line" button. */
+.editor-pos {
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.editor-pos:hover {
+  background: var(--bg-2);
 }
 
 /* ==========================================================================

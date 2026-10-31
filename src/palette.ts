@@ -61,8 +61,10 @@ export function openCommandPalette(opts: { runAction: (id: string) => void; open
 
   const matches = (q: string): Item[] => {
     if (!q) return items.slice(0, 50);
-    const needle = q.toLowerCase();
-    return items.filter((it) => it.hay.includes(needle) || it.label.toLowerCase().includes(needle)).slice(0, 50);
+    // Each whitespace-separated term must appear (it.hay already holds the
+    // label), so "ssh prod" finds a "prod" SSH session regardless of word order.
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    return items.filter((it) => terms.every((t) => it.hay.includes(t))).slice(0, 50);
   };
 
   const render = () => {

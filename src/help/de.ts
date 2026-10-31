@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Für seriell geben Sie <code>COM3</code> oder <code>COM3:115200</code> ein.</li>
       </ol>
       <h4>Als Sitzung speichern</h4>
-      <p>Speichern Sie Verbindungsdaten mit der Schaltfläche ${icon("Plus", 13)} in der Sitzungsliste (${kbd("Ctrl+Shift+N")}) und verbinden Sie sich dann per Doppelklick oder mit ${kbd("Enter")}. In anderen Programmen gespeicherte Verbindungen lassen sich mit <a data-goto="import">Importieren</a> in einem Schritt übernehmen.</p>
+      <p>Speichern Sie Verbindungsdaten mit der Schaltfläche ${icon("Plus", 13)} in der Sitzungsliste (${kbd("Ctrl+Shift+N")}) und verbinden Sie sich dann per Doppelklick oder mit ${kbd("Enter")}. In anderen Programmen gespeicherte Verbindungen lassen sich mit <a data-goto="import">Importieren</a> in einem Schritt übernehmen. Im Sitzungseditor prüft <b>Verbindung testen</b> vor dem Speichern, ob der Port des Hosts offen ist. Gespeicherte Sitzungen lassen sich über ihr Kontextmenü testen, mehrere Sitzungen oder ein ganzer Ordner auf einmal durch Auswahl bzw. Rechtsklick auf den Ordner.</p>
       <h4>Anzeigesprache</h4>
       <p><b>Sprache</b> oben in den Einstellungen schaltet die Oberfläche auf 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français oder Deutsch um (sofort, ohne Verbindungen zu trennen; auch die Anleitung und die Update-Hinweise folgen). Bis Sie eine Sprache wählen, folgt die App der Windows-Anzeigesprache; danach gilt immer Ihre Wahl.</p>`,
   },
@@ -53,9 +53,10 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>PuTTY · KiTTY</td><td>Liest die Einstellungen dieses PCs direkt</td></tr>
         <tr><td>WinSCP</td><td>Die Einstellungen dieses PCs oder, falls keine vorhanden, <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td>Der Ordner <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
+        <tr><td>OpenSSH</td><td>Die Datei <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; Platzhalter wie <code>Host *</code> werden übersprungen)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code>-Datei</td></tr>
         <tr><td>Remotedesktop</td><td>Ein Ordner mit <code>.rdp</code>-Dateien (inklusive Unterordnern)</td></tr>
-        <tr><td>CSV</td><td>Spaltennamen in der ersten Zeile: Name, Protocol, Host, Port, Username, Folder (durch Komma, Semikolon oder Tab getrennt)</td></tr>
+        <tr><td>CSV</td><td>Spaltennamen in der ersten Zeile: Name, Protocol, Host, Port, Username, Folder, Domain (durch Komma, Semikolon oder Tab getrennt). <b>Sitzungsliste exportieren (CSV)</b> im selben Menü schreibt dieses Format.</td></tr>
       </table>
       <p>Zwischen BananaConn-Installationen verwenden Sie <b>Sitzungssicherung exportieren/importieren (JSON)</b> im selben Menü. Die Sicherung enthält neben den Sitzungen auch leere Ordner, Snippets/Makros und SSH-Tunnel. Bei der Wiederherstellung auf demselben PC bleiben die Verknüpfungen zu den Anmeldedaten erhalten, und auch wenn alle Sitzungen schon vorhanden sind, lassen sich nur die fehlenden Ordner, Snippets und Tunnel wiederherstellen. SSH-Tunnel und sicherheitsrelevante Optionen (Zertifikatsfehler ignorieren, Portweiterleitung, Speicherort der Protokolldatei usw.) werden nur importiert, wenn „Auch sicherheitsrelevante Optionen importieren“ aktiviert ist.</p>`,
   },
@@ -79,6 +80,7 @@ export const SECTIONS: HelpSection[] = [
     body: `
       <ul>
         <li><b>Kopieren &amp; Einfügen</b>: Markieren durch Ziehen kopiert sofort, Rechtsklick fügt ein (in den Einstellungen konfigurierbar). ${kbd("Ctrl+C")} kopiert nur, wenn etwas markiert ist; sonst wird es an das Gerät gesendet.</li>
+        <li><b>Links</b>: Adressen in der Ausgabe mit ${kbd("Ctrl")}+Klick im Browser öffnen (ein einfacher Klick dient der Auswahl und dem Fokus). Unter Einstellungen → Terminal lässt sich das Öffnen per einfachem Klick einstellen.</li>
         <li><b>Schriftgröße</b>: ${kbd("Ctrl")}+Mausrad oder ${icon("ZoomIn", 13)}${icon("ZoomOut", 13)} in der Symbolleiste.</li>
         <li><b>Suchen</b>: ${kbd("Ctrl+Shift+F")}.</li>
         <li><b>Tastaturmodus</b>: Wenn Delete, Home oder End auf Geräten wie Cisco IOS <code>~</code> ausgeben, schalten Sie die Symbolleiste auf „Tasten: Gerät“ um (Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E). Den Standard legen Sie im Sitzungseditor fest.</li>
@@ -261,9 +263,11 @@ export const SECTIONS: HelpSection[] = [
         <tr><td>${kbd("Ctrl+Shift+K")}</td><td>Zur Schnellverbindung</td></tr>
         <tr><td>${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}</td><td>Nächster / vorheriger Tab</td></tr>
         <tr><td>${kbd("Ctrl+F4")} · ${kbd("Ctrl+Shift+W")}</td><td>Tab schließen</td></tr>
+        <tr><td>${kbd("Ctrl+Shift+T")}</td><td>Geschlossenen Tab wieder öffnen</td></tr>
         <tr><td>Doppelklick auf Tab</td><td>Dieselbe Sitzung erneut öffnen</td></tr>
         <tr><td>${kbd("Ctrl+Shift+F")}</td><td>Im Terminal suchen</td></tr>
         <tr><td>${kbd("Ctrl")}+Mausrad</td><td>Schriftgröße im Terminal</td></tr>
+        <tr><td>${kbd("Ctrl+0")}</td><td>Schriftgröße im Terminal zurücksetzen</td></tr>
         <tr><td>${kbd("Ctrl+Shift+B")}</td><td>Seitenleiste einklappen</td></tr>
         <tr><td colspan="2"><b>In der Sitzungsliste</b></td></tr>
         <tr><td>${kbd("Enter")} / ${kbd("F2")} / ${kbd("Del")}</td><td>Verbinden / Bearbeiten / Löschen (gilt bei Mehrfachauswahl für alle)</td></tr>

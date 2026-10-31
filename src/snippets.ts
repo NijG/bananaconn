@@ -3,7 +3,7 @@
 import { icon } from "./icons";
 import { saveSnippets, state, type Snippet } from "./store";
 import { groupForKind } from "./snippetLibrary";
-import { contextMenu, esc, modal, toast, type MenuItem } from "./ui";
+import { confirmDialog, contextMenu, esc, listKeys, modal, toast, type MenuItem } from "./ui";
 
 /** Recorded keystrokes made readable: Enter ⏎, Tab ⇥, Esc ␛, other controls ^X. */
 export function showKeys(data: string): string {
@@ -73,6 +73,7 @@ export function openSnippetManager() {
     body: `<div class="vault">
         <aside class="vault-list">
           <button class="btn btn-primary btn-block" data-new>${icon("Plus", 14)}새 스니펫</button>
+          <input type="search" class="list-search" placeholder="이름·내용 검색" spellcheck="false" autocomplete="off" />
           <div class="vault-items"></div>
         </aside>
         <section class="vault-detail"></section>
@@ -82,6 +83,14 @@ export function openSnippetManager() {
   });
   const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
   const detail = m.root.querySelector<HTMLElement>(".vault-detail")!;
+  const search = m.root.querySelector<HTMLInputElement>(".list-search")!;
+  /** Search terms: each must appear in the name, text or group. */
+  let terms: string[] = [];
+  const shown = (s: Snippet) => {
+    if (!terms.length) return true;
+    const hay = `${s.name} ${s.text} ${s.group ?? ""}`.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  };
 
   /** Created with "새 스니펫" but never saved: not written by other commits. */
   const unsaved = new Set<string>();
@@ -89,17 +98,18 @@ export function openSnippetManager() {
 
   const render = () => {
     // The user's own snippets first, then one section per operating system.
-    const groups = [...new Set(list.flatMap((s) => (s.group ? [s.group] : [])))];
+    const visible = list.filter(shown);
+    const groups = [...new Set(visible.flatMap((s) => (s.group ? [s.group] : [])))];
     const item = (s: Snippet) => `<button class="vault-item${s.id === selected ? " on" : ""}" data-id="${esc(s.id)}">
               ${icon(s.macro ? "Circle" : s.run ? "Play" : "ClipboardType", 15)}
               <span><b>${esc(s.name)}</b><small class="mono-ellipsis">${esc(s.macro ? showKeys(s.text) : s.text.split("\n")[0])}</small></span></button>`;
-    const own = list.filter((s) => !s.group);
-    listEl.innerHTML = list.length
+    const own = visible.filter((s) => !s.group);
+    listEl.innerHTML = visible.length
       ? [
           own.length ? `<div class="vault-group">내 스니펫</div>${own.map(item).join("")}` : "",
-          ...groups.map((g) => `<div class="vault-group">${esc(g)}</div>${list.filter((s) => s.group === g).map(item).join("")}`),
+          ...groups.map((g) => `<div class="vault-group">${esc(g)}</div>${visible.filter((s) => s.group === g).map(item).join("")}`),
         ].join("")
-      : `<p class="muted small pad">스니펫이 없습니다.</p>`;
+      : `<p class="muted small pad">${list.length ? "일치하는 스니펫이 없습니다." : "스니펫이 없습니다."}</p>`;
     listEl.querySelectorAll<HTMLElement>("[data-id]").forEach((b) =>
       b.addEventListener("click", () => {
         selected = b.dataset.id!;
@@ -149,7 +159,18 @@ export function openSnippetManager() {
       render();
       toast("저장했습니다", "success");
     });
-    detail.querySelector("[data-del]")!.addEventListener("click", () => {
+    detail.querySelector("[data-del]")!.addEventListener("click", async () => {
+      // A never-saved new snippet has nothing to lose; a saved one confirms,
+      // since the delete is immediate and cannot be undone.
+      if (!unsaved.has(s.id)) {
+        const ok = await confirmDialog({
+          title: "스니펫 삭제",
+          message: `<b data-i18n-skip>${esc(s.name)}</b>을(를) 삭제합니다.`,
+          confirm: "삭제",
+          danger: true,
+        });
+        if (!ok) return;
+      }
       list = list.filter((x) => x.id !== s.id);
       unsaved.delete(s.id);
       selected = list[0]?.id ?? null;
@@ -158,7 +179,15 @@ export function openSnippetManager() {
     });
   };
 
+  listKeys(search, listEl, "[data-id]");
+  search.addEventListener("input", () => {
+    terms = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+    render();
+  });
   m.root.querySelector("[data-new]")!.addEventListener("click", () => {
+    // A new snippet must be visible in the list it is added to.
+    search.value = "";
+    terms = [];
     const s: Snippet = { id: crypto.randomUUID(), name: "새 스니펫", text: "", run: true };
     unsaved.add(s.id);
     list.push(s);

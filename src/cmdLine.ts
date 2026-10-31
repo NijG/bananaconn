@@ -130,8 +130,10 @@ if (typeof window !== "undefined") window.addEventListener("pagehide", () => sav
 
 // Commands that carry a password or token in the line itself are not kept:
 // mysql -pSECRET, sshpass -p x, --password=x, TOKEN=x, curl -u user:pass, user:pass@ URLs.
+// PGPASSWORD is named explicitly: a letter precedes "password", which the
+// (?<![a-z]) guard (there to skip "bypass=1" and the like) would otherwise miss.
 const SECRET =
-  /(?<![a-z])(pass(word|wd)?|pwd|token|secret|api[_-]?key|auth)\w*\s*[=:]\s*\S|--?(pass(word|wd)?|token|secret|api[_-]?key)\b|\bsshpass\b|\bmysql(dump|admin)?\b.*\s-p\S|\bcurl\b.*\s(-u|--user)\s*\S+:\S|:\/\/[^\s/:@]+:[^\s/@]+@|\bsnmp\S*\b.*\s(community|-c)\s|\bkey\s+\d\s+\S|\b(enable\s+)?secret\s+\d?\s*\S/i;
+  /(?<![a-z])(pass(word|wd)?|pwd|token|secret|api[_-]?key|auth)\w*\s*[=:]\s*\S|--?(pass(word|wd)?|token|secret|api[_-]?key)\b|\bpgpassword\s*=|\bsshpass\b|\bmysql(dump|admin)?\b.*\s-p\S|\bcurl\b.*\s(-u|--user)\s*\S+:\S|:\/\/[^\s/:@]+:[^\s/@]+@|\bsnmp\S*\b.*\s(community|-c)\s|\bkey\s+\d\s+\S|\b(enable\s+)?secret\s+\d?\s*\S/i;
 
 /** A line with echoed control keys ("ls^?^?" when the server took DEL as a
  * character, "^H", "^[[A"): what is on the screen is not what ran. */

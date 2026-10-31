@@ -14,12 +14,23 @@ import { sql } from "@codemirror/lang-sql";
 import { xml } from "@codemirror/lang-xml";
 import { yaml } from "@codemirror/lang-yaml";
 import { HighlightStyle, StreamLanguage, syntaxHighlighting, type LanguageSupport, type StreamParser } from "@codemirror/language";
+import { c, cpp, csharp, dart, java, kotlin, scala } from "@codemirror/legacy-modes/mode/clike";
+import { cmake } from "@codemirror/legacy-modes/mode/cmake";
+import { diff } from "@codemirror/legacy-modes/mode/diff";
 import { dockerFile } from "@codemirror/legacy-modes/mode/dockerfile";
+import { go } from "@codemirror/legacy-modes/mode/go";
+import { groovy } from "@codemirror/legacy-modes/mode/groovy";
+import { lua } from "@codemirror/legacy-modes/mode/lua";
 import { nginx } from "@codemirror/legacy-modes/mode/nginx";
+import { perl } from "@codemirror/legacy-modes/mode/perl";
+import { powerShell } from "@codemirror/legacy-modes/mode/powershell";
 import { properties } from "@codemirror/legacy-modes/mode/properties";
+import { r } from "@codemirror/legacy-modes/mode/r";
+import { ruby } from "@codemirror/legacy-modes/mode/ruby";
+import { rust } from "@codemirror/legacy-modes/mode/rust";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
-import { highlightSelectionMatches, openSearchPanel, searchKeymap } from "@codemirror/search";
+import { gotoLine, highlightSelectionMatches, openSearchPanel, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   drawSelection,
@@ -33,8 +44,30 @@ import { tags as t } from "@lezer/highlight";
 import { api, pickSavePath } from "../api";
 import { icon } from "../icons";
 import type { Session } from "../model";
-import { choiceDialog, errorText, esc, h, toast } from "../ui";
+import { choiceDialog, errorText, esc, h, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
+import { language, type Language } from "../i18n";
+import { subscribe } from "../store";
+
+/** CodeMirror's own words (find/replace and go-to-line panels). The editor is
+ * outside the app's DOM translation, so they are given per language here; the
+ * shared dictionary cannot be used ("바꾸기" there means Rename). English is
+ * CodeMirror's default. */
+const CM_KEYS = ["Find", "Replace", "next", "previous", "all", "match case", "regexp", "by word", "replace", "replace all", "close", "Go to line", "go", "current match", "on line", "replaced $ matches", "replaced match on line $"];
+const CM_WORDS: Partial<Record<Language, string[]>> = {
+  ko: ["찾기", "바꿀 내용", "다음", "이전", "모두", "대소문자 구분", "정규식", "단어 단위", "바꾸기", "모두 바꾸기", "닫기", "줄로 이동", "이동", "현재 일치 항목", "줄", "일치 항목 $개를 바꿨습니다", "$번째 줄의 일치 항목을 바꿨습니다"],
+  de: ["Suchen", "Ersetzen", "weiter", "zurück", "alle", "Groß/Klein", "Regex", "ganzes Wort", "ersetzen", "alle ersetzen", "schließen", "Gehe zu Zeile", "los", "aktueller Treffer", "in Zeile", "$ Treffer ersetzt", "Treffer in Zeile $ ersetzt"],
+  es: ["Buscar", "Reemplazar", "siguiente", "anterior", "todo", "mayús./minús.", "regex", "palabra completa", "reemplazar", "reemplazar todo", "cerrar", "Ir a la línea", "ir", "coincidencia actual", "en la línea", "$ coincidencias reemplazadas", "coincidencia de la línea $ reemplazada"],
+  fr: ["Rechercher", "Remplacer", "suivant", "précédent", "tout", "respecter la casse", "regex", "mot entier", "remplacer", "tout remplacer", "fermer", "Aller à la ligne", "aller", "correspondance actuelle", "à la ligne", "$ correspondances remplacées", "correspondance de la ligne $ remplacée"],
+  ja: ["検索", "置換", "次へ", "前へ", "すべて", "大文字小文字を区別", "正規表現", "単語単位", "置換", "すべて置換", "閉じる", "行へ移動", "移動", "現在の一致", "行", "$ 件を置換しました", "$ 行目の一致を置換しました"],
+  vi: ["Tìm", "Thay thế", "tiếp", "trước", "tất cả", "phân biệt hoa thường", "regex", "nguyên từ", "thay thế", "thay thế tất cả", "đóng", "Đi tới dòng", "đi", "kết quả hiện tại", "ở dòng", "đã thay thế $ kết quả", "đã thay thế kết quả ở dòng $"],
+  "zh-CN": ["查找", "替换", "下一个", "上一个", "全部", "区分大小写", "正则", "全词匹配", "替换", "全部替换", "关闭", "转到行", "转到", "当前匹配", "行", "已替换 $ 处", "已替换第 $ 行的匹配"],
+  "zh-TW": ["尋找", "取代", "下一個", "上一個", "全部", "區分大小寫", "規則運算式", "全字拼寫須符合", "取代", "全部取代", "關閉", "移至行", "移至", "目前符合項目", "行", "已取代 $ 處", "已取代第 $ 行的符合項目"],
+};
+function cmPhrases(): Record<string, string> {
+  const words = CM_WORDS[language()];
+  return words ? Object.fromEntries(CM_KEYS.map((k, i) => [k, words[i]])) : {};
+}
 
 /** What the editor needs from the file tab that owns the connection. */
 export interface EditorHost {
@@ -50,6 +83,10 @@ function languageFor(name: string): Extension {
   const lower = name.toLowerCase();
   const ext = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
   if (lower === "dockerfile") return legacy(dockerFile);
+  if (lower === "cmakelists.txt") return legacy(cmake);
+  if (lower === "jenkinsfile") return legacy(groovy);
+  // Extension-less Ruby DSL files common in projects.
+  if (/^(gemfile|rakefile|vagrantfile|brewfile|podfile|fastfile|guardfile|capfile|berksfile|thorfile)$/.test(lower)) return legacy(ruby);
   if (/^(\.bashrc|\.profile|\.bash_profile|\.zshrc)$/.test(lower)) return legacy(shell);
   const map: Record<string, () => LanguageSupport | Extension> = {
     js: javascript, mjs: javascript, cjs: javascript,
@@ -59,6 +96,14 @@ function languageFor(name: string): Extension {
     sh: () => legacy(shell), bash: () => legacy(shell), zsh: () => legacy(shell),
     conf: () => legacy(nginx), toml: () => legacy(toml),
     ini: () => legacy(properties), properties: () => legacy(properties), env: () => legacy(properties), cfg: () => legacy(properties),
+    c: () => legacy(c), h: () => legacy(c),
+    cpp: () => legacy(cpp), cc: () => legacy(cpp), cxx: () => legacy(cpp), hpp: () => legacy(cpp), hh: () => legacy(cpp),
+    java: () => legacy(java), cs: () => legacy(csharp), kt: () => legacy(kotlin), kts: () => legacy(kotlin), scala: () => legacy(scala), dart: () => legacy(dart),
+    go: () => legacy(go), rs: () => legacy(rust), lua: () => legacy(lua),
+    groovy: () => legacy(groovy), gradle: () => legacy(groovy),
+    pl: () => legacy(perl), pm: () => legacy(perl), rb: () => legacy(ruby),
+    ps1: () => legacy(powerShell), psm1: () => legacy(powerShell), psd1: () => legacy(powerShell),
+    r: () => legacy(r), cmake: () => legacy(cmake), diff: () => legacy(diff), patch: () => legacy(diff),
   };
   return map[ext]?.() ?? [];
 }
@@ -103,6 +148,18 @@ export class EditorView implements View {
   private dirtyTimer = 0;
   private disposed = false;
   private wrap = new Compartment();
+  /** CodeMirror's panel words follow a language change without reopening. */
+  private phrases = new Compartment();
+  private lang = language();
+  // Read the language on the next tick: the app applies a new UI language from
+  // its own settings listener, which may run after this one.
+  private unsubscribe = subscribe("settings", () =>
+    setTimeout(() => {
+      if (this.disposed || !this.code || language() === this.lang) return;
+      this.lang = language();
+      this.code.dispatch({ effects: this.phrases.reconfigure(EditorState.phrases.of(cmPhrases())) });
+    }),
+  );
   private wrapping = false;
   private host: HTMLElement;
   private overlay: HTMLElement;
@@ -118,9 +175,10 @@ export class EditorView implements View {
       { class: "view editor-view" },
       `<div class="view-bar">
          <span class="proto-chip" style="--proto:#82aaff">${icon("FileText", 14)}편집</span>
-         <span class="view-endpoint" title="${esc(path)}">${esc(path)}</span>
+         <span class="view-endpoint" data-i18n-skip title="${esc(path)}">${esc(path)}</span>
          <span class="view-state" data-state></span>
          <div class="view-actions">
+           <button type="button" class="editor-meta editor-pos muted" data-act="goto" data-pos title="줄로 이동 (Ctrl+Alt+G)"></button>
            <span class="editor-meta muted" data-meta></span>
            <button class="tool" data-act="find" title="찾기·바꾸기 (Ctrl+F)">${icon("Search", 15)}</button>
            <button class="tool" data-act="wrap" title="자동 줄 바꿈">${icon("WrapText", 15)}</button>
@@ -141,6 +199,7 @@ export class EditorView implements View {
       if (act === "local") this.saveLocal();
       if (act === "find" && this.code) openSearchPanel(this.code);
       if (act === "wrap") this.toggleWrap();
+      if (act === "goto" && this.code) gotoLine(this.code);
     });
     this.load();
   }
@@ -205,7 +264,7 @@ export class EditorView implements View {
   private renderMeta() {
     const meta = this.el.querySelector<HTMLElement>("[data-meta]")!;
     meta.textContent = this.code ? `UTF-8${this.bom ? " BOM" : ""} · ${this.code.state.lineBreak === "\r\n" ? "CRLF" : "LF"}` : "";
-    this.el.querySelector('[data-act="wrap"]')!.classList.toggle("on", this.wrapping);
+    setPressed(this.el.querySelector('[data-act="wrap"]'), this.wrapping);
   }
 
   private async load() {
@@ -233,6 +292,7 @@ export class EditorView implements View {
       doc: text,
       extensions: [
         EditorState.lineSeparator.of(crlf ? "\r\n" : "\n"),
+        this.phrases.of(EditorState.phrases.of(cmPhrases())),
         lineNumbers(),
         highlightActiveLineGutter(),
         highlightActiveLine(),
@@ -251,6 +311,7 @@ export class EditorView implements View {
           ...searchKeymap,
         ]),
         CodeView.updateListener.of((u) => {
+          if (u.selectionSet || u.docChanged) this.renderPos(u.state);
           if (!u.docChanged) return;
           // An edit makes the file dirty at once; whether undo brought it back
           // to the saved text is checked once typing pauses.
@@ -268,7 +329,16 @@ export class EditorView implements View {
     this.savedDoc = this.text();
     this.isDirty = false;
     this.renderMeta();
+    this.renderPos(state);
     this.ws.changed();
+  }
+
+  /** "줄 12, 열 5": where the cursor is, to find the line a device's error names. */
+  private renderPos(st: EditorState) {
+    const head = st.selection.main.head;
+    const line = st.doc.lineAt(head);
+    const el = this.el.querySelector<HTMLElement>("[data-pos]");
+    if (el) el.textContent = `줄 ${line.number}, 열 ${head - line.from + 1}`;
   }
 
   private toggleWrap() {
@@ -353,6 +423,7 @@ export class EditorView implements View {
 
   dispose() {
     this.disposed = true;
+    this.unsubscribe();
     clearTimeout(this.dirtyTimer);
     this.code?.destroy();
     this.owner.editorClosed(this);

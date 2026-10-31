@@ -47,6 +47,14 @@ export const DEFAULT_RISK_RULES: RiskRule[] = [
   warn(String.raw`\bkill(all)?\s+-(9|KILL)\b`, "프로세스 강제 종료"),
   warn(String.raw`\b(chmod\s+-R\s+0?777|chown\s+-R)\b`, "권한·소유자 일괄 변경"),
   warn(SUDO + String.raw`systemctl\s+(stop|disable|mask)\b`, "서비스 중지"),
+  // Firewall and network interface: flushing rules or downing a link can cut
+  // off the remote session itself.
+  warn(String.raw`\bip6?tables(-\w+)?\s+.*(-F|--flush|-P\s+\w+\s+DROP)\b`, "방화벽 규칙 초기화·차단 (원격 접속이 끊길 수 있음)"),
+  warn(String.raw`\bnft\s+flush\s+ruleset\b`, "방화벽 규칙 초기화·차단 (원격 접속이 끊길 수 있음)"),
+  warn(String.raw`\bufw\s+(disable|reset)\b`, "방화벽 끄기·초기화 (원격 접속이 끊길 수 있음)"),
+  warn(String.raw`\bfirewall-cmd\s+--panic-on\b`, "방화벽 차단 모드 (모든 트래픽 차단)"),
+  warn(String.raw`\bip\s+link\s+set\s+(dev\s+)?\S+\s+down\b`, "네트워크 인터페이스 끄기 (원격 접속이 끊길 수 있음)"),
+  warn(String.raw`\bifdown\s+\S+`, "네트워크 인터페이스 끄기 (원격 접속이 끊길 수 있음)"),
   warn(String.raw`^\s*(rmlv|rmvg|reducevg|rmdev|lvremove|vgremove)\b`, "볼륨·장치 제거 (AIX·HP-UX)"),
   warn(String.raw`^\s*reload\b`, "장비 재시작"),
   warn(String.raw`^\s*(write\s+erase|erase\s+(startup-config|nvram:|flash:))`, "장비 설정 삭제"),

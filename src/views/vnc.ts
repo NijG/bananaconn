@@ -6,7 +6,7 @@ import { api } from "../api";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
-import { contextMenu, errorText, esc, h, promptDialog, toast } from "../ui";
+import { contextMenu, errorText, esc, h, promptDialog, toast, setPressed } from "../ui";
 import { patchSession, state } from "../store";
 
 type Quality = "fast" | "balanced" | "sharp";
@@ -197,7 +197,7 @@ export class VncView implements View {
       tick();
       this.statsTimer = window.setInterval(tick, 1000);
     }
-    this.el.querySelector('[data-act="stats"]')!.classList.toggle("on", !!this.statsBox);
+    setPressed(this.el.querySelector('[data-act="stats"]'), !!this.statsBox);
   }
 
   status(): StatusInfo {
@@ -384,8 +384,8 @@ export class VncView implements View {
   }
 
   private syncToggles() {
-    this.el.querySelector('[data-act="scale"]')!.classList.toggle("on", this.scale);
-    this.el.querySelector('[data-act="viewonly"]')!.classList.toggle("on", this.viewOnly);
+    setPressed(this.el.querySelector('[data-act="scale"]'), this.scale);
+    setPressed(this.el.querySelector('[data-act="viewonly"]'), this.viewOnly);
   }
 
   /** RFB itself has no file transfer (TightVNC and UltraVNC each add their own).

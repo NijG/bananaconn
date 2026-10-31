@@ -17,7 +17,7 @@ import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
 import { loadAll, savesSettled, state, subscribe, touchSession } from "./store";
 import { isLanguage, LANGUAGES, setLanguage, type Language } from "./i18n";
-import { confirmDialog, contextMenu, errorText, esc, toast } from "./ui";
+import { confirmDialog, contextMenu, errorText, esc, setPressed, toast } from "./ui";
 import { openVault } from "./vault";
 
 import { Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
@@ -301,8 +301,8 @@ $("#btn-settings").addEventListener("click", () => openSettings());
 const STATE_TEXT = { connecting: "연결 중", connected: "연결됨", closed: "종료됨", error: "오류" };
 function renderStatus() {
   const bar = $("#statusbar");
-  document.querySelectorAll<HTMLElement>("[data-layout]").forEach((b) => b.classList.toggle("on", b.dataset.layout === ws.layout));
-  $("#btn-broadcast").classList.toggle("on", ws.broadcast);
+  document.querySelectorAll<HTMLElement>("[data-layout]").forEach((b) => setPressed(b, b.dataset.layout === ws.layout));
+  setPressed($("#btn-broadcast"), ws.broadcast);
   const tab = ws.activeTab;
   $("#btn-server").classList.toggle("live", !!ftpServer.status || !!fileServers.status("tftp") || !!fileServers.status("http"));
   const right = `${ftpServerBadge()}${fileServerBadges()}${ws.broadcast ? `<span class="sb-warn">${icon("Radio", 13)}동시 입력 켜짐</span>` : ""}
@@ -469,6 +469,7 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
     if (!t) return false;
     ws.duplicateHandler?.(t.session);
   },
+  "tab.reopenClosed": () => ws.reopenLastClosed(),
   "tab.reconnect": () => {
     const v = ws.activeTab?.view;
     if (!v?.reconnect) return false;

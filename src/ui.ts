@@ -67,12 +67,18 @@ const TOAST_ICON: Record<ToastKind, string> = {
   warn: "ShieldAlert",
 };
 
+/** At most this many toasts on screen at once, so a burst (repeated errors, a
+ * trigger, a broadcast to many tabs) cannot fill the screen. */
+const TOAST_MAX = 5;
+
 export function toast(message: string, kind: ToastKind = "info", ms = 3800) {
   let host = document.getElementById("toasts");
   if (!host) {
     host = h("div", { id: "toasts" });
     document.body.appendChild(host);
   }
+  // Drop the oldest so the stack stays bounded (a detached node's own timers no-op).
+  while (host.children.length >= TOAST_MAX) host.firstElementChild!.remove();
   const t = h("div", { class: `toast toast-${kind}` }, `${icon(TOAST_ICON[kind], 16)}<span>${esc(message)}</span>`);
   host.appendChild(t);
   requestAnimationFrame(() => t.classList.add("show"));
@@ -82,6 +88,36 @@ export function toast(message: string, kind: ToastKind = "info", ms = 3800) {
   };
   t.addEventListener("click", close);
   setTimeout(close, ms);
+}
+
+/** Arrow keys between a search box and the list it filters: ↓ from the box
+ * goes to the first item, ↑/↓ move between items, ↑ on the first item goes
+ * back to the box. Items are re-read on every key (lists are redrawn). */
+export function listKeys(search: HTMLInputElement, list: HTMLElement, itemSelector: string) {
+  const items = () => [...list.querySelectorAll<HTMLElement>(itemSelector)];
+  search.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown") return;
+    const first = items()[0];
+    if (!first) return;
+    e.preventDefault();
+    first.focus();
+  });
+  list.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const all = items();
+    const at = all.indexOf(document.activeElement as HTMLElement);
+    if (at < 0) return;
+    e.preventDefault();
+    if (e.key === "ArrowUp" && at === 0) return search.focus();
+    all[Math.max(0, Math.min(all.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)))].focus();
+  });
+}
+
+/** A toggle button's look ("on") and its state for screen readers, together. */
+export function setPressed(el: Element | null, on: boolean) {
+  if (!el) return;
+  el.classList.toggle("on", on);
+  el.setAttribute("aria-pressed", String(on));
 }
 
 export function errorText(err: unknown): string {
@@ -213,6 +249,14 @@ export function modal(opts: {
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape" && modalStack[modalStack.length - 1]?.close === close) {
       e.stopPropagation();
+      // Esc in a search box with text clears it first; the next Esc closes.
+      const t = e.target;
+      if (t instanceof HTMLInputElement && t.type === "search" && t.value && backdrop.contains(t)) {
+        e.preventDefault();
+        t.value = "";
+        t.dispatchEvent(new Event("input", { bubbles: true }));
+        return;
+      }
       close();
     }
   };
@@ -385,14 +429,53 @@ export function contextMenu(x: number, y: number, items: (MenuItem | "-")[]) {
   // Never past the top or left edge: a menu taller than the window scrolls.
   menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - r.width - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - r.height - 8))}px`;
+  const opener = document.activeElement as HTMLElement | null;
+  const enabledItems = () => [...menu.querySelectorAll<HTMLButtonElement>(".ctx-item:not([disabled])")];
   const close = () => {
+    const hadFocus = menu.contains(document.activeElement);
     menu.remove();
     window.removeEventListener("mousedown", dismiss, true);
     window.removeEventListener("keydown", dismiss, true);
     window.removeEventListener("blur", dismiss);
+    // Keyboard use: hand focus back to whatever opened the menu.
+    if (hadFocus && opener?.isConnected) opener.focus?.();
   };
   const dismiss = (e: Event) => {
-    if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+    if (e instanceof KeyboardEvent) {
+      if (e.key === "Escape") return close();
+      // Arrow / Home / End move a roving focus through the enabled items; the
+      // focused <button> activates on Enter or Space by itself. The menu is not
+      // focused on open, so a mouse user is never pulled into it.
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+        const list = enabledItems();
+        if (!list.length) return;
+        e.preventDefault();
+        const at = list.indexOf(document.activeElement as HTMLButtonElement);
+        const next =
+          e.key === "Home" ? 0
+          : e.key === "End" ? list.length - 1
+          : at < 0 ? (e.key === "ArrowDown" ? 0 : list.length - 1)
+          : (at + (e.key === "ArrowDown" ? 1 : -1) + list.length) % list.length;
+        list[next]?.focus();
+        return;
+      }
+      // Typeahead: a letter jumps to the next item starting with it. Only while
+      // the menu has the focus, so typing into a terminal is never taken.
+      if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey && menu.contains(document.activeElement)) {
+        const list = enabledItems();
+        const ch = e.key.toLocaleLowerCase();
+        const at = list.indexOf(document.activeElement as HTMLButtonElement);
+        for (let i = 1; i <= list.length; i++) {
+          const b = list[(at + i) % list.length];
+          if (b.textContent?.trim().toLocaleLowerCase().startsWith(ch)) {
+            e.preventDefault();
+            b.focus();
+            break;
+          }
+        }
+      }
+      return;
+    }
     if (e.type === "mousedown" && menu.contains(e.target as Node)) return;
     close();
   };

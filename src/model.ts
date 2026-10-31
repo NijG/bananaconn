@@ -165,7 +165,13 @@ export function endpoint(s: Pick<Session, "protocol" | "host" | "port" | "userna
 /** Parse quick-connect input such as "root@10.0.0.5:2222", "[fe80::1]:22",
  * "fe80::1" or "john@corp.com@10.0.0.5" (the user ends at the last "@"). */
 export function parseTarget(text: string): { host: string; port: number | null; username: string } | null {
-  const t = text.trim();
+  // A pasted URL form ("ssh://root@host:22", "sftp://host") keeps its scheme;
+  // drop it so the user is not parsed as "ssh://root". A bare IPv6 ("fe80::1")
+  // and "COM3:115200" have no "://", so they are untouched.
+  // A URL's path, query or fragment ("ssh://host:22/", "https://host/admin")
+  // is not part of the target either.
+  const raw = text.trim();
+  const t = /^[a-zA-Z][\w+.-]*:\/\//.test(raw) ? raw.replace(/^[a-zA-Z][\w+.-]*:\/\//, "").replace(/[/?#].*$/, "") : raw;
   // A bare IPv6 address: two or more colons, no brackets, so no port.
   const v6 = t.match(/^(?:(\S+)@)?([0-9A-Fa-f.]*:[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%\w+)?)$/);
   if (v6) return { username: v6[1] ?? "", host: v6[2], port: null };
