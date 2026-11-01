@@ -88,7 +88,16 @@ export function toast(message: string, kind: ToastKind = "info", ms = 3800) {
   };
   t.addEventListener("click", close);
   setTimeout(close, ms);
+  // For a "working…" toast whose job may end before `ms`.
+  return close;
 }
+
+/** A search box's text as lower-case terms: "web  Prod" → ["web", "prod"]. */
+export const searchTerms = (query: string) => query.toLowerCase().split(/\s+/).filter(Boolean);
+
+/** Every term appears somewhere in `hay` (already lower-case), in any order:
+ * "web prod" finds a "prod" session on a "web…" host. No terms: everything. */
+export const matchesTerms = (hay: string, terms: string[]) => terms.every((t) => hay.includes(t));
 
 /** Arrow keys between a search box and the list it filters: ↓ from the box
  * goes to the first item, ↑/↓ move between items, ↑ on the first item goes

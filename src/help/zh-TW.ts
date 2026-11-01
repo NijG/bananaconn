@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>序列連線請輸入 <code>COM3</code> 或 <code>COM3:115200</code>。</li>
       </ol>
       <h4>儲存為工作階段</h4>
-      <p>使用工作階段清單中的 ${icon("Plus", 13)} 按鈕 (${kbd("Ctrl+Shift+N")}) 儲存連線資訊，之後按兩下或按 ${kbd("Enter")} 即可連線。其他程式中儲存的連線，可以透過<a data-goto="import">匯入</a>一次搬過來。在工作階段編輯視窗中按 <b>測試連線</b>，可在儲存前確認主機連接埠是否開放。已儲存的工作階段可從右鍵選單測試，多個工作階段或整個資料夾可選取後或在資料夾上按右鍵一次測試。</p>
+      <p>使用工作階段清單中的 ${icon("Plus", 13)} 按鈕 (${kbd("Ctrl+Shift+N")}) 儲存連線資訊，之後按兩下或按 ${kbd("Enter")} 即可連線。其他程式中儲存的連線，可以透過<a data-goto="import">匯入</a>一次搬過來。在工作階段編輯視窗中按 <b>測試連線</b>，可在儲存前確認主機連接埠是否開放。已儲存的工作階段可從右鍵選單測試，多個工作階段或整個資料夾可選取後或在資料夾上按右鍵一次測試。在結果視窗中可以只重新檢查失敗的工作階段或複製結果，按兩下某一列（或選取後按 Enter）即可直接連線該工作階段。</p>
       <h4>介面語言</h4>
       <p>設定最上方的<b>介面語言</b>可將畫面切換為 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français 或 Deutsch (立即生效且不會中斷連線；使用說明與更新說明也會一併切換)。在您選擇之前，應用程式會依照 Windows 顯示語言；選擇之後，一律以您的選擇為準。</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "從其他程式匯入",
     icon: "Download",
     body: `
-      <p>從工作階段清單上方的 ${icon("Download", 13)} 按鈕中選擇。匯入前會先顯示預覽清單，已存在的工作階段會被略過。<b>不會匯入密碼</b> (各程式都以自己的金鑰加密密碼)。請在第一次連線時輸入，或從認證保管庫指定。</p>
+      <p>從工作階段清單上方的 ${icon("Download", 13)} 按鈕中選擇。匯入前會先顯示預覽清單，已存在的工作階段會被略過。<b>不會匯入密碼</b> (各程式都以自己的金鑰加密密碼)。請在第一次連線時輸入，或從認證保管庫指定。以公開金鑰登入的工作階段會將金鑰檔案關聯到認證保管庫，找不到或無法使用的金鑰檔案會在匯入前提示。</p>
       <table class="help-table">
         <tr><th>程式</th><th>要選擇的項目</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (可攜版：位於執行檔旁)</td></tr>
-        <tr><td>SecureCRT</td><td>工作階段資料夾 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包含資料夾結構、記錄檔名稱與自動記錄設定)，或以 檔案 → 匯出設定 產生的 XML</td></tr>
+        <tr><td>SecureCRT</td><td>工作階段資料夾 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包含資料夾結構、記錄檔名稱、自動記錄設定，以及公開金鑰登入使用的金鑰檔案)，或以 檔案 → 匯出設定 產生的 XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (若已開啟整個檔案加密，請先關閉並儲存)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>直接讀取這台電腦的設定</td></tr>
         <tr><td>WinSCP</td><td>這台電腦的設定，若沒有則選擇 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 資料夾</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 檔案（Host、HostName、User、Port、ProxyJump；略過 <code>Host *</code> 等萬用字元）</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 檔案（Host、HostName、User、Port、ProxyJump、IdentityFile；與 ssh 相同，套用所有符合的 Host 區塊，先出現的值優先；<code>Host *</code> 等萬用字元只提供預設值，不建立工作階段）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 檔案</td></tr>
         <tr><td>遠端桌面</td><td>含有 <code>.rdp</code> 檔案的資料夾 (包含子資料夾)</td></tr>
         <tr><td>CSV</td><td>第一行為欄位名稱：Name, Protocol, Host, Port, Username, Folder, Domain (以逗號、分號或 Tab 分隔)。同一選單中的 <b>匯出工作階段清單 (CSV)</b> 會以此格式寫出。</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>畫面繪製</b> (設定 → 終端機)：「自動」會在有顯示卡的電腦上以 GPU (WebGL) 繪製，加快大量輸出的速度；在沒有顯示卡的伺服器與遠端工作階段中則使用標準繪製方式。只有畫面上可見的終端機會使用 GPU。</li>
         <li><b>片段與巨集</b>：將常用命令儲存在工具列的片段中，並使用「錄製」擷取輸入後重播。</li>
         <li><b>檔案</b> (SSH)：工具列中的檔案按鈕會在旁邊開啟同一部伺服器的 SFTP 窗格。</li>
+        <li><b>自動重新連線</b> (可在設定中關閉)：已登入的 SSH 或 Telnet 工作階段中斷時，稍候片刻後重新連線，持續失敗時等待時間會逐漸變長。登入失敗或在登入過程中中斷的連線不會重新連線：以錯誤的密碼反覆連線可能導致伺服器封鎖您的連線。</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>認證保管庫</b> (上方的鑰匙按鈕)：將密碼與 SSH 金鑰儲存在 Windows 認證管理員中，供編輯工作階段使用。已儲存的密碼絕不會顯示在畫面上。</li>
+        <li><b>認證保管庫</b> (上方的鑰匙按鈕)：將密碼與 SSH 金鑰儲存在 Windows 認證管理員中，供編輯工作階段使用。已儲存的密碼絕不會顯示在畫面上。金鑰可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。</li>
         <li><b>主密碼</b> (設定 → 安全性)：在應用程式啟動時以及離開一段時間後鎖定。</li>
         <li>SSH/SFTP 主機金鑰會與 <code>~/.ssh/known_hosts</code> 比對；未知的金鑰會顯示指紋供確認。金鑰變更時會封鎖連線。</li>
       </ul>`,

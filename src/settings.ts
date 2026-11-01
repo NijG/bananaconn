@@ -162,7 +162,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
         </div>
         <p class="muted small">권장 방식은 한 줄을 보낸 뒤 장비가 그 줄을 되돌려 보내고 프롬프트를 다시 띄우면 바로 다음 줄을 보냅니다. 빠른 장비에는 빠르게, 느린 장비에는 기다렸다가 보내므로 글자가 빠지지 않습니다. 줄 지연과 글자 지연은 "정해진 지연으로"를 고를 때 쓰입니다 (입력을 되돌려 보내지 않는 장비용).</p>
         ${check("serialAutoReconnect", "시리얼 포트가 빠지면 다시 꽂힐 때까지 기다렸다가 자동으로 연결", "USB 시리얼 어댑터를 뽑았다 꽂거나, 연결할 때 아직 꽂혀 있지 않으면 포트가 나타나는 대로 연결합니다.")}
-        ${check("autoReconnect", "SSH·Telnet 연결이 끊기면 자동으로 다시 연결", "네트워크가 끊기거나 세션이 예기치 않게 종료되면 잠시 기다렸다가 자동으로 다시 연결합니다. 기다리는 동안 취소할 수 있고, 사용자가 종료한 연결은 다시 연결하지 않습니다.")}
+        ${check("autoReconnect", "SSH·Telnet 연결이 끊기면 자동으로 다시 연결","네트워크가 끊기거나 세션이 예기치 않게 종료되면 잠시 기다렸다가 자동으로 다시 연결합니다. 기다리는 동안 취소할 수 있습니다. 사용자가 종료한 연결과 로그인에 실패한 연결은 다시 연결하지 않습니다.")}
         <label class="field"><span>시리얼 포트 입출력</span><select name="serialIo">
           ${[["fast", "빠르게 (권장) — 키 입력이 읽기 대기에 막히지 않음"], ["compat", "호환 모드 — 이전 방식 (드라이버에 문제가 있을 때)"]].map(([v, l]) => `<option value="${v}" ${v === s.serialIo ? "selected" : ""}>${l}</option>`).join("")}
         </select></label>

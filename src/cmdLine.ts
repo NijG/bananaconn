@@ -101,8 +101,17 @@ function load(): History {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY) || "{}");
     cache = {};
+    let dropped = false;
     if (raw && typeof raw === "object" && !Array.isArray(raw))
-      for (const [host, list] of Object.entries(raw)) if (Array.isArray(list)) cache[host] = list.filter((c): c is string => typeof c === "string" && !garbled(c)).slice(-PER_HOST);
+      for (const [host, list] of Object.entries(raw))
+        if (Array.isArray(list)) {
+          const kept = list.filter((c): c is string => typeof c === "string" && keepable(c));
+          dropped ||= kept.length !== list.length;
+          cache[host] = kept.slice(-PER_HOST);
+        }
+    // A command kept before the rules caught its form (a password, a risky
+    // command) goes out of storage too, not only out of the suggestions.
+    if (dropped) changed();
   } catch {
     cache = {};
   }
@@ -128,12 +137,41 @@ function changed() {
 }
 if (typeof window !== "undefined") window.addEventListener("pagehide", () => saveTimer && save());
 
-// Commands that carry a password or token in the line itself are not kept:
-// mysql -pSECRET, sshpass -p x, --password=x, TOKEN=x, curl -u user:pass, user:pass@ URLs.
-// PGPASSWORD is named explicitly: a letter precedes "password", which the
-// (?<![a-z]) guard (there to skip "bypass=1" and the like) would otherwise miss.
-const SECRET =
-  /(?<![a-z])(pass(word|wd)?|pwd|token|secret|api[_-]?key|auth)\w*\s*[=:]\s*\S|--?(pass(word|wd)?|token|secret|api[_-]?key)\b|\bpgpassword\s*=|\bsshpass\b|\bmysql(dump|admin)?\b.*\s-p\S|\bcurl\b.*\s(-u|--user)\s*\S+:\S|:\/\/[^\s/:@]+:[^\s/@]+@|\bsnmp\S*\b.*\s(community|-c)\s|\bkey\s+\d\s+\S|\b(enable\s+)?secret\s+\d?\s*\S/i;
+// Commands that carry a password or token in the line itself are not kept
+// (a suggestion would show it on screen later). Case-insensitive.
+const SECRET = new RegExp(
+  [
+    // KEY=value, KEY: value. The (?<![a-z]) guard skips "bypass=1" and the like.
+    String.raw`(?<![a-z])(pass(word|wd)?|pwd|token|secret|api[_-]?key|auth)\w*\s*[=:]\s*\S`,
+    // --password x, -token x; not --password-stdin, which reads it from stdin.
+    String.raw`--?(pass(word|wd)?|token|secret|api[_-]?key)\b(?!-stdin)`,
+    // A letter precedes "password" here, which the guard above would miss.
+    String.raw`\bpgpassword\s*=`,
+    String.raw`\bsshpass\b`,
+    String.raw`\bmysql(dump|admin)?\b.*\s-p\S`,
+    String.raw`\bcurl\b.*\s(-u|--user)\s*\S+:\S`,
+    // user:pass@ in a URL.
+    String.raw`:\/\/[^\s/:@]+:[^\s/@]+@`,
+    String.raw`\bsnmp\S*\b.*\s(community|-c)\s`,
+    String.raw`\bkey\s+\d\s+\S`,
+    String.raw`\b(enable\s+)?secret\s+\d?\s*\S`,
+    // Tools that take the password as a plain argument.
+    String.raw`\blogin\b.*\s-p\s*\S`, // docker / podman / az login -p
+    String.raw`\bsmbclient\b.*\s(-U|--user(name)?=?)\s*\S+%\S`, // -U user%pass
+    String.raw`\bnmcli\b.*\b(password|psk)\s+\S`,
+    String.raw`\bredis-cli\b.*\s-a\s*\S`,
+    String.raw`\bmongo(sh)?\b.*\s-p\s*\S`,
+    String.raw`\bipmitool\b.*\s-P\s*\S`,
+    String.raw`\bhtpasswd\b.*\s-\w*b`, // -b: the password on the line
+    // Network device configuration, at the start or after a "#"/">" prompt:
+    // Cisco "username x password 0 y", "enable password y", line "password y";
+    // FortiGate "set password y", "set psksecret y"; Huawei "local-user x password …".
+    String.raw`(^|[#>]\s*)((username\s+\S+|enable)\s+)?password\s+\d?\s*\S`,
+    String.raw`(^|[#>]\s*)set\s+\S*(password|passwd|secret|psk)\S*\s+\S`,
+    String.raw`\blocal-user\s+\S+\s+password\b`,
+  ].join("|"),
+  "i",
+);
 
 /** A line with echoed control keys ("ls^?^?" when the server took DEL as a
  * character, "^H", "^[[A"): what is on the screen is not what ran. */
@@ -146,12 +184,17 @@ export function holdsSecret(command: string): boolean {
   return SECRET.test(command);
 }
 
-/** Remember a command run at a prompt. Risky commands (riskRules.ts) are never
- * kept, so a suggestion cannot bring an "rm -r" back by accident, and neither
- * are lines with a password or token in them. */
+/** A command the history may keep. Risky commands (riskRules.ts) are not, so a
+ * suggestion cannot bring an "rm -r" back by accident, and neither are lines
+ * with a password or token in them. */
+function keepable(cmd: string): boolean {
+  return !!cmd && cmd.length <= 500 && !garbled(cmd) && !findTypedRisk(cmd) && !holdsSecret(cmd);
+}
+
+/** Remember a command run at a prompt (if keepable). */
 export function rememberCommand(host: string, command: string) {
   const cmd = command.trim();
-  if (!cmd || cmd.length > 500 || garbled(cmd) || findTypedRisk(cmd) || holdsSecret(cmd)) return;
+  if (!keepable(cmd)) return;
   const h = load();
   const list = (h[host] ?? []).filter((c) => c !== cmd);
   list.push(cmd);

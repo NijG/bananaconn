@@ -162,6 +162,17 @@ export function endpoint(s: Pick<Session, "protocol" | "host" | "port" | "userna
   return `${user}${host}${port}`;
 }
 
+/** A saved host that cannot be connected to: one with a space inside. (Other
+ * odd forms are left alone: what a host may look like differs by protocol and
+ * by the program a session was imported from.) */
+export const unusableHost = (host: string) => /\s/.test(host);
+
+/** What a session search looks in, lower-cased (the sidebar and the command
+ * palette both use it, so a query finds the same sessions in either). */
+export function sessionSearchText(s: Session): string {
+  return [s.name, s.host, s.username, endpoint(s), s.folder, PROTOCOLS[s.protocol].label, s.notes].join(" ").toLowerCase();
+}
+
 /** Parse quick-connect input such as "root@10.0.0.5:2222", "[fe80::1]:22",
  * "fe80::1" or "john@corp.com@10.0.0.5" (the user ends at the last "@"). */
 export function parseTarget(text: string): { host: string; port: number | null; username: string } | null {

@@ -39,6 +39,9 @@ enum Backend {
         /// what lets the reader thread reach end-of-file on Windows.
         master: Mutex<Option<Box<dyn MasterPty + Send>>>,
         killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+        /// The converted copy of a PuTTY key ssh.exe logs in with; removed
+        /// when the session ends.
+        key: Mutex<Option<crate::vault::TempKey>>,
     },
     Telnet {
         /// Clone of the socket used only to shut it down (never locked).
@@ -169,10 +172,12 @@ impl Session {
     /// Release the pseudoconsole (off the calling thread: closing it can wait
     /// for pending output to drain).
     fn release_pty(&self) {
-        if let Backend::Pty { master, .. } = &self.backend
-            && let Some(m) = master.lock().unwrap().take() {
+        if let Backend::Pty { master, key, .. } = &self.backend {
+            key.lock().unwrap().take();
+            if let Some(m) = master.lock().unwrap().take() {
                 std::thread::spawn(move || drop(m));
             }
+        }
     }
     /// Common output path: log, auto-fill, then forward to the frontend.
     /// `idle`: the read did not fill the buffer, so nothing more is waiting
@@ -847,6 +852,13 @@ fn forward_args(lines: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// What ssh.exe's question for the passphrase of key file `key` contains, in
+/// lower case as the autofill compares it. OpenSSH prints at most 100
+/// characters of the path ('%.100s').
+pub(crate) fn passphrase_prompt(key: &str) -> String {
+    format!("passphrase for key '{}", key.to_lowercase().chars().take(100).collect::<String>())
+}
+
 /// User and host as OpenSSH will print them in its password prompt, from
 /// `ssh -G` (which applies ~/.ssh/config). Falls back to the typed values.
 fn ssh_prompt_target(host: &str, port: u16, username: &str) -> (String, String) {
@@ -915,14 +927,21 @@ fn open_ssh(app: &AppHandle, req: &OpenRequest, cred: Option<vault::Resolved>, o
     cmd.args(["-p", &req.port.unwrap_or(22).to_string()]);
     cmd.args(["-o", &format!("ServerAliveInterval={}", req.keepalive.unwrap_or(30))]);
     let mut rules = Vec::new();
+    let mut temp_key = None;
     if let Some(c) = &cred {
-        if let Some(key) = &c.key_path {
-            cmd.args(["-i", key, "-o", "IdentitiesOnly=yes"]);
-            if let Some(p) = &c.passphrase {
+        if let Some(original) = &c.key_path {
+            // A PuTTY key goes in as a converted copy ssh.exe can read, with
+            // the copy's own one-time passphrase.
+            temp_key = vault::terminal_key(app, original, c.passphrase.as_deref())?;
+            let (key, passphrase) = match &temp_key {
+                Some(t) => (t.path.to_string_lossy().into_owned(), Some(t.passphrase.clone())),
+                None => (original.clone(), c.passphrase.clone()),
+            };
+            cmd.args(["-i", &key, "-o", "IdentitiesOnly=yes"]);
+            if let Some(p) = passphrase {
                 rules.push(AutofillRule {
-                    // OpenSSH prints at most 100 characters of the path ('%.100s').
-                    keywords: vec![format!("passphrase for key '{}", key.to_lowercase().chars().take(100).collect::<String>())],
-                    reply: p.clone(),
+                    keywords: vec![passphrase_prompt(&key)],
+                    reply: p,
                     remaining: 1,
                 });
             }
@@ -1002,6 +1021,7 @@ fn open_ssh(app: &AppHandle, req: &OpenRequest, cred: Option<vault::Resolved>, o
         Backend::Pty {
             master: Mutex::new(Some(pair.master)),
             killer: Mutex::new(killer),
+            key: Mutex::new(temp_key),
         },
         spawn_writer(writer),
         rules,
@@ -1125,6 +1145,9 @@ fn open_telnet(
     std::thread::spawn(move || {
         let mut parser = telnet::Parser::new();
         let mut buf = [0u8; 16384];
+        // 1 when the connection broke (reset, aborted) rather than being closed
+        // by the server or by us: the frontend may reconnect only then.
+        let mut code = 0;
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -1135,7 +1158,12 @@ fn open_telnet(
                     }
                     continue;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        code = 1;
+                    }
+                    break;
+                }
             };
             let feed = parser.feed(&buf[..n]);
             if !feed.replies.is_empty() {
@@ -1151,7 +1179,7 @@ fn open_telnet(
             }
             rs.deliver(&feed.data, n < buf.len());
         }
-        rs.out.finish(0);
+        rs.out.finish(code);
     });
     Ok(session)
 }

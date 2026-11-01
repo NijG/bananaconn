@@ -10,7 +10,7 @@ import { api, pickOpenFile } from "../api";
 import { icon } from "../icons";
 import { findTypedRisk } from "../riskRules";
 import { state, updateSettings } from "../store";
-import { confirmDialog, contextMenu, errorText, esc, h, promptDialog, toast } from "../ui";
+import { confirmDialog, contextMenu, errorText, esc, h, matchesTerms, promptDialog, searchTerms, toast } from "../ui";
 import { writeClipboard } from "../clipboard";
 import { tr } from "../i18n";
 import { judge } from "./policy";
@@ -291,9 +291,9 @@ function render(answer: string, insertable = true, insertTitle = "입력 줄에 
                 const r = riskOf(l);
                 return `<div class="ai-cmd${r ? ` risk-${r.action}` : ""}"><code>${esc(l)}</code>${
                   r?.action === "block"
-                    ? `<span class="ai-risk" title="${esc(r.note)}">${icon("Ban", 13)}차단</span>`
-                    : `<button class="tool" data-insert="${esc(l)}" title="${esc(insertTitle)}">${icon(insertTitle.startsWith("복사") ? "Copy" : "CornerDownLeft", 13)}</button>`
-                }${r?.action === "warn" ? `<span class="ai-risk" title="${esc(r.note)}">${icon("TriangleAlert", 13)}</span>` : ""}</div>`;
+                    ? `<span class="ai-risk" title="${esc(tr(r.note))}">${icon("Ban", 13)}${esc(tr("차단됨"))}</span>`
+                    : `<button class="tool" data-insert="${esc(l)}" title="${esc(tr(insertTitle))}">${icon(insertTitle.startsWith("복사") ? "Copy" : "CornerDownLeft", 13)}</button>`
+                }${r?.action === "warn" ? `<span class="ai-risk" title="${esc(tr(r.note))}">${icon("TriangleAlert", 13)}</span>` : ""}</div>`;
               })
               .join("")
           : "";
@@ -301,7 +301,7 @@ function render(answer: string, insertable = true, insertTitle = "입력 줄에 
       // copies them all at once (newlines preserved) to paste and run. A single
       // "insert all" onto the one-line terminal input can't work — the input is
       // one command and the terminal collapses newlines — so it is not offered.
-      return `<div class="ai-code"><pre>${esc(body.replace(/\s+$/, ""))}</pre><div class="ai-code-actions"><button class="tool" data-copy="${esc(body.trim())}" title="복사">${icon("Copy", 13)}</button></div>${actions}</div>`;
+      return `<div class="ai-code"><pre>${esc(body.replace(/\s+$/, ""))}</pre><div class="ai-code-actions"><button class="tool" data-copy="${esc(body.trim())}" title="${esc(tr("복사"))}">${icon("Copy", 13)}</button></div>${actions}</div>`;
     })
     .join("");
 }
@@ -694,7 +694,7 @@ export class AiPanel {
     if (!this.conn) return;
     const sel = bar.querySelector<HTMLSelectElement>(".ai-session")!;
     sel.innerHTML = this.sessions
-      .map((s) => `<option value="${esc(s.id)}" ${s.id === this.sessionId ? "selected" : ""}>${esc(s.name)}</option>`)
+      .map((s) => `<option value="${esc(s.id)}" data-i18n-skip ${s.id === this.sessionId ? "selected" : ""}>${esc(s.name)}</option>`)
       .join("");
   }
 
@@ -820,11 +820,13 @@ export class AiPanel {
 
   /** Dim the turns that do not contain the query; show how many match. */
   private filterLog(query: string) {
-    const q = query.trim().toLowerCase();
+    // Each word anywhere in the turn, as the other searches match.
+    const terms = searchTerms(query);
+    const q = terms.length > 0;
     let hits = 0;
     for (const el of Array.from(this.log.children) as HTMLElement[]) {
       if (el.classList.contains("ai-empty")) continue;
-      const match = !q || (el.textContent ?? "").toLowerCase().includes(q);
+      const match = matchesTerms((el.textContent ?? "").toLowerCase(), terms);
       el.classList.toggle("ai-search-hidden", !!q && !match);
       if (q && match) hits++;
     }
@@ -1074,10 +1076,11 @@ export class AiPanel {
     if (mode) mode.innerHTML = `${icon(this.runMode === "off" ? "Ban" : "SquareTerminal", 13)}<span>${this.runMode === "auto" ? "읽기 전용 자동 실행" : this.runMode === "confirm" ? "실행 전 확인" : "실행 안 함"}</span>`;
     if (!this.provider) return noProvider(this.log, () => (this.refreshProviders(), this.draw(), this.input.focus()));
     if (!this.turns.length) {
+      // The log is i18n-skipped (it holds the conversation): translate here.
       this.log.innerHTML = `<div class="ai-empty small"><p>${
         this.runMode === "off"
-          ? `터미널에서 텍스트를 선택하고 질문하면 함께 보냅니다. 답의 명령은 ${icon("CornerDownLeft", 12)} 버튼으로 입력 줄에 넣을 수 있고, 실행은 직접 Enter로 합니다.`
-          : "할 일을 적으면 AI가 이 터미널에서 명령을 실행해 결과를 보고 분석합니다. 읽기 전용 명령은 바로 실행하고, 시스템을 바꿀 수 있는 명령은 실행 전에 묻습니다. 실행 방식은 아래 버튼에서 바꿉니다."
+          ? esc(tr("터미널에서 텍스트를 선택하고 질문하면 함께 보냅니다. 답의 명령은 {0} 버튼으로 입력 줄에 넣을 수 있고, 실행은 직접 Enter로 합니다.")).replace("{0}", icon("CornerDownLeft", 12))
+          : esc(tr("할 일을 적으면 AI가 이 터미널에서 명령을 실행해 결과를 보고 분석합니다. 읽기 전용 명령은 바로 실행하고, 시스템을 바꿀 수 있는 명령은 실행 전에 묻습니다. 실행 방식은 아래 버튼에서 바꿉니다."))
       }</p></div>`;
       return;
     }
@@ -1388,7 +1391,7 @@ export function commandBar(container: HTMLElement, host: AiHost, initial = ""): 
     `<div class="ai-bar-row">${icon("Sparkles", 15)}<input placeholder="할 일을 적으세요 (예: 최근 1시간 동안의 에러 로그)" spellcheck="false" />
       <button class="btn btn-sm btn-primary" data-go>${icon("WandSparkles", 13)}명령 만들기</button>
       <button class="tool" data-x title="닫기 (Esc)">${icon("X", 14)}</button></div>
-    <div class="ai-bar-out" hidden data-i18n-skip></div>`,
+    <div class="ai-bar-out" hidden></div>`,
   );
   container.append(bar);
   const input = bar.querySelector("input")!;
@@ -1427,9 +1430,11 @@ export function commandBar(container: HTMLElement, host: AiHost, initial = ""): 
     if (!(await confirmSend(p, sent, { skip: false }))) return;
     out.hidden = false;
     command = "";
-    out.innerHTML = `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")} ${esc(providerLabel(p))}</div>`;
+    // The answer, the command and the service name are skipped one by one:
+    // the notes and buttons around them are app text to translate.
+    out.innerHTML = `<div class="ai-wait">${icon("LoaderCircle", 14, "spin")} <span data-i18n-skip>${esc(providerLabel(p))}</span></div>`;
     asking = ask(p, prompts.command(host.target()), [{ role: "user", content: sent }], (sofar) => {
-      out.innerHTML = `<div class="ai-text">${esc(masker.unmask(sofar))}</div>`;
+      out.innerHTML = `<div class="ai-text" data-i18n-skip>${esc(masker.unmask(sofar))}</div>`;
     });
     try {
       const answer = masker.unmask(await asking.done);
@@ -1438,12 +1443,12 @@ export function commandBar(container: HTMLElement, host: AiHost, initial = ""): 
       const explanation = answer.replace(/```[\s\S]*?```/g, "").trim();
       const r = command ? riskOf(command) : null;
       out.innerHTML = command
-        ? `<div class="ai-cmd big${r ? ` risk-${r.action}` : ""}"><code>${esc(command)}</code></div>
+        ? `<div class="ai-cmd big${r ? ` risk-${r.action}` : ""}"><code data-i18n-skip>${esc(command)}</code></div>
            ${lines.length > 1 ? `<div class="muted small">명령이 ${lines.length}줄입니다. 첫 줄만 넣습니다. 나머지는 AI 대화에서 하나씩 넣으세요.</div>` : ""}
            ${r ? `<div class="ai-error"><span>${r.action === "block" ? "차단된 명령이라 입력 줄에 넣지 않습니다" : "위험한 명령입니다. 실행하면 확인 창이 뜹니다"}</span>: <span>${esc(r.note)}</span></div>` : ""}
-           <div class="ai-text muted">${esc(explanation)}</div>
+           <div class="ai-text muted" data-i18n-skip>${esc(explanation)}</div>
            <div class="ai-bar-row end">${r?.action === "block" ? "" : `<button class="btn btn-sm btn-primary" data-insert>${icon("CornerDownLeft", 13)}입력 줄에 넣기 (Enter)</button>`}<button class="btn btn-sm" data-again>${icon("RefreshCw", 13)}다시</button></div>`
-        : `<div class="ai-text">${esc(answer)}</div>`;
+        : `<div class="ai-text" data-i18n-skip>${esc(answer)}</div>`;
       if (r?.action === "block") command = "";
     } catch (err) {
       const msg = errorText(err);

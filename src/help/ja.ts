@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>シリアルの場合は <code>COM3</code> または <code>COM3:115200</code> と入力します。</li>
       </ol>
       <h4>セッションとして保存する</h4>
-      <p>セッション一覧の ${icon("Plus", 13)} ボタン (${kbd("Ctrl+Shift+N")}) で接続情報を保存し、ダブルクリックまたは ${kbd("Enter")} で接続します。他のプログラムに保存した接続は <a data-goto="import">インポート</a> でまとめて移行できます。セッション編集画面の <b>接続を確認</b> で、保存前にホストのポートが開いているかすぐ確認できます。保存済みのセッションは右クリックメニューから、複数のセッションやフォルダーは選択するかフォルダーを右クリックしてまとめて確認できます。</p>
+      <p>セッション一覧の ${icon("Plus", 13)} ボタン (${kbd("Ctrl+Shift+N")}) で接続情報を保存し、ダブルクリックまたは ${kbd("Enter")} で接続します。他のプログラムに保存した接続は <a data-goto="import">インポート</a> でまとめて移行できます。セッション編集画面の <b>接続を確認</b> で、保存前にホストのポートが開いているかすぐ確認できます。保存済みのセッションは右クリックメニューから、複数のセッションやフォルダーは選択するかフォルダーを右クリックしてまとめて確認できます。結果画面では失敗したセッションだけを再確認したり結果をコピーしたりでき、行をダブルクリックする (または選択して Enter を押す) とそのセッションにすぐ接続します。</p>
       <h4>表示言語</h4>
       <p>設定の一番上にある <b>表示言語</b> で、画面を 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français、Deutsch に切り替えられます (切断せずにすぐ反映され、ガイドと更新内容も追従します)。選択するまでは Windows の表示言語に従い、一度選ぶと常にその選択が優先されます。</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "他のプログラムからインポート",
     icon: "Download",
     body: `
-      <p>セッション一覧の上にある ${icon("Download", 13)} ボタンから選びます。インポート前にプレビュー一覧が表示され、既存のセッションはスキップされます。<b>パスワードはインポートされません</b> (各プログラムが独自のキーで暗号化しているため)。初回接続時に入力するか、資格情報ボールトから指定してください。</p>
+      <p>セッション一覧の上にある ${icon("Download", 13)} ボタンから選びます。インポート前にプレビュー一覧が表示され、既存のセッションはスキップされます。<b>パスワードはインポートされません</b> (各プログラムが独自のキーで暗号化しているため)。初回接続時に入力するか、資格情報ボールトから指定してください。公開鍵でログインしていたセッションはキーファイルを資格情報ボールトに関連付け、見つからないキーファイルや使えないキーファイルはインポート前に知らせます。</p>
       <table class="help-table">
         <tr><th>プログラム</th><th>選択するもの</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (ポータブル版: 実行ファイルと同じ場所)</td></tr>
-        <tr><td>SecureCRT</td><td>セッションフォルダー <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (フォルダー構成、ログファイル名、自動ログ設定を含む)、またはファイル → 設定のエクスポートで作成した XML</td></tr>
+        <tr><td>SecureCRT</td><td>セッションフォルダー <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (フォルダー構成、ログファイル名、自動ログ設定、公開鍵ログインに使うキーファイルを含む)、またはファイル → 設定のエクスポートで作成した XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (ファイル全体の暗号化がオンの場合は、先にオフにして保存)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>この PC の設定を直接読み込みます</td></tr>
         <tr><td>WinSCP</td><td>この PC の設定、なければ <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> フォルダー</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> ファイル (Host・HostName・User・Port・ProxyJump。<code>Host *</code> などのワイルドカードは除外)</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> ファイル (Host・HostName・User・Port・ProxyJump・IdentityFile。ssh と同じく一致する Host ブロックをすべて適用し、先に出た値を使用。<code>Host *</code> などのワイルドカードはセッションを作らず既定値としてのみ適用)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> ファイル</td></tr>
         <tr><td>リモートデスクトップ</td><td><code>.rdp</code> ファイルがあるフォルダー (サブフォルダーを含む)</td></tr>
         <tr><td>CSV</td><td>1 行目に列名: Name, Protocol, Host, Port, Username, Folder, Domain (カンマ、セミコロン、タブ区切り)。同じメニューの <b>セッション一覧をエクスポート (CSV)</b> がこの形式で書き出します。</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>描画方式</b> (設定 → ターミナル): 「自動」はグラフィックカードのある PC では GPU (WebGL) で描画して大量の出力を高速化し、グラフィックカードのないサーバーやリモートセッションでは標準の描画方式を使います。GPU を使うのは画面に表示中のターミナルだけです。</li>
         <li><b>スニペットとマクロ</b>: よく使うコマンドをツールバーのスニペットに保存し、「記録」で入力を記録して再生できます。</li>
         <li><b>ファイル</b> (SSH): ツールバーのファイルボタンで、同じサーバーの SFTP ペインを横に開きます。</li>
+        <li><b>自動再接続</b> (設定でオフにできます): ログイン済みの SSH・Telnet セッションが切れると、少し待ってから再接続し、失敗が続くと待ち時間を少しずつ延ばします。ログインに失敗した接続やログイン中に切れた接続は再接続しません。間違ったパスワードで接続を繰り返すと、サーバーに接続を遮断されることがあるためです。</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>資格情報ボールト</b> (上部のキーボタン): パスワードと SSH キーを Windows 資格情報マネージャーに保存し、セッションの編集で使用します。保存したパスワードが画面に送られることはありません。</li>
+        <li><b>資格情報ボールト</b> (上部のキーボタン): パスワードと SSH キーを Windows 資格情報マネージャーに保存し、セッションの編集で使用します。保存したパスワードが画面に送られることはありません。キーは OpenSSH 形式と PuTTY 形式 (.ppk) を使えます。</li>
         <li><b>マスターパスワード</b> (設定 → セキュリティ): アプリの起動時と離席後にアプリをロックします。</li>
         <li>SSH/SFTP のホストキーは <code>~/.ssh/known_hosts</code> と照合され、未知のキーは確認用にフィンガープリントが表示されます。キーが変更されている場合は接続をブロックします。</li>
       </ul>`,

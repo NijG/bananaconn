@@ -77,6 +77,29 @@ export const MOBA_SAMPLE = [
   `옛날 장비= #100#2%10.9.9.9%513%root${MOBA_TAIL}`,
   `사내 위키= #313#11%https://wiki%${MOBA_TAIL}`,
 ].join("\r\n");
+
+// A SecureCRT Sessions folder: the key set for all sessions (SSH2.ini), a
+// session's own PuTTY key, a key in SecureCRT's own format, a missing one, and
+// a password SecureCRT had saved.
+const crt = (lines: string[]) => `\uFEFF${lines.join("\r\n")}\r\n`;
+// An Export Settings XML whose key file is not on this PC but rides along in its Files key.
+const CRT_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<VanDyke version="3.0">
+  <key name="Sessions">
+    <key name="app01"><string name="Protocol Name">SSH2</string><string name="Hostname">10.0.1.21</string><string name="Username">app</string>
+      <dword name="Use Global Public Key">0</dword><string name="Identity Filename V2">${"$"}{VDS_CONFIG_PATH}\\Keys\\missing_app.ppk</string></key>
+  </key>
+  <key name="Files">
+    <key name="File 0"><string name="Path">${"$"}{VDS_CONFIG_PATH}\\Keys\\missing_app.ppk</string><binary name="Contents">50 75 54 54 59 2d 55 73 65 72 2d 4b 65 79 2d 46 69 6c 65 2d 33 3a 20 73 73 68 2d 65 64 32 35 35 31 39 0a 45 6e 63 72 79 70 74 69 6f 6e 3a 20 6e 6f 6e 65 0a 43 6f 6d 6d 65 6e 74 3a 20 70 72 65 76 69 65 77 0a</binary></key>
+  </key>
+</VanDyke>`;
+const CRT_SAMPLE = [
+  { rel: "Linux/web01.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.11', 'S:"Username"=root', 'D:"[SSH2] Port"=00000016', 'S:"SSH2 Authentications V2"=publickey,password', 'D:"Use Global Public Key"=00000001', 'S:"Identity Filename V2"=']) },
+  { rel: "Linux/db01.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.12', 'S:"Username"=dba', 'D:"Use Global Public Key"=00000000', 'S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Keys\\db.ppk']) },
+  { rel: "Linux/old-app.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.13', 'S:"Username"=app', 'D:"Use Global Public Key"=00000000', 'S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Identity']) },
+  { rel: "Linux/batch.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.14', 'S:"Username"=batch', 'D:"Use Global Public Key"=00000000', 'S:"Identity Filename V2"=D:\\keys\\missing_batch']) },
+  { rel: "Network/core-sw.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.9.0.1', 'S:"Username"=netops', 'S:"SSH2 Authentications V2"=password,keyboard-interactive', 'D:"Session Password Saved"=00000001', 'S:"Password V2"=02:preview']) },
+];
 let ftpd: any = null;
 const monitors = new Map<string, number>();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -239,6 +262,8 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
     case "vault_reveal":
       return null;
     case "read_text_file":
+      if (/SecureCRT.*XML/i.test(a.path)) return CRT_XML;
+      if (/SSH2\.ini$/i.test(a.path)) return crt(['S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Keys\\id_ed25519', 'D:"Public Key Type"=00000000']);
       // The preview picker returns a fake path named after the dialog title.
       if (/JSON/.test(a.path))
         return JSON.stringify({
@@ -308,7 +333,14 @@ ${a.host}에 대한 Ping 통계:
         ? 'Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\Default%20Settings]\r\n"HostName"=""\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\core%20sw01]\r\n"HostName"="10.9.0.1"\r\n"PortNumber"=dword:00000016\r\n"Protocol"="ssh"\r\n"UserName"="netops"\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\console]\r\n"Protocol"="serial"\r\n"SerialLine"="COM4"\r\n"SerialSpeed"=dword:00002580\r\n'
         : "";
     case "import_scan":
-      return [];
+      return a.ext === "ini" ? CRT_SAMPLE : [];
+    case "import_store_key":
+      return `C:\\Users\\me\\.ssh\\${a.name}`;
+    case "import_check_keys":
+      return a.paths.map((p: string) => ({
+        path: p.replace("${VDS_CONFIG_PATH}", a.configDir ?? "C:\\Users\\me\\AppData\\Roaming\\VanDyke\\Config"),
+        kind: /^capi::/i.test(p) ? "store" : /missing/i.test(p) ? "missing" : /\.ppk$/i.test(p) ? "putty" : /Identity$/.test(p) ? "foreign" : "openssh",
+      }));
     case "update_open_folder":
       return;
     case "update_check":

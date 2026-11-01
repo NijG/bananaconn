@@ -26,11 +26,11 @@ async function authGuide(p: { share: string; reason: string }) {
   const choice = await choiceDialog({
     title: "업데이트 폴더에 로그인할 수 없습니다",
     icon: "KeyRound",
-    message: `<p><b>${esc(p.share)}</b>: ${esc(p.reason)}</p>
+    message: `<p><b data-i18n-skip>${esc(p.share)}</b>: ${esc(p.reason)}</p>
       <p>Windows는 공유 폴더에 지금 로그인한 Windows 계정으로 먼저 접속하고, 공유 폴더가 익명(게스트) 읽기를 허용해도 게스트로 넘어가지 않습니다(Windows 10/11 기본 보안 설정).</p>
       <ul>
         <li><b>폴더 열기</b>: 탐색기에서 폴더를 엽니다. 로그인 창에 NAS 계정을 입력하고 "자격 증명 기억"을 체크하면 다음부터는 바로 접속됩니다.</li>
-        <li><b>NAS 계정 지정</b>: 설정 → 업데이트에서 자격 증명 보관함의 NAS 계정을 고르면, 앱이 업데이트를 확인할 때 그 계정으로 로그인합니다.${named ? " (지금 고른 계정으로도 로그인하지 못했습니다.)" : ""}</li>
+        <li><b>NAS 계정 지정</b>: 설정 → 업데이트에서 자격 증명 보관함의 NAS 계정을 고르면, 앱이 업데이트를 확인할 때 그 계정으로 로그인합니다.${named ? " <span>(지금 고른 계정으로도 로그인하지 못했습니다.)</span>" : ""}</li>
       </ul>`,
     choices: [
       { value: "open", label: "폴더 열기" },

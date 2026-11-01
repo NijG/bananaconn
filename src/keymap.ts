@@ -22,6 +22,8 @@ export interface ActionDef {
   note?: string;
   /** Global action that a terminal keeps for the remote program (F1 for htop, Ctrl+F for less). */
   terminalKeeps?: boolean;
+  /** The label is the user's own text (their snippet's name): never translated. */
+  userLabel?: boolean;
 }
 
 export const SCOPES: { scope: Scope; label: string }[] = [
@@ -115,7 +117,7 @@ export const FIXED: { keys: string; label: string }[] = [
 /** A snippet or macro can be given a shortcut too (terminal scope). */
 export const SNIPPET_PREFIX = "snippet:";
 export function snippetAction(s: Snippet): ActionDef {
-  return { id: SNIPPET_PREFIX + s.id, label: s.name, scope: "terminal", keys: [], note: s.macro ? "매크로 재생" : "스니펫 보내기" };
+  return { id: SNIPPET_PREFIX + s.id, label: s.name, scope: "terminal", keys: [], note: s.macro ? "매크로 재생" : "스니펫 보내기", userLabel: !s.group };
 }
 
 /** Every action, the snippets included. */

@@ -3,7 +3,8 @@
 import { icon } from "./icons";
 import { saveSnippets, state, type Snippet } from "./store";
 import { groupForKind } from "./snippetLibrary";
-import { confirmDialog, contextMenu, esc, listKeys, modal, toast, type MenuItem } from "./ui";
+import { confirmDialog, contextMenu, esc, listKeys, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
+import { tr } from "./i18n";
 
 /** Recorded keystrokes made readable: Enter ⏎, Tab ⇥, Esc ␛, other controls ^X. */
 export function showKeys(data: string): string {
@@ -84,12 +85,13 @@ export function openSnippetManager() {
   const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
   const detail = m.root.querySelector<HTMLElement>(".vault-detail")!;
   const search = m.root.querySelector<HTMLInputElement>(".list-search")!;
-  /** Search terms: each must appear in the name, text or group. */
+  /** Search terms: each must appear in the name, text or group. A built-in
+   * snippet (one with a group) is shown translated, so its name is searched
+   * as shown too ("disk" finds "디스크 사용량" in English); the user's own
+   * snippets are never translated. */
   let terms: string[] = [];
   const shown = (s: Snippet) => {
-    if (!terms.length) return true;
-    const hay = `${s.name} ${s.text} ${s.group ?? ""}`.toLowerCase();
-    return terms.every((t) => hay.includes(t));
+    return !terms.length || matchesTerms(`${s.name} ${s.group ? tr(s.name) : ""} ${s.text} ${s.group ?? ""}`.toLowerCase(), terms);
   };
 
   /** Created with "새 스니펫" but never saved: not written by other commits. */
@@ -102,7 +104,11 @@ export function openSnippetManager() {
     const groups = [...new Set(visible.flatMap((s) => (s.group ? [s.group] : [])))];
     const item = (s: Snippet) => `<button class="vault-item${s.id === selected ? " on" : ""}" data-id="${esc(s.id)}">
               ${icon(s.macro ? "Circle" : s.run ? "Play" : "ClipboardType", 15)}
-              <span><b>${esc(s.name)}</b><small class="mono-ellipsis">${esc(s.macro ? showKeys(s.text) : s.text.split("\n")[0])}</small></span></button>`;
+              <span${
+                // The user's own snippets are kept as written; the built-in
+                // library (grouped by OS) is app text and is translated.
+                s.group ? "" : " data-i18n-skip"
+              }><b>${esc(s.name)}</b><small class="mono-ellipsis">${esc(s.macro ? showKeys(s.text) : s.text.split("\n")[0])}</small></span></button>`;
     const own = visible.filter((s) => !s.group);
     listEl.innerHTML = visible.length
       ? [
@@ -181,7 +187,7 @@ export function openSnippetManager() {
 
   listKeys(search, listEl, "[data-id]");
   search.addEventListener("input", () => {
-    terms = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+    terms = searchTerms(search.value);
     render();
   });
   m.root.querySelector("[data-new]")!.addEventListener("click", () => {

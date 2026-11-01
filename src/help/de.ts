@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Für seriell geben Sie <code>COM3</code> oder <code>COM3:115200</code> ein.</li>
       </ol>
       <h4>Als Sitzung speichern</h4>
-      <p>Speichern Sie Verbindungsdaten mit der Schaltfläche ${icon("Plus", 13)} in der Sitzungsliste (${kbd("Ctrl+Shift+N")}) und verbinden Sie sich dann per Doppelklick oder mit ${kbd("Enter")}. In anderen Programmen gespeicherte Verbindungen lassen sich mit <a data-goto="import">Importieren</a> in einem Schritt übernehmen. Im Sitzungseditor prüft <b>Verbindung testen</b> vor dem Speichern, ob der Port des Hosts offen ist. Gespeicherte Sitzungen lassen sich über ihr Kontextmenü testen, mehrere Sitzungen oder ein ganzer Ordner auf einmal durch Auswahl bzw. Rechtsklick auf den Ordner.</p>
+      <p>Speichern Sie Verbindungsdaten mit der Schaltfläche ${icon("Plus", 13)} in der Sitzungsliste (${kbd("Ctrl+Shift+N")}) und verbinden Sie sich dann per Doppelklick oder mit ${kbd("Enter")}. In anderen Programmen gespeicherte Verbindungen lassen sich mit <a data-goto="import">Importieren</a> in einem Schritt übernehmen. Im Sitzungseditor prüft <b>Verbindung testen</b> vor dem Speichern, ob der Port des Hosts offen ist. Gespeicherte Sitzungen lassen sich über ihr Kontextmenü testen, mehrere Sitzungen oder ein ganzer Ordner auf einmal durch Auswahl bzw. Rechtsklick auf den Ordner. Im Ergebnis lassen sich nur die fehlgeschlagenen Sitzungen erneut prüfen oder die Tabelle kopieren; ein Doppelklick auf eine Zeile (oder Enter darauf) verbindet mit dieser Sitzung.</p>
       <h4>Anzeigesprache</h4>
       <p><b>Sprache</b> oben in den Einstellungen schaltet die Oberfläche auf 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français oder Deutsch um (sofort, ohne Verbindungen zu trennen; auch die Anleitung und die Update-Hinweise folgen). Bis Sie eine Sprache wählen, folgt die App der Windows-Anzeigesprache; danach gilt immer Ihre Wahl.</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "Aus anderen Programmen importieren",
     icon: "Download",
     body: `
-      <p>Wählen Sie über die Schaltfläche ${icon("Download", 13)} oberhalb der Sitzungsliste. Vor dem Import wird eine Vorschauliste angezeigt, vorhandene Sitzungen werden übersprungen. <b>Passwörter werden nicht importiert</b> (jedes Programm verschlüsselt sie mit einem eigenen Schlüssel). Geben Sie sie bei der ersten Verbindung ein oder weisen Sie sie aus dem Anmeldedaten-Tresor zu.</p>
+      <p>Wählen Sie über die Schaltfläche ${icon("Download", 13)} oberhalb der Sitzungsliste. Vor dem Import wird eine Vorschauliste angezeigt, vorhandene Sitzungen werden übersprungen. <b>Passwörter werden nicht importiert</b> (jedes Programm verschlüsselt sie mit einem eigenen Schlüssel). Geben Sie sie bei der ersten Verbindung ein oder weisen Sie sie aus dem Anmeldedaten-Tresor zu. Sitzungen, die sich mit einem öffentlichen Schlüssel angemeldet haben, werden im Anmeldedaten-Tresor mit ihren Schlüsseldateien verknüpft; Schlüsseldateien, die nicht gefunden oder nicht verwendet werden können, werden vor dem Import angezeigt.</p>
       <table class="help-table">
         <tr><th>Programm</th><th>Was auswählen</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (portabel: neben der ausführbaren Datei)</td></tr>
-        <tr><td>SecureCRT</td><td>Sitzungsordner <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (inklusive Ordnerstruktur, Protokolldateinamen und Einstellungen zur automatischen Protokollierung) oder eine mit File → Export Settings erstellte XML</td></tr>
+        <tr><td>SecureCRT</td><td>Sitzungsordner <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (inklusive Ordnerstruktur, Protokolldateinamen, Einstellungen zur automatischen Protokollierung und der Schlüsseldateien für die Anmeldung mit öffentlichem Schlüssel) oder eine mit File → Export Settings erstellte XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (wenn die Verschlüsselung der ganzen Datei aktiv ist, schalten Sie sie zuerst aus und speichern)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>Liest die Einstellungen dieses PCs direkt</td></tr>
         <tr><td>WinSCP</td><td>Die Einstellungen dieses PCs oder, falls keine vorhanden, <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td>Der Ordner <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
-        <tr><td>OpenSSH</td><td>Die Datei <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; Platzhalter wie <code>Host *</code> werden übersprungen)</td></tr>
+        <tr><td>OpenSSH</td><td>Die Datei <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile; wie bei ssh gelten alle passenden Host-Blöcke, der erste Wert gewinnt; Platzhalter wie <code>Host *</code> liefern nur Standardwerte, keine Sitzungen)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code>-Datei</td></tr>
         <tr><td>Remotedesktop</td><td>Ein Ordner mit <code>.rdp</code>-Dateien (inklusive Unterordnern)</td></tr>
         <tr><td>CSV</td><td>Spaltennamen in der ersten Zeile: Name, Protocol, Host, Port, Username, Folder, Domain (durch Komma, Semikolon oder Tab getrennt). <b>Sitzungsliste exportieren (CSV)</b> im selben Menü schreibt dieses Format.</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Darstellung</b> (Einstellungen → Terminal): „Automatisch“ zeichnet auf PCs mit Grafikkarte per GPU (WebGL), was umfangreiche Ausgaben beschleunigt, und nutzt auf Servern und Remote-Sitzungen ohne Grafikkarte den Standard-Renderer. Nur auf dem Bildschirm sichtbare Terminals verwenden die GPU.</li>
         <li><b>Snippets &amp; Makros</b>: Speichern Sie häufig verwendete Befehle unter Snippets in der Symbolleiste und zeichnen Sie mit „Aufnahme“ Eingaben auf, um sie wieder abzuspielen.</li>
         <li><b>Dateien</b> (SSH): Die Schaltfläche „Dateien“ in der Symbolleiste öffnet daneben einen SFTP-Bereich für denselben Server.</li>
+        <li><b>Automatisch neu verbinden</b> (in den Einstellungen abschaltbar): Bricht eine angemeldete SSH- oder Telnet-Sitzung ab, wird nach kurzer Wartezeit neu verbunden; schlägt es weiter fehl, wird jedes Mal länger gewartet. Eine Verbindung mit fehlgeschlagener Anmeldung oder eine, die während der Anmeldung endete, wird nicht neu verbunden: Wiederholte Verbindungen mit einem falschen Passwort können dazu führen, dass der Server Sie sperrt.</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Anmeldedaten-Tresor</b> (Schlüsselschaltfläche oben): Speichert Passwörter und SSH-Schlüssel in der Windows-Anmeldeinformationsverwaltung zur Verwendung im Sitzungseditor. Gespeicherte Passwörter werden nie auf dem Bildschirm angezeigt.</li>
+        <li><b>Anmeldedaten-Tresor</b> (Schlüsselschaltfläche oben): Speichert Passwörter und SSH-Schlüssel in der Windows-Anmeldeinformationsverwaltung zur Verwendung im Sitzungseditor. Gespeicherte Passwörter werden nie auf dem Bildschirm angezeigt. Schlüssel können im OpenSSH- oder PuTTY-Format (.ppk) vorliegen.</li>
         <li><b>Master-Passwort</b> (Einstellungen → Sicherheit): Sperrt die App beim Start und nach Abwesenheit.</li>
         <li>SSH/SFTP-Host-Schlüssel werden mit <code>~/.ssh/known_hosts</code> abgeglichen; bei unbekannten Schlüsseln wird zur Bestätigung ein Fingerabdruck angezeigt. Geänderte Schlüssel blockieren die Verbindung.</li>
       </ul>`,

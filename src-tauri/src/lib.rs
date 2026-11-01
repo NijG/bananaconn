@@ -110,6 +110,8 @@ pub fn run() {
             store::read_text_file,
             importsrc::import_scan,
             importsrc::registry_export,
+            importsrc::import_check_keys,
+            importsrc::import_store_key,
             term::term_open,
             term::term_write,
             term::term_ack,

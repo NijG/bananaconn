@@ -6,9 +6,10 @@
 import { api, on, type ProxyLogEvent, type TunnelInfo } from "./api";
 import { proxyOf } from "./proxy";
 import { icon } from "./icons";
-import { endpoint, parseTarget, type Session } from "./model";
+import { endpoint, parseTarget, unusableHost, type Session } from "./model";
 import { state } from "./store";
 import { confirmDialog, errorText, esc, modal, promptDialog, toast } from "./ui";
+import { userText } from "./i18n";
 
 // ---- connecting through a gateway -----------------------------------------------------
 
@@ -27,7 +28,7 @@ export function gatewayField(current: unknown): string {
   const ssh = state.sessions.filter((s) => s.protocol === "ssh" && ((!String(s.options.jumpHost ?? "").trim() && !s.options.gateway) || s.id === current)).sort((a, b) => a.name.localeCompare(b.name, "ko"));
   return `<label class="field"><span>SSH 게이트웨이 (선택)</span><select name="opt.gateway">
       <option value="">사용 안 함 (직접 연결)</option>
-      ${ssh.map((s) => `<option value="${esc(s.id)}" ${s.id === current ? "selected" : ""}>${esc(s.name)} · ${esc(endpoint(s))}</option>`).join("")}
+      ${ssh.map((s) => `<option value="${esc(s.id)}" data-i18n-skip ${s.id === current ? "selected" : ""}>${esc(s.name)} · ${esc(endpoint(s))}</option>`).join("")}
     </select></label>
     <p class="muted small">고르면 그 SSH 서버에 먼저 로그인한 다음, 그 서버를 거쳐 대상에 연결합니다(방화벽 뒤의 장비).</p>`;
 }
@@ -70,7 +71,7 @@ export async function openSshTunnel(
         const ok = await confirmDialog({
           title: "처음 접속하는 게이트웨이",
           icon: "ShieldCheck",
-          message: `게이트웨이 <b>${esc(gw.host)}</b>의 호스트 키를 아직 신뢰한 적이 없습니다.<br><br>
+          message: `게이트웨이 <b data-i18n-skip>${esc(gw.host)}</b>의 호스트 키를 아직 신뢰한 적이 없습니다.<br><br>
             지문: <code class="fp">${esc(fp)}</code><br><br>서버 관리자가 알려 준 지문과 같은지 확인한 다음 신뢰하세요.`,
           confirm: "신뢰하고 연결",
         });
@@ -153,7 +154,7 @@ function wireEvents() {
   eventsWired = true;
   on<{ id: string; kind: string; detail: string }>("tunnel-event", (e) => {
     const name = loadSaved().find((t) => t.id === e.id)?.name;
-    toast(`${name ? `터널 ${name}: ` : "SSH 게이트웨이: "}${e.detail}`, e.kind === "error" ? "error" : "warn", 6000);
+    toast(`${name ? `터널 ${userText(name)}: ` : "SSH 게이트웨이: "}${e.detail}`, e.kind === "error" ? "error" : "warn", 6000);
   });
 }
 wireEvents();
@@ -193,7 +194,7 @@ export function openTunnelManager() {
   const sshSessions = () => state.sessions.filter((s) => s.protocol === "ssh");
   form.querySelector<HTMLSelectElement>("[name=gateway]")!.innerHTML = sshSessions().length
     ? sshSessions()
-        .map((s) => `<option value="${esc(s.id)}">${esc(s.name)} · ${esc(endpoint(s))}</option>`)
+        .map((s) => `<option value="${esc(s.id)}" data-i18n-skip>${esc(s.name)} · ${esc(endpoint(s))}</option>`)
         .join("")
     : `<option value="">저장된 SSH 세션이 없습니다</option>`;
 
@@ -219,9 +220,13 @@ export function openTunnelManager() {
       const gw = state.sessions.find((s) => s.id === t.gatewayId);
       const html = `<div class="tunnel-row${r ? " on" : ""}" data-id="${esc(t.id)}">
           <span class="sb-dot ${r ? "connected" : "idle"}"></span>
-          <div class="tunnel-main"><b>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>
-            <span class="mono small">127.0.0.1:${esc(String(t.localPort))} → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span>
-            <span class="muted small">${gw ? `${esc(gw.name)} 경유` : "SSH 세션이 삭제됨"}<span class="tunnel-stats"></span></span></div>
+          <div class="tunnel-main"><b data-i18n-skip>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>
+            <span class="mono small" data-i18n-skip>127.0.0.1:${esc(String(t.localPort))} → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span>
+            <span class="muted small">${
+              // The session name is the user's: kept out of the "{0} 경유" pattern,
+              // whose value the translator would translate too ("삭제" → "Delete").
+              gw ? `<span title="SSH 서버">${icon("Server", 12)}</span> <span data-i18n-skip>${esc(gw.name)}</span>` : "SSH 세션이 삭제됨"
+            }<span class="tunnel-stats"></span></span></div>
           <button class="btn btn-sm ${r ? "btn-danger" : "btn-primary"}" data-toggle ${busy.has(t.id) || !gw ? "disabled" : ""}>
             ${r ? `${icon("Square", 13)}중지` : `${icon("Play", 13)}시작`}</button>
           <button class="tool" data-del title="삭제" ${r || busy.has(t.id) ? "disabled" : ""}>${icon("Trash2", 14)}</button>
@@ -254,6 +259,14 @@ export function openTunnelManager() {
     if (!t) return;
     if ((e.target as HTMLElement).closest("[data-del]")) {
       if (busy.has(t.id) || running.some((r) => r.id === t.id)) return;
+      const ok = await confirmDialog({
+        title: "터널 삭제",
+        message: `<b data-i18n-skip>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>을(를) 삭제합니다.`,
+        confirm: "삭제",
+        danger: true,
+      });
+      // While the dialog was open the tunnel may have been deleted or opened.
+      if (!ok || !list.some((x) => x.id === t.id) || busy.has(t.id) || running.some((r) => r.id === t.id)) return;
       list = list.filter((x) => x.id !== t.id);
       storeSaved(list);
       return render();
@@ -284,11 +297,13 @@ export function openTunnelManager() {
     // "db.internal:5432", "[fe80::1]:22" or "http://db:8080/" pasted into the
     // host field: split off the port (the port field, if filled, wins), as
     // the SSH server would otherwise be asked for a host named "db.internal:5432".
-    // A "user@" there is not a target this form has: left for the server to refuse.
+    // A forward has no user, so "root@db:22" is refused here rather than saved
+    // as a tunnel that can never open.
     let targetHost = val("targetHost");
     let targetPort = val("targetPort");
     const parsed = parseTarget(targetHost);
-    if (parsed && !parsed.username) {
+    if (parsed?.username) return toast("호스트 이름이 올바르지 않습니다", "warn");
+    if (parsed) {
       targetHost = parsed.host;
       targetPort ||= parsed.port ? String(parsed.port) : "";
     }
@@ -303,6 +318,7 @@ export function openTunnelManager() {
     if (!t.gatewayId) return toast("먼저 SSH 세션을 저장하세요", "warn");
     if (!validPort(t.localPort) || !validPort(t.targetPort)) return toast("포트는 1부터 65535 사이의 정수여야 합니다", "warn");
     if (!t.targetHost) return toast("대상 호스트를 입력하세요", "warn");
+    if (unusableHost(t.targetHost)) return toast("호스트 이름이 올바르지 않습니다", "warn");
     if (list.some((x) => x.localPort === t.localPort)) return toast(`내 PC 포트 ${t.localPort}을(를) 쓰는 터널이 이미 있습니다`, "warn");
     list.push(t);
     storeSaved(list);

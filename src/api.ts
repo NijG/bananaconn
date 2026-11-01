@@ -36,6 +36,11 @@ export interface Credential {
   hasSecret: boolean;
 }
 
+/** What an imported key file is (import_check_keys): "openssh" is read by
+ * ssh.exe, a PuTTY key is converted for it; the rest cannot be used. "store":
+ * a key in the Windows certificate store, not a file. */
+export type ImportKeyKind = "openssh" | "putty" | "putty-encrypted" | "foreign" | "public" | "unknown" | "missing" | "store";
+
 export interface TransferProgress {
   transferId: string;
   file: string;
@@ -281,6 +286,11 @@ export const api = {
   importScan: (root: string, ext: string) => call<{ rel: string; text: string }[]>("import_scan", { root, ext }),
   /** PuTTY / KiTTY / WinSCP sessions as .reg text ("" when the tool was never used). */
   registryExport: (key: string) => call<string>("registry_export", { key }),
+  /** The key files an import names, resolved (SecureCRT's ${VDS_CONFIG_PATH}
+   * stands for `configDir`; ~, %VAR%) and checked, in the same order. */
+  importCheckKeys: (paths: string[], configDir: string | null) => call<{ path: string; kind: ImportKeyKind }[]>("import_check_keys", { paths, configDir }),
+  /** Save a key file an import carries in the .ssh folder (owner only); its path. */
+  importStoreKey: (name: string, contents: number[]) => call<string>("import_store_key", { name, contents }),
   /** The running app's version (tauri.conf.json). */
   appVersion: async () => (isTauri ? (await import("@tauri-apps/api/app")).getVersion() : "0.7.4"),
   /** Compare the update folder's signed latest.json with this version. */

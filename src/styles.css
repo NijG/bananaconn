@@ -2115,9 +2115,35 @@ code.fp {
   border-collapse: collapse;
   font-size: 13px;
 }
-.reach-table td {
+.reach-table td,
+.reach-table th {
   padding: 5px 8px;
   border-bottom: 1px solid var(--line);
+}
+.reach-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+}
+/* A long session name wraps in its own column instead of squeezing the
+   address and result onto two lines each. */
+.reach-table td:first-child {
+  max-width: 220px;
+  overflow-wrap: anywhere;
+}
+.reach-table td:nth-child(2) {
+  white-space: nowrap;
+}
+.reach-table.can-open tbody tr {
+  cursor: pointer;
+}
+.reach-table.can-open tbody tr:hover,
+.reach-table.can-open tbody tr:focus-visible {
+  background: var(--bg-3);
+}
+.reach-table.can-open tbody tr:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .reach-table td.ok {
   color: var(--ok);
@@ -2575,6 +2601,10 @@ code.fp {
 .import-summary {
   margin-bottom: 12px;
   line-height: 1.7;
+}
+/* A warning line that runs as text (names and reasons in a list). */
+.import-warn {
+  color: var(--warn);
 }
 .import-table {
   max-height: 320px;

@@ -352,11 +352,11 @@ export class RdpView implements View {
       icon: changed ? "ShieldAlert" : "ShieldCheck",
       danger: changed,
       message: changed
-        ? `<b>${esc(this.session.host)}</b> 서버의 인증서가 이전과 다릅니다.<br><br>
+        ? `<b data-i18n-skip>${esc(this.session.host)}</b> 서버의 인증서가 이전과 다릅니다.<br><br>
            이전: <code class="fp">${esc(previous)}</code><br>새 인증서: <code class="fp">${esc(fingerprint)}</code><br><br>
            Windows의 RDP 자체 서명 인증서는 주기적으로 갱신되기도 하지만, 중간자 공격일 수도 있습니다.
            서버에서 인증서를 교체한 것이 확실할 때만 계속하세요.`
-        : `<b>${esc(this.session.host)}</b> 서버의 인증서를 아직 신뢰한 적이 없습니다.<br><br>
+        : `<b data-i18n-skip>${esc(this.session.host)}</b> 서버의 인증서를 아직 신뢰한 적이 없습니다.<br><br>
            공개 키 지문: <code class="fp">${esc(fingerprint)}</code><br><br>
            서버 관리자가 알려 준 지문과 같은지 확인하세요. 신뢰하면 다음부터는 묻지 않습니다.`,
       confirm: changed ? "새 인증서 신뢰" : "신뢰하고 연결",

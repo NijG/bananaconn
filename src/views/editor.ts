@@ -46,7 +46,7 @@ import { icon } from "../icons";
 import type { Session } from "../model";
 import { choiceDialog, errorText, esc, h, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
-import { language, type Language } from "../i18n";
+import { language, userText, type Language } from "../i18n";
 import { subscribe } from "../store";
 
 /** CodeMirror's own words (find/replace and go-to-line panels). The editor is
@@ -356,7 +356,7 @@ export class EditorView implements View {
   private async save(force: boolean): Promise<void> {
     if (!this.code || this.saving) return;
     const problem = this.connectionProblem();
-    if (problem) return toast(problem, "warn", 6000);
+    if (problem) return void toast(problem, "warn", 6000);
     this.saving = true;
     const text = this.text();
     try {
@@ -364,7 +364,7 @@ export class EditorView implements View {
       this.savedDoc = text;
       // Edits made while the save was in flight keep the file dirty.
       this.isDirty = this.text() !== text;
-      toast(`${this.name} 을(를) 저장했습니다`, "success", 2500);
+      toast(`${userText(this.name)} 을(를) 저장했습니다`, "success", 2500);
       this.owner.refreshRemote();
       this.ws.changed();
     } catch (err) {
@@ -374,7 +374,7 @@ export class EditorView implements View {
         const choice = await choiceDialog({
           title: "서버의 파일이 바뀌었습니다",
           icon: "TriangleAlert",
-          message: `<b>${esc(this.name)}</b>을(를) 연 뒤에 다른 곳에서 서버의 파일이 바뀌었습니다.`,
+          message: `<b data-i18n-skip>${esc(this.name)}</b>을(를) 연 뒤에 다른 곳에서 서버의 파일이 바뀌었습니다.`,
           choices: [
             { value: "reload", label: "내 변경 버리고 다시 읽기" },
             { value: "overwrite", label: "내 내용으로 덮어쓰기", kind: "danger" as const },
@@ -404,7 +404,7 @@ export class EditorView implements View {
       });
       if (choice !== "reload") return;
     }
-    if (this.connectionProblem()) return toast(this.connectionProblem()!, "warn");
+    if (this.connectionProblem()) return void toast(this.connectionProblem()!, "warn");
     await this.load();
   }
 
@@ -415,7 +415,7 @@ export class EditorView implements View {
     try {
       const bom = this.bom ? "﻿" : "";
       await api.saveTextFile(path, bom + this.text());
-      toast(`내 PC에 저장했습니다: ${path}`, "success");
+      toast(`내 PC에 저장했습니다: ${userText(path)}`, "success");
     } catch (err) {
       toast(errorText(err), "error");
     }

@@ -780,3 +780,140 @@ async fn builtin_tftp_and_http_servers_confine_and_serve() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&secret);
 }
+
+// ---- terminal login with a converted PuTTY key -----------------------------------------------
+
+/// Accepts one public key, and opens a shell that says so and ends.
+#[derive(Clone)]
+struct KeyServer {
+    key: russh::keys::ssh_key::PublicKey,
+}
+
+impl russh::server::Handler for KeyServer {
+    type Error = russh::Error;
+
+    async fn auth_publickey_offered(&mut self, _user: &str, key: &russh::keys::ssh_key::PublicKey) -> Result<russh::server::Auth, Self::Error> {
+        Ok(if key.key_data() == self.key.key_data() { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+    }
+
+    async fn auth_publickey(&mut self, _user: &str, key: &russh::keys::ssh_key::PublicKey) -> Result<russh::server::Auth, Self::Error> {
+        Ok(if key.key_data() == self.key.key_data() { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pty_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)
+    }
+
+    async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut russh::server::Session) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        session.data(channel, b"LOGGED-IN-WITH-KEY\r\n".to_vec())?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)
+    }
+}
+
+/// The terminal's ssh.exe logs in with a PuTTY key (.ppk), which it cannot
+/// read itself, through the converted copy: it asks for the copy's one-time
+/// passphrase with the path given to it, which is what the autofill answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_exe_logs_in_with_a_converted_putty_key() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::Write;
+    use std::sync::Arc;
+    if std::process::Command::new("ssh").arg("-V").output().is_err() {
+        return; // no OpenSSH client here
+    }
+    let base = std::env::temp_dir().join(format!("bx-ppk-login-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let ppk = base.join("web.ppk");
+    std::fs::write(&ppk, crate::vault::tests::PPK).unwrap();
+    let public = russh::keys::decode_secret_key(crate::vault::tests::PPK, None).unwrap().public_key().clone();
+    let temp = crate::vault::convert_putty(&ppk, None, &base.join("copies")).unwrap();
+    let key_path = temp.path.to_string_lossy().into_owned();
+
+    let config = Arc::new(russh::server::Config {
+        keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = KeyServer { key: public };
+    let accept = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (config, server) = (config.clone(), server.clone());
+            tokio::spawn(async move {
+                if let Ok(running) = russh::server::run_stream(config, s, server).await {
+                    let _ = running.await;
+                }
+            });
+        }
+    });
+
+    // ssh.exe in a pseudo-console as the terminal runs it, with no user config
+    // and a known_hosts of its own.
+    let empty_config = base.join("config");
+    std::fs::write(&empty_config, "").unwrap();
+    let known = base.join("known_hosts");
+    let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 200, pixel_width: 0, pixel_height: 0 }).unwrap();
+    let mut cmd = CommandBuilder::new("ssh");
+    cmd.args(["-F", &empty_config.to_string_lossy(), "-p", &port.to_string(), "-i", &key_path, "-o", "IdentitiesOnly=yes"]);
+    cmd.args(["-o", "StrictHostKeyChecking=no", "-o", &format!("UserKnownHostsFile={}", known.to_string_lossy()), "--", "tester@127.0.0.1"]);
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let prompt = crate::term::passphrase_prompt(&key_path);
+    let (mut seen, mut answered) = (String::new(), false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && !seen.contains("LOGGED-IN-WITH-KEY") {
+        let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+        // As the autofill does: the line asking ends in ':' and names the key.
+        let lower = seen.to_lowercase();
+        let last = lower.trim_end().rsplit(['\n', '\r']).next().unwrap_or("").to_string();
+        if !answered && lower.trim_end().ends_with(':') && last.contains(&prompt) {
+            writer.write_all(format!("{}\r", temp.passphrase).as_bytes()).unwrap();
+            writer.flush().unwrap();
+            answered = true;
+        }
+    }
+    let _ = child.kill();
+    accept.abort();
+    assert!(answered, "ssh.exe never asked for the copy's passphrase as expected ({prompt}): {seen:?}");
+    assert!(seen.contains("LOGGED-IN-WITH-KEY"), "no login: {seen:?}");
+    drop(temp);
+    drop(pair.master);
+    let _ = std::fs::remove_dir_all(&base);
+}

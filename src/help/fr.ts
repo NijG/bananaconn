@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Pour une liaison série, saisissez <code>COM3</code> ou <code>COM3:115200</code>.</li>
       </ol>
       <h4>L'enregistrer comme session</h4>
-      <p>Enregistrez les paramètres de connexion avec le bouton ${icon("Plus", 13)} de la liste des sessions (${kbd("Ctrl+Shift+N")}), puis connectez-vous par un double-clic ou avec ${kbd("Enter")}. Les connexions enregistrées dans d'autres programmes peuvent être reprises en une fois via <a data-goto="import">Importer</a>. Dans l'éditeur de session, <b>Tester la connexion</b> vérifie avant l'enregistrement si le port de l'hôte est ouvert. Les sessions enregistrées se testent depuis leur menu contextuel, et plusieurs sessions ou un dossier entier d'un coup en les sélectionnant ou par clic droit sur le dossier.</p>
+      <p>Enregistrez les paramètres de connexion avec le bouton ${icon("Plus", 13)} de la liste des sessions (${kbd("Ctrl+Shift+N")}), puis connectez-vous par un double-clic ou avec ${kbd("Enter")}. Les connexions enregistrées dans d'autres programmes peuvent être reprises en une fois via <a data-goto="import">Importer</a>. Dans l'éditeur de session, <b>Tester la connexion</b> vérifie avant l'enregistrement si le port de l'hôte est ouvert. Les sessions enregistrées se testent depuis leur menu contextuel, et plusieurs sessions ou un dossier entier d'un coup en les sélectionnant ou par clic droit sur le dossier. Dans les résultats, vous pouvez revérifier uniquement les sessions en échec ou copier le tableau ; un double-clic sur une ligne (ou Entrée sur celle-ci) connecte cette session.</p>
       <h4>Langue de l'interface</h4>
       <p><b>Langue</b>, en haut des Paramètres, bascule l'interface en 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français ou Deutsch (immédiatement, sans déconnexion ; le guide et les notes de mise à jour suivent aussi). Tant que vous n'avez pas choisi, l'application suit la langue d'affichage de Windows ; une fois choisie, votre préférence l'emporte toujours.</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "Importer depuis d'autres programmes",
     icon: "Download",
     body: `
-      <p>Choisissez dans le bouton ${icon("Download", 13)} au-dessus de la liste des sessions. Un aperçu est affiché avant l'importation, et les sessions existantes sont ignorées. <b>Les mots de passe ne sont pas importés</b> (chaque programme les chiffre avec sa propre clé). Saisissez-les à la première connexion ou attribuez-en un depuis le coffre d'identifiants.</p>
+      <p>Choisissez dans le bouton ${icon("Download", 13)} au-dessus de la liste des sessions. Un aperçu est affiché avant l'importation, et les sessions existantes sont ignorées. <b>Les mots de passe ne sont pas importés</b> (chaque programme les chiffre avec sa propre clé). Saisissez-les à la première connexion ou attribuez-en un depuis le coffre d'identifiants. Les sessions qui s'identifiaient par clé publique sont associées à leurs fichiers de clé dans le coffre d'identifiants, et les fichiers de clé introuvables ou inutilisables sont signalés avant l'importation.</p>
       <table class="help-table">
         <tr><th>Programme</th><th>Quoi choisir</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (version portable : à côté de l'exécutable)</td></tr>
-        <tr><td>SecureCRT</td><td>Le dossier de sessions <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (y compris l'arborescence, les noms de fichiers journaux et les réglages de journalisation automatique), ou un XML créé via Fichier → Exporter les paramètres</td></tr>
+        <tr><td>SecureCRT</td><td>Le dossier de sessions <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (y compris l'arborescence, les noms de fichiers journaux, les réglages de journalisation automatique et les fichiers de clé utilisés pour l'identification par clé publique), ou un XML créé via Fichier → Exporter les paramètres</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (si le chiffrement complet du fichier est activé, désactivez-le et enregistrez d'abord)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>Lit directement les paramètres de ce PC</td></tr>
         <tr><td>WinSCP</td><td>Les paramètres de ce PC, ou <code>WinSCP.ini</code> à défaut</td></tr>
         <tr><td>Xshell</td><td>Le dossier <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
-        <tr><td>OpenSSH</td><td>Le fichier <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump ; les jokers comme <code>Host *</code> sont ignorés)</td></tr>
+        <tr><td>OpenSSH</td><td>Le fichier <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile ; comme ssh, tous les blocs Host correspondants s'appliquent et la première valeur l'emporte ; les jokers comme <code>Host *</code> ne fournissent que des valeurs par défaut, pas de sessions)</td></tr>
         <tr><td>RDCMan</td><td>Fichier <code>.rdg</code></td></tr>
         <tr><td>Bureau à distance</td><td>Un dossier contenant des fichiers <code>.rdp</code> (sous-dossiers inclus)</td></tr>
         <tr><td>CSV</td><td>Noms de colonnes sur la première ligne : Name, Protocol, Host, Port, Username, Folder, Domain (séparés par virgule, point-virgule ou tabulation). <b>Exporter la liste des sessions (CSV)</b> du même menu écrit ce format.</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Rendu</b> (Paramètres → Terminal) : « Auto » dessine avec le GPU (WebGL) sur les PC dotés d'une carte graphique, ce qui accélère les sorties volumineuses, et utilise le rendu standard sur les serveurs et sessions distantes qui n'en ont pas. Seuls les terminaux visibles à l'écran utilisent le GPU.</li>
         <li><b>Extraits et macros</b> : enregistrez les commandes fréquentes sous Extraits dans la barre d'outils, et utilisez « Enregistrer » pour capturer une saisie et la rejouer.</li>
         <li><b>Fichiers</b> (SSH) : le bouton Fichiers de la barre d'outils ouvre à côté un volet SFTP du même serveur.</li>
+        <li><b>Reconnexion automatique</b> (désactivable dans les paramètres) : quand une session SSH ou Telnet identifiée est coupée, l'application attend un instant puis se reconnecte, en attendant plus longtemps à chaque nouvel échec. Une connexion dont l'identification a échoué, ou qui s'est terminée pendant l'identification, n'est pas rétablie : se connecter encore et encore avec un mauvais mot de passe peut amener le serveur à vous bloquer.</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Coffre d'identifiants</b> (bouton clé en haut) : stocke les mots de passe et clés SSH dans le Gestionnaire d'identification Windows pour les utiliser dans l'éditeur de session. Les mots de passe enregistrés ne sont jamais affichés à l'écran.</li>
+        <li><b>Coffre d'identifiants</b> (bouton clé en haut) : stocke les mots de passe et clés SSH dans le Gestionnaire d'identification Windows pour les utiliser dans l'éditeur de session. Les mots de passe enregistrés ne sont jamais affichés à l'écran. Les clés peuvent être au format OpenSSH ou PuTTY (.ppk).</li>
         <li><b>Mot de passe principal</b> (Paramètres → Sécurité) : verrouille l'application au démarrage et après une absence.</li>
         <li>Les clés d'hôte SSH/SFTP sont vérifiées par rapport à <code>~/.ssh/known_hosts</code> ; une clé inconnue affiche une empreinte à confirmer. Une clé modifiée bloque la connexion.</li>
       </ul>`,

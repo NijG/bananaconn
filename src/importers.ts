@@ -11,9 +11,32 @@
 // - Xshell: *.xsh INI files ([CONNECTION] Host=, Port=, Protocol=).
 // - Remote Desktop Connection Manager: *.rdg XML; mstsc: *.rdp files.
 // - CSV with a header row (comma, semicolon or tab separated).
+// - OpenSSH client config; the bookmark sections of a MobaXterm.ini.
+// Every parser hands its sessions to add(), so all imports share one set of
+// rules (host field splitting, unusable hosts, ports, notes).
 
-import { PROTOCOLS, type Protocol } from "./model";
-import type { ParsedImport } from "./importExport";
+import { parseTarget, PROTOCOLS, unusableHost, type Protocol, type Session } from "./model";
+
+/** What a parser found: sessions to review, and entries it could not take. */
+export interface ParsedImport {
+  sessions: Session[];
+  skipped: { name: string; reason: string }[];
+  /** Private-key files a source names for a session (SecureCRT "Identity
+   * Filename", OpenSSH IdentityFile), as written there: the import resolves
+   * and checks them (import_check_keys) and turns the usable ones into key
+   * credentials, so the session logs in with the key instead of being asked
+   * for a password. Keyed by the session's id; never read here. */
+  keyLinks?: { sessionId: string; keyPath: string }[];
+  /** The folder SecureCRT's "${VDS_CONFIG_PATH}" in key paths stands for. */
+  configDir?: string;
+  /** Sessions whose password the source had saved. Passwords are not
+   * imported, so these will ask for one. */
+  savedPasswords?: string[];
+  /** Key files the source itself carries (SecureCRT's Export Settings), by
+   * the path its sessions name them with: used when that file is not on
+   * this PC. */
+  keyFiles?: { keyPath: string; contents: number[] }[];
+}
 
 const empty = (): ParsedImport => ({ sessions: [], skipped: [] });
 const joinFolder = (...parts: (string | undefined)[]) =>
@@ -26,22 +49,44 @@ const joinFolder = (...parts: (string | undefined)[]) =>
 function add(
   out: ParsedImport,
   source: string,
-  s: { protocol: Protocol | null; name: string; host: string; port?: number | string | null; username?: string; folder?: string; options?: Record<string, unknown> },
+  s: {
+    protocol: Protocol | null;
+    name: string;
+    host: string;
+    port?: number | string | null;
+    username?: string;
+    folder?: string;
+    options?: Record<string, unknown>;
+    keyPath?: string;
+    savedPassword?: boolean;
+  },
   unsupported?: string,
 ) {
   const name = s.name.trim() || s.host.trim();
   if (!s.protocol) return out.skipped.push({ name: name || "(이름 없음)", reason: unsupported ? `${unsupported}은(는) 지원하지 않습니다` : "알 수 없는 종류" });
-  const host = s.host.trim();
+  let host = s.host.trim();
   if (!host) return out.skipped.push({ name: name || "(이름 없음)", reason: "호스트가 비어 있습니다" });
   const n = typeof s.port === "string" ? Number(s.port) : s.port;
-  const port = s.protocol === "serial" ? 0 : n && Number.isInteger(n) && n > 0 && n < 65536 ? n : PROTOCOLS[s.protocol].port;
+  const given = n && Number.isInteger(n) && n > 0 && n < 65536 ? n : null;
+  let username = (s.username ?? "").trim();
+  // "root@10.0.0.1:2222" or "ssh://host:22/" in the host field (a hand-edited
+  // CSV): split it as Quick connect reads it. Port and user columns win.
+  const t = s.protocol === "serial" ? null : parseTarget(host);
+  if (t && t.host !== host) {
+    host = t.host;
+    username ||= t.username;
+  }
+  // Reported rather than added as a session that only fails later.
+  if (unusableHost(host)) return out.skipped.push({ name, reason: "호스트 이름이 올바르지 않습니다" });
+  const port = s.protocol === "serial" ? 0 : (given ?? t?.port ?? PROTOCOLS[s.protocol].port);
+  const id = crypto.randomUUID();
   out.sessions.push({
-    id: crypto.randomUUID(),
+    id,
     name,
     protocol: s.protocol,
     host,
     port,
-    username: (s.username ?? "").trim(),
+    username,
     credentialId: null,
     folder: s.folder ?? "",
     notes: `${source}에서 가져옴`,
@@ -49,6 +94,107 @@ function add(
     createdAt: Date.now(),
     lastUsed: null,
   });
+  const keyPath = s.keyPath?.trim();
+  if (keyPath) (out.keyLinks ??= []).push({ sessionId: id, keyPath });
+  if (s.savedPassword) (out.savedPasswords ??= []).push(id);
+}
+
+// ---- MobaXterm.ini --------------------------------------------------------------------------
+//
+// Seen in MobaXterm.ini files: bookmark sections named "Bookmarks",
+// "Bookmarks_N" with "SubRep" (folder) and "ImgNum" keys; session values start
+// with " #<type>#<icon>%" using these type codes, and these escape tokens.
+// The field order after the icon (host%port%user%…) follows the commonly
+// documented MobaXterm format; imports are shown for review before saving.
+
+const MOBA_TYPES: Record<string, Protocol> = {
+  "109": "ssh",
+  "98": "telnet",
+  "91": "rdp",
+  "128": "vnc",
+  "130": "ftp",
+  "140": "sftp",
+};
+
+const MOBA_UNSUPPORTED: Record<string, string> = {
+  "100": "rlogin",
+  "313": "웹 브라우저",
+};
+
+const MOBA_ESCAPES: [string, string][] = [
+  ["__PTVIRG__", ";"],
+  ["__DIEZE__", "#"],
+  ["__EQQUAL__", "="],
+  ["__EQUAL__", "="],
+  ["__POURCENT__", "%"],
+  ["__PERCENT__", "%"],
+  ["__PIIPE__", "|"],
+  ["__PIPE__", "|"],
+  ["__DBLQUO__", '"'],
+  ["__BACKSLASH__", "\\"],
+  ["__DBLDOT__", ":"],
+  ["__INF__", "<"],
+  ["__SUP__", ">"],
+];
+
+function mobaUnescape(s: string): string {
+  let out = s;
+  for (const [token, ch] of MOBA_ESCAPES) out = out.split(token).join(ch);
+  return out.trim();
+}
+
+/** The bookmark sessions of a MobaXterm.ini. */
+export function parseMobaXtermIni(text: string, rootFolder: string): ParsedImport {
+  const out = empty();
+  let inBookmarks = false;
+  let folder = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith(";")) continue;
+    const section = line.match(/^\[(.+)\]$/);
+    if (section) {
+      inBookmarks = /^Bookmarks(_\d+)?$/i.test(section[1]);
+      folder = "";
+      continue;
+    }
+    if (!inBookmarks) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1);
+    if (/^SubRep$/i.test(key)) {
+      folder = mobaUnescape(value);
+      continue;
+    }
+    if (/^ImgNum$/i.test(key)) continue;
+    const parts = value.trim().split("#");
+    // " #109#0%host%22%user%…#MobaFont%…" → ["", "109", "0%host%22%user%…", …]
+    if (parts.length < 3 || parts[0] !== "") continue;
+    const name = mobaUnescape(key);
+    const code = parts[1];
+    // An unknown type keeps its code in the reason, for a report of what was left out.
+    if (!MOBA_TYPES[code] && !MOBA_UNSUPPORTED[code]) {
+      out.skipped.push({ name, reason: `알 수 없는 종류 (${code})` });
+      continue;
+    }
+    const protocol = MOBA_TYPES[code] ?? null;
+    const fields = parts[2].split("%");
+    add(
+      out,
+      "MobaXterm",
+      {
+        protocol,
+        name,
+        host: mobaUnescape(fields[1] ?? ""),
+        port: fields[2],
+        // A VNC bookmark's third field is not a user name.
+        username: protocol === "vnc" ? "" : mobaUnescape(fields[3] ?? ""),
+        folder: joinFolder(rootFolder, folder),
+      },
+      MOBA_UNSUPPORTED[code],
+    );
+  }
+  return out;
 }
 
 // ---- SecureCRT -------------------------------------------------------------------------------
@@ -56,8 +202,20 @@ function add(
 const CRT_PROTOCOLS: Record<string, Protocol> = { ssh2: "ssh", ssh1: "ssh", telnet: "telnet", serial: "serial", "telnet/ssl": "telnet" };
 const CRT_PARITY = ["none", "odd", "even", "none", "none"];
 
-/** Session values from SecureCRT, however they were stored. */
-function crtSession(out: ParsedImport, get: (key: string) => string | undefined, name: string, folder: string) {
+/** The key file SecureCRT's SSH2.ini sets for all sessions (Global Options →
+ * SSH2), from the file's text. */
+export function secureCrtGlobalKey(ssh2Ini: string): string | undefined {
+  const values = new Map<string, string>();
+  for (const line of ssh2Ini.replace(/^﻿/, "").split(/\r?\n/)) {
+    const m = line.match(/^S:"(Identity Filename(?: V2)?)"=(.*)$/);
+    if (m) values.set(m[1], m[2].trim());
+  }
+  return values.get("Identity Filename V2") || values.get("Identity Filename") || undefined;
+}
+
+/** Session values from SecureCRT, however they were stored. `globalKey`: the
+ * key file set for all sessions (SSH2.ini, or the SSH2 key of an export). */
+function crtSession(out: ParsedImport, get: (key: string) => string | undefined, name: string, folder: string, globalKey?: string) {
   const protoName = (get("Protocol Name") ?? "").trim();
   const protocol = CRT_PROTOCOLS[protoName.toLowerCase()] ?? null;
   const num = (key: string) => {
@@ -92,16 +250,33 @@ function crtSession(out: ParsedImport, get: (key: string) => string | undefined,
       logLinePrefix: get("Custom Log Message Each Line") ?? "",
     });
   }
-  add(
-    out,
-    "SecureCRT",
-    { protocol, name, host, port: protocol === "ssh" ? num("[SSH2] Port") ?? num("[SSH1] Port") : num("Port"), username: get("Username"), folder, options },
-    protoName || undefined,
-  );
+  // An SSH session keeps its port under its own protocol's key first.
+  const port =
+    protocol !== "ssh" ? num("Port") : protoName.toLowerCase() === "ssh1" ? (num("[SSH1] Port") ?? num("[SSH2] Port")) : (num("[SSH2] Port") ?? num("[SSH1] Port"));
+  // A session that logs in with a key is imported with it as a key credential
+  // (importExport), so it uses the key rather than asking for a password. The
+  // key is the one set for all sessions while "Use Global Public Key" is on (as
+  // it is by default; an older session without the setting uses its own key
+  // file if it names one), else the session's own. Only when public-key auth is
+  // in use: SecureCRT lists the methods in "SSH2 Authentications V2"; a session
+  // without that list is taken as using it.
+  let keyPath: string | undefined;
+  if (protocol === "ssh") {
+    const own = (get("Identity Filename V2") ?? get("Identity Filename") ?? "").trim();
+    const useGlobal = get("Use Global Public Key");
+    const key = useGlobal === "0" ? own : useGlobal === undefined ? own || globalKey : globalKey;
+    const methods = get("SSH2 Authentications V2")?.trim();
+    if (key && (!methods || methods.split(",").some((m) => m.trim().toLowerCase() === "publickey"))) keyPath = key;
+  }
+  // A password SecureCRT kept is not imported: the review says which sessions
+  // will ask for one.
+  const savedPassword = protocol !== "serial" && (get("Session Password Saved") === "1" || !!get("Password V2")?.trim() || !!get("Password")?.trim());
+  add(out, "SecureCRT", { protocol, name, host, port, username: get("Username"), folder, options, keyPath, savedPassword }, protoName || undefined);
 }
 
-/** One session INI file. `rel` is its path under the Sessions folder. */
-export function parseSecureCrtFiles(files: { rel: string; text: string }[], rootFolder = "SecureCRT"): ParsedImport {
+/** One session INI file. `rel` is its path under the Sessions folder.
+ * `globalKey`: the key file SSH2.ini sets for all sessions. */
+export function parseSecureCrtFiles(files: { rel: string; text: string }[], rootFolder = "SecureCRT", globalKey?: string): ParsedImport {
   const out = empty();
   for (const f of files) {
     const parts = f.rel.split("/");
@@ -114,34 +289,51 @@ export function parseSecureCrtFiles(files: { rel: string; text: string }[], root
       values.set(m[2], m[1] === "D" ? String(parseInt(m[3], 16)) : m[3]);
     }
     if (!values.has("Protocol Name")) continue;
-    crtSession(out, (k) => values.get(k), file.replace(/\.ini$/i, ""), joinFolder(rootFolder, ...parts));
+    crtSession(out, (k) => values.get(k), file.replace(/\.ini$/i, ""), joinFolder(rootFolder, ...parts), globalKey);
   }
   return out;
 }
 
-/** SecureCRT "Export Settings" XML. */
+/** SecureCRT "Export Settings" XML. Its SSH2 key holds the key file set for
+ * all sessions. */
 export function parseSecureCrtXml(xml: string, rootFolder = "SecureCRT"): ParsedImport {
   const out = empty();
   const doc = parseXml(xml);
-  const sessions = [...doc.querySelectorAll("key")].find((k) => k.getAttribute("name") === "Sessions" && k.parentElement?.tagName === "VanDyke");
+  const top = (name: string) => [...doc.querySelectorAll("key")].find((k) => k.getAttribute("name") === name && k.parentElement?.tagName === "VanDyke");
+  const sessions = top("Sessions");
   if (!sessions) return out;
+  const ssh2 = new Map([...(top("SSH2")?.children ?? [])].map((v) => [v.getAttribute("name") ?? "", (v.textContent ?? "").trim()]));
+  const globalKey = ssh2.get("Identity Filename V2") || ssh2.get("Identity Filename") || undefined;
   const walk = (node: Element, path: string[]) => {
     for (const child of [...node.children].filter((c) => c.tagName === "key")) {
       const name = child.getAttribute("name") ?? "";
       const values = new Map<string, string>();
       for (const v of child.children) if (v.tagName !== "key") values.set(v.getAttribute("name") ?? "", v.textContent ?? "");
       if (values.has("Protocol Name")) {
-        if (name !== "Default") crtSession(out, (k) => values.get(k), name, joinFolder(rootFolder, ...path));
+        if (name !== "Default") crtSession(out, (k) => values.get(k), name, joinFolder(rootFolder, ...path), globalKey);
       } else walk(child, [...path, name]);
     }
   };
   walk(sessions, []);
+  // The export's Files key holds the files its settings name, each as a Path
+  // string and Contents in hex: kept for the key files the sessions use.
+  const named = new Set((out.keyLinks ?? []).map((k) => k.keyPath));
+  for (const file of [...(top("Files")?.children ?? [])].filter((c) => c.tagName === "key")) {
+    const value = (name: string) => [...file.children].find((v) => v.getAttribute("name") === name)?.textContent?.trim() ?? "";
+    const keyPath = value("Path");
+    const hex = value("Contents").split(/\s+/).filter(Boolean);
+    if (!named.has(keyPath) || !hex.length || hex.length > 64 * 1024 || hex.some((b) => !/^[0-9a-f]{2}$/i.test(b))) continue;
+    (out.keyFiles ??= []).push({ keyPath, contents: hex.map((b) => parseInt(b, 16)) });
+  }
   return out;
 }
 
 // ---- mRemoteNG --------------------------------------------------------------------------------
 
 const MRNG_PROTOCOLS: Record<string, Protocol> = { rdp: "rdp", vnc: "vnc", ssh1: "ssh", ssh2: "ssh", telnet: "telnet" };
+/** The settings an import takes that mRemoteNG lets a node inherit. */
+const MRNG_INHERITED = ["Protocol", "Port", "Username", "Domain"] as const;
+type MrngValues = Partial<Record<(typeof MRNG_INHERITED)[number], string>>;
 
 export function parseMRemoteNg(xml: string, rootFolder = "mRemoteNG"): ParsedImport {
   const out = empty();
@@ -150,16 +342,23 @@ export function parseMRemoteNg(xml: string, rootFolder = "mRemoteNG"): ParsedImp
   if (root.getAttribute("FullFileEncryption") === "true" || root.getAttribute("FullFileEncryption") === "True") {
     throw new Error("mRemoteNG 파일 전체가 암호화되어 있습니다. mRemoteNG의 옵션 → 보안에서 '전체 파일 암호화'를 끄고 저장한 뒤 다시 가져오세요");
   }
-  const walk = (node: Element, path: string[]) => {
+  // A connection (or folder) with InheritUsername="true" and so on takes that
+  // value from the folder above it, which may itself inherit: a folder's
+  // effective values are passed down the walk.
+  const effective = (n: Element, above: MrngValues): MrngValues => {
+    const v: MrngValues = {};
+    for (const k of MRNG_INHERITED) v[k] = (n.getAttribute(`Inherit${k}`) ?? "").toLowerCase() === "true" ? above[k] : (n.getAttribute(k) ?? undefined);
+    return v;
+  };
+  const walk = (node: Element, path: string[], above: MrngValues) => {
     for (const n of [...node.children].filter((c) => c.tagName === "Node")) {
       const name = n.getAttribute("Name") ?? "";
+      const v = effective(n, above);
       if ((n.getAttribute("Type") ?? "").toLowerCase() === "container") {
-        walk(n, [...path, name]);
+        walk(n, [...path, name], v);
         continue;
       }
-      const proto = (n.getAttribute("Protocol") ?? "").toLowerCase();
-      const domain = n.getAttribute("Domain") ?? "";
-      const protocol = MRNG_PROTOCOLS[proto] ?? null;
+      const protocol = MRNG_PROTOCOLS[(v.Protocol ?? "").toLowerCase()] ?? null;
       add(
         out,
         "mRemoteNG",
@@ -167,16 +366,16 @@ export function parseMRemoteNg(xml: string, rootFolder = "mRemoteNG"): ParsedImp
           protocol,
           name,
           host: n.getAttribute("Hostname") ?? "",
-          port: n.getAttribute("Port"),
-          username: n.getAttribute("Username") ?? "",
+          port: v.Port,
+          username: v.Username ?? "",
           folder: joinFolder(rootFolder, ...path),
-          options: protocol === "rdp" && domain ? { domain } : {},
+          options: protocol === "rdp" && v.Domain ? { domain: v.Domain } : {},
         },
-        n.getAttribute("Protocol") ?? undefined,
+        v.Protocol,
       );
     }
   };
-  walk(root, []);
+  walk(root, [], {});
   return out;
 }
 
@@ -460,35 +659,43 @@ function csvRecords(text: string, sep: string): string[][] {
 
 // ---- OpenSSH client config (~/.ssh/config) ---------------------------------------------------
 
-/** OpenSSH client config: "Host alias" lines, then keywords (HostName, User,
- * Port, ProxyJump), case-insensitive, "#" starting a comment. Wildcard patterns
- * ("Host *", "web?"), negations ("!host") and "Match" blocks are defaults, not
- * connectable hosts, so they are skipped. Keys and other secrets are never
- * imported (ProxyJump maps to the jump-host option, which the import surfaces). */
+/** The keywords an imported session takes from an OpenSSH config. */
+const SSH_CONFIG_KEYS = new Set(["hostname", "user", "port", "proxyjump", "identityfile"]);
+
+/** An ssh_config Host pattern list against a host name, as ssh matches it:
+ * case-insensitive, "*" and "?" wildcards, and a matching "!pattern" rules the
+ * whole line out whatever else on it matches. */
+function sshHostMatches(host: string, patterns: string[]): boolean {
+  const name = host.toLowerCase();
+  let matched = false;
+  for (const p of patterns) {
+    const negated = p.startsWith("!");
+    const glob = (negated ? p.slice(1) : p).toLowerCase();
+    const re = new RegExp(`^${glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+    if (!re.test(name)) continue;
+    if (negated) return false;
+    matched = true;
+  }
+  return matched;
+}
+
+/** OpenSSH client config (~/.ssh/config), read the way ssh reads it: every
+ * Host block whose patterns match a host applies, in file order, and the first
+ * value found for a keyword wins, so "Host *" defaults fill in only what is
+ * left (and settings before the first Host apply to every host). One session
+ * per name written literally on a Host line; wildcard patterns ("*", "web?")
+ * and negations only contribute settings. "Match" blocks are conditional and
+ * are left out. Keywords: HostName (with %h, the host's own name), User, Port,
+ * ProxyJump (to the jump-host option, which the import review shows), and
+ * IdentityFile (the private-key path, imported as a key credential so the
+ * session logs in with the key). A key's passphrase and other secrets are never
+ * imported. */
 export function parseSshConfig(text: string): ParsedImport {
   const out = empty();
-  let aliases: string[] = [];
-  let fields: Record<string, string> = {};
-  // A Match block's settings are conditional, so they are not folded into a host.
-  let inMatch = false;
-
-  const flush = () => {
-    for (const alias of aliases) {
-      const proxy = fields.proxyjump && !/^none$/i.test(fields.proxyjump) ? fields.proxyjump : "";
-      add(out, "OpenSSH", {
-        protocol: "ssh",
-        name: alias,
-        host: fields.hostname || alias,
-        port: fields.port,
-        username: fields.user,
-        folder: "OpenSSH",
-        options: proxy ? { jumpHost: proxy } : {},
-      });
-    }
-    aliases = [];
-    fields = {};
-  };
-
+  type Block = { patterns: string[]; fields: Record<string, string> };
+  const blocks: Block[] = [{ patterns: ["*"], fields: {} }];
+  // The block settings go into; null inside a Match block.
+  let cur: Block | null = blocks[0];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
@@ -499,20 +706,42 @@ export function parseSshConfig(text: string): ParsedImport {
     let value = m[2].trim();
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
     if (key === "host") {
-      flush();
-      inMatch = false;
-      aliases = value.split(/\s+/).filter((p) => p && !/[*?]/.test(p) && !p.startsWith("!"));
-    } else if (key === "match") {
-      flush();
-      inMatch = true;
-    } else if (!inMatch && aliases.length) {
-      if (key === "hostname") fields.hostname = value;
-      else if (key === "user") fields.user = value;
-      else if (key === "port") fields.port = value;
-      else if (key === "proxyjump") fields.proxyjump = value;
-    }
+      cur = { patterns: value.split(/\s+/).filter(Boolean), fields: {} };
+      blocks.push(cur);
+    } else if (key === "match") cur = null;
+    else if (cur && SSH_CONFIG_KEYS.has(key) && !(key in cur.fields)) cur.fields[key] = value;
   }
-  flush();
+
+  // Every name written literally on a Host line, once (ssh compares them
+  // case-insensitively), in the order the file first names them.
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const b of blocks.slice(1))
+    for (const p of b.patterns)
+      if (!/[*?]/.test(p) && !p.startsWith("!") && !seen.has(p.toLowerCase())) {
+        seen.add(p.toLowerCase());
+        names.push(p);
+      }
+
+  for (const name of names) {
+    const f: Record<string, string> = {};
+    for (const b of blocks) if (sshHostMatches(name, b.patterns)) for (const [k, v] of Object.entries(b.fields)) if (!(k in f)) f[k] = v;
+    // HostName takes "%h" (the name given) and "%%".
+    const host = f.hostname ? f.hostname.replace(/%([h%])/g, (_m, c: string) => (c === "h" ? name : "%")) : name;
+    const proxy = f.proxyjump && !/^none$/i.test(f.proxyjump) ? f.proxyjump : "";
+    // IdentityFile "none" disables key auth; "~" is expanded on import (importExport).
+    const keyFile = f.identityfile && !/^none$/i.test(f.identityfile) ? f.identityfile : "";
+    add(out, "OpenSSH", {
+      protocol: "ssh",
+      name,
+      host,
+      port: f.port,
+      username: f.user,
+      folder: "OpenSSH",
+      options: proxy ? { jumpHost: proxy } : {},
+      keyPath: keyFile || undefined,
+    });
+  }
   return out;
 }
 

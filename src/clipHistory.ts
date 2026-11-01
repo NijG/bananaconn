@@ -10,7 +10,9 @@ export function openClipboardHistory() {
     title: "클립보드 히스토리",
     icon: "ClipboardList",
     width: 560,
-    body: `<div class="clip-hist" data-i18n-skip></div>`,
+    // Only the copied texts are skipped (on .clip-item): the delete buttons'
+    // tooltips and the "nothing yet" note are app text to translate.
+    body: `<div class="clip-hist"></div>`,
     footer: `<button class="btn" data-close>닫기</button><button class="btn btn-danger-ghost" data-clear>${icon("Trash2", 14)}기록 지우기</button>`,
   });
   const list = m.root.querySelector<HTMLElement>(".clip-hist")!;
@@ -27,7 +29,7 @@ export function openClipboardHistory() {
     list.innerHTML = items
       .map(
         (t, i) =>
-          `<div class="clip-row" data-i="${i}"><button type="button" class="clip-item" data-pick="${i}" title="${esc(t.length > 1000 ? `${t.slice(0, 1000)}…` : t)}"><span class="clip-text">${esc(t.length > 300 ? `${t.slice(0, 300)}…` : t)}</span></button><button type="button" class="icon-btn clip-del" data-del="${i}" title="이 항목 삭제">${icon("Trash2", 13)}</button></div>`,
+          `<div class="clip-row" data-i="${i}"><button type="button" class="clip-item" data-pick="${i}" data-i18n-skip title="${esc(t.length > 1000 ? `${t.slice(0, 1000)}…` : t)}"><span class="clip-text">${esc(t.length > 300 ? `${t.slice(0, 300)}…` : t)}</span></button><button type="button" class="icon-btn clip-del" data-del="${i}" title="이 항목 삭제">${icon("Trash2", 13)}</button></div>`,
       )
       .join("");
   };

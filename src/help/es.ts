@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Para serie, escriba <code>COM3</code> o <code>COM3:115200</code>.</li>
       </ol>
       <h4>Guardarla como sesión</h4>
-      <p>Guarde los datos de conexión con el botón ${icon("Plus", 13)} de la lista de sesiones (${kbd("Ctrl+Shift+N")}) y luego conéctese con doble clic o pulsando ${kbd("Enter")}. Las conexiones guardadas en otros programas se pueden traer de una sola vez con <a data-goto="import">Importar</a>. En el editor de sesiones, <b>Probar conexión</b> comprueba antes de guardar si el puerto del host está abierto. Las sesiones guardadas se prueban desde su menú contextual, y varias sesiones o una carpeta entera a la vez seleccionándolas o con clic derecho en la carpeta.</p>
+      <p>Guarde los datos de conexión con el botón ${icon("Plus", 13)} de la lista de sesiones (${kbd("Ctrl+Shift+N")}) y luego conéctese con doble clic o pulsando ${kbd("Enter")}. Las conexiones guardadas en otros programas se pueden traer de una sola vez con <a data-goto="import">Importar</a>. En el editor de sesiones, <b>Probar conexión</b> comprueba antes de guardar si el puerto del host está abierto. Las sesiones guardadas se prueban desde su menú contextual, y varias sesiones o una carpeta entera a la vez seleccionándolas o con clic derecho en la carpeta. En los resultados puede volver a comprobar solo las sesiones fallidas o copiar la tabla, y un doble clic en una fila (o Enter sobre ella) conecta con esa sesión.</p>
       <h4>Idioma de la interfaz</h4>
       <p><b>Idioma</b>, en la parte superior de Configuración, cambia la interfaz a 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français o Deutsch (al instante, sin desconectar; la guía y las notas de actualización también lo siguen). Hasta que elija uno, la aplicación sigue el idioma de visualización de Windows; una vez elegido, siempre prevalece su elección.</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "Importar desde otros programas",
     icon: "Download",
     body: `
-      <p>Elija en el botón ${icon("Download", 13)} situado sobre la lista de sesiones. Antes de importar se muestra una lista de vista previa, y las sesiones existentes se omiten. <b>Las contraseñas no se importan</b> (cada programa las cifra con su propia clave). Introdúzcalas en la primera conexión o asigne una desde el almacén de credenciales.</p>
+      <p>Elija en el botón ${icon("Download", 13)} situado sobre la lista de sesiones. Antes de importar se muestra una lista de vista previa, y las sesiones existentes se omiten. <b>Las contraseñas no se importan</b> (cada programa las cifra con su propia clave). Introdúzcalas en la primera conexión o asigne una desde el almacén de credenciales. Las sesiones que iniciaban sesión con clave pública se vinculan a sus archivos de clave en el almacén de credenciales, y los archivos de clave que no se encuentran o no se pueden usar se indican antes de importar.</p>
       <table class="help-table">
         <tr><th>Programa</th><th>Qué elegir</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (portable: junto al ejecutable)</td></tr>
-        <tr><td>SecureCRT</td><td>Carpeta de sesiones <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (incluida la estructura de carpetas, los nombres de archivos de registro y la configuración de registro automático), o un XML creado con File → Export Settings</td></tr>
+        <tr><td>SecureCRT</td><td>Carpeta de sesiones <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (incluida la estructura de carpetas, los nombres de archivos de registro, la configuración de registro automático y los archivos de clave usados para iniciar sesión con clave pública), o un XML creado con File → Export Settings</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (si el cifrado del archivo completo está activado, desactívelo y guarde primero)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>Lee directamente la configuración de este PC</td></tr>
         <tr><td>WinSCP</td><td>La configuración de este PC o, si no hay, <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td>La carpeta <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
-        <tr><td>OpenSSH</td><td>El archivo <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; se omiten comodines como <code>Host *</code>)</td></tr>
+        <tr><td>OpenSSH</td><td>El archivo <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile; como ssh, se aplican todos los bloques Host que coinciden y gana el primer valor; los comodines como <code>Host *</code> solo aportan valores predeterminados, no sesiones)</td></tr>
         <tr><td>RDCMan</td><td>Archivo <code>.rdg</code></td></tr>
         <tr><td>Escritorio remoto</td><td>Una carpeta que contenga archivos <code>.rdp</code> (incluidas las subcarpetas)</td></tr>
         <tr><td>CSV</td><td>Nombres de columna en la primera línea: Name, Protocol, Host, Port, Username, Folder, Domain (separados por comas, punto y coma o tabulaciones). <b>Exportar lista de sesiones (CSV)</b> en el mismo menú escribe este formato.</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Renderizado</b> (Configuración → Terminal): "Automático" dibuja con la GPU (WebGL) en PC con tarjeta gráfica, lo que acelera las salidas intensas, y usa el renderizador estándar en servidores y sesiones remotas sin ella. Solo los terminales visibles en pantalla usan la GPU.</li>
         <li><b>Fragmentos y macros</b>: guarde los comandos que usa con frecuencia en Fragmentos de la barra de herramientas, y use "Grabar" para capturar la entrada y reproducirla.</li>
         <li><b>Archivos</b> (SSH): el botón Archivos de la barra de herramientas abre al lado un panel SFTP del mismo servidor.</li>
+        <li><b>Reconexión automática</b> (se puede desactivar en Configuración): si una sesión SSH o Telnet con sesión iniciada se corta, espera un momento y vuelve a conectar, esperando más cada vez que sigue fallando. Una conexión cuyo inicio de sesión falló, o que terminó durante el inicio de sesión, no se vuelve a conectar: conectarse una y otra vez con una contraseña incorrecta puede hacer que el servidor le bloquee.</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Almacén de credenciales</b> (botón de llave en la parte superior): guarda contraseñas y claves SSH en el Administrador de credenciales de Windows para usarlas en el editor de sesiones. Las contraseñas guardadas nunca se muestran en pantalla.</li>
+        <li><b>Almacén de credenciales</b> (botón de llave en la parte superior): guarda contraseñas y claves SSH en el Administrador de credenciales de Windows para usarlas en el editor de sesiones. Las contraseñas guardadas nunca se muestran en pantalla. Las claves pueden estar en formato OpenSSH o PuTTY (.ppk).</li>
         <li><b>Contraseña maestra</b> (Configuración → Seguridad): bloquea la aplicación al iniciarse y tras un periodo de ausencia.</li>
         <li>Las claves de host SSH/SFTP se comprueban con <code>~/.ssh/known_hosts</code>; las claves desconocidas muestran una huella digital para confirmarla. Las claves que cambian bloquean la conexión.</li>
       </ul>`,

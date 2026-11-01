@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>For serial, type <code>COM3</code> or <code>COM3:115200</code>.</li>
       </ol>
       <h4>Save it as a session</h4>
-      <p>Save connection details with the ${icon("Plus", 13)} button in the session list (${kbd("Ctrl+Shift+N")}), then connect by double-clicking or pressing ${kbd("Enter")}. Connections saved in other programs can be moved over in one go with <a data-goto="import">Import</a>. In the session editor, <b>Test connection</b> checks before saving whether the host's port is open. Saved sessions can be tested from their right-click menu, and several sessions or a whole folder at once by selecting them or right-clicking the folder.</p>
+      <p>Save connection details with the ${icon("Plus", 13)} button in the session list (${kbd("Ctrl+Shift+N")}), then connect by double-clicking or pressing ${kbd("Enter")}. Connections saved in other programs can be moved over in one go with <a data-goto="import">Import</a>. In the session editor, <b>Test connection</b> checks before saving whether the host's port is open. Saved sessions can be tested from their right-click menu, and several sessions or a whole folder at once by selecting them or right-clicking the folder. In the results you can recheck only the failed sessions or copy the table, and double-clicking a row (or Enter on it) connects to that session.</p>
       <h4>Screen language</h4>
       <p><b>Language</b> at the top of Settings switches the screen to 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français or Deutsch (at once, without disconnecting; the guide and update notes follow it too). Until you choose, the app follows the Windows display language; once you choose, your choice always wins.</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "Import from other programs",
     icon: "Download",
     body: `
-      <p>Choose from the ${icon("Download", 13)} button above the session list. A preview list is shown before importing, and existing sessions are skipped. <b>Passwords are not imported</b> (each program encrypts them with its own key). Enter them on first connect or assign one from the credential vault.</p>
+      <p>Choose from the ${icon("Download", 13)} button above the session list. A preview list is shown before importing, and existing sessions are skipped. <b>Passwords are not imported</b> (each program encrypts them with its own key). Enter them on first connect or assign one from the credential vault. Sessions that logged in with a public key are linked to their key files in the credential vault, and key files that cannot be found or used are listed before importing.</p>
       <table class="help-table">
         <tr><th>Program</th><th>What to choose</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (portable: next to the executable)</td></tr>
-        <tr><td>SecureCRT</td><td>Session folder <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (including folder structure, log file names and auto-logging settings), or an XML made with File → Export Settings</td></tr>
+        <tr><td>SecureCRT</td><td>Session folder <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (including folder structure, log file names, auto-logging settings and the key files used for public-key login), or an XML made with File → Export Settings</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (if full-file encryption is on, turn it off and save first)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>Reads this PC's settings directly</td></tr>
         <tr><td>WinSCP</td><td>This PC's settings, or <code>WinSCP.ini</code> if none</td></tr>
         <tr><td>Xshell</td><td>The <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> folder</td></tr>
-        <tr><td>OpenSSH</td><td>The <code>.ssh\\config</code> file (Host, HostName, User, Port, ProxyJump; wildcards such as <code>Host *</code> are skipped)</td></tr>
+        <tr><td>OpenSSH</td><td>The <code>.ssh\\config</code> file (Host, HostName, User, Port, ProxyJump, IdentityFile; as ssh does, every matching Host block applies and the first value wins; wildcards such as <code>Host *</code> only supply defaults, not sessions)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> file</td></tr>
         <tr><td>Remote Desktop</td><td>A folder containing <code>.rdp</code> files (subfolders included)</td></tr>
         <tr><td>CSV</td><td>Column names on the first line: Name, Protocol, Host, Port, Username, Folder, Domain (comma, semicolon or tab separated). <b>Export session list (CSV)</b> in the same menu writes this format.</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Rendering</b> (Settings → Terminal): "Auto" draws with the GPU (WebGL) on PCs with a graphics card, speeding up heavy output, and uses the standard renderer on servers and remote sessions without one. Only terminals visible on screen use the GPU.</li>
         <li><b>Snippets &amp; macros</b>: Save frequently used commands under Snippets in the toolbar, and use "Record" to capture input and play it back.</li>
         <li><b>Files</b> (SSH): The Files button in the toolbar opens an SFTP pane for the same server alongside.</li>
+        <li><b>Automatic reconnect</b> (can be turned off in Settings): when a logged-in SSH or Telnet session drops, it waits a moment and reconnects, waiting longer each time it keeps failing. A connection whose login failed, or that ended during login, is not reconnected: connecting again and again with a wrong password can get the server to block you.</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Credential vault</b> (key button at the top): Stores passwords and SSH keys in Windows Credential Manager for use in the session editor. Saved passwords are never sent to the screen.</li>
+        <li><b>Credential vault</b> (key button at the top): Stores passwords and SSH keys in Windows Credential Manager for use in the session editor. Saved passwords are never sent to the screen. Keys can be in OpenSSH or PuTTY (.ppk) format.</li>
         <li><b>Master password</b> (Settings → Security): Locks the app on startup and after you've been away.</li>
         <li>SSH/SFTP host keys are checked against <code>~/.ssh/known_hosts</code>; unknown keys show a fingerprint for confirmation. Changed keys block the connection.</li>
       </ul>`,

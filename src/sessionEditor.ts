@@ -2,7 +2,7 @@
 
 import { icon } from "./icons";
 import { proxyFields, proxyOptions, proxyProblem } from "./proxy";
-import { BAUD_RATES, defaultPort, newSession, normalizeFolder, PROTOCOL_ORDER, PROTOCOLS, serialSettings, type Protocol, type Session } from "./model";
+import { BAUD_RATES, defaultPort, newSession, normalizeFolder, parseTarget, PROTOCOL_ORDER, PROTOCOLS, unusableHost, serialSettings, type Protocol, type Session } from "./model";
 import { allFolders, state, upsertSession } from "./store";
 import { api } from "./api";
 import { errorText, esc, modal, toast } from "./ui";
@@ -392,6 +392,14 @@ export function editSession(
         form.querySelector<HTMLInputElement>("[name='opt.proxyHost'], [name='opt.proxyLocalCommand']")?.focus();
         return;
       }
+      // The Wake-on-LAN MAC, checked as the backend's parse_mac reads it (12 hex
+      // digits, any separators), so a typo shows now, not when waking.
+      const mac = String(s.options.wolMac ?? "").trim();
+      if (mac && (mac.match(/[0-9a-f]/gi) ?? []).length !== 12) {
+        toast("MAC 주소가 올바르지 않습니다 (예: AA:BB:CC:DD:EE:FF)", "warn");
+        form.querySelector<HTMLInputElement>("[name='opt.wolMac']")?.focus();
+        return;
+      }
       if (s.protocol === "serial") {
         s.host = s.host.toUpperCase();
         s.port = null;
@@ -405,6 +413,11 @@ export function editSession(
       }
       if (!s.host) {
         toast("호스트를 입력하세요", "warn");
+        form.querySelector<HTMLInputElement>("[name=host]")?.focus();
+        return;
+      }
+      if (unusableHost(s.host)) {
+        toast("호스트 이름이 올바르지 않습니다", "warn");
         form.querySelector<HTMLInputElement>("[name=host]")?.focus();
         return;
       }
@@ -450,6 +463,21 @@ export function editSession(
       } finally {
         checkBtn.disabled = false;
       }
+    });
+    // "root@10.0.0.1:2222" or "ssh://host:22/" pasted into Host: spread it over
+    // Host, Port and User (a filled User is kept), as Quick connect reads it.
+    // Delegated: render() redraws the fields when the protocol changes.
+    form.addEventListener("change", (e) => {
+      const input = e.target as HTMLInputElement;
+      if (input.name !== "host" || s.protocol === "serial") return;
+      const raw = input.value.trim();
+      const t = parseTarget(raw);
+      if (!t || (t.host === raw && !t.port && !t.username)) return;
+      input.value = t.host;
+      const port = form.querySelector<HTMLInputElement>("[name=port]");
+      if (t.port && port) port.value = String(t.port);
+      const user = form.querySelector<HTMLInputElement>("[name=username]");
+      if (t.username && user && !user.value.trim()) user.value = t.username;
     });
     m.root.querySelector("[data-save]")!.addEventListener("click", () => save(false));
     m.root.querySelector("[data-connect]")!.addEventListener("click", () => save(true));

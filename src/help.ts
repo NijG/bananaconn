@@ -1,9 +1,9 @@
 // In-app usage guide (F1 or the "?" button): sections on the left, a search
 // box that filters them, and the content on the right.
 
-import { language } from "./i18n";
+import { language, userText } from "./i18n";
 import { icon } from "./icons";
-import { esc, modal } from "./ui";
+import { esc, matchesTerms, modal, searchTerms } from "./ui";
 
 export interface HelpSection {
   id: string;
@@ -29,7 +29,7 @@ const KO_SECTIONS: HelpSection[] = [
         <li>시리얼은 <code>COM3</code> 또는 <code>COM3:115200</code>처럼 입력합니다.</li>
       </ol>
       <h4>세션으로 저장해 두기</h4>
-      <p>왼쪽 세션 목록의 ${icon("Plus", 13)} 버튼(${kbd("Ctrl+Shift+N")})으로 접속 정보를 저장하면, 더블클릭이나 ${kbd("Enter")}로 접속합니다. 다른 프로그램에 저장해 둔 접속 정보는 <a data-goto="import">가져오기</a>로 한 번에 옮길 수 있습니다. 세션 편집 창의 <b>연결 확인</b>을 누르면 저장하기 전에 호스트의 포트가 열려 있는지 바로 확인합니다. 저장된 세션은 오른쪽 클릭 메뉴에서, 여러 세션이나 폴더는 선택하거나 폴더를 오른쪽 클릭해 한꺼번에 확인할 수 있습니다.</p>
+      <p>왼쪽 세션 목록의 ${icon("Plus", 13)} 버튼(${kbd("Ctrl+Shift+N")})으로 접속 정보를 저장하면, 더블클릭이나 ${kbd("Enter")}로 접속합니다. 다른 프로그램에 저장해 둔 접속 정보는 <a data-goto="import">가져오기</a>로 한 번에 옮길 수 있습니다. 세션 편집 창의 <b>연결 확인</b>을 누르면 저장하기 전에 호스트의 포트가 열려 있는지 바로 확인합니다. 저장된 세션은 오른쪽 클릭 메뉴에서, 여러 세션이나 폴더는 선택하거나 폴더를 오른쪽 클릭해 한꺼번에 확인할 수 있습니다. 결과 창에서는 실패한 세션만 다시 확인하거나 결과를 복사할 수 있고, 행을 두 번 누르거나 선택하고 Enter를 누르면 그 세션에 바로 접속합니다.</p>
       <h4>화면 언어</h4>
       <p>설정 맨 위의 <b>화면 언어</b>에서 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français, Deutsch 중 하나를 고릅니다(연결을 끊지 않고 바로 바뀌며, 도움말과 업데이트 안내도 그 언어로 나옵니다). 고르기 전에는 Windows 표시 언어를 따르고, 한 번 고르면 그 선택이 항상 우선합니다.</p>`,
   },
@@ -53,16 +53,16 @@ const KO_SECTIONS: HelpSection[] = [
     title: "다른 프로그램에서 가져오기",
     icon: "Download",
     body: `
-      <p>세션 목록 위의 ${icon("Download", 13)} 버튼에서 고릅니다. 가져오기 전에 목록을 보여 주며, 이미 있는 세션은 건너뜁니다. <b>비밀번호는 가져오지 않습니다</b>(각 프로그램이 자체 키로 암호화해 두기 때문입니다). 처음 접속할 때 입력하거나 자격 증명 보관함에서 지정하세요.</p>
+      <p>세션 목록 위의 ${icon("Download", 13)} 버튼에서 고릅니다. 가져오기 전에 목록을 보여 주며, 이미 있는 세션은 건너뜁니다. <b>비밀번호는 가져오지 않습니다</b>(각 프로그램이 자체 키로 암호화해 두기 때문입니다). 처음 접속할 때 입력하거나 자격 증명 보관함에서 지정하세요. 공개 키로 로그인하던 세션은 키 파일을 찾아 자격 증명 보관함에 연결하고, 찾을 수 없거나 쓸 수 없는 키 파일은 가져오기 전에 알려 줍니다.</p>
       <table class="help-table">
         <tr><th>프로그램</th><th>고를 것</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (포터블은 실행 파일 옆)</td></tr>
-        <tr><td>SecureCRT</td><td>세션 폴더 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (폴더 구조와 로그 파일 이름·자동 기록 설정까지), 또는 파일 → 설정 내보내기로 만든 XML</td></tr>
+        <tr><td>SecureCRT</td><td>세션 폴더 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (폴더 구조와 로그 파일 이름·자동 기록 설정, 공개 키 로그인에 쓰는 키 파일까지), 또는 파일 → 설정 내보내기로 만든 XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (전체 파일 암호화를 쓰고 있으면 끄고 저장한 뒤)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>이 PC의 설정을 바로 읽습니다</td></tr>
         <tr><td>WinSCP</td><td>이 PC의 설정, 없으면 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>문서\\NetSarang Computer\\&lt;버전&gt;\\Xshell\\Sessions</code> 폴더</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 파일 (Host·HostName·User·Port·ProxyJump; <code>Host *</code> 같은 와일드카드는 건너뜀)</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 파일 (Host·HostName·User·Port·ProxyJump·IdentityFile; ssh처럼 맞는 Host 블록을 모두 적용하고 먼저 나온 값을 씀. <code>Host *</code> 같은 와일드카드는 세션을 만들지 않고 기본값으로만 적용)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 파일</td></tr>
         <tr><td>원격 데스크톱</td><td><code>.rdp</code> 파일이 있는 폴더 (하위 폴더 포함)</td></tr>
         <tr><td>CSV</td><td>첫 줄에 열 이름: Name, Protocol, Host, Port, Username, Folder, Domain (쉼표·세미콜론·탭 구분). 같은 메뉴의 <b>세션 목록 내보내기(CSV)</b>가 이 형식으로 씁니다.</td></tr>
@@ -98,6 +98,7 @@ const KO_SECTIONS: HelpSection[] = [
         <li><b>화면 그리기</b>(설정 → 터미널): "자동"은 그래픽 카드가 있는 PC에서 GPU(WebGL)로 그려 대량 출력이 빨라지고, 그래픽 카드가 없는 서버·원격 환경에서는 기본 방식으로 그립니다. 화면에 보이는 터미널만 GPU를 씁니다.</li>
         <li><b>스니펫·매크로</b>: 툴바의 스니펫에 자주 쓰는 명령을 저장해 두고, "기록"으로 입력을 녹화해 다시 재생합니다.</li>
         <li><b>파일</b>(SSH): 툴바의 파일 버튼으로 같은 서버의 SFTP 창을 옆에 엽니다.</li>
+        <li><b>자동 재연결</b>(설정에서 끌 수 있음): 로그인된 SSH·Telnet 세션이 끊기면 잠시 기다렸다가 다시 연결하고, 계속 실패하면 점점 더 오래 기다립니다. 로그인에 실패했거나 로그인 중에 끊긴 연결은 다시 연결하지 않습니다. 틀린 비밀번호로 계속 접속하면 서버가 접속을 차단할 수 있기 때문입니다.</li>
       </ul>`,
   },
   {
@@ -246,7 +247,7 @@ const KO_SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>자격 증명 보관함</b>(상단 열쇠 버튼): 비밀번호와 SSH 키를 Windows 자격 증명 관리자에 저장하고, 세션 편집에서 골라 씁니다. 저장된 비밀번호는 화면으로 보내지 않습니다.</li>
+        <li><b>자격 증명 보관함</b>(상단 열쇠 버튼): 비밀번호와 SSH 키를 Windows 자격 증명 관리자에 저장하고, 세션 편집에서 골라 씁니다. 저장된 비밀번호는 화면으로 보내지 않습니다. 키는 OpenSSH 형식과 PuTTY 형식(.ppk)을 쓸 수 있습니다.</li>
         <li><b>마스터 비밀번호</b>(설정 → 보안): 시작할 때와 자리를 비운 뒤 앱을 잠급니다.</li>
         <li>SSH·SFTP 호스트 키는 <code>~/.ssh/known_hosts</code>로 확인하며, 처음 보는 키는 지문을 보여 주고 확인을 받습니다. 바뀐 키는 연결을 막습니다.</li>
       </ul>`,
@@ -340,15 +341,17 @@ export async function openHelp(sectionId = "start") {
   };
   search.addEventListener("input", () => {
     const q = norm(search.value);
+    // Each word anywhere in the section, as the other searches match ("키 ssh").
+    const terms = searchTerms(q);
     let first: string | null = null;
     for (const b of buttons) {
-      const hit = !q || plain(SECTIONS.find((s) => s.id === b.dataset.help)!).includes(q);
+      const hit = matchesTerms(plain(SECTIONS.find((s) => s.id === b.dataset.help)!), terms);
       b.hidden = !hit;
       if (hit && !first) first = b.dataset.help!;
     }
     if (first && q) show(first);
     else if (q && !first) {
-      body.innerHTML = `<p class="muted">"${esc(search.value.trim())}"와 일치하는 내용이 없습니다.</p>`;
+      body.innerHTML = `<p class="muted">"${esc(userText(search.value.trim()))}"와 일치하는 내용이 없습니다.</p>`;
       buttons.forEach((b) => b.classList.remove("on"));
     }
   });

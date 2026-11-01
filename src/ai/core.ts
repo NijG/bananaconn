@@ -91,14 +91,27 @@ const SECRET = "«SECRET»";
 const SECRET_RULES: RegExp[] = [
   // key = value, key: value (password=, api_key:, TOKEN=, "secret": "…")
   /((?<![a-z])(?:pass(?:word|wd|phrase)?|pwd|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|client[_-]?secret)\w*["']?\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;]+)/gi,
-  // --password x, --token=x (a "(" starts an expression, e.g. a ConvertTo-SecureString call, masked below)
-  /(\s--?(?:pass(?:word|wd)?|token|secret|api[_-]?key)(?:=|\s+))(?!\()(\S+)/gi,
+  // --password x, --token=x, also first on a line (a "(" starts an expression,
+  // e.g. a ConvertTo-SecureString call, masked below)
+  /((?:^|\s)--?(?:pass(?:word|wd)?|token|secret|api[_-]?key)(?:=|\s+))(?!\()(\S+)/gim,
   // PowerShell: ConvertTo-SecureString 'plain' -AsPlainText (also inside -Password (…))
   /(ConvertTo-SecureString\s+(?:-String\s+)?)("[^"\n]*"|'[^'\n]*'|[^\s)]+)/gi,
   // net user <name> <password> /add — not a switch (/add, -something)
   /(\bnet\s+user\s+[^\s/]+\s+)(?![/-])(\S+)/gi,
   // mysql -pSECRET
   /(\bmysql\w*\b[^\n]*?\s-p)(\S+)/g,
+  // Tools that take the password as a plain argument (an option right after
+  // "-p" means none was given: "mongo -p --host db" prompts for it).
+  /(\blogin\b[^\n]*?\s-p\s*)(?!-)(\S+)/gi, // docker / podman / az login -p
+  /(\bsmbclient\b[^\n]*?\s(?:-U|--user(?:name)?=?)\s*[^\s%]+%)(\S+)/gi, // -U user%pass
+  /(\bnmcli\b[^\n]*?\b(?:password|psk)\s+)(\S+)/gi,
+  /(\bredis-cli\b[^\n]*?\s-a\s*)(?!-)(\S+)/gi,
+  /(\bmongo(?:sh)?\b[^\n]*?\s-p\s*)(?!-)(\S+)/gi,
+  /(\bipmitool\b[^\n]*?\s-P\s*)(\S+)/g, // -P password (-p is the port)
+  /(\bsshpass\b[^\n]*?\s-p\s*)(\S+)/g,
+  // A letter precedes "password" here, which the first rule's guard skips.
+  /(\bpgpassword\s*=\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;]+)/gi,
+  /(\bsnmp\w*\b[^\n]*?\s-c\s*)(\S+)/g, // snmpwalk -c community
   // curl -u user:pass
   /(\s(?:-u|--user)\s*[^\s:]+:)(\S+)/g,
   // scheme://user:pass@host

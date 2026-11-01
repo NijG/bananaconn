@@ -3,34 +3,68 @@
 import { api } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
-import { PROTOCOLS, type Session } from "./model";
+import { userText } from "./i18n";
+import { parseTarget, PROTOCOLS, type Session } from "./model";
 import { errorText, esc, modal, toast } from "./ui";
 
 type Tool = "ping" | "ports" | "dns";
+
+/** The port check's starting list. */
+const DEFAULT_PORTS = "22, 23, 80, 443, 3389, 5900";
 
 /** Sessions a direct TCP check can say something about (see checkReachable). */
 const directlyCheckable = (s: Pick<Session, "protocol" | "host" | "options">) =>
   !!s.host.trim() && s.protocol !== "serial" && s.protocol !== "tftp" && !s.options.proxyType && !String(s.options.jumpHost ?? "").trim() && !s.options.gateway;
 
+/** A checkReachableMany run is going: a second click would only stack a
+ * second set of connects and a second result dialog. */
+let manyRunning = false;
+
 /** Check many saved sessions at once (8 at a time) and show one table. */
-export async function checkReachableMany(list: Session[]): Promise<void> {
+/** `connect`: double-clicking a row closes the dialog and opens that session. */
+export async function checkReachableMany(list: Session[], connect?: (s: Session) => void): Promise<void> {
   if (!list.length) return void toast("확인할 세션이 없습니다", "info");
+  if (manyRunning) return void toast("확인하는 중...", "info");
+  manyRunning = true;
+  try {
+    await runReachableMany(list, connect);
+  } finally {
+    manyRunning = false;
+  }
+}
+
+async function runReachableMany(list: Session[], connect?: (s: Session) => void): Promise<void> {
   const todo = list.filter(directlyCheckable);
-  const results = new Map<string, { open: boolean; text: string }>();
+  // Sessions to the same host:port (another user, another protocol option)
+  // share one connect: same answer, fewer connects to the server.
+  const target = (s: Session) => `${s.host.trim().toLowerCase()}\n${s.port || PROTOCOLS[s.protocol].port}`;
+  const targets = [...new Set(todo.map(target))];
+  const byTarget = new Map<string, { open: boolean; text: string }>();
   let next = 0;
   const worker = async () => {
-    while (next < todo.length) {
-      const s = todo[next++];
-      const port = s.port || PROTOCOLS[s.protocol].port;
+    while (next < targets.length) {
+      const key = targets[next++];
+      const [host, port] = key.split("\n");
       try {
-        const [r] = await api.netPorts(s.host.trim(), [port]);
-        results.set(s.id, r?.open ? { open: true, text: `열려 있음 (${r.ms ?? 0}ms)` } : { open: false, text: r?.detail ?? "응답 없음" });
+        const [r] = await api.netPorts(host, [Number(port)]);
+        byTarget.set(key, r?.open ? { open: true, text: `열려 있음 (${r.ms ?? 0}ms)` } : { open: false, text: r?.detail ?? "응답 없음" });
       } catch (err) {
-        results.set(s.id, { open: false, text: errorText(err) });
+        byTarget.set(key, { open: false, text: errorText(err) });
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(8, todo.length) }, worker));
+  // An unanswered host takes up to 3 s per address: say something meanwhile.
+  const working = todo.length ? toast("확인하는 중...", "info", 120_000) : null;
+  try {
+    await Promise.all(Array.from({ length: Math.min(8, targets.length) }, worker));
+  } finally {
+    working?.();
+  }
+  const results = new Map<string, { open: boolean; text: string }>();
+  for (const s of todo) {
+    const r = byTarget.get(target(s));
+    if (r) results.set(s.id, r);
+  }
   const open = [...results.values()].filter((r) => r.open).length;
   // Problems first: failed, then not tested, then open (stable within each).
   const rank = (s: Session) => {
@@ -42,17 +76,45 @@ export async function checkReachableMany(list: Session[]): Promise<void> {
     .map((s) => {
       const r = results.get(s.id);
       const port = s.port || PROTOCOLS[s.protocol].port;
-      return `<tr><td data-i18n-skip><b>${esc(s.name || s.host)}</b></td><td class="mono" data-i18n-skip>${esc(`${s.host}:${port}`)}</td>
+      return `<tr data-sid="${esc(s.id)}"><td data-i18n-skip><b>${esc(s.name || s.host)}</b></td><td class="mono" data-i18n-skip>${esc(`${s.host}:${port}`)}</td>
         <td class="${r ? (r.open ? "ok" : "bad") : "muted"}">${esc(r ? r.text : "확인하지 않음 (프록시·점프 호스트·게이트웨이·시리얼·TFTP)")}</td></tr>`;
     })
     .join("");
+  const failed = todo.filter((s) => results.get(s.id)?.open === false);
+  const recheck = failed.length ? `<button class="btn" data-recheck>${icon("RefreshCw", 14)}실패한 세션 다시 확인</button>` : "";
   const m = modal({
     title: "연결 확인 결과",
     icon: "Activity",
     width: 640,
-    body: `<p class="muted small">${esc(`${todo.length}개 중 ${open}개 열림`)}</p><table class="reach-table">${rows}</table>`,
-    footer: `<button class="btn" data-copy-result>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
+    body: `<p class="muted small">${esc(`${todo.length}개 중 ${open}개 열림`)}</p><table class="reach-table"><thead><tr><th>이름</th><th>주소</th><th>상태</th></tr></thead><tbody>${rows}</tbody></table>`,
+    footer: `${recheck}<button class="btn" data-copy-result>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
   });
+  m.root.querySelector("[data-recheck]")?.addEventListener("click", () => {
+    m.close();
+    void checkReachableMany(failed, connect);
+  });
+  if (connect) {
+    m.root.querySelector(".reach-table")!.classList.add("can-open");
+    // Rows are reachable with Tab and open with Enter too, not only by mouse.
+    m.root.querySelectorAll("tbody tr").forEach((tr) => {
+      tr.setAttribute("title", "두 번 누르면 연결합니다");
+      tr.setAttribute("tabindex", "0");
+    });
+    const open = (e: Event) => {
+      const id = (e.target as HTMLElement).closest<HTMLElement>("tr[data-sid]")?.dataset.sid;
+      const s = id && list.find((x) => x.id === id);
+      if (!s) return;
+      m.close();
+      connect(s);
+    };
+    const body = m.root.querySelector("tbody")!;
+    body.addEventListener("dblclick", open);
+    body.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || !(e.target as HTMLElement).matches("tr[data-sid]")) return;
+      e.preventDefault();
+      open(e);
+    });
+  }
   // The table as shown (in the screen language), one tab-separated line per row.
   m.root.querySelector("[data-copy-result]")!.addEventListener("click", () => {
     const lines = [...m.root.querySelectorAll<HTMLTableRowElement>(".reach-table tr")].map((tr) => [...tr.cells].map((c) => c.innerText.trim()).join("\t"));
@@ -71,10 +133,11 @@ export async function checkReachable(s: Pick<Session, "protocol" | "host" | "por
   if (s.options.proxyType || String(s.options.jumpHost ?? "").trim() || s.options.gateway)
     return void toast("프록시·점프 호스트·게이트웨이를 거치는 세션은 직접 확인할 수 없습니다", "info");
   const port = s.port || PROTOCOLS[s.protocol].port;
+  const working = toast("확인하는 중...", "info", 120_000);
   try {
-    const [r] = await api.netPorts(host, [port]);
-    if (r?.open) toast(`${host}:${port} 포트가 열려 있습니다 (${r.ms ?? 0}ms)`, "success");
-    else toast(`${host}:${port} — ${r?.detail ?? "응답 없음"}`, "warn", 6000);
+    const [r] = await api.netPorts(host, [port]).finally(working);
+    if (r?.open) toast(`${userText(`${host}:${port}`)} 포트가 열려 있습니다 (${r.ms ?? 0}ms)`, "success");
+    else toast(`${userText(`${host}:${port}`)} — ${r?.detail ?? "응답 없음"}`, "warn", 6000);
   } catch (err) {
     toast(errorText(err), "error");
   }
@@ -148,7 +211,7 @@ export function openNetworkTools(initialHost = "") {
       extra.title = "보낼 횟수";
     } else if (t === "ports") {
       extra.type = "text";
-      extra.value = "22, 23, 80, 443, 3389, 5900";
+      extra.value = DEFAULT_PORTS;
       extra.title = "포트 (쉼표, 범위 8000-8010)";
     }
     host.focus();
@@ -159,7 +222,15 @@ export function openNetworkTools(initialHost = "") {
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (busy) return void stopPing();
-    const target = host.value.trim();
+    // "root@10.0.0.1:22" or "https://server.lan/admin" pasted: the tools take a
+    // host, so use the host part (as Quick connect reads it) and show it.
+    const raw = host.value.trim();
+    const parsed = parseTarget(raw);
+    const target = parsed?.host ?? raw;
+    if (target !== raw) host.value = target;
+    // "10.0.0.1:2222" in the port check: that port is the one meant, unless
+    // the port list was already changed from its default.
+    if (tool === "ports" && parsed?.port && extra.value === DEFAULT_PORTS) extra.value = String(parsed.port);
     if (!target) return void host.focus();
     busy = true;
     copyBtn.hidden = true;

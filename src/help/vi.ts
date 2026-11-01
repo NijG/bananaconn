@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>Với cổng nối tiếp, nhập <code>COM3</code> hoặc <code>COM3:115200</code>.</li>
       </ol>
       <h4>Lưu thành phiên</h4>
-      <p>Lưu thông tin kết nối bằng nút ${icon("Plus", 13)} trong danh sách phiên (${kbd("Ctrl+Shift+N")}), sau đó kết nối bằng cách nhấp đúp hoặc nhấn ${kbd("Enter")}. Các kết nối đã lưu trong chương trình khác có thể chuyển sang một lần bằng <a data-goto="import">Nhập</a>. Trong trình sửa phiên, <b>Kiểm tra kết nối</b> cho biết cổng của máy chủ có mở không trước khi lưu. Phiên đã lưu có thể kiểm tra từ menu chuột phải; nhiều phiên hoặc cả thư mục thì chọn chúng hoặc nhấp chuột phải vào thư mục để kiểm tra một lần.</p>
+      <p>Lưu thông tin kết nối bằng nút ${icon("Plus", 13)} trong danh sách phiên (${kbd("Ctrl+Shift+N")}), sau đó kết nối bằng cách nhấp đúp hoặc nhấn ${kbd("Enter")}. Các kết nối đã lưu trong chương trình khác có thể chuyển sang một lần bằng <a data-goto="import">Nhập</a>. Trong trình sửa phiên, <b>Kiểm tra kết nối</b> cho biết cổng của máy chủ có mở không trước khi lưu. Phiên đã lưu có thể kiểm tra từ menu chuột phải; nhiều phiên hoặc cả thư mục thì chọn chúng hoặc nhấp chuột phải vào thư mục để kiểm tra một lần. Trong kết quả, bạn có thể chỉ kiểm tra lại các phiên thất bại hoặc sao chép bảng, và nhấp đúp vào một dòng (hoặc nhấn Enter trên dòng đó) để kết nối ngay phiên đó.</p>
       <h4>Ngôn ngữ giao diện</h4>
       <p><b>Ngôn ngữ</b> ở đầu Cài đặt chuyển giao diện sang 한국어, English, 日本語, 简体中文, 繁體中文, Tiếng Việt, Español, Français hoặc Deutsch (ngay lập tức, không ngắt kết nối; hướng dẫn và ghi chú cập nhật cũng đổi theo). Cho đến khi bạn chọn, ứng dụng theo ngôn ngữ hiển thị của Windows; khi đã chọn, lựa chọn của bạn luôn được ưu tiên.</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "Nhập từ chương trình khác",
     icon: "Download",
     body: `
-      <p>Chọn từ nút ${icon("Download", 13)} phía trên danh sách phiên. Danh sách xem trước được hiển thị trước khi nhập, và các phiên đã có sẽ được bỏ qua. <b>Mật khẩu không được nhập</b> (mỗi chương trình mã hóa bằng khóa riêng). Hãy nhập khi kết nối lần đầu hoặc gán từ kho thông tin đăng nhập.</p>
+      <p>Chọn từ nút ${icon("Download", 13)} phía trên danh sách phiên. Danh sách xem trước được hiển thị trước khi nhập, và các phiên đã có sẽ được bỏ qua. <b>Mật khẩu không được nhập</b> (mỗi chương trình mã hóa bằng khóa riêng). Hãy nhập khi kết nối lần đầu hoặc gán từ kho thông tin đăng nhập. Các phiên đăng nhập bằng khóa công khai được liên kết với tệp khóa trong kho thông tin đăng nhập, và các tệp khóa không tìm thấy hoặc không dùng được sẽ được báo trước khi nhập.</p>
       <table class="help-table">
         <tr><th>Chương trình</th><th>Cần chọn</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (bản portable: cạnh tệp thực thi)</td></tr>
-        <tr><td>SecureCRT</td><td>Thư mục phiên <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (gồm cấu trúc thư mục, tên tệp nhật ký và cài đặt tự động ghi nhật ký), hoặc tệp XML tạo bằng File → Export Settings</td></tr>
+        <tr><td>SecureCRT</td><td>Thư mục phiên <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (gồm cấu trúc thư mục, tên tệp nhật ký, cài đặt tự động ghi nhật ký và tệp khóa dùng để đăng nhập bằng khóa công khai), hoặc tệp XML tạo bằng File → Export Settings</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (nếu bật mã hóa toàn bộ tệp, hãy tắt và lưu trước)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>Đọc trực tiếp cài đặt trên PC này</td></tr>
         <tr><td>WinSCP</td><td>Cài đặt trên PC này, hoặc <code>WinSCP.ini</code> nếu không có</td></tr>
         <tr><td>Xshell</td><td>Thư mục <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
-        <tr><td>OpenSSH</td><td>Tệp <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump; bỏ qua ký tự đại diện như <code>Host *</code>)</td></tr>
+        <tr><td>OpenSSH</td><td>Tệp <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile; giống ssh, áp dụng mọi khối Host khớp và giá trị đầu tiên được dùng; ký tự đại diện như <code>Host *</code> chỉ cung cấp giá trị mặc định, không tạo phiên)</td></tr>
         <tr><td>RDCMan</td><td>Tệp <code>.rdg</code></td></tr>
         <tr><td>Remote Desktop</td><td>Thư mục chứa tệp <code>.rdp</code> (bao gồm thư mục con)</td></tr>
         <tr><td>CSV</td><td>Tên cột ở dòng đầu: Name, Protocol, Host, Port, Username, Folder, Domain (phân tách bằng dấu phẩy, dấu chấm phẩy hoặc tab). <b>Xuất danh sách phiên (CSV)</b> trong cùng menu ghi theo định dạng này.</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Kết xuất</b> (Cài đặt → Terminal): "Tự động" vẽ bằng GPU (WebGL) trên PC có card đồ họa, giúp tăng tốc khi đầu ra nhiều, và dùng trình kết xuất tiêu chuẩn trên máy chủ và phiên từ xa không có card đồ họa. Chỉ các terminal đang hiển thị trên màn hình mới dùng GPU.</li>
         <li><b>Đoạn lệnh &amp; macro</b>: Lưu các lệnh hay dùng trong Đoạn lệnh trên thanh công cụ, và dùng "Ghi" để ghi lại dữ liệu nhập rồi phát lại.</li>
         <li><b>Tệp</b> (SSH): Nút Tệp trên thanh công cụ mở khung SFTP của cùng máy chủ ở bên cạnh.</li>
+        <li><b>Tự động kết nối lại</b> (có thể tắt trong Cài đặt): khi một phiên SSH hoặc Telnet đã đăng nhập bị rớt, ứng dụng chờ một lát rồi kết nối lại, và chờ lâu hơn mỗi lần vẫn thất bại. Kết nối đăng nhập không thành công hoặc bị ngắt trong lúc đăng nhập sẽ không kết nối lại: kết nối lặp lại với mật khẩu sai có thể khiến máy chủ chặn bạn.</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Kho thông tin đăng nhập</b> (nút chìa khóa ở trên cùng): Lưu mật khẩu và khóa SSH trong Windows Credential Manager để dùng trong trình sửa phiên. Mật khẩu đã lưu không bao giờ được hiển thị ra màn hình.</li>
+        <li><b>Kho thông tin đăng nhập</b> (nút chìa khóa ở trên cùng): Lưu mật khẩu và khóa SSH trong Windows Credential Manager để dùng trong trình sửa phiên. Mật khẩu đã lưu không bao giờ được hiển thị ra màn hình. Khóa có thể ở định dạng OpenSSH hoặc PuTTY (.ppk).</li>
         <li><b>Mật khẩu chính</b> (Cài đặt → Bảo mật): Khóa ứng dụng khi khởi động và sau khi bạn rời đi.</li>
         <li>Khóa máy chủ SSH/SFTP được đối chiếu với <code>~/.ssh/known_hosts</code>; khóa chưa biết sẽ hiển thị dấu vân tay để xác nhận. Khóa đã thay đổi sẽ chặn kết nối.</li>
       </ul>`,

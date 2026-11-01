@@ -3,10 +3,10 @@
 // the action list and sessions; the caller runs the chosen action or session.
 
 import { icon } from "./icons";
-import { endpoint, PROTOCOLS, type Session } from "./model";
+import { endpoint, PROTOCOLS, sessionSearchText, type Session } from "./model";
 import { ACTIONS, bindings } from "./keymap";
 import { state } from "./store";
-import { esc } from "./ui";
+import { esc, matchesTerms, searchTerms } from "./ui";
 import { tr } from "./i18n";
 
 interface Item {
@@ -34,7 +34,7 @@ export function openCommandPalette(opts: { runAction: (id: string) => void; open
       sub: `${info.label} · ${ep}`,
       icon: info.icon,
       keys: [],
-      hay: `${s.name} ${s.host} ${ep} ${s.folder ?? ""}`.toLowerCase(),
+      hay: sessionSearchText(s),
       run: () => opts.openSession(s),
     });
   }
@@ -61,10 +61,8 @@ export function openCommandPalette(opts: { runAction: (id: string) => void; open
 
   const matches = (q: string): Item[] => {
     if (!q) return items.slice(0, 50);
-    // Each whitespace-separated term must appear (it.hay already holds the
-    // label), so "ssh prod" finds a "prod" SSH session regardless of word order.
-    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
-    return items.filter((it) => terms.every((t) => it.hay.includes(t))).slice(0, 50);
+    const terms = searchTerms(q);
+    return items.filter((it) => matchesTerms(it.hay, terms)).slice(0, 50);
   };
 
   const render = () => {

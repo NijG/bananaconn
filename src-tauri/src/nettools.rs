@@ -23,6 +23,13 @@ fn valid_host(host: &str) -> bool {
         && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '%' | '_'))
 }
 
+/// The host the dialog sent, as the tools take it: trimmed, an IPv6 literal
+/// out of its URL brackets ("[::1]"), and checked by valid_host.
+fn parse_host(host: &str) -> Result<String, String> {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if valid_host(host) { Ok(host.to_string()) } else { Err("호스트 이름이 올바르지 않습니다".into()) }
+}
+
 /// Running pings by the id the dialog gave, so closing it (or "Stop") ends
 /// ping.exe instead of leaving it running for up to 20 x 2 s.
 static PINGS: Mutex<Option<HashMap<String, Arc<Mutex<Child>>>>> = Mutex::new(None);
@@ -33,10 +40,7 @@ fn pings<R>(f: impl FnOnce(&mut HashMap<String, Arc<Mutex<Child>>>) -> R) -> R {
 
 #[tauri::command]
 pub async fn net_ping(id: String, host: String, count: u32) -> Result<String, String> {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
-    if !valid_host(&host) {
-        return Err("호스트 이름이 올바르지 않습니다".into());
-    }
+    let host = parse_host(&host)?;
     let count = count.clamp(1, 20);
     tauri::async_runtime::spawn_blocking(move || {
         let ping = std::env::var_os("SystemRoot")
@@ -120,12 +124,15 @@ fn prefer_failure(have_refused: bool, have_any: bool, new_refused: bool) -> bool
     !have_any || (new_refused && !have_refused)
 }
 
+/// Each item once, in the resolver's order (Vec::dedup alone keeps "a, b, a").
+fn unique_in_order<T: Eq + std::hash::Hash + Clone>(v: &mut Vec<T>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|x| seen.insert(x.clone()));
+}
+
 #[tauri::command]
 pub async fn net_ports(host: String, ports: Vec<u16>) -> Result<Vec<PortResult>, String> {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_string();
-    if !valid_host(&host) {
-        return Err("호스트 이름이 올바르지 않습니다".into());
-    }
+    let host = parse_host(&host)?;
     if ports.is_empty() || ports.len() > 64 || ports.contains(&0) {
         return Err("포트는 1~65535 사이로 64개까지 확인할 수 있습니다".into());
     }
@@ -137,26 +144,36 @@ pub async fn net_ports(host: String, ports: Vec<u16>) -> Result<Vec<PortResult>,
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{host} 주소를 찾을 수 없습니다: {e}"))?;
-    ips.dedup();
+    unique_in_order(&mut ips);
     if ips.is_empty() {
         return Err(format!("{host} 주소를 찾을 수 없습니다"));
     }
     let ips = &ips;
     let checks = ports.into_iter().map(|port| async move {
-        let mut best: Option<PortResult> = None;
-        let mut have_refused = false;
-        for ip in ips {
+        // Every address at once: a dual-stack host whose IPv6 does not answer
+        // takes 3 s, not 3 s per address. The outcome is chosen as before: open
+        // on any address wins (the first one in the resolver's order), else the
+        // failures in that order through prefer_failure.
+        let attempts = ips.iter().map(|ip| async move {
             let started = Instant::now();
             let mut a = *ip;
             a.set_port(port);
-            let (refused, r) = match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(a)).await {
-                Ok(Ok(_)) => return PortResult { port, open: true, ms: Some(started.elapsed().as_millis() as u64), detail: "열림".into() },
+            match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(a)).await {
+                Ok(Ok(_)) => (false, PortResult { port, open: true, ms: Some(started.elapsed().as_millis() as u64), detail: "열림".into() }),
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                     (true, PortResult { port, open: false, ms: None, detail: "닫힘 (연결 거부)".into() })
                 }
                 Ok(Err(e)) => (false, PortResult { port, open: false, ms: None, detail: format!("연결 실패: {e}") }),
                 Err(_) => (false, PortResult { port, open: false, ms: None, detail: "응답 없음 (방화벽에서 막혔을 수 있음)".into() }),
-            };
+            }
+        });
+        let outcomes = futures_util::future::join_all(attempts).await;
+        let mut best: Option<PortResult> = None;
+        let mut have_refused = false;
+        for (refused, r) in outcomes {
+            if r.open {
+                return r;
+            }
             if prefer_failure(have_refused, best.is_some(), refused) {
                 best = Some(r);
                 have_refused = refused;
@@ -176,10 +193,7 @@ pub struct DnsResult {
 
 #[tauri::command]
 pub async fn net_dns(host: String) -> Result<DnsResult, String> {
-    let host = host.trim().to_string();
-    if !valid_host(&host) {
-        return Err("호스트 이름이 올바르지 않습니다".into());
-    }
+    let host = parse_host(&host)?;
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
         let mut addresses: Vec<String> = (host.as_str(), 0)
@@ -187,7 +201,7 @@ pub async fn net_dns(host: String) -> Result<DnsResult, String> {
             .map_err(|e| format!("{host} 주소를 찾을 수 없습니다: {e}"))?
             .map(|a| a.ip().to_string())
             .collect();
-        addresses.dedup();
+        unique_in_order(&mut addresses);
         Ok(DnsResult { addresses, ms: started.elapsed().as_millis() as u64 })
     })
     .await
@@ -290,7 +304,14 @@ mod wol_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefer_failure, valid_host};
+    use super::{prefer_failure, unique_in_order, valid_host};
+
+    #[test]
+    fn duplicates_are_dropped_keeping_the_first_order() {
+        let mut v = vec!["::1", "127.0.0.1", "::1", "10.0.0.1", "127.0.0.1"];
+        unique_in_order(&mut v);
+        assert_eq!(v, ["::1", "127.0.0.1", "10.0.0.1"]);
+    }
 
     #[test]
     fn refused_is_preferred_over_less_certain_failures() {
@@ -358,5 +379,12 @@ mod port_tests {
         let port = listener.local_addr().unwrap().port();
         let res = tauri::async_runtime::block_on(super::net_ports("localhost".into(), vec![port])).unwrap();
         assert!(res[0].open, "{}", res[0].detail);
+    }
+
+    /// A bracketed IPv6 literal, as pasted from a URL, is looked up as the address.
+    #[test]
+    fn dns_takes_a_bracketed_ipv6_literal() {
+        let res = tauri::async_runtime::block_on(super::net_dns(" [::1] ".into())).unwrap();
+        assert_eq!(res.addresses, ["::1"]);
     }
 }

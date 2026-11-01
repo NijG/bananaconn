@@ -16,6 +16,9 @@ export interface LogEntry {
   detail: string;
 }
 
+/** Event kinds whose detail is only a path, or "a → b" (ftpserver.rs, fileservers.rs). */
+const PATH_KINDS = new Set(["download", "upload", "delete", "mkdir", "rmdir", "rename"]);
+
 /** Draws an activity log newest first into `box`. Each call adds only the
  * entries that arrived since the previous one (a busy server sends an event per
  * file; redrawing up to `max` rows each time would be quadratic). */
@@ -23,8 +26,11 @@ export function logRenderer(box: HTMLElement, kinds: Record<string, [string, str
   let shown = 0;
   const row = (e: LogEntry) => {
     const [ic, label] = kinds[e.kind] ?? ["Info", e.kind];
+    // The client's user/address is never translated; nor is the detail of a
+    // file event, which is a path ("denied" and "error" details are app text).
+    const pathOnly = PATH_KINDS.has(e.kind);
     return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
-          ${e.user ? `<span class="who">${esc(e.user)}</span>` : ""}<span class="what">${esc(e.detail)}</span></div>`;
+          ${e.user ? `<span class="who" data-i18n-skip>${esc(e.user)}</span>` : ""}<span class="what"${pathOnly ? " data-i18n-skip" : ""}>${esc(e.detail)}</span></div>`;
   };
   return (log: LogEntry[]) => {
     if (!log.length) {

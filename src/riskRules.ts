@@ -39,12 +39,22 @@ export const DEFAULT_RISK_RULES: RiskRule[] = [
   block(String.raw`^\s*w32tm\s+/(config|resync|register|unregister)\b`, "Windows 시간 설정 변경"),
   block(String.raw`^\s*Set-Date\b`, "Windows 시간 변경"),
   // Destructive or disruptive: ask, then log.
-  warn(String.raw`\brm\s+(?:-\S*[rRf]|--(?:recursive|force))`, "파일 강제·재귀 삭제"),
-  warn(SUDO + String.raw`(reboot|shutdown|halt|poweroff|init\s+[06])\b`, "재부팅·종료 (장비에서는 포트 끄기)"),
-  warn(String.raw`\b(mkfs(\.\w+)?|fdisk|parted|wipefs)\b`, "디스크 포맷·파티션 변경"),
+  // An option anywhere among the arguments ("rm -v -r dir", GNU's "rm dir -rf"),
+  // but not past the end of the command (";", "&", "|").
+  // A container tool's own "rm" ("docker rm -f web") removes containers, not
+  // files: it has a rule of its own below.
+  warn(String.raw`(?<!\b(?:docker|podman|nerdctl)\s+(?:[^\s;&|]+\s+)*)\brm\s+(?:[^\s;&|]+\s+)*?-(?:[^\s-]*[rRf]|-(?:recursive|force)\b)`, "파일 강제·재귀 삭제"),
+  warn(String.raw`\b(docker|podman|nerdctl)\s+(?:(?:container|image|compose)\s+)?(rm|rmi)\s+(?:[^\s;&|]+\s+)*?-(?:[^\s-]*f|-force\b)`, "컨테이너·이미지 강제 삭제"),
+  warn(
+    SUDO + String.raw`(reboot|shutdown|halt|poweroff|(tel)?init\s+[06]|systemctl(\s+-\S+)*\s+(reboot|poweroff|halt|kexec|soft-reboot|rescue|emergency|isolate\s+(rescue|emergency|poweroff|reboot|halt)))\b`,
+    "재부팅·종료 (장비에서는 포트 끄기)",
+  ),
+  warn(String.raw`\b(mkfs(\.\w+)?|fdisk|parted|wipefs|diskpart|Format-Volume|Clear-Disk|Initialize-Disk)\b|^\s*format\s+[a-z]:`, "디스크 포맷·파티션 변경"),
   warn(String.raw`\bdd\s+.*\bof=`, "디스크에 직접 쓰기"),
   warn(String.raw`>\s*/dev/(sd|nvme|hd|xvd|vd)`, "장치 덮어쓰기"),
-  warn(String.raw`\bkill(all)?\s+-(9|KILL)\b`, "프로세스 강제 종료"),
+  warn(String.raw`\b(kill|pkill|killall)\s+(?:[^\s;&|]+\s+)*?(-(9|KILL|SIGKILL)|-s\s+(9|KILL|SIGKILL)|--signal[=\s]+(9|KILL|SIGKILL))\b`, "프로세스 강제 종료"),
+  // Windows (PowerShell and cmd) recursive deletes.
+  warn(String.raw`^\s*(Remove-Item|ri|rd|rmdir|del|erase)\b(?=.*\s-Recurse\b)|^\s*(rd|rmdir|del|erase)\s+(?=(\S+\s+)*/s\b)`, "파일 강제·재귀 삭제"),
   warn(String.raw`\b(chmod\s+-R\s+0?777|chown\s+-R)\b`, "권한·소유자 일괄 변경"),
   warn(SUDO + String.raw`systemctl\s+(stop|disable|mask)\b`, "서비스 중지"),
   // Firewall and network interface: flushing rules or downing a link can cut
@@ -58,7 +68,8 @@ export const DEFAULT_RISK_RULES: RiskRule[] = [
   warn(String.raw`^\s*(rmlv|rmvg|reducevg|rmdev|lvremove|vgremove)\b`, "볼륨·장치 제거 (AIX·HP-UX)"),
   warn(String.raw`^\s*reload\b`, "장비 재시작"),
   warn(String.raw`^\s*(write\s+erase|erase\s+(startup-config|nvram:|flash:))`, "장비 설정 삭제"),
-  warn(String.raw`^\s*(delete|format)\s+(flash|bootflash|disk|nvram|usb)`, "장비 저장소 삭제·포맷"),
+  // Options may come first: "delete /force /recursive flash:/dir" ("del" too).
+  warn(String.raw`^\s*(delete|del|format)\s+(/\S+\s+)*(flash|bootflash|disk|nvram|usb)`, "장비 저장소 삭제·포맷"),
   warn(String.raw`^\s*copy\s+\S+\s+(running-config|startup-config)\b`, "장비 설정 덮어쓰기"),
   warn(String.raw`^\s*(configure(\s+terminal)?|conf\s+t)\s*$`, "장비 설정 모드 진입"),
   warn(String.raw`^\s*execute\s+(reboot|shutdown|factoryreset|formatlogdisk)\b`, "장비 재시작·초기화 (FortiGate)"),

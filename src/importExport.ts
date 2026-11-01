@@ -1,9 +1,10 @@
-// Session backup (JSON export/import) and imports from other tools
-// (MobaXterm here; the other parsers live in importers.ts).
+// Session backup (JSON export/import) and imports from other tools (the
+// parsers live in importers.ts; here: reading the files, review and saving).
 
-import { api, pickFolder, pickOpenFile, pickSavePath } from "./api";
+import { api, pickFolder, pickOpenFile, pickSavePath, type ImportKeyKind } from "./api";
 import {
   parseCsv,
+  parseMobaXtermIni,
   parseMRemoteNg,
   parsePuttyReg,
   parseRdcMan,
@@ -13,127 +14,32 @@ import {
   parseSshConfig,
   parseWinScp,
   parseXshellFiles,
+  secureCrtGlobalKey,
+  type ParsedImport,
 } from "./importers";
 import type { MenuItem } from "./ui";
 import { icon } from "./icons";
 import { endpoint, isSensitiveOption, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
-import { addFolder, saveSnippets, state, upsertSessions, type Snippet } from "./store";
+import { addFolder, reloadCredentials, saveSnippets, state, upsertSessions, type Snippet } from "./store";
 import { addSavedTunnels, parseTunnel, savedTunnels } from "./tunnels";
 import { errorText, esc, modal, timestamp, toast } from "./ui";
 
-// ---- MobaXterm.ini -----------------------------------------------------------------
-//
-// Seen in MobaXterm.ini files: bookmark sections named "Bookmarks",
-// "Bookmarks_N" with "SubRep" (folder) and "ImgNum" keys; session values start
-// with " #<type>#<icon>%" using these type codes, and these escape tokens.
-// The field order after the icon (host%port%user%…) follows the commonly
-// documented MobaXterm format; imports are shown for review before saving.
-
-const MOBA_TYPES: Record<string, Protocol> = {
-  "109": "ssh",
-  "98": "telnet",
-  "91": "rdp",
-  "128": "vnc",
-  "130": "ftp",
-  "140": "sftp",
-};
-
-const MOBA_UNSUPPORTED: Record<string, string> = {
-  "100": "rlogin",
-  "313": "웹 브라우저",
-};
-
-const MOBA_ESCAPES: [string, string][] = [
-  ["__PTVIRG__", ";"],
-  ["__DIEZE__", "#"],
-  ["__EQQUAL__", "="],
-  ["__EQUAL__", "="],
-  ["__POURCENT__", "%"],
-  ["__PERCENT__", "%"],
-  ["__PIIPE__", "|"],
-  ["__PIPE__", "|"],
-  ["__DBLQUO__", '"'],
-  ["__BACKSLASH__", "\\"],
-  ["__DBLDOT__", ":"],
-  ["__INF__", "<"],
-  ["__SUP__", ">"],
-];
-
-function mobaUnescape(s: string): string {
-  let out = s;
-  for (const [token, ch] of MOBA_ESCAPES) out = out.split(token).join(ch);
-  return out.trim();
-}
-
-export interface ParsedImport {
-  sessions: Session[];
-  skipped: { name: string; reason: string }[];
-}
-
-/** Parse MobaXterm.ini text into BananaConn sessions (pure; no side effects). */
-export function parseMobaXtermIni(text: string, rootFolder: string): ParsedImport {
-  const out: ParsedImport = { sessions: [], skipped: [] };
-  let inBookmarks = false;
-  let folder = "";
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith(";")) continue;
-    const section = line.match(/^\[(.+)\]$/);
-    if (section) {
-      inBookmarks = /^Bookmarks(_\d+)?$/i.test(section[1]);
-      folder = "";
-      continue;
-    }
-    if (!inBookmarks) continue;
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq);
-    const value = line.slice(eq + 1);
-    if (/^SubRep$/i.test(key)) {
-      folder = mobaUnescape(value).split("\\").map((p) => p.trim()).filter(Boolean).join("/");
-      continue;
-    }
-    if (/^ImgNum$/i.test(key)) continue;
-    const parts = value.trim().split("#");
-    // " #109#0%host%22%user%…#MobaFont%…" → ["", "109", "0%host%22%user%…", …]
-    if (parts.length < 3 || parts[0] !== "") continue;
-    const name = mobaUnescape(key);
-    const protocol = MOBA_TYPES[parts[1]];
-    if (!protocol) {
-      out.skipped.push({ name, reason: MOBA_UNSUPPORTED[parts[1]] ? `${MOBA_UNSUPPORTED[parts[1]]}은(는) 지원하지 않습니다` : `알 수 없는 종류 (${parts[1]})` });
-      continue;
-    }
-    const fields = parts[2].split("%");
-    const host = mobaUnescape(fields[1] ?? "");
-    if (!host) {
-      out.skipped.push({ name, reason: "호스트가 비어 있습니다" });
-      continue;
-    }
-    const port = Number(fields[2]);
-    const fullFolder = [rootFolder, folder].filter(Boolean).join("/");
-    out.sessions.push({
-      id: crypto.randomUUID(),
-      name: name || host,
-      protocol,
-      host,
-      port: Number.isInteger(port) && port > 0 && port < 65536 ? port : PROTOCOLS[protocol].port,
-      username: protocol === "vnc" ? "" : mobaUnescape(fields[3] ?? ""),
-      credentialId: null,
-      folder: fullFolder,
-      notes: "MobaXterm에서 가져옴",
-      options: {},
-      createdAt: Date.now(),
-      lastUsed: null,
-    });
-  }
-  return out;
-}
-
 // ---- review & save -----------------------------------------------------------------------
 
-function sameTarget(a: Session, b: Session) {
-  return a.protocol === b.protocol && a.host.toLowerCase() === b.host.toLowerCase() && a.port === b.port && a.username === b.username && a.name === b.name;
-}
+/** What makes two sessions the same one for an import: protocol, host (any
+ * case), port, user and name. One already here, or an earlier repeat in the
+ * same file, is not added again. A key, so a large import is matched in one
+ * pass instead of every pair compared. */
+const targetKey = (s: Session) => JSON.stringify([s.protocol, s.host.toLowerCase(), s.port, s.username, s.name]);
+
+/** Why a key file a source names cannot be used, for the review. */
+const KEY_PROBLEMS: Partial<Record<ImportKeyKind, string>> = {
+  missing: "키 파일이 없습니다",
+  foreign: "OpenSSH 형식이 아닙니다",
+  unknown: "OpenSSH 형식이 아닙니다",
+  public: "공개 키 파일입니다",
+  store: "Windows 인증서 저장소의 키입니다",
+};
 
 /** Show what will be imported; resolves after the user saves or cancels. */
 /** `tunnels`: SSH tunnels a backup carries; they come along only with the
@@ -141,10 +47,55 @@ function sameTarget(a: Session, b: Session) {
 /** `extras`: other things a backup restores (folders, snippets, tunnels)
  * that are missing here; with them the import can be confirmed even when
  * every session already exists. */
-function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras = 0): Promise<{ saved: number; keep: boolean; confirmed: boolean }> {
+async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras = 0): Promise<{ saved: number; keep: boolean; confirmed: boolean }> {
+  // Not already saved, and not a repeat within the file itself (a CSV with a
+  // row twice): the first of each is kept, the rest count as existing.
+  const saved0 = new Map(state.sessions.map((s) => [targetKey(s), s]));
+  const seen = new Set(saved0.keys());
+  const fresh: Session[] = [];
+  // Sessions already here (an earlier import of the same tool) that have no
+  // login set: a usable key this import names for them is linked to them too.
+  const bare = new Map<string, Session>();
+  for (const s of parsed.sessions) {
+    const k = targetKey(s);
+    if (seen.has(k)) {
+      const old = saved0.get(k);
+      if (old && !old.credentialId) bare.set(s.id, old);
+      continue;
+    }
+    seen.add(k);
+    fresh.push(s);
+  }
+  const dupes = parsed.sessions.length - fresh.length;
+  const freshIds = new Set(fresh.map((s) => s.id));
+  const target = new Map<string, Session>([...fresh.map((s) => [s.id, s] as const), ...bare]);
+  // Key files named for those sessions, resolved and checked: a usable one is
+  // linked as a key credential on save; one that is not is reported, as that
+  // session will log in some other way (a password).
+  const named = (parsed.keyLinks ?? []).filter((k) => target.has(k.sessionId));
+  const raw = [...new Set(named.map((k) => k.keyPath))];
+  const checks = raw.length ? await api.importCheckKeys(raw, parsed.configDir ?? null) : [];
+  const checked = new Map(raw.map((r, i) => [r, checks[i]]));
+  const keyLinks: { session: Session; keyPath: string; carried?: number[] }[] = [];
+  const keyProblems: { name: string; reason: string }[] = [];
+  let lockedPutty = 0;
+  // A key file that is not on this PC but that the export itself carries is
+  // saved to the .ssh folder on save, then linked.
+  const carried = new Map((parsed.keyFiles ?? []).map((f) => [f.keyPath, f.contents]));
+  for (const k of named) {
+    const c = checked.get(k.keyPath);
+    const session = target.get(k.sessionId)!;
+    if (c && (c.kind === "openssh" || c.kind === "putty" || c.kind === "putty-encrypted")) {
+      keyLinks.push({ session, keyPath: c.path });
+      if (c.kind === "putty-encrypted") lockedPutty++;
+    } else if (c?.kind === "missing" && carried.has(k.keyPath)) keyLinks.push({ session, keyPath: k.keyPath, carried: carried.get(k.keyPath) });
+    else keyProblems.push({ name: session.name, reason: KEY_PROBLEMS[c?.kind ?? "unknown"] ?? "OpenSSH 형식이 아닙니다" });
+  }
+  const carriedFiles = new Set(keyLinks.filter((k) => k.carried).map((k) => k.keyPath)).size;
+  const linkedFresh = keyLinks.filter((k) => freshIds.has(k.session.id)).length;
+  const repairs = new Set(keyLinks.filter((k) => !freshIds.has(k.session.id)).map((k) => k.session)).size;
+  const savedPasswords = (parsed.savedPasswords ?? []).filter((id) => freshIds.has(id)).length;
   return new Promise((resolve) => {
-    const fresh = parsed.sessions.filter((s) => !state.sessions.some((e) => sameTarget(e, s)));
-    const dupes = parsed.sessions.length - fresh.length;
     const counts = Object.entries(
       fresh.reduce<Record<string, number>>((acc, s) => ((acc[s.protocol] = (acc[s.protocol] ?? 0) + 1), acc), {}),
     );
@@ -176,8 +127,8 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
         const p = PROTOCOLS[s.protocol];
         const flags = sensitiveOf(s);
         return `<tr><td><span class="proto-chip" style="--proto:${p.color}">${p.label}</span></td>
-          <td>${esc(s.name)}${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}${esc([...new Set(flags.map(labelOf))].join(", "))}</small>` : ""}</td>
-          <td class="mono">${esc(endpoint(s))}</td><td class="muted">${esc(s.folder || "—")}</td></tr>`;
+          <td><span data-i18n-skip>${esc(s.name)}</span>${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}${esc([...new Set(flags.map(labelOf))].join(", "))}</small>` : ""}</td>
+          <td class="mono" data-i18n-skip>${esc(endpoint(s))}</td><td class="muted" data-i18n-skip>${esc(s.folder || "—")}</td></tr>`;
       })
       .join("");
     const m = modal({
@@ -185,10 +136,33 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
       icon: "Download",
       width: 760,
       body: `<div class="import-summary">
-          <b>${fresh.length}</b>개 세션을 가져옵니다 ${counts.map(([p, n]) => `<span class="muted">${PROTOCOLS[p as Protocol].label} ${n}</span>`).join(" · ")}
+          <b>${fresh.length}개 세션을 가져옵니다</b> ${counts.map(([p, n]) => `<span class="muted">${PROTOCOLS[p as Protocol].label} ${n}</span>`).join(" · ")}
           ${dupes ? `<br><span class="muted">이미 있는 세션 ${dupes}개는 건너뜁니다.</span>` : ""}
+          ${linkedFresh ? `<br><span class="muted">키 파일 ${linkedFresh}개를 자격 증명 보관함에 연결합니다. 비밀번호는 저장하지 않습니다.</span>` : ""}
+          ${repairs ? `<br><span class="muted">이미 있는 세션 중 로그인 정보가 없는 ${repairs}개에 키 파일을 연결합니다.</span>` : ""}
+          ${carriedFiles ? `<br><span class="muted">이 PC에 없는 키 파일 ${carriedFiles}개는 내보낸 파일에 든 것을 .ssh 폴더에 저장해 씁니다.</span>` : ""}
+          ${lockedPutty ? `<br><span class="muted">암호가 걸린 PuTTY 키를 쓰는 세션 ${lockedPutty}개는 자격 증명 보관함에서 키 암호를 저장해야 연결됩니다.</span>` : ""}
+          ${
+            // Each name kept as written (data-i18n-skip), each reason a text of its own to translate.
+            keyProblems.length
+              ? `<br><span class="import-warn">키 파일을 쓸 수 없는 세션 ${keyProblems.length}개: ${keyProblems
+                  .slice(0, 4)
+                  .map((p) => `<span data-i18n-skip>${esc(p.name)}</span> (<span>${esc(p.reason)}</span>)`)
+                  .join(", ")}${keyProblems.length > 4 ? " <span>외</span>" : ""}</span>`
+              : ""
+          }
+          ${savedPasswords ? `<br><span class="muted">원래 프로그램에 비밀번호가 저장되어 있던 세션 ${savedPasswords}개는 비밀번호를 가져오지 않으므로 연결할 때 입력해야 합니다.</span>` : ""}
+          ${keyProblems.length || savedPasswords ? `<br><span class="warn-text">${icon("ShieldAlert", 12)}비밀번호를 모르면 짐작해서 넣지 마세요. 여러 번 틀리면 서버가 접속을 차단할 수 있습니다.</span>` : ""}
           ${!fresh.length && extras ? `<br><span class="muted">세션은 모두 이미 있습니다. 백업의 폴더·스니펫·터널 중 없는 것만 복원합니다.</span>` : ""}
-          ${parsed.skipped.length ? `<br><span class="muted">가져올 수 없는 항목 ${parsed.skipped.length}개: ${esc(parsed.skipped.slice(0, 4).map((s) => `${s.name} (${s.reason})`).join(", "))}${parsed.skipped.length > 4 ? " 외" : ""}</span>` : ""}
+          ${
+            // Each name kept as written (data-i18n-skip), each reason a text of its own to translate.
+            parsed.skipped.length
+              ? `<br><span class="muted">가져올 수 없는 항목 ${parsed.skipped.length}개: ${parsed.skipped
+                  .slice(0, 4)
+                  .map((s) => `<span data-i18n-skip>${esc(s.name)}</span> (<span>${esc(s.reason)}</span>)`)
+                  .join(", ")}${parsed.skipped.length > 4 ? " <span>외</span>" : ""}</span>`
+              : ""
+          }
         </div>
         ${fresh.length ? `<div class="import-table"><table><thead><tr><th>종류</th><th>이름</th><th>대상</th><th>폴더</th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}
         ${risky.length || tunnels ? `<label class="check block import-risky"><input type="checkbox" name="keepSensitive"/>
@@ -196,7 +170,7 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
           <small>인증서 오류 무시, 에이전트 전달, 포트 포워딩, 점프 호스트, 프록시, 드라이브 공유, 로그 파일 위치 설정입니다. 직접 만든 백업이 아니라면 끈 채로 두세요. 끄면 이 옵션만 빼고 가져옵니다.</small></span></label>` : ""}
         <p class="muted small">비밀번호는 가져오지 않습니다. 처음 연결할 때 입력하거나 자격 증명 보관함에서 지정하세요.</p>`,
       footer: `<button class="btn" data-close>취소</button>
-               <button class="btn btn-primary" data-ok ${fresh.length || extras ? "" : "disabled"}>${icon("Check", 14)}${fresh.length ? `${fresh.length}개 가져오기` : "백업 복원"}</button>`,
+               <button class="btn btn-primary" data-ok ${fresh.length || extras || repairs ? "" : "disabled"}>${icon("Check", 14)}${fresh.length ? `${fresh.length}개 가져오기` : extras ? "백업 복원" : "키 파일 연결"}</button>`,
       onClose: () => resolve({ saved, keep, confirmed }),
     });
     m.root.querySelector("[data-ok]")!.addEventListener("click", async () => {
@@ -205,10 +179,28 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
         if (!keep)
           for (const s of fresh) for (const k of Object.keys(s.options)) if (isSensitiveOption(k)) delete s.options[k];
         confirmed = true;
+        // Key files the export carries go to the .ssh folder first (once per
+        // file); one that cannot be saved leaves its sessions unlinked.
+        const stored = new Map<string, string | null>();
+        for (const k of keyLinks.filter((k) => k.carried)) {
+          if (!stored.has(k.keyPath)) {
+            const name = k.keyPath.split(/[\\/]/).pop() || "imported_key";
+            stored.set(k.keyPath, await api.importStoreKey(name, k.carried!).catch((err) => (toast(errorText(err), "error"), null)));
+          }
+          k.keyPath = stored.get(k.keyPath) ?? "";
+        }
+        // Link key files first so the saved session already points at its key.
+        const linkable = keyLinks.filter((k) => k.keyPath);
+        if (linkable.length) await linkKeyCredentials(linkable);
         if (fresh.length) {
           await upsertSessions(fresh);
           saved = fresh.length;
           toast(`${saved}개 세션을 가져왔습니다`, "success");
+        }
+        const repaired = [...new Set(keyLinks.filter((k) => !freshIds.has(k.session.id) && k.session.credentialId).map((k) => k.session))];
+        if (repaired.length) {
+          await upsertSessions(repaired);
+          toast(`이미 있는 세션 ${repaired.length}개에 키 파일을 연결했습니다`, "success");
         }
       } catch (err) {
         toast(errorText(err), "error");
@@ -216,6 +208,35 @@ function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, extras =
       m.close();
     });
   });
+}
+
+/** Link the usable key files of an import (absolute paths, from
+ * import_check_keys) to their sessions as key credentials, so each logs in
+ * with its key instead of being asked for a password. One credential per key
+ * file, shared by every session that uses it (SecureCRT's key for all
+ * sessions), and an existing one for the same file is reused; it names no
+ * user, so each session logs in as its own. No secret is stored: an encrypted
+ * key still asks for its passphrase. */
+async function linkKeyCredentials(keyLinks: { session: Session; keyPath: string }[]) {
+  const forKey = new Map(state.credentials.filter((c) => c.kind === "key" && c.keyPath).map((c) => [c.keyPath!.toLowerCase(), c.id]));
+  let made = 0;
+  for (const { session: s, keyPath } of keyLinks) {
+    if (s.credentialId) continue;
+    let id = forKey.get(keyPath.toLowerCase());
+    if (!id) {
+      try {
+        const name = `${keyPath.split(/[\\/]/).pop() || keyPath} 키`;
+        id = (await api.vaultSave({ id: crypto.randomUUID(), name, username: "", kind: "key", keyPath, hasSecret: false }, null)).id;
+        forKey.set(keyPath.toLowerCase(), id);
+        made++;
+      } catch {
+        // Leave the session without a credential; it will ask for a password.
+        continue;
+      }
+    }
+    s.credentialId = id;
+  }
+  if (made) await reloadCredentials();
 }
 
 async function readChosenFile(title: string, defaultPath?: string): Promise<string | null> {
@@ -259,7 +280,12 @@ export const importSecureCrtFolder = () =>
   runImport("SecureCRT 세션 가져오기", "SecureCRT 세션 폴더", async () => {
     const appData = await appDataDir();
     const dir = await pickFolder("SecureCRT 세션 폴더 선택 (Config\\Sessions)", appData ? `${appData}\\VanDyke\\Config\\Sessions` : undefined);
-    return dir ? parseSecureCrtFiles(await api.importScan(dir, "ini")) : null;
+    if (!dir) return null;
+    // The configuration folder around Sessions keeps SSH2.ini, with the key file
+    // set for all sessions, and is what ${VDS_CONFIG_PATH} in key paths means.
+    const configDir = dir.replace(/[\\/]+$/, "").replace(/[\\/]Sessions$/i, "");
+    const ssh2 = await api.readTextFile(`${configDir}\\SSH2.ini`).catch(() => "");
+    return { ...parseSecureCrtFiles(await api.importScan(dir, "ini"), "SecureCRT", secureCrtGlobalKey(ssh2)), configDir };
   });
 
 export const importSecureCrtXml = () =>
@@ -352,11 +378,24 @@ export async function importFromBackup() {
     const list = Array.isArray(data) ? data : Array.isArray((data as { sessions?: unknown }).sessions) ? (data as { sessions: unknown[] }).sessions : null;
     if (!list) return toast("세션 목록을 찾지 못했습니다", "error");
     const parsed = list.map((raw) => normalizeSession(raw)).filter((s): s is Session => s !== null);
-    // New ids for imported sessions; one already here (same target) keeps its id,
-    // so SSH gateway references inside the backup can be rewritten to match.
+    // New ids for imported sessions. One already here keeps its id, and a
+    // repeat within the backup gets the first one's (the review adds only that
+    // one), so SSH gateway and tunnel references in the backup still point at
+    // a session that exists.
+    const idByKey = new Map<string, string>();
+    for (const e of state.sessions) if (!idByKey.has(targetKey(e))) idByKey.set(targetKey(e), e.id);
+    const newIds = parsed.map((s) => {
+      const k = targetKey(s);
+      if (!idByKey.has(k)) idByKey.set(k, crypto.randomUUID());
+      return idByKey.get(k)!;
+    });
+    // Backup id → new id, for those references. A hand-edited backup may give
+    // two sessions one id: references go to the first of them.
     const ids = new Map<string, string>();
-    for (const s of parsed) ids.set(s.id, state.sessions.find((e) => sameTarget(e, s))?.id ?? crypto.randomUUID());
-    const sessions = parsed.map((s) => {
+    parsed.forEach((s, i) => {
+      if (!ids.has(s.id)) ids.set(s.id, newIds[i]);
+    });
+    const sessions = parsed.map((s, i) => {
       const options = { ...s.options };
       if (typeof options.gateway === "string") {
         const gw = options.gateway;
@@ -367,7 +406,7 @@ export async function importFromBackup() {
       // Credentials live in this PC's vault: a link is kept when that
       // credential exists here (a restore on the same PC), dropped otherwise.
       const credentialId = s.credentialId && state.credentials.some((c) => c.id === s.credentialId) ? s.credentialId : null;
-      return { ...s, id: ids.get(s.id)!, credentialId, options };
+      return { ...s, id: newIds[i], credentialId, options };
     });
     const tunnels = Array.isArray((data as { tunnels?: unknown }).tunnels) ? (data as { tunnels: unknown[] }).tunnels.length : 0;
     const d = data as { folders?: unknown; snippets?: unknown };

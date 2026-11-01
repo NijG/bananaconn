@@ -246,16 +246,7 @@ async fn generate_key(path: String, key_type: String, passphrase: String, commen
                 .map_err(|e| format!("키를 암호화할 수 없습니다: {e}"))?
         };
         let pem = key.to_openssh(LineEnding::LF).map_err(|e| format!("키를 저장할 수 없습니다: {e}"))?;
-        // OpenSSH for Windows rejects private keys other accounts can read, and a
-        // new file inherits its folder's ACL. Lock the empty file down first, then
-        // write the key, so it is never readable by anyone else.
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-            .map_err(|e| format!("개인 키를 저장할 수 없습니다: {e}"))?;
-        let written = restrict_to_owner(target)
-            .and_then(|()| fs::write(target, pem.as_bytes()).map_err(|e| format!("개인 키를 저장할 수 없습니다: {e}")))
+        let written = write_private(target, pem.as_bytes())
             .and_then(|()| fs::write(&pub_path, format!("{public}\n")).map_err(|e| format!("공개 키를 저장할 수 없습니다: {e}")));
         if let Err(e) = written {
             // Leave no half-made key pair behind.
@@ -266,6 +257,140 @@ async fn generate_key(path: String, key_type: String, passphrase: String, commen
         Ok(public)
     })
     .await
+}
+
+/// Write a new private key file that only this user can read. OpenSSH for
+/// Windows rejects private keys other accounts can read, and a new file
+/// inherits its folder's ACL: the empty file is locked down first, then
+/// written, so the key is never readable by anyone else. Nothing is left
+/// behind when it fails.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("개인 키를 저장할 수 없습니다: {e}"))?;
+    let written = restrict_to_owner(path).and_then(|()| fs::write(path, bytes).map_err(|e| format!("개인 키를 저장할 수 없습니다: {e}")));
+    if written.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    written
+}
+
+/// What a key file is, for logging in with it, from its first lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyFileKind {
+    /// No such file, or it cannot be read.
+    Missing,
+    /// OpenSSH or PEM: ssh.exe and the SFTP client read it.
+    OpenSsh,
+    /// PuTTY (.ppk): the SFTP client reads it; the terminal uses a converted
+    /// copy (terminal_key).
+    Putty { encrypted: bool },
+    /// The SSH.com format of keys SecureCRT made: neither reads it.
+    Foreign,
+    /// A public key, not the private one.
+    Public,
+    Unknown,
+}
+
+pub(crate) fn key_file_kind(path: &Path) -> KeyFileKind {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else { return KeyFileKind::Missing };
+    let mut head = Vec::new();
+    if file.take(4096).read_to_end(&mut head).is_err() {
+        return KeyFileKind::Missing;
+    }
+    key_kind_of(&head)
+}
+
+/// What a key file is, from its first bytes.
+pub(crate) fn key_kind_of(head: &[u8]) -> KeyFileKind {
+    let text = String::from_utf8_lossy(&head[..head.len().min(4096)]);
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    let first = text.lines().next().unwrap_or("").trim();
+    let pem = first.strip_prefix("-----BEGIN ").and_then(|r| r.strip_suffix("-----"));
+    if let Some(label) = pem {
+        return match label {
+            "OPENSSH PRIVATE KEY" | "RSA PRIVATE KEY" | "EC PRIVATE KEY" | "DSA PRIVATE KEY" | "PRIVATE KEY" | "ENCRYPTED PRIVATE KEY" => KeyFileKind::OpenSsh,
+            "PUBLIC KEY" | "RSA PUBLIC KEY" => KeyFileKind::Public,
+            _ => KeyFileKind::Unknown,
+        };
+    }
+    if first.starts_with("PuTTY-User-Key-File-") {
+        let encryption = text.lines().find_map(|l| l.strip_prefix("Encryption:")).map(str::trim).unwrap_or("none");
+        return KeyFileKind::Putty { encrypted: encryption != "none" };
+    }
+    if first.starts_with("---- BEGIN SSH2 ") {
+        return if first.contains("PUBLIC KEY") { KeyFileKind::Public } else { KeyFileKind::Foreign };
+    }
+    let algorithm = first.split_whitespace().next().unwrap_or("");
+    if ["ssh-", "ecdsa-", "sk-"].iter().any(|p| algorithm.starts_with(p)) && first.split_whitespace().nth(1).is_some_and(|b| b.starts_with("AAAA")) {
+        return KeyFileKind::Public;
+    }
+    KeyFileKind::Unknown
+}
+
+/// A converted copy of a key for ssh.exe, encrypted with a one-time
+/// passphrase; the file is removed when this is dropped.
+pub(crate) struct TempKey {
+    pub path: PathBuf,
+    pub passphrase: String,
+}
+
+impl Drop for TempKey {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The key file ssh.exe should use for a credential's key: `None` when it
+/// reads the key itself (OpenSSH, PEM, or a file that is not there, which it
+/// reports); for a PuTTY key (.ppk), which it cannot read, a temporary
+/// OpenSSH copy. The copy is encrypted with a one-time passphrase that the
+/// terminal answers when ssh.exe asks, so the key never lies on disk
+/// unprotected, and it is removed once the session ends (copies left by a
+/// crash are swept on the next conversion).
+pub(crate) fn terminal_key(app: &AppHandle, key_path: &str, passphrase: Option<&str>) -> Result<Option<TempKey>, String> {
+    let KeyFileKind::Putty { encrypted } = key_file_kind(Path::new(key_path)) else { return Ok(None) };
+    if encrypted && passphrase.is_none() {
+        return Err(format!("암호가 걸린 PuTTY 키(.ppk)입니다: {key_path}. 자격 증명 보관함에서 이 키의 암호를 저장하면 터미널에서도 쓸 수 있습니다."));
+    }
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("데이터 폴더를 찾을 수 없습니다: {e}"))?
+        .join("terminal-keys");
+    convert_putty(Path::new(key_path), passphrase, &dir).map(Some)
+}
+
+pub(crate) fn convert_putty(key_path: &Path, passphrase: Option<&str>, dir: &Path) -> Result<TempKey, String> {
+    use rand::distr::{Alphanumeric, SampleString};
+    let text = fs::read_to_string(key_path).map_err(|e| format!("키 파일을 읽을 수 없습니다 ({}): {e}", key_path.display()))?;
+    let key = russh::keys::decode_secret_key(&text, passphrase).map_err(|e| format!("PuTTY 키(.ppk)를 열 수 없습니다 ({}): {e}", key_path.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("폴더를 만들 수 없습니다: {e}"))?;
+    sweep_stale(dir);
+    let mut rng = rand::rngs::ThreadRng::default();
+    let one_time = Alphanumeric.sample_string(&mut rng, 32);
+    let pem = key
+        .encrypt(&mut rng, one_time.as_bytes())
+        .and_then(|k| k.to_openssh(LineEnding::LF))
+        .map_err(|e| format!("키를 변환할 수 없습니다: {e}"))?;
+    let path = dir.join(format!("{}.key", Alphanumeric.sample_string(&mut rng, 16)));
+    write_private(&path, pem.as_bytes())?;
+    Ok(TempKey { path, passphrase: one_time })
+}
+
+/// Remove converted keys older than an hour: ssh.exe reads its key while it
+/// logs in, and each connection makes its own copy.
+fn sweep_stale(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let stale = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 3600);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Remove inherited permissions and grant access to the current user only
@@ -350,7 +475,7 @@ pub fn vault_default_key_dir() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -385,6 +510,90 @@ mod tests {
         }
         // Never overwrites.
         assert!(tauri::async_runtime::block_on(generate_key(path_s, "ed25519".into(), String::new(), String::new())).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // PuTTY's example keys from the ssh-key crate's tests (the second one's
+    // passphrase is "123").
+    pub(crate) const PPK: &str = "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: user@example.com\nPublic-Lines: 2\nAAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF\nSqti\nPrivate-Lines: 1\nAAAAILYGwiLRDBba4WxwpNRRc0cuxhfgXGVpINJuVsCPtZHt\nPrivate-MAC: 94140d0344fad6aa1bf7b71e9c93db11ccac8a232f8a51e11c024869d608c82d\n";
+    const PPK_ENC: &str = "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: aes256-cbc\nComment: user@example.com\nPublic-Lines: 2\nAAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF\nSqti\nKey-Derivation: Argon2id\nArgon2-Memory: 8192\nArgon2-Passes: 34\nArgon2-Parallelism: 1\nArgon2-Salt: 63d1d43f7bf7700720496646a2f5ec17\nPrivate-Lines: 1\nDyWtExZ3dxFutnb12tIwXBC6kWdozrvP+r6faHKBGDb4+qEar9XBiC0BmGySMHUi\nPrivate-MAC: 52fd00d4ef47ebc506e4e709486c0c6bc0606e24fe2c6cb1b3d168f4da238a66\n";
+    pub(crate) const PPK_PUBLIC: &str = "AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bx-keys-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn key_files_are_told_apart_by_their_first_lines() {
+        let dir = scratch("kinds");
+        let kind = |name: &str, text: &str| {
+            let p = dir.join(name);
+            fs::write(&p, text).unwrap();
+            key_file_kind(&p)
+        };
+        assert_eq!(kind("a", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n"), KeyFileKind::OpenSsh);
+        assert_eq!(kind("b", "\u{feff}-----BEGIN RSA PRIVATE KEY-----\r\nMIIE\r\n"), KeyFileKind::OpenSsh);
+        assert_eq!(kind("c", PPK), KeyFileKind::Putty { encrypted: false });
+        assert_eq!(kind("d", PPK_ENC), KeyFileKind::Putty { encrypted: true });
+        assert_eq!(kind("e", "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nSubject: me\nP2/56wAAA\n"), KeyFileKind::Foreign);
+        assert_eq!(kind("f", "---- BEGIN SSH2 PUBLIC KEY ----\nAAAAB3\n"), KeyFileKind::Public);
+        assert_eq!(kind("g", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA me@pc\n"), KeyFileKind::Public);
+        assert_eq!(kind("h", "not a key"), KeyFileKind::Unknown);
+        assert_eq!(key_file_kind(&dir.join("absent")), KeyFileKind::Missing);
+        // A folder is not a key file.
+        assert_eq!(key_file_kind(&dir), KeyFileKind::Missing);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn putty_keys_convert_to_a_protected_openssh_copy() {
+        let dir = scratch("putty");
+        let ppk = dir.join("web.ppk");
+        fs::write(&ppk, PPK).unwrap();
+        let copies = dir.join("copies");
+        let temp = convert_putty(&ppk, None, &copies).unwrap();
+        let path = temp.path.clone();
+        // OpenSSH format, unreadable without the one-time passphrase.
+        assert!(fs::read_to_string(&path).unwrap().starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(russh::keys::load_secret_key(&path, None).is_err());
+        let key = russh::keys::load_secret_key(&path, Some(&temp.passphrase)).unwrap();
+        assert_eq!(key.public_key().to_openssh().unwrap().split_whitespace().nth(1), Some(PPK_PUBLIC));
+        // The system OpenSSH (the terminal's ssh.exe) reads it with that passphrase.
+        if let Ok(out) = std::process::Command::new("ssh-keygen").args(["-y", "-P", &temp.passphrase, "-f"]).arg(&path).output() {
+            assert!(out.status.success(), "ssh-keygen: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1), Some(PPK_PUBLIC));
+        }
+        // Gone with the session.
+        drop(temp);
+        assert!(!path.exists());
+
+        // An encrypted one needs its passphrase.
+        let enc = dir.join("enc.ppk");
+        fs::write(&enc, PPK_ENC).unwrap();
+        assert!(convert_putty(&enc, None, &copies).is_err());
+        assert!(convert_putty(&enc, Some("wrong"), &copies).is_err());
+        let temp = convert_putty(&enc, Some("123"), &copies).unwrap();
+        let key = russh::keys::load_secret_key(&temp.path, Some(&temp.passphrase)).unwrap();
+        assert_eq!(key.public_key().to_openssh().unwrap().split_whitespace().nth(1), Some(PPK_PUBLIC));
+        drop(temp);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copies_left_behind_are_swept() {
+        let dir = scratch("sweep");
+        let old = dir.join("old.key");
+        let new = dir.join("new.key");
+        fs::write(&old, "x").unwrap();
+        fs::write(&new, "x").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&old).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)).unwrap();
+        drop(file);
+        sweep_stale(&dir);
+        assert!(!old.exists() && new.exists());
         let _ = fs::remove_dir_all(dir);
     }
 }

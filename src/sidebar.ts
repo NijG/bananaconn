@@ -10,7 +10,7 @@ const SESSION_H = 42;
 const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
-import { endpoint, PROTOCOLS, type Session } from "./model";
+import { endpoint, PROTOCOLS, sessionSearchText, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { checkReachable, checkReachableMany } from "./nettools";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
@@ -36,7 +36,8 @@ import {
   upsertSessions,
 } from "./store";
 import { api } from "./api";
-import { confirmDialog, contextMenu, errorText, esc, modal, promptDialog, toast } from "./ui";
+import { confirmDialog, contextMenu, errorText, esc, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
+import { userText } from "./i18n";
 
 export interface SidebarActions {
   connect(s: Session): void;
@@ -82,6 +83,8 @@ export class Sidebar {
   private tree: HTMLElement;
   private redrawQueued = false;
   private query = "";
+  /** `query` split once per search, not once per session it is matched against. */
+  private terms: string[] = [];
   /** The tree markup now on screen. */
   private shown = "";
   /** The focused session (keyboard actions, F2, Ctrl+C). */
@@ -141,6 +144,7 @@ export class Sidebar {
       clearTimeout(searchTimer);
       searchTimer = window.setTimeout(() => {
         this.query = query;
+        this.terms = searchTerms(query);
         this.render();
       }, 80);
     });
@@ -208,12 +212,7 @@ export class Sidebar {
 
   private matches(s: Session) {
     if (!this.query) return true;
-    const hay = [s.name, s.host, s.username, s.folder, PROTOCOLS[s.protocol].label, s.notes]
-      .join(" ")
-      .toLowerCase();
-    // Each whitespace-separated term must appear somewhere, so "web prod"
-    // matches a "prod" session on a "web…" host regardless of field order.
-    return this.query.split(/\s+/).every((term) => hay.includes(term));
+    return matchesTerms(sessionSearchText(s), this.terms);
   }
 
   private build(): FolderNode {
@@ -290,7 +289,7 @@ export class Sidebar {
     if (!html.length) {
       html.push(
         this.query
-          ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(this.query)}"와 일치하는 세션이 없습니다</p></div>`
+          ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(userText(this.query))}"와 일치하는 세션이 없습니다</p></div>`
           : `<div class="tree-empty">${icon("Server", 26)}<p>저장된 세션이 없습니다</p>
                <button class="btn btn-primary btn-sm" data-first>${icon("Plus", 14)}첫 세션 만들기</button>
                <button class="btn btn-sm" data-import>${icon("Download", 14)}다른 프로그램에서 가져오기</button></div>`,
@@ -450,7 +449,7 @@ export class Sidebar {
           {
             label: "이 폴더의 세션 연결 확인",
             icon: "Activity",
-            action: () => void checkReachableMany(state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/"))),
+            action: () => void checkReachableMany(state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/")), (s) => this.actions.connect(s)),
           },
           { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession(path) },
           { label: "하위 폴더 만들기", icon: "FolderPlus", action: () => this.newFolder(path) },
@@ -546,7 +545,7 @@ export class Sidebar {
     const broadcast = String(s.options.wolBroadcast ?? "").trim() || undefined;
     try {
       await api.wakeOnLan(mac, broadcast);
-      toast(`${s.name || s.host}에 Wake-on-LAN 신호를 보냈습니다`, "success", 3000);
+      toast(`${userText(s.name || s.host)}에 Wake-on-LAN 신호를 보냈습니다`, "success", 3000);
     } catch (err) {
       toast(errorText(err), "error");
     }
@@ -558,7 +557,7 @@ export class Sidebar {
     contextMenu(x, y, [
       { label: `${list.length}개 세션 연결`, icon: "Play", hint: "Enter", action: () => list.forEach((s) => this.actions.connect(s)) },
       "-",
-      { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list) },
+      { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: "F2", action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
       "-",
@@ -701,7 +700,7 @@ export class Sidebar {
       const folder = form.querySelector<HTMLInputElement>("[name=folder]")!.value.split("/").map((p) => p.trim()).filter(Boolean).join("/");
       m.close();
       await this.moveTo(list.map((s) => s.id), folder);
-      toast(`세션 ${list.length}개를 ${folder ? `"${folder}"` : "최상위"}(으)로 옮겼습니다`, "success");
+      toast(`세션 ${list.length}개를 ${folder ? userText(`"${folder}"`) : "최상위"}(으)로 옮겼습니다`, "success");
     };
     form.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -792,7 +791,7 @@ export class Sidebar {
   }
 
   private async bulkDelete(list: Session[]) {
-    const names = list.slice(0, 6).map((s) => `<b>${esc(s.name)}</b>`).join(", ") + (list.length > 6 ? ` 외 ${list.length - 6}개` : "");
+    const names = list.slice(0, 6).map((s) => `<b data-i18n-skip>${esc(s.name)}</b>`).join(", ") + (list.length > 6 ? ` 외 ${list.length - 6}개` : "");
     const ok = await confirmDialog({
       title: `세션 ${list.length}개 삭제`,
       message: `${names} 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.`,
@@ -808,7 +807,7 @@ export class Sidebar {
 
   private copySession(s: Session) {
     this.clip = structuredClone(s);
-    toast(`"${s.name}" 세션을 복사했습니다. Ctrl+V로 붙여넣을 때마다 새 세션이 만들어집니다`, "info");
+    toast(`${userText(`"${s.name}"`)} 세션을 복사했습니다. Ctrl+V로 붙여넣을 때마다 새 세션이 만들어집니다`, "info");
   }
 
   /** Paste `from` (default: the copied session) into `folder` as a new session with a free name. */
@@ -830,7 +829,7 @@ export class Sidebar {
   private async deleteSession(s: Session) {
     const ok = await confirmDialog({
       title: "세션 삭제",
-      message: `<b>${esc(s.name)}</b> 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.`,
+      message: `<b data-i18n-skip>${esc(s.name)}</b> 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.`,
       confirm: "삭제",
       danger: true,
     });
@@ -861,7 +860,7 @@ export class Sidebar {
     const inside = state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/")).length;
     const ok = await confirmDialog({
       title: "폴더 삭제",
-      message: `<b>${esc(path)}</b> 폴더를 삭제합니다.${inside ? `<br>안에 있는 세션 ${inside}개는 상위 폴더로 옮겨지며 삭제되지 않습니다.` : ""}`,
+      message: `<b data-i18n-skip>${esc(path)}</b> 폴더를 삭제합니다.${inside ? `<br>안에 있는 세션 ${inside}개는 상위 폴더로 옮겨지며 삭제되지 않습니다.` : ""}`,
       confirm: "삭제",
       danger: true,
     });

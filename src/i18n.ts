@@ -7,6 +7,9 @@
 //
 // Terminal output, the editor and other user data are never touched.
 
+import { build, HANGUL, translate, type Tables } from "./i18nTables";
+export { userText } from "./i18nTables";
+
 /** Languages offered, each named in itself (the order of the settings list). */
 export const LANGUAGES = [
   ["ko", "한국어"],
@@ -22,29 +25,8 @@ export const LANGUAGES = [
 export type Language = (typeof LANGUAGES)[number][0];
 export const isLanguage = (x: unknown): x is Language => LANGUAGES.some(([code]) => code === x);
 
-const HANGUL = /[가-힣]/;
 const SKIP = ".xterm, .cm-editor, [data-i18n-skip]";
 const ATTRS = ["title", "placeholder", "aria-label"];
-
-/** One language's lookup tables. need: the longest fixed piece of a phrase;
- * a text without it cannot match, and that check is far cheaper than the regex. */
-interface Tables {
-  exact: Map<string, string>;
-  patterns: { re: RegExp; order: number[]; en: string; need: string }[];
-}
-const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-
-/** Phrases were extracted from HTML source: decode the entities the DOM shows decoded. */
-const decode = (s: string) =>
-  s
-    .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-/** "${icon(…)}저장": a leading {0} there is the button's icon, a separate DOM node.
- * Not "{0}: …" or "{0} · …", where {0} is a value in the text (a device name). */
-const ICON = /^\{0\}(?=[\p{L}\p{N}])/u;
 
 /** Each dictionary is loaded (and its patterns built) the first time its
  * language is chosen: Korean, the default, never pays for any at startup. */
@@ -54,61 +36,13 @@ function loadDictionary(language: Language): Promise<Tables | null> {
   let p = loaded.get(language);
   if (!p) {
     const load = DICTIONARIES[`./i18n/${language}.json`];
-    p = load ? load().then(({ default: entries }) => build(entries)) : Promise.resolve(null);
+    p = load ? load().then(({ default: entries }) => build(entries, language)) : Promise.resolve(null);
     loaded.set(language, p);
   }
   return p;
 }
 /** The tables of the language on screen (null: Korean, or still loading). */
 let active: Tables | null = null;
-
-function build(entries: { ko: string; t: string }[]): Tables {
-  const exact = new Map<string, string>();
-  const patterns: Tables["patterns"] = [];
-  for (const entry of entries) {
-    let key = norm(decode(entry.ko));
-    let en = decode(entry.t);
-    if (ICON.test(key) && ICON.test(en) && !/\{[1-9]\}/.test(key)) {
-      key = key.replace(ICON, "");
-      en = en.replace(ICON, "");
-    }
-    if (!key || key === en) continue;
-    // "<b>키 확인</b>: …": the DOM has a text node per piece between tags.
-    const TAG = /<[^>]+>/;
-    if (TAG.test(key)) {
-      const kp = key.split(TAG);
-      const ep = en.split(TAG);
-      if (kp.length === ep.length)
-        kp.forEach((k, i) => {
-          const kk = norm(k);
-          if (HANGUL.test(kk) && !/\{\d+\}/.test(kk) && !exact.has(kk)) exact.set(kk, ep[i].trim());
-        });
-      continue;
-    }
-    if (!HANGUL.test(key)) continue;
-    if (!/\{\d+\}/.test(key)) {
-      if (!exact.has(key)) exact.set(key, en);
-      continue;
-    }
-    // "설정을 저장했습니다 ({0}줄): {1}" → /^설정을 저장했습니다 \((.+?)줄\): (.+?)$/
-    const order: number[] = [];
-    const source = key
-      .split(/(\{\d+\})/)
-      .map((part) => {
-        const m = /^\{(\d+)\}$/.exec(part);
-        if (!m) return part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        order.push(Number(m[1]));
-        // May be empty: `${hidden ? " · 2개 숨김" : ""}`.
-        return "([\\s\\S]*?)";
-      })
-      .join("");
-    const need = key.split(/\{\d+\}/).reduce((a, b) => (b.length > a.length ? b : a), "");
-    patterns.push({ re: new RegExp(`^${source}$`), order, en, need });
-  }
-  // Longer patterns first: more specific.
-  patterns.sort((a, b) => b.re.source.length - a.re.source.length);
-  return { exact, patterns };
-}
 
 /** Results by text for the language on screen: the same labels and file names
  * come up again and again. Bounded; cleared when full or on a language change. */
@@ -120,47 +54,10 @@ export function tr(text: string): string {
   if (!active || !HANGUL.test(text)) return text;
   const known = memo.get(text);
   if (known !== undefined) return known;
-  const out = translate(text);
+  const out = translate(active, text, tr);
   if (memo.size >= MEMO_MAX) memo.clear();
   memo.set(text, out);
   return out;
-}
-
-/** "(…)" around a translated phrase, or undefined when it was not known. */
-const wrap = (out: string, inner: string) => (out === inner ? undefined : `(${out})`);
-
-function translate(text: string): string {
-  const core = norm(text);
-  const lead = text.match(/^\s*/)![0];
-  const tail = text.match(/\s*$/)![0];
-  // "(지원하지 않는 장비입니다)": a phrase in parentheses, often a pattern's value.
-  const inner = /^\((.+)\)$/.exec(core)?.[1];
-  const hit = active!.exact.get(core) ?? translatePattern(core) ?? translateParts(core) ?? (inner && HANGUL.test(inner) ? wrap(translate(inner), inner) : undefined);
-  return hit === undefined ? text : lead + hit + tail;
-}
-
-/** "연결됨 · 80×24", "이름: 값": several phrases in one text, translated piece by piece. */
-function translateParts(core: string): string | undefined {
-  for (const sep of [" · ", " — ", "\n"]) {
-    if (!core.includes(sep)) continue;
-    const parts = core.split(sep);
-    const out = parts.map((p) => tr(p));
-    if (out.some((p, i) => p !== parts[i])) return out.join(sep);
-  }
-  return undefined;
-}
-
-function translatePattern(core: string): string | undefined {
-  for (const p of active!.patterns) {
-    if (!core.includes(p.need)) continue;
-    const m = p.re.exec(core);
-    if (!m) continue;
-    const values: string[] = [];
-    p.order.forEach((n, i) => (values[n] = m[i + 1]));
-    // Values may themselves be Korean phrases ("{0}: 파일이 없습니다").
-    return p.en.replace(/\{(\d+)\}/g, (_s, n) => tr(values[Number(n)] ?? ""));
-  }
-  return undefined;
 }
 
 let lang: Language = "ko";

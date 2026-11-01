@@ -26,7 +26,8 @@ import { hasRemoteCommands, PROMPT_END, setRemoteCommands } from "../cmdLine";
 import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands";
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
-import { tr } from "../i18n";
+import { asksAtEnd, loginFailure, loginThrough, plainLines, unusableKey } from "../sshLogin";
+import { tr, userText } from "../i18n";
 import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
 
 /** Editing keys in recorded macros, as private-use marks U+E100.. in this
@@ -241,6 +242,26 @@ export class TerminalView implements View {
   private reAttempts = 0;
   private reTimer = 0;
   private reDeclined = false;
+  /** The SSH login of the current connection, read from its output (sshLogin.ts).
+   * Until the login has gone through, the connection is not established: no
+   * resource-monitor login, startup commands or SFTP window (each would only add
+   * failed logins to a wrong password), and no auto-reconnect once it ends after
+   * a password or host-key question — an authentication failure keeps failing
+   * however often it is retried, and repeated tries get an account or address
+   * blocked. Other protocols are logged in once connected.
+   * `loginText`: the latest output while the login is under way (last 8 KB).
+   * `loginAsked`: ssh.exe asked for a password, passphrase or host-key answer.
+   * `endBytes`: the connection's last output, read when it ends. */
+  private loginText = "";
+  private captureLogin = false;
+  private loginDecoder = new TextDecoder();
+  private loginSeen = 0;
+  private loginTimer = 0;
+  private loginAsked = false;
+  private loggedIn = false;
+  private loggedInAt = 0;
+  private keyWarned = false;
+  private endBytes = new Uint8Array(0);
   /** "Notify when the task finishes" is on for this tab, with its silence timer
    * and whether output has been seen since it was armed. */
   private notifyDone = false;
@@ -485,6 +506,10 @@ export class TerminalView implements View {
    * for network gear unless this session already chose a mode. */
   deviceDetected(d: DeviceInfo) {
     if (this.disposed) return;
+    // The resource monitor logged in and read the device: this session is past
+    // its login, so stop watching for a login failure (and free the buffer).
+    this.captureLogin = false;
+    this.loginText = "";
     // Remember the OS the first time so later connections skip re-detecting it:
     // the monitor reuses it, and snippets, history recall and key mode apply at
     // once without waiting. Cleared if the monitor later finds it no longer fits.
@@ -743,7 +768,7 @@ export class TerminalView implements View {
       const path = await pickSavePath(`${name}_${timestamp()}.cfg`, [{ name: "설정 파일", extensions: ["cfg", "txt", "conf"] }]);
       if (!path) return;
       await api.saveTextFile(path, text);
-      toast(`설정을 저장했습니다 (${text.split("\n").length}줄): ${path}`, "success", 6000);
+      toast(`설정을 저장했습니다 (${text.split("\n").length}줄): ${userText(path)}`, "success", 6000);
     } catch (err) {
       toast(`설정 백업 실패: ${errorText(err)}`, "error", 6000);
     }
@@ -876,7 +901,7 @@ export class TerminalView implements View {
       const ok = await confirmDialog({
         title: "처음 보는 호스트 키",
         icon: "ShieldCheck",
-        message: `모니터링 연결이 <b>${esc(this.session.host)}</b>의 호스트 키를 확인해야 합니다.<br><br>지문: <code class="fp">${esc(m.fingerprint ?? "")}</code>`,
+        message: `모니터링 연결이 <b data-i18n-skip>${esc(this.session.host)}</b>의 호스트 키를 확인해야 합니다.<br><br>지문: <code class="fp">${esc(m.fingerprint ?? "")}</code>`,
         confirm: "신뢰하고 시작",
       });
       if (ok) this.startMonitor({ trustedFingerprint: m.fingerprint });
@@ -1127,7 +1152,7 @@ export class TerminalView implements View {
     if (enter && (confirmed || state.settings.checkTypedCommands || "paste" in input)) {
       const hit = this.enterRisk(text.slice(0, enter.index));
       if (hit && !(confirmed?.includes(hit.rule) && hit.rule.action !== "block")) {
-        toast(`${this.title()}: 줄에 위험한 명령이 있어 동시 입력의 Enter를 보내지 않았습니다 (${hit.rule.note}). 확인한 뒤 이 탭에서 직접 Enter를 누르세요`, "warn", 8000);
+        toast(`${userText(this.title())}: 줄에 위험한 명령이 있어 동시 입력의 Enter를 보내지 않았습니다 (${hit.rule.note}). 확인한 뒤 이 탭에서 직접 Enter를 누르세요`, "warn", 8000);
         // Keys before the Enter still arrive, so the line matches what was typed.
         if ("keys" in input && enter.index) {
           const head = input.keys.slice(0, input.keys.search(/[\r\n]/));
@@ -1419,6 +1444,19 @@ export class TerminalView implements View {
     // A new TextDecoder so a partial multibyte character left over from a dropped
     // connection does not corrupt the first trigger line of this one.
     this.decoder = new TextDecoder();
+    // A new login, not established until it has gone through (watchLogin; only
+    // ssh prints its questions and failures there: a Telnet bad login re-prompts
+    // instead of ending the connection).
+    this.loginText = "";
+    this.captureLogin = this.session.protocol === "ssh";
+    this.loginDecoder = new TextDecoder();
+    this.loginSeen = 0;
+    clearTimeout(this.loginTimer);
+    this.loginAsked = false;
+    this.loggedIn = false;
+    this.loggedInAt = 0;
+    this.keyWarned = false;
+    this.endBytes = new Uint8Array(0);
     // Reuse the OS detected on an earlier connection (no re-sniff, no re-detect).
     this.osGuess = String(this.session.options.osKind ?? "") || undefined;
     this.osSniff = "";
@@ -1535,6 +1573,7 @@ export class TerminalView implements View {
     const shown = this.highlighter.process(bytes, state.settings.highlightKeywords && !this.lsColors.listing);
     this.term.write(shown, () => this.ack(rid, n));
     this.sniffOs(bytes);
+    this.watchLogin(bytes);
     this.onOutput(bytes);
     if (!this.gotOutput) {
       this.gotOutput = true;
@@ -1608,6 +1647,85 @@ export class TerminalView implements View {
     patchSession(this.session.id, {}, { osKind: kind }).catch(() => {});
   }
 
+  /** Follow an SSH connection's output: keep its last part for exited(), and
+   * while the login is under way, read it for ssh.exe's questions and warnings.
+   * The login has gone through once the server has spoken since the last
+   * question and the output has settled (a banner can come just before a
+   * password question). */
+  private watchLogin(bytes: Uint8Array) {
+    // Telnet keeps its last output too: its login runs inside the connection.
+    if (this.session.protocol !== "ssh" && this.session.protocol !== "telnet") return;
+    const keep = 4096;
+    if (bytes.length >= keep) this.endBytes = bytes.slice(bytes.length - keep);
+    else {
+      const prev = this.endBytes.subarray(Math.max(0, this.endBytes.length + bytes.length - keep));
+      const next = new Uint8Array(prev.length + bytes.length);
+      next.set(prev);
+      next.set(bytes, prev.length);
+      this.endBytes = next;
+    }
+    if (!this.captureLogin) return;
+    clearTimeout(this.loginTimer);
+    // No login prints this much: the server is plainly talking.
+    this.loginSeen += bytes.length;
+    if (this.loginSeen > 256 * 1024) return this.loginComplete();
+    this.loginText = (this.loginText + this.loginDecoder.decode(bytes, { stream: true })).slice(-8192);
+    const lines = plainLines(this.loginText);
+    if (!this.keyWarned) {
+      const key = unusableKey(lines);
+      if (key) {
+        this.keyWarned = true;
+        this.warnUnusableKey(key);
+      }
+    }
+    if (asksAtEnd(lines)) this.loginAsked = true;
+    else if (loginThrough(lines)) this.loginTimer = window.setTimeout(() => this.loginComplete(), 1500);
+  }
+
+  /** ssh.exe could not use the session's key file and went on to other ways of
+   * logging in, usually a password: say so before a password the user may not
+   * know is guessed at, since a few wrong ones can get the account or address
+   * blocked. */
+  private warnUnusableKey(key: { path: string; why: "missing" | "format" | "permissions" }) {
+    const why = { missing: "키 파일이 없습니다", format: "OpenSSH 형식이 아닙니다", permissions: "다른 사용자도 읽을 수 있는 파일입니다" }[key.why];
+    toast(`키 파일을 쓰지 못했습니다 (${why}): ${userText(key.path)}. 비밀번호를 물어도 모르면 입력하지 마세요. 틀린 비밀번호를 여러 번 넣으면 서버가 접속을 차단할 수 있습니다.`, "warn", 15000);
+  }
+
+  /** The login went through (SSH: see watchLogin; Telnet and serial: once
+   * connected). Only now is the connection established: what needs a logged-in
+   * session starts, and a later drop may auto-reconnect. */
+  private loginComplete() {
+    clearTimeout(this.loginTimer);
+    this.captureLogin = false;
+    if (this.loggedIn || this.disposed || this.state !== "connected") return;
+    this.loggedIn = true;
+    this.loggedInAt = Date.now();
+    this.startMonitor();
+    this.runStartupCommands();
+    // The SFTP browser opens next to a new SSH session (Settings).
+    if (!this.filesOpened && this.session.protocol === "ssh" && state.settings.sftpWithSsh) {
+      this.filesOpened = true;
+      // The file backend connects directly, so a jump-host/gateway session's
+      // SFTP cannot tunnel: say so instead of opening a window that just fails.
+      if (fileTransferBlockedReason(this.session)) toast("점프 호스트·게이트웨이를 쓰는 세션은 SFTP 창을 자동으로 열지 않습니다", "info");
+      else queueMicrotask(() => !this.disposed && this.openFiles(this.session, this));
+    }
+  }
+
+  /** The overlay for a login that failed (wrong credentials or a changed host
+   * key): a manual "reconnect" only, never the automatic countdown, so a wrong
+   * password or key is not sent to the server over and over. */
+  private showLoginFailure(why: "auth" | "hostkey") {
+    this.stopAutoReconnect();
+    if (why === "hostkey") {
+      return this.showOverlay("호스트 키가 바뀌었습니다", "서버의 호스트 키가 알려진 것과 다릅니다. 서버가 교체된 것인지 확인한 뒤 다시 연결하세요. 잘못된 서버일 수 있어 자동으로 다시 연결하지 않습니다.");
+    }
+    const detail = this.session.credentialId
+      ? "사용자 이름과 비밀번호 또는 키가 맞는지 확인하세요. 틀린 로그인 정보로 계속 다시 연결하면 서버가 접속을 차단할 수 있어 자동 재연결을 멈췄습니다."
+      : "이 세션에는 저장된 로그인 정보가 없습니다. 자격 증명 보관함에서 비밀번호나 키를 지정하면 다음부터 묻지 않습니다. 틀린 로그인 정보로 계속 다시 연결하면 서버가 접속을 차단할 수 있어 자동 재연결을 멈췄습니다.";
+    this.showOverlay("로그인하지 못했습니다", detail);
+  }
+
   private decoder = new TextDecoder();
   /** Trigger patterns compiled once and cached by source, so a busy stream does
    *  not rebuild the same regex for every output line. null = malformed pattern. */
@@ -1673,7 +1791,7 @@ export class TerminalView implements View {
   }
 
   private fireTrigger(rule: TriggerRule, line: string) {
-    if (rule.action === "alert") toast(`${this.title()}: ${line.trim().slice(0, 200)}`, "warn", 6000);
+    if (rule.action === "alert") toast(`${userText(this.title())}: ${userText(line.trim().slice(0, 200))}`, "warn", 6000);
     else if (rule.action === "beep") beep();
     else if (rule.action === "send" && rule.value && this.state === "connected") {
       // A send writes to the terminal; its echo and the server's reply can match
@@ -1724,12 +1842,39 @@ export class TerminalView implements View {
     if (id === this.runtimeId) this.stopPaste(true);
     if (id !== this.runtimeId) return;
     this.stopMonitor();
+    clearTimeout(this.loginTimer);
     this.setState("closed");
     this.term.write(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
     // A serial line ends with an error only when the port went away.
     if (code && this.waitForPort("연결이 끊어졌습니다.")) return;
-    // SSH/Telnet dropped unexpectedly (non-zero exit): reconnect on its own.
-    if (code && this.scheduleAutoReconnect()) return;
+    if (this.session.protocol === "ssh" && code) {
+      const lines = plainLines(new TextDecoder().decode(this.endBytes));
+      // A login that failed (wrong credentials, or a changed host key) must not
+      // auto-reconnect: retrying the same login only gets the account or IP blocked.
+      const failure = loginFailure(lines);
+      if (failure) return this.showLoginFailure(failure);
+      // Ended after a password (passphrase, host key) question and before the
+      // login went through: reconnecting would only ask, or try, again.
+      if (this.loginAsked && !this.loggedIn && !loginThrough(lines)) {
+        return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
+      }
+    }
+    // A Telnet login runs inside the connection, so only its last output tells:
+    // a broken connection is reconnected when that was the device's own prompt,
+    // not a login question or a failed login (a device that resets the
+    // connection after wrong passwords must not be sent them again).
+    if (this.session.protocol === "telnet" && code) {
+      const lines = plainLines(new TextDecoder().decode(this.endBytes));
+      if (loginFailure(lines)) return this.showLoginFailure("auth");
+      if (!loginThrough(lines)) {
+        return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
+      }
+    }
+    // Dropped unexpectedly: reconnect on its own. ssh.exe ends with 255 when the
+    // connection fails or is lost; any other code is the exit status of the
+    // remote shell, which the user ended.
+    const dropped = this.session.protocol === "ssh" ? code === 255 : code !== 0;
+    if (dropped && this.scheduleAutoReconnect()) return;
     this.showOverlay("연결이 종료되었습니다", "다시 연결하거나 탭을 닫을 수 있습니다.");
   }
 
@@ -1740,6 +1885,10 @@ export class TerminalView implements View {
   private scheduleAutoReconnect(): boolean {
     const p = this.session.protocol;
     if ((p !== "ssh" && p !== "telnet") || this.closing || this.disposed || this.reDeclined || !state.settings.autoReconnect) return false;
+    // A session that ran for a while before it dropped starts the backoff over;
+    // one that keeps ending at once (a server that is down, or that hangs up
+    // right after the login) is retried less and less often.
+    if (this.loggedInAt && Date.now() - this.loggedInAt >= 60_000) this.reAttempts = 0;
     const delays = [2, 4, 8, 15, 30];
     let left = delays[Math.min(this.reAttempts, delays.length - 1)];
     this.reAttempts++;
@@ -1837,20 +1986,8 @@ export class TerminalView implements View {
   }
 
   private setState(s: ViewState) {
-    if (s === "connected" && this.state !== "connected") {
-      queueMicrotask(() => this.startMonitor());
-      // A successful connection clears the backoff and runs startup commands.
-      this.reAttempts = 0;
-      this.runStartupCommands();
-    }
-    // The SFTP browser opens next to a new SSH session (Settings).
-    if (s === "connected" && this.state !== "connected" && !this.filesOpened && this.session.protocol === "ssh" && state.settings.sftpWithSsh) {
-      this.filesOpened = true;
-      // The file backend connects directly, so a jump-host/gateway session's
-      // SFTP cannot tunnel: say so instead of opening a window that just fails.
-      if (fileTransferBlockedReason(this.session)) toast("점프 호스트·게이트웨이를 쓰는 세션은 SFTP 창을 자동으로 열지 않습니다", "info");
-      else queueMicrotask(() => !this.disposed && this.openFiles(this.session, this));
-    }
+    // Telnet and serial are logged in once connected (SSH: watchLogin).
+    if (s === "connected" && this.state !== "connected" && this.session.protocol !== "ssh") queueMicrotask(() => this.loginComplete());
     this.state = s;
     const label: Record<ViewState, string> = {
       connecting: "연결 중",
@@ -2090,8 +2227,8 @@ export class TerminalView implements View {
       const ok = await confirmDialog({
         title: file ? "텍스트 파일 보내기" : "여러 줄 붙여넣기",
         icon: "ClipboardPaste",
-        message: `<p><b>${esc(`${lines.length}줄을 보냅니다: ${this.title()}`)}</b></p>
-          ${file ? `<p class="muted small">${esc(`파일: ${file}`)}</p>` : ""}
+        message: `<p><b>${esc(`${lines.length}줄을 보냅니다: ${userText(this.title())}`)}</b></p>
+          ${file ? `<p class="muted small">${esc(`파일: ${userText(file)}`)}</p>` : ""}
           <pre class="paste-preview" data-i18n-skip>${preview}${lines.length > 6 ? "\n…" : ""}</pre>
           ${how ? `<p class="muted small">${how}</p>` : ""}`,
         confirm: "보내기",
@@ -2267,6 +2404,7 @@ export class TerminalView implements View {
     this.closing = true;
     this.stopAutoReconnect();
     clearTimeout(this.notifyTimer);
+    clearTimeout(this.loginTimer);
     this.stopPortWait();
     this.resizer.disconnect();
     clearInterval(this.blinkTimer);

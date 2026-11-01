@@ -16,7 +16,8 @@ import {
   type ActionDef,
 } from "./keymap";
 import { state, subscribe, updateSettings } from "./store";
-import { confirmDialog, esc, modal, toast } from "./ui";
+import { confirmDialog, esc, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { tr, userText } from "./i18n";
 
 const kbd = (chord: string) => chord.split("+").map((k) => `<kbd>${esc(k)}</kbd>`).join("+");
 const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -57,17 +58,22 @@ export function openShortcuts() {
   const list = m.root.querySelector<HTMLElement>(".shortcuts-list")!;
   const search = m.root.querySelector<HTMLInputElement>(".shortcuts-search")!;
 
-  const matchesFilter = (a: ActionDef) => {
-    if (!filter) return true;
-    const f = filter.toLowerCase();
-    return a.label.toLowerCase().includes(f) || (a.note ?? "").toLowerCase().includes(f) || bindings(a.id).some((k) => k.toLowerCase().includes(f));
-  };
+  /** A label put into a message: a user's snippet name kept as written. */
+  const shownLabel = (a: ActionDef) => (a.userLabel ? userText(a.label) : a.label);
+
+  // Searched as shown too: app labels and notes appear translated ("copy"
+  // finds "복사" in English); a user's snippet name only as written.
+  const matchesFilter = (a: ActionDef) =>
+    matchesTerms(
+      [a.label, a.userLabel ? "" : tr(a.label), a.note ?? "", a.note ? tr(a.note) : "", ...bindings(a.id)].join(" ").toLowerCase(),
+      searchTerms(filter),
+    );
 
   const row = (a: ActionDef) => {
     const keys = bindings(a.id);
     const changed = !same(keys, a.keys);
     return `<tr data-id="${esc(a.id)}"${changed ? ' class="changed"' : ""}>
-        <td class="sc-label"><span>${esc(a.label)}</span>${a.note ? `<small class="muted">${esc(a.note)}</small>` : ""}</td>
+        <td class="sc-label"><span${a.userLabel ? " data-i18n-skip" : ""}>${esc(a.label)}</span>${a.note ? `<small class="muted">${esc(a.note)}</small>` : ""}</td>
         <td class="sc-keys"><div class="sc-chips">${keys.map((k) => `<span class="sc-chip">${kbd(k)}<button type="button" class="icon-btn" data-remove="${esc(k)}" title="이 키 빼기">${icon("X", 12)}</button></span>`).join("") || `<span class="muted small">없음</span>`}</div></td>
         <td class="sc-acts">
           <button type="button" class="btn btn-sm" data-add>${capturing === a.id ? "키를 누르세요… (Esc: 취소)" : `${icon("Plus", 13)}키 추가`}</button>
@@ -104,7 +110,7 @@ export function openShortcuts() {
   };
 
   const render = () => {
-    const fixed = FIXED.filter((f) => !filter || f.label.toLowerCase().includes(filter.toLowerCase()) || f.keys.toLowerCase().includes(filter.toLowerCase()));
+    const fixed = FIXED.filter((f) => matchesTerms(`${f.label} ${tr(f.label)} ${f.keys}`.toLowerCase(), searchTerms(filter)));
     const open = new Set([...list.querySelectorAll<HTMLDetailsElement>("details.sc-group[open] summary")].map((s) => s.firstChild?.textContent?.trim()));
     list.innerHTML =
       SCOPES.map(({ scope, label }) => section(label, ACTIONS.filter((a) => a.scope === scope))).join("") +
@@ -112,7 +118,7 @@ export function openShortcuts() {
       (fixed.length
         ? `<h4>바꿀 수 없는 키</h4><table class="shortcut-table fixed"><tbody>${fixed.map((f) => `<tr><td class="sc-label">${esc(f.label)}</td><td class="sc-keys">${f.keys.split(" ").map((k) => (k.includes("+") ? kbd(k) : `<kbd>${esc(k)}</kbd>`)).join(" ")}</td><td></td></tr>`).join("")}</tbody></table>`
         : "") ||
-      `<p class="muted">"${esc(filter)}"와 일치하는 단축키가 없습니다.</p>`;
+      `<p class="muted">"${esc(userText(filter))}"와 일치하는 단축키가 없습니다.</p>`;
     list.querySelectorAll<HTMLDetailsElement>("details.sc-group").forEach((d) => {
       if (open.has(d.querySelector("summary")?.firstChild?.textContent?.trim())) d.open = true;
     });
@@ -142,7 +148,7 @@ export function openShortcuts() {
       const ok = await confirmDialog({
         title: "이미 쓰는 단축키",
         icon: "Keyboard",
-        message: esc(`${chord}는 지금 ${others.map((o) => o.label).join(", ")}에 쓰이고 있습니다. 그 동작에서 빼고 ${def.label}에 지정할까요?`),
+        message: esc(`${chord}는 지금 ${others.map(shownLabel).join(", ")}에 쓰이고 있습니다. 그 동작에서 빼고 ${shownLabel(def)}에 지정할까요?`),
         confirm: "옮기기",
       });
       if (!ok) return;
@@ -165,7 +171,7 @@ export function openShortcuts() {
     const remove = target.closest<HTMLElement>("[data-remove]")?.dataset.remove;
     if (remove) return setKeys(def, bindings(def.id).filter((k) => k !== remove));
     if (target.closest("[data-default]")) {
-      const taken = def.keys.flatMap((k) => conflicts(def.id, k).map((o) => `${k} (${o.label})`));
+      const taken = def.keys.flatMap((k) => conflicts(def.id, k).map((o) => `${k} (${shownLabel(o)})`));
       if (taken.length) toast(`기본 키가 다른 동작에도 지정되어 있습니다: ${taken.join(", ")}`, "warn", 6000);
       return setKeys(def, def.keys);
     }

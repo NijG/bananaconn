@@ -6,7 +6,7 @@ import { api, pickOpenFile, type Credential } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
-import { confirmDialog, errorText, esc, listKeys, modal, toast } from "./ui";
+import { confirmDialog, errorText, esc, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
 
 /** A strong random password: at least one upper, lower, digit and symbol, the
  * rest mixed, shuffled. Ambiguous characters (O/0, l/1) are left out. */
@@ -55,10 +55,7 @@ export function openVault(): Promise<void> {
     /** Search terms: each must appear in the name or user name. */
     let terms: string[] = [];
     const renderList = () => {
-      const items = state.credentials.filter((c) => {
-        const hay = `${c.name} ${c.username}`.toLowerCase();
-        return terms.every((t) => hay.includes(t));
-      });
+      const items = state.credentials.filter((c) => matchesTerms(`${c.name} ${c.username}`.toLowerCase(), terms));
       listEl.innerHTML = items.length
         ? items
             .map(
@@ -176,7 +173,7 @@ export function openVault(): Promise<void> {
         const used = state.sessions.filter((s) => s.credentialId === c.id).length;
         const ok = await confirmDialog({
           title: "자격 증명 삭제",
-          message: `<b>${esc(c.name)}</b>을(를) 삭제합니다.${used ? `<br>이 자격 증명을 쓰는 세션 ${used}개는 접속할 때 직접 입력하게 됩니다.` : ""}${
+          message: `<b data-i18n-skip>${esc(c.name)}</b>을(를) 삭제합니다.${used ? `<br>이 자격 증명을 쓰는 세션 ${used}개는 접속할 때 직접 입력하게 됩니다.` : ""}${
             isKey ? "<br>키 파일 자체는 삭제하지 않습니다." : ""
           }`,
           confirm: "삭제",
@@ -238,7 +235,7 @@ export function openVault(): Promise<void> {
 
     listKeys(search, listEl, "[data-id]");
     search.addEventListener("input", () => {
-      terms = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+      terms = searchTerms(search.value);
       renderList();
     });
     m.root.querySelector("[data-new]")!.addEventListener("click", () => {

@@ -9,9 +9,10 @@ import { actionFor } from "../keymap";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials } from "../store";
-import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, modal, promptDialog, toast, setPressed } from "../ui";
+import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
+import { userText } from "../i18n";
 
 type Side = "local" | "remote";
 type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean; trustedCert?: string };
@@ -88,6 +89,8 @@ class Pane {
   private sortKey: SortKey = "name";
   private sortDir = 1;
   private listEl: HTMLElement;
+  /** Redraws the visible rows when the list is resized; ended by dispose(). */
+  private resizer: ResizeObserver;
   private redrawQueued = false;
   private pathInput: HTMLInputElement;
   private filterInput: HTMLInputElement;
@@ -142,7 +145,8 @@ class Pane {
       });
     };
     this.listEl.addEventListener("scroll", redraw, { passive: true });
-    new ResizeObserver(redraw).observe(this.listEl);
+    this.resizer = new ResizeObserver(redraw);
+    this.resizer.observe(this.listEl);
     this.pathInput = this.el.querySelector(".path-input")!;
     this.filterInput = this.el.querySelector(".pane-filter input")!;
     this.syncHiddenButton();
@@ -224,14 +228,9 @@ class Pane {
 
   /** Entries after the hidden-file and name filters. */
   private visible(): FileEntry[] {
-    // Every whitespace-separated term must appear ("log 2025" finds
-    // "app-2025-10.log"), like the session and command-palette searches.
-    const terms = this.filter.toLowerCase().split(/\s+/).filter(Boolean);
-    return this.entries.filter((e) => {
-      if (!Pane.showHidden && e.name.startsWith(".")) return false;
-      const name = e.name.toLowerCase();
-      return terms.every((t) => name.includes(t));
-    });
+    // "log 2025" finds "app-2025-10.log", as the session searches match.
+    const terms = searchTerms(this.filter);
+    return this.entries.filter((e) => (Pane.showHidden || !e.name.startsWith(".")) && matchesTerms(e.name.toLowerCase(), terms));
   }
 
   syncHiddenButton() {
@@ -280,7 +279,7 @@ class Pane {
   private rowHtml(e: FileEntry): string {
     const ico = e.isDir ? (this.path === "" && this.side === "local" ? "HardDrive" : "Folder") : "File";
     return `<div class="file-row${this.selected.has(e.path) ? " selected" : ""}${e.isDir ? " dir" : ""}" draggable="true" data-path="${esc(e.path)}">
-          <span class="fname">${icon(ico, 15)}<span>${esc(e.name)}</span>${e.isLink ? `<em>링크</em>` : ""}</span>
+          <span class="fname">${icon(ico, 15)}<span data-i18n-skip>${esc(e.name)}</span>${e.isLink ? `<em>링크</em>` : ""}</span>
           <span class="fsize">${e.isDir ? "" : formatBytes(e.size)}</span>
           <span class="fdate">${formatDate(e.modified)}</span>
           ${this.side === "remote" ? `<span class="fperm">${esc(e.perm ?? "")}</span>` : ""}
@@ -359,6 +358,11 @@ class Pane {
     // A remote text file opens in the built-in editor.
     else if (this.side === "remote" && entry.size <= EDITOR_MAX) this.owner.openEditor(entry);
     else this.owner.send(this.side, [entry]);
+  }
+
+  /** The tab is closing: stop watching the list's size. */
+  dispose() {
+    this.resizer.disconnect();
   }
 
   private wire() {
@@ -541,7 +545,7 @@ class Pane {
     // case, but renaming a file to a different case of its own name is fine).
     const key = (n: string) => (this.side === "local" ? n.toLowerCase() : n);
     if (this.entries.some((e) => e.path !== entry.path && key(e.name) === key(name)))
-      return toast(`같은 이름(${name})이 이미 있습니다`, "warn");
+      return toast(`같은 이름(${userText(name)})이 이미 있습니다`, "warn");
     try {
       await this.op("rename", entry.path, this.join(this.parent(entry.path), name));
       await this.refresh();
@@ -555,9 +559,13 @@ class Pane {
     const dirs = entries.filter((e) => e.isDir).length;
     const ok = await confirmDialog({
       title: "삭제",
-      message: `${entries.length === 1 ? `<b>${esc(entries[0].name)}</b>` : `${entries.length}개 항목`}을(를) 영구히 삭제합니다.${
+      message: `${entries.length === 1 ? `<b data-i18n-skip>${esc(entries[0].name)}</b>` : `${entries.length}개 항목`}을(를) 영구히 삭제합니다.${
         dirs ? "<br>폴더는 안의 내용까지 모두 삭제됩니다." : ""
-      }<br>${this.side === "remote" ? "서버" : "내 PC"}에서 삭제하며 되돌릴 수 없습니다.`,
+      }<br>${
+        // Whole sentences, not "{0}에서 …" with the place filled in: a
+        // translated place cannot take the case or article the sentence needs.
+        this.side === "remote" ? "서버에서 삭제하며 되돌릴 수 없습니다." : "내 PC에서 삭제하며 되돌릴 수 없습니다."
+      }`,
       confirm: "삭제",
       danger: true,
     });
@@ -738,7 +746,7 @@ export class FilesView implements View, EditorHost {
       // Watch only once the editor actually opened; a failed open leaves nothing behind.
       if (this.disposed) throw new Error("탭이 닫혔습니다");
       this.editing.push({ remote: entry.path, local, name: entry.name, mtime, pending: 0, upload: null, stopping: false, failedAt: 0 });
-      toast(`${entry.name} 을(를) 열었습니다. 저장하면 서버에 자동으로 올립니다.`, "success", 5000);
+      toast(`${userText(entry.name)} 을(를) 열었습니다. 저장하면 서버에 자동으로 올립니다.`, "success", 5000);
       this.renderEditing();
       this.ensureEditTimer();
     } catch (err) {
@@ -790,12 +798,12 @@ export class FilesView implements View, EditorHost {
           w.mtime = mtime;
           w.failedAt = 0;
           if (this.disposed) return;
-          toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
+          toast(`${userText(w.name)} 변경 내용을 서버에 저장했습니다`, "success");
           this.remotePane.refresh();
         } catch (err) {
           // Retried on the next poll; report each failing version only once.
           if (w.failedAt !== mtime && !this.disposed && this.state === "connected")
-            toast(`${w.name} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있으며 다시 시도합니다)`, "error", 8000);
+            toast(`${userText(w.name)} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있으며 다시 시도합니다)`, "error", 8000);
           w.failedAt = mtime;
         } finally {
           w.upload = null;
@@ -824,7 +832,7 @@ export class FilesView implements View, EditorHost {
         const choice = await choiceDialog({
           title: "올리지 않은 변경이 있습니다",
           icon: "TriangleAlert",
-          message: `<b>${esc(w.name)}</b>에 서버로 아직 올리지 않은 변경이 있습니다. 감시를 끝내면 내 PC의 임시 파일도 지워집니다.`,
+          message: `<b data-i18n-skip>${esc(w.name)}</b>에 서버로 아직 올리지 않은 변경이 있습니다. 감시를 끝내면 내 PC의 임시 파일도 지워집니다.`,
           choices: [
             ...(this.state === "connected" ? [{ value: "upload", label: "올리고 끝내기" }] : []),
             { value: "discard", label: "버리고 끝내기", kind: "danger" as const },
@@ -834,10 +842,10 @@ export class FilesView implements View, EditorHost {
         if (choice === "upload") {
           try {
             await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
-            toast(`${w.name} 변경 내용을 서버에 저장했습니다`, "success");
+            toast(`${userText(w.name)} 변경 내용을 서버에 저장했습니다`, "success");
             this.remotePane.refresh();
           } catch (err) {
-            return toast(`${w.name} 업로드 실패: ${errorText(err)} (감시를 계속합니다)`, "error", 8000);
+            return toast(`${userText(w.name)} 업로드 실패: ${errorText(err)} (감시를 계속합니다)`, "error", 8000);
           }
         }
       }
@@ -866,7 +874,7 @@ export class FilesView implements View, EditorHost {
     box.hidden = !this.editing.length;
     box.innerHTML = this.editing
       .map(
-        (w) => `<span class="edit-chip" title="${esc(w.remote)}">${icon("ExternalLink", 13)}${esc(w.name)}
+        (w) => `<span class="edit-chip" title="${esc(w.remote)}">${icon("ExternalLink", 13)}<span data-i18n-skip>${esc(w.name)}</span>
           <button class="tool" data-stop="${esc(w.remote)}" title="편집 감시 끝내기">${icon("X", 12)}</button></span>`,
       )
       .join("");
@@ -979,7 +987,7 @@ export class FilesView implements View, EditorHost {
         title: "신뢰할 수 없는 서버 인증서",
         icon: "ShieldAlert",
         danger: true,
-        message: `<b>${esc(this.session.host)}</b> 서버의 TLS 인증서를 Windows가 신뢰하지 않습니다.<br><br>
+        message: `<b data-i18n-skip>${esc(this.session.host)}</b> 서버의 TLS 인증서를 Windows가 신뢰하지 않습니다.<br><br>
           서버가 보낸 인증서 지문 (SHA-256):<br><code class="fp">${esc(fp || detail)}</code><br><br>
           서버 관리자가 알려 준 지문과 같은지 확인한 다음 신뢰하세요. 내부망의 자체 서명 인증서 서버라면 계속해도 되지만,
           인터넷 서버라면 중간자 공격일 수 있습니다. 신뢰하면 이 지문의 인증서만 다음 접속에서 자동으로 허용합니다.`,
@@ -999,7 +1007,7 @@ export class FilesView implements View, EditorHost {
       const ok = await confirmDialog({
         title: "처음 접속하는 서버",
         icon: "ShieldCheck",
-        message: `<b>${esc(this.session.host)}</b> 서버의 호스트 키를 아직 신뢰한 적이 없습니다.<br><br>
+        message: `<b data-i18n-skip>${esc(this.session.host)}</b> 서버의 호스트 키를 아직 신뢰한 적이 없습니다.<br><br>
           지문: <code class="fp">${esc(fp)}</code><br><br>
           서버 관리자가 알려 준 지문과 같은지 확인한 다음 신뢰하세요. 신뢰하면 <code>~/.ssh/known_hosts</code>에 기록됩니다.`,
         confirm: "신뢰하고 연결",
@@ -1013,7 +1021,7 @@ export class FilesView implements View, EditorHost {
       modal({
         title: "호스트 키가 바뀌었습니다",
         icon: "ShieldAlert",
-        body: `<p class="modal-text danger-text"><b>${esc(this.session.host)}</b> 서버가 이전과 다른 호스트 키를 보냈습니다.
+        body: `<p class="modal-text danger-text"><b data-i18n-skip>${esc(this.session.host)}</b> 서버가 이전과 다른 호스트 키를 보냈습니다.
           중간자 공격일 수 있으므로 연결을 차단했습니다.<br><br>새 지문: <code class="fp">${esc(fp)}</code><br><br>
           서버를 다시 설치했거나 키를 교체한 것이 확실하다면, <code>~/.ssh/known_hosts</code>에서 이 서버의 줄을 지운 다음 다시 연결하세요.</p>`,
         footer: `<button class="btn btn-primary" data-close>확인</button>`,
@@ -1135,7 +1143,7 @@ export class FilesView implements View, EditorHost {
     if (to === "local") {
       const unsafe = entries.filter((e) => !isSafeLocalName(e.name));
       if (unsafe.length) {
-        toast(`Windows에 저장할 수 없는 이름 ${unsafe.length}개를 건너뜁니다: ${unsafe.slice(0, 3).map((u) => u.name).join(", ")}`, "warn", 6000);
+        toast(`Windows에 저장할 수 없는 이름 ${unsafe.length}개를 건너뜁니다: ${userText(unsafe.slice(0, 3).map((u) => u.name).join(", "))}`, "warn", 6000);
         entries = entries.filter((e) => isSafeLocalName(e.name));
         if (!entries.length) return;
       }
@@ -1153,7 +1161,7 @@ export class FilesView implements View, EditorHost {
       return false;
     });
     if (dupes.length) {
-      toast(`대소문자만 다른 같은 이름 ${dupes.length}개를 건너뜁니다: ${dupes.slice(0, 3).map((d) => d.name).join(", ")}`, "warn", 6000);
+      toast(`대소문자만 다른 같은 이름 ${dupes.length}개를 건너뜁니다: ${userText(dupes.slice(0, 3).map((d) => d.name).join(", "))}`, "warn", 6000);
       const drop = new Set(dupes);
       entries = entries.filter((e) => !drop.has(e));
     }
@@ -1166,11 +1174,11 @@ export class FilesView implements View, EditorHost {
     );
     const clashes = entries.filter((e) => existing.has(key(e.name)) || queuedHere.has(key(dest.join(destDir, e.name))));
     if (clashes.length) {
-      const list = clashes.slice(0, 6).map((c) => `<li>${esc(c.name)}${c.isDir ? " (폴더 — 안의 같은 파일을 덮어씀)" : ""}</li>`).join("");
+      const list = clashes.slice(0, 6).map((c) => `<li><span data-i18n-skip>${esc(c.name)}</span>${c.isDir ? " (폴더 — 안의 같은 파일을 덮어씀)" : ""}</li>`).join("");
       const choice = await choiceDialog({
         title: "같은 이름이 이미 있습니다",
         icon: "TriangleAlert",
-        message: `${to === "local" ? "내 PC" : "서버"}의 <b>${esc(destDir)}</b> 에 같은 이름 ${clashes.length}개가 있습니다.
+        message: `${to === "local" ? "내 PC" : "서버"}의 <b data-i18n-skip>${esc(destDir)}</b> 에 같은 이름 ${clashes.length}개가 있습니다.
           <ul class="clash-list">${list}${clashes.length > 6 ? `<li>외 ${clashes.length - 6}개</li>` : ""}</ul>`,
         choices: [
           ...(clashes.length < entries.length ? [{ value: "skip", label: "겹치는 항목 건너뛰기" }] : []),
@@ -1308,7 +1316,7 @@ export class FilesView implements View, EditorHost {
       j.el.dataset.job = j.id;
       j.el.className = `job job-${j.status}`;
       j.el.innerHTML = `${icon(j.direction === "download" ? "Download" : "Upload", 15)}
-        <div class="job-main"><div class="job-name">${esc(j.name)}${j.isDir ? " (폴더)" : ""}</div>
+        <div class="job-main"><div class="job-name"><span data-i18n-skip>${esc(j.name)}</span>${j.isDir ? " (폴더)" : ""}</div>
           <div class="job-bar"><i></i></div>
           <div class="job-status"></div></div>
         ${j.status === "running" || j.status === "queued" ? `<button class="tool" data-cancel title="취소">${icon("X", 14)}</button>` : ""}`;
@@ -1343,6 +1351,8 @@ export class FilesView implements View, EditorHost {
   dispose() {
     this.disposed = true;
     if (this.editTimer) clearInterval(this.editTimer);
+    this.localPane.dispose();
+    this.remotePane.dispose();
     // An upload still reading the temp file finishes (or fails) before it goes.
     // A watch being stopped owns its own cleanup (its dialog may still be open
     // and about to upload), so releasing its temp here would pull the file out

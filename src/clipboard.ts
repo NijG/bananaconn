@@ -2,14 +2,21 @@
 // reads never depend on WebView clipboard-permission prompts.
 
 import { isTauri } from "./api";
+import { holdsSecret } from "./cmdLine";
 
 // ---- clipboard history (this PC only) ------------------------------------------
 // Recent copies, newest first, so the user can paste something copied earlier.
-// Kept in localStorage; capped and de-duplicated. Very large copies are skipped.
+// Kept in localStorage; capped and de-duplicated. Very large copies are skipped,
+// and so is text with a password or token in a line of it (a command copied
+// from the terminal such as "mysql -pS3cret"): the history would otherwise
+// keep it on disk and show it in the picker. The same rules as the command
+// history (cmdLine.holdsSecret).
 
 const HIST_KEY = "bx.clipHistory";
 const HIST_MAX = 30;
 const HIST_ITEM_MAX = 100_000;
+
+const secretIn = (text: string) => text.split(/\r?\n/).some(holdsSecret);
 
 function loadHistory(): string[] {
   try {
@@ -20,9 +27,18 @@ function loadHistory(): string[] {
   }
 }
 let history: string[] = loadHistory();
+// Entries kept by an earlier version that hold a secret leave the store too.
+if (history.some(secretIn)) {
+  history = history.filter((t) => !secretIn(t));
+  try {
+    localStorage.setItem(HIST_KEY, JSON.stringify(history));
+  } catch {
+    // best-effort
+  }
+}
 
 function record(text: string) {
-  if (!text || text.length > HIST_ITEM_MAX) return;
+  if (!text || text.length > HIST_ITEM_MAX || secretIn(text)) return;
   history = [text, ...history.filter((t) => t !== text)].slice(0, HIST_MAX);
   try {
     localStorage.setItem(HIST_KEY, JSON.stringify(history));

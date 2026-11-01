@@ -20,7 +20,7 @@ export const SECTIONS: HelpSection[] = [
         <li>串口请输入 <code>COM3</code> 或 <code>COM3:115200</code>。</li>
       </ol>
       <h4>保存为会话</h4>
-      <p>使用会话列表中的 ${icon("Plus", 13)} 按钮 (${kbd("Ctrl+Shift+N")}) 保存连接信息，之后双击或按 ${kbd("Enter")} 即可连接。在其他程序中保存的连接可以通过<a data-goto="import">导入</a>一次性迁移过来。在会话编辑窗口中点击 <b>测试连接</b>，可在保存前确认主机端口是否开放。已保存的会话可从右键菜单测试，多个会话或整个文件夹可选中后或右键文件夹一次性测试。</p>
+      <p>使用会话列表中的 ${icon("Plus", 13)} 按钮 (${kbd("Ctrl+Shift+N")}) 保存连接信息，之后双击或按 ${kbd("Enter")} 即可连接。在其他程序中保存的连接可以通过<a data-goto="import">导入</a>一次性迁移过来。在会话编辑窗口中点击 <b>测试连接</b>，可在保存前确认主机端口是否开放。已保存的会话可从右键菜单测试，多个会话或整个文件夹可选中后或右键文件夹一次性测试。在结果窗口中可以只重新检查失败的会话或复制结果，双击某一行（或选中后按 Enter）即可直接连接该会话。</p>
       <h4>界面语言</h4>
       <p>设置顶部的<b>语言</b>可将界面切换为 한국어、English、日本語、简体中文、繁體中文、Tiếng Việt、Español、Français 或 Deutsch (立即生效，不会断开连接；指南和更新说明也会随之切换)。在您选择之前，应用跟随 Windows 显示语言；一旦选择，始终以您的选择为准。</p>`,
   },
@@ -44,16 +44,16 @@ export const SECTIONS: HelpSection[] = [
     title: "从其他程序导入",
     icon: "Download",
     body: `
-      <p>通过会话列表上方的 ${icon("Download", 13)} 按钮选择。导入前会显示预览列表，已存在的会话会被跳过。<b>不会导入密码</b> (各程序使用自己的密钥加密)。请在首次连接时输入，或从凭据库中分配。</p>
+      <p>通过会话列表上方的 ${icon("Download", 13)} 按钮选择。导入前会显示预览列表，已存在的会话会被跳过。<b>不会导入密码</b> (各程序使用自己的密钥加密)。请在首次连接时输入，或从凭据库中分配。以公钥登录的会话会将其密钥文件关联到凭据库，找不到或无法使用的密钥文件会在导入前提示。</p>
       <table class="help-table">
         <tr><th>程序</th><th>选择内容</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (便携版：位于可执行文件旁)</td></tr>
-        <tr><td>SecureCRT</td><td>会话文件夹 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包括文件夹结构、日志文件名和自动日志设置)，或通过 文件 → 导出设置 生成的 XML</td></tr>
+        <tr><td>SecureCRT</td><td>会话文件夹 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包括文件夹结构、日志文件名、自动日志设置以及公钥登录使用的密钥文件)，或通过 文件 → 导出设置 生成的 XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (如果开启了整个文件加密，请先关闭并保存)</td></tr>
         <tr><td>PuTTY · KiTTY</td><td>直接读取本机设置</td></tr>
         <tr><td>WinSCP</td><td>本机设置，没有时选择 <code>WinSCP.ini</code></td></tr>
         <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 文件夹</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 文件（Host、HostName、User、Port、ProxyJump；跳过 <code>Host *</code> 等通配符）</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 文件（Host、HostName、User、Port、ProxyJump、IdentityFile；与 ssh 相同，应用所有匹配的 Host 块，先出现的值优先；<code>Host *</code> 等通配符只提供默认值，不创建会话）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 文件</td></tr>
         <tr><td>远程桌面</td><td>包含 <code>.rdp</code> 文件的文件夹 (包括子文件夹)</td></tr>
         <tr><td>CSV</td><td>第一行为列名：Name, Protocol, Host, Port, Username, Folder, Domain (以逗号、分号或制表符分隔)。同一菜单中的 <b>导出会话列表 (CSV)</b> 按此格式写出。</td></tr>
@@ -89,6 +89,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>渲染</b> (设置 → 终端)：“自动”在有显卡的电脑上使用 GPU (WebGL) 绘制，加快大量输出；在没有显卡的服务器和远程会话中使用标准渲染器。只有屏幕上可见的终端才使用 GPU。</li>
         <li><b>片段 &amp; 宏</b>：将常用命令保存在工具栏的“片段”中，使用“录制”捕获输入并回放。</li>
         <li><b>文件</b> (SSH)：工具栏中的“文件”按钮会在旁边打开同一服务器的 SFTP 窗格。</li>
+        <li><b>自动重连</b> (可在设置中关闭)：已登录的 SSH 或 Telnet 会话断开时，稍等片刻后重新连接，持续失败时等待时间会逐渐变长。登录失败或在登录过程中断开的连接不会重连：用错误的密码反复连接可能导致服务器阻止您连接。</li>
       </ul>`,
   },
   {
@@ -237,7 +238,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>凭据库</b> (顶部的钥匙按钮)：将密码和 SSH 密钥保存在 Windows 凭据管理器中，供会话编辑器使用。已保存的密码绝不会显示在屏幕上。</li>
+        <li><b>凭据库</b> (顶部的钥匙按钮)：将密码和 SSH 密钥保存在 Windows 凭据管理器中，供会话编辑器使用。已保存的密码绝不会显示在屏幕上。密钥可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。</li>
         <li><b>主密码</b> (设置 → 安全)：在启动时以及您离开一段时间后锁定应用。</li>
         <li>SSH/SFTP 主机密钥会与 <code>~/.ssh/known_hosts</code> 进行核对；未知密钥会显示指纹供确认。密钥已更改时会阻止连接。</li>
       </ul>`,

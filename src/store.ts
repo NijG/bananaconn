@@ -48,8 +48,8 @@ export interface Settings {
   /** Wait for a serial port that went away (USB adapter unplugged) or is not
    * there yet, and connect when it shows up. */
   serialAutoReconnect: boolean;
-  /** Auto-reconnect an SSH/Telnet session that drops unexpectedly (with a
-   * short, backing-off, cancellable countdown). */
+  /** Auto-reconnect an SSH or Telnet session that drops unexpectedly after its
+   * login went through (with a short, backing-off, cancellable countdown). */
   autoReconnect: boolean;
   /** Output trigger rules (pattern → alert / beep / auto-response). */
   triggers: TriggerRule[];
