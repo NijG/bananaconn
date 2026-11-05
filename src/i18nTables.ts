@@ -122,9 +122,20 @@ export function translate(t: Tables, text: string, tr: (s: string) => string): s
   const tail = text.match(/\s*$/)![0];
   // "(지원하지 않는 장비입니다)": a phrase in parentheses, often a pattern's value.
   const inner = /^\((.+)\)$/.exec(core)?.[1];
-  const hit = t.exact.get(core) ?? translatePattern(t, core, tr) ?? translateParts(core, tr) ?? (inner && HANGUL.test(inner) ? wrap(translate(t, inner, tr), inner) : undefined);
+  // ": 경고" after "<b>name</b>": a value put right after markup leaves its
+  // text node starting with the separator, which no phrase matches.
+  const after = /^([:,·—]) (.+)$/.exec(core);
+  const hit =
+    t.exact.get(core) ??
+    translatePattern(t, core, tr) ??
+    translateParts(core, tr) ??
+    (inner && HANGUL.test(inner) ? wrap(translate(t, inner, tr), inner) : undefined) ??
+    (after && HANGUL.test(after[2]) ? prefix(after[1], translate(t, after[2], tr), after[2]) : undefined);
   return hit === undefined ? text : lead + hit + tail;
 }
+
+/** The separator back before a translated rest, or undefined when it was not known. */
+const prefix = (sep: string, out: string, rest: string) => (out === rest ? undefined : `${sep} ${out}`);
 
 /** "(…)" around a translated phrase, or undefined when it was not known. */
 const wrap = (out: string, inner: string) => (out === inner ? undefined : `(${out})`);

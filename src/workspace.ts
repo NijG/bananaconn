@@ -7,6 +7,7 @@
 
 import { icon } from "./icons";
 import { PROTOCOLS, type Protocol, type Session } from "./model";
+import { copyAddresses } from "./clipboard";
 import { state, updateSettings } from "./store";
 import { confirmDialog, contextMenu, esc, h, toast } from "./ui";
 
@@ -188,8 +189,8 @@ export class Workspace {
       const ok = await confirmDialog({
         title: warning ? "닫으면 작업이 사라집니다" : "연결된 탭 닫기",
         message: warning
-          ? `<b>${esc(tab.view.title())}</b>: ${esc(warning)}<br>그래도 탭을 닫을까요?`
-          : `<b>${esc(tab.view.title())}</b> 연결이 아직 열려 있습니다. 탭을 닫고 연결을 끊을까요?`,
+          ? `<b data-i18n-skip>${esc(tab.view.title())}</b>: <span>${esc(warning)}</span><br>그래도 탭을 닫을까요?`
+          : `<b data-i18n-skip>${esc(tab.view.title())}</b> 연결이 아직 열려 있습니다. 탭을 닫고 연결을 끊을까요?`,
         confirm: "닫기",
         danger: true,
         // Unsaved work is always asked about; an open connection can stop asking.
@@ -224,21 +225,32 @@ export class Workspace {
   }
 
   async closeOthers(id: string) {
-    const others = this.tabs.filter((t) => t.id !== id);
-    const live = others.filter((t) => t.view.state === "connected" || t.view.closeWarning?.());
+    await this.closeTabs(this.tabs.filter((t) => t.id !== id), "다른 탭 모두 닫기");
+  }
+
+  /** Close the tabs after `id` in the tab bar. */
+  async closeRight(id: string) {
+    const at = this.tabs.findIndex((t) => t.id === id);
+    if (at >= 0) await this.closeTabs(this.tabs.slice(at + 1), "오른쪽 탭 모두 닫기");
+  }
+
+  /** Close several tabs, asking first (titled `title`) when some are
+   * connected or have work left, as closing one tab does. */
+  private async closeTabs(tabs: Tab[], title: string) {
+    const live = tabs.filter((t) => t.view.state === "connected" || t.view.closeWarning?.());
     if (live.length && (state.settings.confirmClose || live.some((t) => t.view.closeWarning?.()))) {
       const ok = await confirmDialog({
-        title: "다른 탭 모두 닫기",
-        message: `연결 중이거나 작업이 남은 탭 ${live.length}개도 닫힙니다.<br><span class="muted">${live
+        title,
+        message: `연결 중이거나 작업이 남은 탭 ${live.length}개도 닫힙니다.<br><span class="muted" data-i18n-skip>${live
           .slice(0, 5)
           .map((t) => esc(t.view.title()))
-          .join(", ")}${live.length > 5 ? " 외" : ""}</span>`,
+          .join(", ")}</span>${live.length > 5 ? ` 외 ${live.length - 5}개` : ""}`,
         confirm: "모두 닫기",
         danger: true,
       });
       if (!ok) return;
     }
-    for (const t of others) await this.close(t.id, true);
+    for (const t of tabs) await this.close(t.id, true);
   }
 
   setLayout(layout: Layout) {
@@ -412,18 +424,26 @@ export class Workspace {
     });
     tab.el.addEventListener("contextmenu", (e) => {
       e.preventDefault();
+      const saved = state.sessions.find((s) => s.id === tab.session.id);
       contextMenu(e.clientX, e.clientY, [
         { label: "다시 연결", icon: "RotateCw", action: () => tab.view.reconnect?.(), disabled: !tab.view.reconnect },
-        { label: "같은 세션 하나 더 열기", icon: "Copy", hint: "더블클릭", action: () => this.duplicateHandler?.(tab.session) },
+        { label: "같은 세션 하나 더 열기", icon: "CopyPlus", hint: "더블클릭", action: () => this.duplicateHandler?.(tab.session) },
+        // The saved session behind the tab (none for a quick connection or one deleted since).
+        { label: "세션 편집…", icon: "Pencil", action: () => saved && this.editHandler?.(saved), disabled: !saved || !this.editHandler },
+        { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([tab.session]) },
         "-",
         { label: "탭 닫기", icon: "X", hint: "Ctrl+F4", action: () => this.close(tab.id) },
         { label: "다른 탭 모두 닫기", icon: "X", action: () => this.closeOthers(tab.id), disabled: this.tabs.length < 2 },
+        { label: "오른쪽 탭 모두 닫기", icon: "X", action: () => this.closeRight(tab.id), disabled: this.tabs.indexOf(tab) === this.tabs.length - 1 },
       ]);
     });
   }
 
   /** Set by the app to reopen a session from the tab menu. */
   duplicateHandler: ((s: Session) => void) | null = null;
+  /** Set by the app to open the session editor from the tab menu. */
+  editHandler: ((s: Session) => void) | null = null;
+
 
   /** Sessions of recently closed tabs, for "reopen closed tab" (Ctrl+Shift+T). */
   private closedStack: Session[] = [];

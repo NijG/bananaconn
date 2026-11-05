@@ -248,7 +248,9 @@ fn open_manifest(app: &AppHandle, src: &Source, credential: Option<&str>) -> Res
         return Err("업데이트 폴더 계정에는 비밀번호 방식 자격 증명을 고르세요".into());
     };
     connect_share(&root, &c.username, &password).map_err(|code| match code {
-        86 | 1326 | 2202 => format!("UPDATE_AUTH::{root}::선택한 NAS 계정({})의 이름이나 비밀번호가 맞지 않습니다", c.username),
+        // BADCRED: the chosen account itself was refused (the app stops sending
+        // it on automatic checks, so a wrong password cannot lock the account).
+        86 | 1326 | 2202 => format!("UPDATE_AUTH::{root}::BADCRED::선택한 NAS 계정({})의 이름이나 비밀번호가 맞지 않습니다", c.username),
         // Windows allows one account per server and user session.
         1219 => format!("UPDATE_AUTH::{root}::이 PC가 이미 다른 계정으로 {root} 에 연결되어 있습니다. 탐색기에서 연결을 끊거나 로그아웃한 뒤 다시 시도하세요"),
         _ => format!("{root} 에 연결할 수 없습니다: {}", std::io::Error::from_raw_os_error(code)),

@@ -9,11 +9,11 @@ import type { PasteEvent } from "../api";
 import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
-import { endpoint, PROTOCOLS, serialSettings, type Session } from "../model";
+import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
 import { addMacro, snippetMenu } from "../snippets";
 import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit, type RiskRule } from "../riskRules";
-import { patchSession, state, subscribe, updateSettings, type Snippet, type TriggerRule } from "../store";
+import { patchSession, state, subscribe, takeSavedSession, updateSettings, type Snippet, type TriggerRule } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
 import { CmdAssist } from "../cmdAssist";
@@ -26,6 +26,7 @@ import { hasRemoteCommands, PROMPT_END, setRemoteCommands } from "../cmdLine";
 import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands";
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
+import { forgetHostKey } from "../hostKeys";
 import { asksAtEnd, loginFailure, loginThrough, plainLines, unusableKey } from "../sshLogin";
 import { tr, userText } from "../i18n";
 import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
@@ -102,6 +103,8 @@ interface SharedMonitor {
   device?: DeviceInfo;
   /** No tab of this device on screen: sampling paused. */
   paused?: boolean;
+  /** The credential of the last start (part of monitorNeedsLogin's key). */
+  credentialId?: string | null;
 }
 
 /** Pause the monitor while none of its tabs is on screen, resume when one is. */
@@ -133,8 +136,18 @@ let webglFailed = false;
 const monitors = new Map<string, SharedMonitor>();
 const monitorsById = new Map<string, SharedMonitor>();
 
+/** Monitors (server, user and credential) whose own login found no usable
+ * key or saved password and asked for one. Kept for the app's run, past the
+ * tabs: a later automatic start (each reconnect) shows the login prompt again
+ * instead of trying the same keys on the server once more; failed key attempts
+ * count toward its limits. The user starts it again from the status bar. */
+const monitorNeedsLogin = new Set<string>();
+const loginKey = (m: SharedMonitor, credentialId: string | null) => `${m.key}|${credentialId ?? ""}`;
+
 function setMonitorInfo(m: SharedMonitor, info: MonitorInfo | null) {
   m.info = info;
+  if (info?.kind === "login") monitorNeedsLogin.add(loginKey(m, m.credentialId ?? null));
+  else if (info?.kind === "stats") monitorNeedsLogin.delete(loginKey(m, m.credentialId ?? null));
   // Only a tab on screen shows the monitor (status bar of the active tab), and
   // all tabs live in one workspace, so one redraw covers them; samples for
   // tabs in the background cost nothing.
@@ -142,6 +155,9 @@ function setMonitorInfo(m: SharedMonitor, info: MonitorInfo | null) {
 }
 
 function failedMonitor(msg: string): MonitorInfo {
+  // An encrypted key without its passphrase: the login prompt's value is used
+  // as the passphrase (remote.rs), checked on this PC.
+  if (msg === "NEED_PASSPHRASE" || msg === "BAD_PASSPHRASE") return { kind: "login", message: msg === "BAD_PASSPHRASE" ? "키 암호가 맞지 않습니다" : "키 암호가 필요합니다" };
   return msg === "NEED_PASSWORD" || msg === "NEED_USERNAME" || /인증에 실패/.test(msg)
     ? { kind: "login", message: /인증에 실패/.test(msg) ? "비밀번호가 올바르지 않습니다" : "", needUser: msg === "NEED_USERNAME" }
     : msg.startsWith("HOSTKEY_UNKNOWN::")
@@ -160,7 +176,7 @@ function nextMonitorInfo(prev: MonitorInfo | null, e: MonitorEvent): MonitorInfo
 /** The server's busiest processes (and file systems), read over the monitor connection. */
 function showTopProcesses(id: string, title: string) {
   const m = modal({
-    title: `${title} · 상위 프로세스`,
+    title: `${userText(title)} · 상위 프로세스`,
     icon: "Activity",
     width: 900,
     body: `<div class="top-view"></div>`,
@@ -558,7 +574,7 @@ export class TerminalView implements View {
       },
     }));
     contextMenu(r.left, r.bottom + 4, [
-      { label: `${deviceTitle(d)}${d.name ? ` · ${d.name}` : ""}`, icon: "Server", disabled: true },
+      { label: `${deviceTitle(d)}${d.name ? ` · ${userText(d.name)}` : ""}`, icon: "Server", disabled: true },
       "-",
       ...(d.backup ? [{ label: "설정 백업 (running-config를 파일로 저장)…", icon: "Save", action: () => this.backupConfig() }] : []),
       ...(d.backup ? [{ label: "설정을 AI로 점검…", icon: "Sparkles", action: () => void this.aiConfigReview() }] : []),
@@ -813,7 +829,8 @@ export class TerminalView implements View {
 
   /** Show the CPU/memory monitor for this server, starting its connection
    * (a second, quiet login) unless another tab already runs it. */
-  async startMonitor(extra: { password?: string; trustedFingerprint?: string; noPassword?: boolean } = {}) {
+  /** `auto`: started by a login going through, not by the user. */
+  async startMonitor(extra: { password?: string; trustedFingerprint?: string; noPassword?: boolean } = {}, auto = false) {
     const proto = this.session.protocol;
     if ((proto !== "ssh" && proto !== "telnet") || !state.settings.remoteMonitor || this.disposed) return;
     if (this.session.options.jumpHost || this.session.options.gateway) {
@@ -837,6 +854,10 @@ export class TerminalView implements View {
     // Another tab's connection is already up (or logging in): just show it.
     const running = m.info?.kind === "stats" || m.info?.kind === "starting";
     if (running && !extra.password && !extra.trustedFingerprint && !extra.noPassword) return this.ws.changed();
+    // An earlier start asked for a login: ask again rather than try once more.
+    const lk = loginKey(m, this.session.credentialId);
+    m.credentialId = this.session.credentialId;
+    if (auto && monitorNeedsLogin.has(lk)) return setMonitorInfo(m, { kind: "login", message: "" });
     setMonitorInfo(m, { kind: "starting" });
     try {
       await api.monitorStart({
@@ -886,9 +907,14 @@ export class TerminalView implements View {
         if (!u?.value.trim()) return;
         sh.user = u.value.trim();
       }
+      // The user's values kept as written in a translated label; "사용자" is app text.
+      const user = this.session.username || sh.user;
+      const who = user ? userText(user) : "사용자";
       const res = await promptDialog({
         title: "리소스 모니터링 로그인",
-        label: `${this.session.username || sh.user || "사용자"}@${this.session.host} 의 비밀번호 (모니터링에만 쓰고 저장하지 않음)`,
+        label: /키 암호/.test(m.message ?? "")
+          ? `${who}@${userText(this.session.host)} 의 개인 키 암호 (모니터링에만 쓰고 저장하지 않음)`
+          : `${who}@${userText(this.session.host)} 의 비밀번호 (모니터링에만 쓰고 저장하지 않음)`,
         type: "password",
         icon: "Activity",
         confirm: "모니터링 시작",
@@ -1399,7 +1425,7 @@ export class TerminalView implements View {
     const res = await promptDialog({ title: "매크로 저장", label: "매크로 이름", icon: "Circle", confirm: "저장", value: `매크로 ${state.snippets.filter((s) => s.macro).length + 1}` });
     if (!res?.value.trim()) return toast("매크로를 저장하지 않았습니다", "info");
     addMacro(res.value.trim(), keys);
-    toast(`매크로 "${res.value.trim()}"를 저장했습니다. 스니펫 메뉴에서 다른 터미널에 재생할 수 있습니다.`, "success", 5000);
+    toast(`매크로 "${userText(res.value.trim())}"를 저장했습니다. 스니펫 메뉴에서 다른 터미널에 재생할 수 있습니다.`, "success", 5000);
   }
 
   /** The host's padding should match the terminal theme's background. */
@@ -1444,11 +1470,11 @@ export class TerminalView implements View {
     // A new TextDecoder so a partial multibyte character left over from a dropped
     // connection does not corrupt the first trigger line of this one.
     this.decoder = new TextDecoder();
-    // A new login, not established until it has gone through (watchLogin; only
-    // ssh prints its questions and failures there: a Telnet bad login re-prompts
-    // instead of ending the connection).
+    // A new login, not established until it has gone through (watchLogin). A
+    // Telnet login runs inside the connection ("Username:", "Password:"), so it
+    // is read from the output the same way; a serial line has no login here.
     this.loginText = "";
-    this.captureLogin = this.session.protocol === "ssh";
+    this.captureLogin = this.session.protocol === "ssh" || this.session.protocol === "telnet";
     this.loginDecoder = new TextDecoder();
     this.loginSeen = 0;
     clearTimeout(this.loginTimer);
@@ -1489,7 +1515,7 @@ export class TerminalView implements View {
         port: tunnelPort ?? this.session.port,
         username: this.session.username,
         credentialId: this.session.credentialId,
-        keepalive: (this.session.options.keepalive as number) || null,
+        keepalive: keepaliveOf(this.session.options),
         jumpHost: String(this.session.options.jumpHost ?? ""),
         forwards: String(this.session.options.forwards ?? ""),
         compression: !!this.session.options.compression,
@@ -1546,6 +1572,7 @@ export class TerminalView implements View {
     }
     this.stopPortWait();
     this.portWaitDeclined = false;
+    if (takeSavedSession(this.session)) this.ws.changed();
     this.stopPaste(true);
     this.stopMonitor();
     if (this.runtimeId) {
@@ -1688,10 +1715,20 @@ export class TerminalView implements View {
    * blocked. */
   private warnUnusableKey(key: { path: string; why: "missing" | "format" | "permissions" }) {
     const why = { missing: "키 파일이 없습니다", format: "OpenSSH 형식이 아닙니다", permissions: "다른 사용자도 읽을 수 있는 파일입니다" }[key.why];
-    toast(`키 파일을 쓰지 못했습니다 (${why}): ${userText(key.path)}. 비밀번호를 물어도 모르면 입력하지 마세요. 틀린 비밀번호를 여러 번 넣으면 서버가 접속을 차단할 수 있습니다.`, "warn", 15000);
+    // A key others can read is fixed in place: once it is, connect again with it.
+    const fix =
+      key.why === "permissions"
+        ? {
+            label: "키 파일 권한 고치기",
+            run: async () => {
+              if ((await (await import("../vault")).protectKeyFile(key.path)) && !this.disposed) this.reconnect();
+            },
+          }
+        : undefined;
+    toast(`키 파일을 쓰지 못했습니다 (${why}): ${userText(key.path)}. 비밀번호를 물어도 모르면 입력하지 마세요. 틀린 비밀번호를 여러 번 넣으면 서버가 접속을 차단할 수 있습니다.`, "warn", fix ? 30000 : 15000, fix);
   }
 
-  /** The login went through (SSH: see watchLogin; Telnet and serial: once
+  /** The login went through (SSH and Telnet: see watchLogin; serial: once
    * connected). Only now is the connection established: what needs a logged-in
    * session starts, and a later drop may auto-reconnect. */
   private loginComplete() {
@@ -1700,7 +1737,7 @@ export class TerminalView implements View {
     if (this.loggedIn || this.disposed || this.state !== "connected") return;
     this.loggedIn = true;
     this.loggedInAt = Date.now();
-    this.startMonitor();
+    this.startMonitor({}, true);
     this.runStartupCommands();
     // The SFTP browser opens next to a new SSH session (Settings).
     if (!this.filesOpened && this.session.protocol === "ssh" && state.settings.sftpWithSsh) {
@@ -1718,13 +1755,51 @@ export class TerminalView implements View {
   private showLoginFailure(why: "auth" | "hostkey") {
     this.stopAutoReconnect();
     if (why === "hostkey") {
-      return this.showOverlay("호스트 키가 바뀌었습니다", "서버의 호스트 키가 알려진 것과 다릅니다. 서버가 교체된 것인지 확인한 뒤 다시 연결하세요. 잘못된 서버일 수 있어 자동으로 다시 연결하지 않습니다.");
+      this.showOverlay("호스트 키가 바뀌었습니다", "서버의 호스트 키가 알려진 것과 다릅니다. 서버가 교체된 것인지 확인한 뒤 다시 연결하세요. 잘못된 서버일 수 있어 자동으로 다시 연결하지 않습니다.");
+      // A reinstalled server: forget the old key; the reconnect then shows the
+      // new fingerprint for approval in the terminal.
+      const row = this.overlay.querySelector(".overlay-card .row");
+      const forget = h("button", { class: "btn" });
+      forget.innerHTML = `${icon("ShieldAlert", 15)}저장된 키 지우기`;
+      forget.addEventListener("click", async () => {
+        if ((await forgetHostKey(this.session.host, this.session.port || 22, this.session.username)) && !this.disposed) this.reconnect();
+      });
+      row?.insertBefore(forget, row.lastElementChild);
+      return;
     }
     const detail = this.session.credentialId
       ? "사용자 이름과 비밀번호 또는 키가 맞는지 확인하세요. 틀린 로그인 정보로 계속 다시 연결하면 서버가 접속을 차단할 수 있어 자동 재연결을 멈췄습니다."
       : "이 세션에는 저장된 로그인 정보가 없습니다. 자격 증명 보관함에서 비밀번호나 키를 지정하면 다음부터 묻지 않습니다. 틀린 로그인 정보로 계속 다시 연결하면 서버가 접속을 차단할 수 있어 자동 재연결을 멈췄습니다.";
     this.showOverlay("로그인하지 못했습니다", detail);
+    // The session's key file the login could not use (missing, another format,
+    // readable by others): said on the card, as the likely cause.
+    const card = this.overlay.querySelector<HTMLElement>(".overlay-card");
+    const cred = state.credentials.find((c) => c.id === this.session.credentialId);
+    import("../vault")
+      .then((v) => v.credentialIssue(cred))
+      .then((issue) => {
+        if (!issue || !card?.isConnected) return;
+        const line = h("p", { class: "key-issue" });
+        // Two texts of their own, so the screen translation follows a language change.
+        line.innerHTML = `${icon("TriangleAlert", 12)}<span>이 세션의 키 파일:</span> <span>${esc(issue)}</span>`;
+        card.querySelector(".row")?.before(line);
+      })
+      .catch(() => {});
+    // A saved session's login is fixed in its editor; "save and connect"
+    // reconnects this tab with what was saved.
+    if (!state.sessions.some((s) => s.id === this.session.id)) return;
+    const row = this.overlay.querySelector(".overlay-card .row");
+    const edit = h("button", { class: "btn" });
+    edit.innerHTML = `${icon("Pencil", 15)}세션 편집`;
+    edit.addEventListener("click", async () => {
+      const saved = state.sessions.find((s) => s.id === this.session.id);
+      if (!saved) return;
+      const res = await (await import("../sessionEditor")).editSession(saved);
+      if (res?.connect && !this.disposed) this.reconnect();
+    });
+    row?.insertBefore(edit, row.lastElementChild);
   }
+
 
   private decoder = new TextDecoder();
   /** Trigger patterns compiled once and cached by source, so a busy stream does
@@ -1986,8 +2061,8 @@ export class TerminalView implements View {
   }
 
   private setState(s: ViewState) {
-    // Telnet and serial are logged in once connected (SSH: watchLogin).
-    if (s === "connected" && this.state !== "connected" && this.session.protocol !== "ssh") queueMicrotask(() => this.loginComplete());
+    // A serial line is ready once connected (SSH and Telnet: watchLogin).
+    if (s === "connected" && this.state !== "connected" && this.session.protocol === "serial") queueMicrotask(() => this.loginComplete());
     this.state = s;
     const label: Record<ViewState, string> = {
       connecting: "연결 중",
@@ -2153,7 +2228,7 @@ export class TerminalView implements View {
       }
       this.logPath = await api.termSetLogging(this.runtimeId, options);
       setPressed(this.el.querySelector('.view-actions [data-act="log"]'), !!this.logPath);
-      if (this.logPath) toast(`로그 기록을 시작했습니다: ${this.logPath}`, "success");
+      if (this.logPath) toast(`로그 기록을 시작했습니다: ${userText(this.logPath)}`, "success");
       else toast("로그 기록을 중지했습니다");
       this.ws.changed();
     } catch (err) {

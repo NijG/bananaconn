@@ -331,6 +331,19 @@ pub(crate) fn key_kind_of(head: &[u8]) -> KeyFileKind {
     KeyFileKind::Unknown
 }
 
+/// Whether a private key file is protected by a passphrase: a PuTTY key with
+/// an Encryption other than none, an OpenSSH key with a cipher, or a PEM key
+/// marked ENCRYPTED.
+pub(crate) fn key_is_encrypted(path: &Path) -> bool {
+    match key_file_kind(path) {
+        KeyFileKind::Putty { encrypted } => encrypted,
+        KeyFileKind::OpenSsh => fs::read_to_string(path).is_ok_and(|t| {
+            t.contains("ENCRYPTED") || PrivateKey::from_openssh(t.trim()).is_ok_and(|k| k.is_encrypted())
+        }),
+        _ => false,
+    }
+}
+
 /// A converted copy of a key for ssh.exe, encrypted with a one-time
 /// passphrase; the file is removed when this is dropped.
 pub(crate) struct TempKey {
@@ -393,24 +406,125 @@ fn sweep_stale(dir: &Path) {
     }
 }
 
-/// Remove inherited permissions and grant access to the current user only
-/// (the same protection ssh-keygen applies).
+/// Make a key credential's file readable by this user only, as ssh-keygen
+/// does for the keys it makes: OpenSSH for Windows ignores a private key
+/// other accounts can read ("UNPROTECTED PRIVATE KEY FILE") and asks for a
+/// password instead. Only the file of a saved key credential, and only a
+/// private key, so this cannot change the permissions of any other file.
+#[tauri::command]
+pub async fn vault_protect_key(app: AppHandle, key_path: String) -> Result<(), String> {
+    blocking(move || {
+        crate::lock::require_unlocked(&app)?;
+        let known: Vec<String> = read_all(&app)?.into_iter().filter(|c| c.kind == "key").filter_map(|c| c.key_path).collect();
+        let ssh_dir = dirs::home_dir().map(|h| h.join(".ssh"));
+        let path = protectable_key(&key_path, &known, ssh_dir.as_deref()).ok_or("자격 증명 보관함이나 .ssh 폴더의 키 파일만 고칠 수 있습니다")?;
+        if !matches!(key_file_kind(&path), KeyFileKind::OpenSsh | KeyFileKind::Putty { .. }) {
+            return Err("개인 키 파일이 아닙니다".into());
+        }
+        restrict_to_owner(&path)
+    })
+    .await
+}
+
+/// The file `vault_protect_key` may change: a saved key credential's file, or
+/// a file directly in the user's .ssh folder (the default keys ssh.exe tries
+/// on its own). Compared as real paths, so a short name (ADMINI~1) matches and
+/// ".." cannot reach out of the folder.
+fn protectable_key(key_path: &str, known: &[String], ssh_dir: Option<&Path>) -> Option<PathBuf> {
+    let real = fs::canonicalize(key_path.trim()).ok()?;
+    if known.iter().any(|p| fs::canonicalize(p.trim()).is_ok_and(|k| k == real)) {
+        return Some(real);
+    }
+    let dir = fs::canonicalize(ssh_dir?).ok()?;
+    (real.parent() == Some(dir.as_path())).then_some(real)
+}
+
+/// Whether accounts other than this user, SYSTEM and Administrators may access
+/// the file: OpenSSH for Windows then ignores it as a private key
+/// ("UNPROTECTED PRIVATE KEY FILE"). None when its permissions cannot be read.
+pub(crate) fn others_can_read(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    let me = current_user_sid().ok()?;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the DACL points into `sd`, which is freed once it has been read;
+    // each SID string is freed after it is copied.
+    unsafe {
+        let rc = GetNamedSecurityInfoW(wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), &mut dacl, std::ptr::null_mut(), &mut sd);
+        if rc != 0 {
+            return None;
+        }
+        // No DACL at all: everyone has full access.
+        let mut open = dacl.is_null();
+        let count = if dacl.is_null() { 0 } else { (*dacl).AceCount };
+        for i in 0..u32::from(count) {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, i, &mut ace) == 0 {
+                continue;
+            }
+            let allowed = ace as *const ACCESS_ALLOWED_ACE;
+            if (*allowed).Header.AceType != ACCESS_ALLOWED_ACE_TYPE || (*allowed).Mask == 0 {
+                continue;
+            }
+            let sid = std::ptr::addr_of!((*allowed).SidStart) as *mut core::ffi::c_void;
+            let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                continue;
+            }
+            let len = (0..).take_while(|&n| *text.add(n) != 0).count();
+            let name = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text as _);
+            if name != me && name != "S-1-5-18" && name != "S-1-5-32-544" {
+                open = true;
+                break;
+            }
+        }
+        LocalFree(sd as _);
+        Some(open)
+    }
+}
+
+/// Make the file's permissions full control for the current user and nothing
+/// else: no inherited entries, and no explicit ones left from before (a key
+/// copied from another program's folder may carry its own grants), which is
+/// what OpenSSH for Windows requires of a private key.
 fn restrict_to_owner(path: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Grant by SID: a bare %USERNAME% can resolve to a different (local vs.
-    // domain) account with the same name.
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    let fail = |what: String| format!("키 파일 권한을 설정할 수 없습니다: {what}");
+    // By SID: a bare %USERNAME% can resolve to a different (local vs. domain)
+    // account with the same name. "P": not inherited from the folder.
     let sid = current_user_sid()?;
-    let out = std::process::Command::new(system32("icacls.exe"))
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r", &format!("*{sid}:F")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("키 파일 권한을 설정할 수 없습니다: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!("키 파일 권한을 설정할 수 없습니다: {}", String::from_utf8_lossy(&out.stdout).trim()))
+    let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})").encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: valid NUL-terminated strings; `sd` is freed with LocalFree below,
+    // and the DACL pointer only borrows from it until then.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut()) == 0 {
+            return Err(fail(std::io::Error::last_os_error().to_string()));
+        }
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let read = GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted);
+        let rc = if read == 0 || present == 0 {
+            None
+        } else {
+            Some(SetNamedSecurityInfoW(wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), dacl, std::ptr::null()))
+        };
+        LocalFree(sd as _);
+        match rc {
+            None => Err(fail("DACL".into())),
+            Some(0) => Ok(()),
+            Some(code) => Err(fail(std::io::Error::from_raw_os_error(code as i32).to_string())),
+        }
     }
 }
 
@@ -421,8 +535,20 @@ fn system32(exe: &str) -> PathBuf {
     root.join("System32").join(exe)
 }
 
-/// SID of the account this process runs as, from `whoami /user`.
+/// SID of the account this process runs as. Read once (it cannot change while
+/// the app runs): each key file check needs it, and `whoami` takes ~20 ms.
 fn current_user_sid() -> Result<String, String> {
+    static SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(sid) = SID.get() {
+        return Ok(sid.clone());
+    }
+    // A failure is not kept: the next call tries again.
+    let sid = read_user_sid()?;
+    Ok(SID.get_or_init(|| sid).clone())
+}
+
+/// The SID from `whoami /user`.
+fn read_user_sid() -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new(system32("whoami.exe"))
@@ -579,6 +705,77 @@ pub(crate) mod tests {
         let key = russh::keys::load_secret_key(&temp.path, Some(&temp.passphrase)).unwrap();
         assert_eq!(key.public_key().to_openssh().unwrap().split_whitespace().nth(1), Some(PPK_PUBLIC));
         drop(temp);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A key other accounts can read is refused by the system OpenSSH, and
+    /// accepted once it is restricted to this user.
+    #[test]
+    fn an_unprotected_key_is_accepted_after_restricting_it() {
+        let dir = scratch("protect");
+        let path = dir.join("id_open");
+        let key = PrivateKey::random(&mut rand::rngs::ThreadRng::default(), Algorithm::Ed25519).unwrap();
+        fs::write(&path, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        // Everyone (S-1-1-0) may read it.
+        let granted = std::process::Command::new(system32("icacls.exe")).arg(&path).args(["/grant", "*S-1-1-0:R"]).output().unwrap();
+        assert!(granted.status.success());
+        assert_eq!(others_can_read(&path), Some(true), "Everyone may read it");
+        // Windows OpenSSH (what the terminal runs), not another ssh-keygen on PATH
+        // (Git's ignores Windows permissions).
+        let keygen = system32("OpenSSH").join("ssh-keygen.exe");
+        let Ok(before) = std::process::Command::new(&keygen).args(["-y", "-f"]).arg(&path).output() else {
+            return; // no OpenSSH client here
+        };
+        assert!(!before.status.success(), "accepted while others can read it");
+        assert!(String::from_utf8_lossy(&before.stderr).contains("UNPROTECTED"), "{}", String::from_utf8_lossy(&before.stderr));
+        restrict_to_owner(&path).unwrap();
+        assert_eq!(others_can_read(&path), Some(false), "only this user now");
+        let after = std::process::Command::new(&keygen).args(["-y", "-f"]).arg(&path).output().unwrap();
+        assert!(after.status.success(), "{}", String::from_utf8_lossy(&after.stderr));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_vault_keys_and_ssh_folder_keys_may_be_protected() {
+        let dir = scratch("scope");
+        let ssh = dir.join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        let (default_key, saved, other) = (ssh.join("id_ed25519"), dir.join("saved_key"), dir.join("elsewhere"));
+        for p in [&default_key, &saved, &other] {
+            fs::write(p, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        }
+        let known = vec![saved.to_string_lossy().replace('\\', "/")];
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        assert!(protectable_key(&s(&default_key), &known, Some(&ssh)).is_some(), "a default key in .ssh");
+        assert!(protectable_key(&s(&saved), &known, Some(&ssh)).is_some(), "a saved key, written with /");
+        assert!(protectable_key(&s(&other), &known, Some(&ssh)).is_none(), "any other file");
+        // Out of .ssh through "..", or a subfolder of it.
+        assert!(protectable_key(&format!(r"{}\..\elsewhere", s(&ssh)), &known, Some(&ssh)).is_none());
+        fs::create_dir_all(ssh.join("sub")).unwrap();
+        fs::write(ssh.join("sub").join("k"), "x").unwrap();
+        assert!(protectable_key(&s(&ssh.join("sub").join("k")), &known, Some(&ssh)).is_none());
+        assert!(protectable_key(&s(&dir.join("missing")), &known, Some(&ssh)).is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encrypted_keys_are_recognised() {
+        let dir = scratch("enc");
+        let w = |name: &str, text: &str| {
+            let p = dir.join(name);
+            fs::write(&p, text).unwrap();
+            p
+        };
+        assert!(key_is_encrypted(&w("ppk_enc", PPK_ENC)));
+        assert!(!key_is_encrypted(&w("ppk", PPK)));
+        let mut rng = rand::rngs::ThreadRng::default();
+        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        assert!(!key_is_encrypted(&w("plain", &key.to_openssh(LineEnding::LF).unwrap())));
+        assert!(key_is_encrypted(&w("locked", &key.encrypt(&mut rng, b"pw").unwrap().to_openssh(LineEnding::LF).unwrap())));
+        assert!(key_is_encrypted(&w("pem", "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+")));
+        assert!(!key_is_encrypted(&dir.join("absent")));
         let _ = fs::remove_dir_all(dir);
     }
 

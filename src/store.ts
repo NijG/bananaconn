@@ -289,15 +289,30 @@ let unreadable: unknown[] = [];
 /** The list as last read from or written to disk. */
 let savedSessions: Session[] = [];
 
+/** Why the saved session list could not be read (the backend's message), or
+ * null: read, or not tried yet. Saving stays off while it is set. */
+let loadProblem: string | null = null;
+export const sessionsLoadProblem = () => loadProblem;
+
 export async function loadAll() {
-  const raw = await api.sessionsLoad();
+  let raw: Record<string, unknown>[];
+  try {
+    raw = await api.sessionsLoad();
+  } catch (err) {
+    loadProblem = errorText(err);
+    notify("sessions");
+    throw err;
+  }
+  loadProblem = null;
   const parsed = raw.map((r) => [r, normalizeSession(r)] as const);
   state.sessions = parsed.flatMap(([, s]) => (s ? [s] : []));
   unreadable = parsed.flatMap(([r, s]) => (s ? [] : [r]));
   savedSessions = structuredClone(state.sessions);
   sessionsLoaded = true;
   notify("sessions");
-  await reloadCredentials();
+  // The vault list is read on its own: its failure (an unreadable or damaged
+  // credentials.json, which the message names) is not the session list failing.
+  await reloadCredentials().catch((err) => toast(errorText(err), "error", 8000));
 }
 
 export async function reloadCredentials() {
@@ -309,9 +324,20 @@ export async function reloadCredentials() {
 let nextSave: Promise<void> | null = null;
 let saves: Promise<unknown> = Promise.resolve();
 
-/** Save all sessions. Changes made in the same moment (20 tabs opening, a
- * device detected on each) share one write and one sidebar redraw; saves run
- * one after another, so an older list never lands after a newer one. */
+/** After the user chose to: an empty list in place of the unreadable one (the
+ * backend keeps the file aside first and refuses if it cannot, or if the file
+ * reads fine now). Resolves with where the old file was kept. */
+export async function startEmptySessionList(): Promise<string> {
+  const kept = await api.sessionsReset();
+  state.sessions = [];
+  unreadable = [];
+  savedSessions = [];
+  sessionsLoaded = true;
+  loadProblem = null;
+  notify("sessions");
+  return kept;
+}
+
 /** Resolves once every session save started so far has finished (or failed). */
 export function savesSettled(): Promise<unknown> {
   return saves;
@@ -321,12 +347,19 @@ export function savesSettled(): Promise<unknown> {
  * changed together with sessions the next save writes. */
 let pendingRollbacks: (() => void)[] = [];
 
-/** `rollback` undoes what the caller changed besides `state.sessions`; it runs
+/** Save all sessions. Changes made in the same moment (20 tabs opening, a
+ * device detected on each) share one write and one sidebar redraw; saves run
+ * one after another, so an older list never lands after a newer one.
+ * `rollback` undoes what the caller changed besides `state.sessions`; it runs
  * when this change does not reach the disk and the session list is restored. */
 async function persistSessions(rollback?: () => void) {
   if (!sessionsLoaded) {
     rollback?.();
-    const err = new Error("세션 목록을 읽지 못해 저장하지 않았습니다. 앱을 다시 시작하세요.");
+    const err = new Error(
+      loadProblem
+        ? "세션 목록 파일을 읽지 못해 저장하지 않았습니다. 세션 목록에서 빈 목록으로 새로 시작할 수 있습니다."
+        : "세션 목록을 읽지 못해 저장하지 않았습니다. 앱을 다시 시작하세요.",
+    );
     toast(`세션을 저장하지 못했습니다: ${errorText(err)}`, "error");
     throw err;
   }
@@ -382,6 +415,21 @@ export async function upsertSessions(list: Session[]) {
     else at.set(s.id, state.sessions.push(s) - 1);
   }
   await persistSessions();
+}
+
+/** Before a tab reconnects, bring its copy of the session up to the saved one:
+ * a login fixed in the editor after a failure must not be tried again with the
+ * old one. Updated in place (a gateway link may hold the same object). A
+ * session that is gone, a quick connection, or one changed to another kind
+ * keeps the tab's copy. A user name typed at a login prompt (file tabs) stays
+ * while the saved session names none. True when the copy was updated. */
+export function takeSavedSession(tab: Session): boolean {
+  const saved = state.sessions.find((s) => s.id === tab.id);
+  if (!saved || saved.protocol !== tab.protocol) return false;
+  const typed = tab.username;
+  Object.assign(tab, structuredClone(saved));
+  if (!tab.username) tab.username = typed;
+  return true;
 }
 
 /**

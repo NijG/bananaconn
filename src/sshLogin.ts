@@ -113,13 +113,16 @@ export function loginFailure(lines: string[]): "auth" | "hostkey" | null {
  * readable by other users), so it moved on to other ways of logging in —
  * usually a password the user may not know. From ssh.exe's warning. */
 export function unusableKey(lines: string[]): { path: string; why: "missing" | "format" | "permissions" } | null {
+  // Inside quotes OpenSSH for Windows doubles each backslash
+  // ('C:\\Users\\me\\key'); the unquoted form is printed as given.
+  const quoted = (p: string) => p.replace(/\\\\/g, "\\");
   for (const line of lines) {
     let m = /Identity file (.+?) not accessible/i.exec(line);
     if (m) return { path: m[1], why: "missing" };
     m = /Load key "(.+?)": (.+)$/i.exec(line);
-    if (m) return { path: m[1], why: /permission|bad owner/i.test(m[2]) ? "permissions" : /no such file|not found|cannot find/i.test(m[2]) ? "missing" : "format" };
+    if (m) return { path: quoted(m[1]), why: /permission|bad owner/i.test(m[2]) ? "permissions" : /no such file|not found|cannot find/i.test(m[2]) ? "missing" : "format" };
     m = /Permissions for '(.+?)' are too open/i.exec(line);
-    if (m) return { path: m[1], why: "permissions" };
+    if (m) return { path: quoted(m[1]), why: "permissions" };
   }
   return null;
 }

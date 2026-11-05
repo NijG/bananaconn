@@ -60,6 +60,11 @@ export function openShortcuts() {
 
   /** A label put into a message: a user's snippet name kept as written. */
   const shownLabel = (a: ActionDef) => (a.userLabel ? userText(a.label) : a.label);
+  /** Several labels put into a message as one list: the phrase lookup does not
+   * split a value at commas, so each is shown as on screen now (an app label
+   * translated, a snippet name as written) and the list kept as one value. */
+  const shownList = (items: string[]) => userText(items.join(", "));
+  const onScreen = (a: ActionDef) => (a.userLabel ? a.label : tr(a.label));
 
   // Searched as shown too: app labels and notes appear translated ("copy"
   // finds "복사" in English); a user's snippet name only as written.
@@ -148,7 +153,7 @@ export function openShortcuts() {
       const ok = await confirmDialog({
         title: "이미 쓰는 단축키",
         icon: "Keyboard",
-        message: esc(`${chord}는 지금 ${others.map(shownLabel).join(", ")}에 쓰이고 있습니다. 그 동작에서 빼고 ${shownLabel(def)}에 지정할까요?`),
+        message: esc(`${chord}는 지금 ${others.length > 1 ? shownList(others.map(onScreen)) : shownLabel(others[0])}에 쓰이고 있습니다. 그 동작에서 빼고 ${shownLabel(def)}에 지정할까요?`),
         confirm: "옮기기",
       });
       if (!ok) return;
@@ -171,8 +176,8 @@ export function openShortcuts() {
     const remove = target.closest<HTMLElement>("[data-remove]")?.dataset.remove;
     if (remove) return setKeys(def, bindings(def.id).filter((k) => k !== remove));
     if (target.closest("[data-default]")) {
-      const taken = def.keys.flatMap((k) => conflicts(def.id, k).map((o) => `${k} (${shownLabel(o)})`));
-      if (taken.length) toast(`기본 키가 다른 동작에도 지정되어 있습니다: ${taken.join(", ")}`, "warn", 6000);
+      const taken = def.keys.flatMap((k) => conflicts(def.id, k).map((o) => `${k} (${onScreen(o)})`));
+      if (taken.length) toast(`기본 키가 다른 동작에도 지정되어 있습니다: ${shownList(taken)}`, "warn", 6000);
       return setKeys(def, def.keys);
     }
     if (target.closest("[data-add]")) {

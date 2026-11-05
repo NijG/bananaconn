@@ -47,6 +47,16 @@ export const PROTOCOL_ORDER: Protocol[] = ["ssh", "telnet", "serial", "sftp", "f
 /** Common serial line speeds. */
 export const BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 
+/** The SSH keepalive interval stored in a session's options, as the backend
+ * takes it: whole seconds 1..3600 (the editor's range), else null for the
+ * default (30). Anything else, such as text from an edited backup, would fail
+ * the connection. */
+export function keepaliveOf(o: Record<string, unknown>): number | null {
+  const v = o.keepalive;
+  const n = typeof v === "number" || typeof v === "string" ? Number(v) : NaN;
+  return Number.isInteger(n) && n > 0 && n <= 3600 ? n : null;
+}
+
 /** Serial line settings stored in a session's options. */
 export function serialSettings(o: Record<string, unknown>) {
   const num = (v: unknown, d: number) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : d);
@@ -82,7 +92,6 @@ export function newSession(protocol: Protocol): Session {
   };
 }
 
-/** Accept sessions saved by older builds and drop protocols no longer supported. */
 /** Options that weaken security or reach other hosts; imports must surface them. */
 export const SENSITIVE_OPTIONS = [
   "allowInvalidCert",
@@ -166,6 +175,55 @@ export function endpoint(s: Pick<Session, "protocol" | "host" | "port" | "userna
  * odd forms are left alone: what a host may look like differs by protocol and
  * by the program a session was imported from.) */
 export const unusableHost = (host: string) => /\s/.test(host);
+
+/** Whether a value passes the check ssh.exe's arguments get when connecting
+ * (term.rs safe_token, with the same `extra` characters allowed). */
+export function sshArgOk(value: string, extra = ""): boolean {
+  return (
+    value !== "" &&
+    !value.startsWith("-") &&
+    [...value].every((c) => /[A-Za-z0-9._\-@:[\]]/.test(c) || extra.includes(c) || (c > "\x7f" && !/\s/u.test(c)))
+  );
+}
+
+/** A port forward spec ("8080:localhost:80", "1080"), as term.rs forward_args checks it. */
+export const forwardSpecOk = (spec: string) => sshArgOk(spec, "*");
+
+/** A jump host list ("user@bastion:22,next"), as term.rs open_ssh checks it. */
+export const jumpHostOk = (jump: string) => sshArgOk(jump.trim(), ",");
+
+/** A saved SSH server as one hop of a jump host list ("user@host:port", the
+ * port left out when it is 22). An IPv6 address is always in brackets: ssh -J
+ * takes the first ":" of a bare one for the port and refuses it. */
+export function jumpHop(s: Pick<Session, "host" | "port" | "username">): string {
+  const host = s.host.trim();
+  const user = s.username ? `${s.username}@` : "";
+  const port = s.port && s.port !== 22 ? `:${s.port}` : "";
+  return `${user}${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}${port}`;
+}
+
+/** A jump host list as it is kept: each "ssh://user@host:port" URI (which
+ * ProxyJump and ssh -J also take) as "user@host:port", the same hop in the
+ * form the check above lets through, without spaces or empty hops (which ssh
+ * refuses) between the commas. */
+export function normalizeJumpHost(jump: string): string {
+  return jump
+    .split(",")
+    .map((j) => j.trim().replace(/^ssh:\/\/([^/?#]+)\/?$/i, "$1"))
+    .filter(Boolean)
+    .join(",");
+}
+
+/** The first port forward line connecting would refuse (term.rs forward_args):
+ * each is "L|R|D <spec>"; blank lines and "#" comments are skipped. */
+export function badForwardLine(text: string): string | null {
+  for (const line of text.split(/\r?\n/).map((l) => l.trim())) {
+    if (!line || line.startsWith("#")) continue;
+    const m = /^([LRD])\s+(.*)$/i.exec(line);
+    if (!m || !forwardSpecOk(m[2].trim())) return line;
+  }
+  return null;
+}
 
 /** What a session search looks in, lower-cased (the sidebar and the command
  * palette both use it, so a query finds the same sessions in either). */

@@ -106,6 +106,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             store::sessions_load,
+            store::sessions_reset,
             store::sessions_save,
             store::read_text_file,
             importsrc::import_scan,
@@ -113,6 +114,7 @@ pub fn run() {
             importsrc::import_check_keys,
             importsrc::import_store_key,
             term::term_open,
+            term::known_host_forget,
             term::term_write,
             term::term_ack,
             term::windows_build,
@@ -198,6 +200,7 @@ pub fn run() {
             vault::vault_delete,
             vault::vault_generate_key,
             vault::vault_public_key,
+            vault::vault_protect_key,
             vault::vault_reveal,
             vault::vault_default_key_dir,
         ])

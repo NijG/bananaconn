@@ -10,9 +10,11 @@ const SESSION_H = 42;
 const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
-import { endpoint, PROTOCOLS, sessionSearchText, type Session } from "./model";
+import { endpoint, jumpHostOk, normalizeJumpHost, PROTOCOLS, sessionSearchText, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
+import { canBeGateway, confirmGatewayBreak, gatewayChoices, GATEWAY_PROTOCOLS, gatewayUserList, gatewayUsers } from "./tunnels";
 import { checkReachable, checkReachableMany } from "./nettools";
+import { copyAddresses } from "./clipboard";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
   adoptManualOrder,
@@ -30,6 +32,8 @@ import {
   removeSession,
   removeSessions,
   renameFolder,
+  sessionsLoadProblem,
+  startEmptySessionList,
   state,
   subscribe,
   upsertSession,
@@ -286,9 +290,16 @@ export class Sidebar {
     for (const id of this.picked) if (!shown.has(id)) this.picked.delete(id);
     if (this.selected && !shown.has(this.selected)) this.selected = null;
     if (this.anchor && !shown.has(this.anchor)) this.anchor = null;
+    const loadProblem = sessionsLoadProblem();
     if (!html.length) {
       html.push(
-        this.query
+        loadProblem && !this.query
+          ? // The saved list could not be read: saving is off, so offer no new
+            // session, only what the user can do about the file.
+            `<div class="tree-empty">${icon("TriangleAlert", 26)}<p>세션 목록 파일을 읽지 못했습니다</p>
+               <p class="muted small tree-problem">${esc(loadProblem)}</p>
+               <button class="btn btn-sm" data-reset-sessions>${icon("RotateCcw", 14)}빈 목록으로 새로 시작…</button></div>`
+          : this.query
           ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(userText(this.query))}"와 일치하는 세션이 없습니다</p></div>`
           : `<div class="tree-empty">${icon("Server", 26)}<p>저장된 세션이 없습니다</p>
                <button class="btn btn-primary btn-sm" data-first>${icon("Plus", 14)}첫 세션 만들기</button>
@@ -315,6 +326,7 @@ export class Sidebar {
     this.rows = [];
     this.tree.innerHTML = markup;
     this.tree.querySelector("[data-first]")?.addEventListener("click", () => this.actions.edit(null));
+    this.tree.querySelector("[data-reset-sessions]")?.addEventListener("click", () => void this.resetSessionList());
     this.tree.querySelector("[data-import]")?.addEventListener("click", async (e) => {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const mod = await import("./importExport").catch((err) => void toast(errorText(err), "error"));
@@ -528,6 +540,7 @@ export class Sidebar {
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
       ...(s.protocol !== "serial" && s.protocol !== "tftp" ? [{ label: "연결 확인", icon: "Activity", action: () => void checkReachable(s) }] : []),
       ...(String(s.options.wolMac ?? "").trim() ? [{ label: "Wake-on-LAN (전원 켜기)", icon: "Power", action: () => void this.wake(s) }] : []),
+      { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([s]) },
       "-",
       { label: "편집", icon: "Pencil", hint: "F2", action: () => this.actions.edit(s) },
       { label: "복사", icon: "Copy", hint: "Ctrl+C", action: () => this.copySession(s) },
@@ -560,6 +573,8 @@ export class Sidebar {
       { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: "F2", action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
+      // One per line, in the order shown: a list of hosts to paste elsewhere.
+      { label: `주소 ${list.length}개 복사`, icon: "ClipboardList", action: () => void copyAddresses(list) },
       "-",
       { label: `${list.length}개 삭제`, icon: "Trash2", hint: "Del", danger: true, action: () => this.bulkDelete(list) },
     ]);
@@ -716,6 +731,8 @@ export class Sidebar {
          <div class="field">${control}</div></div>`;
     const creds = state.credentials;
     const terminals = list.filter((s) => PROTOCOLS[s.protocol].view === "terminal").length;
+    const sshCount = list.filter((s) => s.protocol === "ssh").length;
+    const gatewayCount = list.filter((s) => GATEWAY_PROTOCOLS.has(s.protocol)).length;
     const m = modal({
       title: `세션 ${list.length}개 한꺼번에 수정`,
       icon: "Pencil",
@@ -743,6 +760,26 @@ export class Sidebar {
                 )
               : ""
           }
+          ${
+            sshCount
+              ? row(
+                  "jumpHost",
+                  "점프 호스트",
+                  `<input name="jumpHost" autocomplete="off" spellcheck="false" placeholder="비우면 직접 연결 (예: user@bastion:22)" disabled/>`,
+                )
+              : ""
+          }
+          ${
+            gatewayCount
+              ? row(
+                  "gateway",
+                  "SSH 게이트웨이",
+                  `<select name="gateway" disabled><option value="">사용 안 함 (직접 연결)</option>${gatewayChoices()
+                    .map((g) => `<option value="${esc(g.id)}" data-i18n-skip>${esc(g.name)} · ${esc(endpoint(g))}</option>`)
+                    .join("")}</select>`,
+                )
+              : ""
+          }
         </form>`,
       footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>적용</button>`,
     });
@@ -760,7 +797,19 @@ export class Sidebar {
       if (on("port") && val("port") && !/^\d+$/.test(val("port"))) return toast("포트는 1~65535 사이 숫자로 입력하세요", "error");
       const port = on("port") && val("port") ? Number(val("port")) : null;
       if (port !== null && (port < 1 || port > 65535)) return toast("포트는 1~65535 사이 숫자로 입력하세요", "error");
-      if (!["username", "port", "credentialId", "folder", "keyMode"].some(on)) return toast("바꿀 항목을 하나 이상 체크하세요", "error");
+      if (!["username", "port", "credentialId", "folder", "keyMode", "jumpHost", "gateway"].some(on)) return toast("바꿀 항목을 하나 이상 체크하세요", "error");
+      // Kept as the session editor keeps it, and checked as connecting checks it.
+      const jump = normalizeJumpHost(val("jumpHost"));
+      if (on("jumpHost") && jump && !jumpHostOk(jump)) {
+        form.querySelector<HTMLInputElement>("[name=jumpHost]")?.focus();
+        return toast("점프 호스트 값이 올바르지 않습니다 (예: user@bastion:22, 여러 개는 쉼표로 구분)", "warn", 6000);
+      }
+      // The gateway as chosen: still saved, and not one this edit gives a jump
+      // host (a gateway connects to its server directly).
+      const gateway = on("gateway") ? val("gateway") : "";
+      if (gateway && !state.sessions.some((x) => x.id === gateway)) return toast("고른 SSH 게이트웨이 세션이 삭제되었습니다. 다시 고르세요", "warn");
+      if (gateway && on("jumpHost") && jump && list.some((x) => x.id === gateway))
+        return toast("점프 호스트를 지정하는 SSH 세션은 게이트웨이로 쓸 수 없습니다", "warn", 6000);
       const folder = val("folder").split("/").map((p) => p.trim()).filter(Boolean).join("/");
       // `list` was taken when the dialog opened: start from each stored record
       // as it is now (a tab may have linked a credential or touched lastUsed),
@@ -775,8 +824,17 @@ export class Sidebar {
         if (on("credentialId")) s.credentialId = val("credentialId") || null;
         if (on("folder")) s.folder = folder;
         if (on("keyMode") && PROTOCOLS[s.protocol].view === "terminal") s.options = { ...s.options, keyMode: val("keyMode") };
+        // Only SSH connects through a jump host (the others use a gateway session).
+        if (on("jumpHost") && s.protocol === "ssh") s.options = { ...s.options, jumpHost: jump };
+        if (on("gateway") && GATEWAY_PROTOCOLS.has(s.protocol)) s.options = { ...s.options, gateway };
         return s;
       });
+      // Gateways of other sessions this edit leaves unusable as one (a jump
+      // host given to them): those sessions could no longer connect.
+      const after = new Map(updated.map((u) => [u.id, u]));
+      const final = state.sessions.map((x) => after.get(x.id) ?? x);
+      const users = [...new Set(current.filter((c) => canBeGateway(c) && !canBeGateway(after.get(c.id)!)).flatMap((c) => gatewayUsers(c.id, final)))];
+      if (users.length && !(await confirmGatewayBreak(users))) return;
       m.close();
       if (updated.length) await upsertSessions(updated);
       this.refocus();
@@ -794,7 +852,7 @@ export class Sidebar {
     const names = list.slice(0, 6).map((s) => `<b data-i18n-skip>${esc(s.name)}</b>`).join(", ") + (list.length > 6 ? ` 외 ${list.length - 6}개` : "");
     const ok = await confirmDialog({
       title: `세션 ${list.length}개 삭제`,
-      message: `${names} 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.`,
+      message: `${names} 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.${gatewayDeleteNote(list)}`,
       confirm: `${list.length}개 삭제`,
       danger: true,
     });
@@ -826,10 +884,28 @@ export class Sidebar {
     this.reveal(copy.id);
   }
 
+  /** Start an empty session list in place of the unreadable file, which the
+   * backend keeps aside first. */
+  private async resetSessionList() {
+    const ok = await confirmDialog({
+      title: "빈 목록으로 새로 시작",
+      message: "읽지 못한 세션 목록 파일은 지우지 않고 같은 폴더에 사본(sessions.json.bad-…)으로 보관한 다음, 빈 목록으로 다시 시작합니다. 사본은 나중에 직접 고쳐서 되살릴 수 있습니다.",
+      confirm: "새로 시작",
+      focusCancel: true,
+    });
+    if (!ok) return;
+    try {
+      const kept = await startEmptySessionList();
+      toast(`빈 목록으로 새로 시작했습니다. 원본 사본: ${userText(kept)}`, "success", 8000);
+    } catch (err) {
+      toast(errorText(err), "error", 8000);
+    }
+  }
+
   private async deleteSession(s: Session) {
     const ok = await confirmDialog({
       title: "세션 삭제",
-      message: `<b data-i18n-skip>${esc(s.name)}</b> 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.`,
+      message: `<b data-i18n-skip>${esc(s.name)}</b> 세션을 목록에서 삭제합니다. 열려 있는 탭은 그대로 유지됩니다.${gatewayDeleteNote([s])}`,
       confirm: "삭제",
       danger: true,
     });
@@ -932,4 +1008,14 @@ export class Sidebar {
     if (act === "tree.edit") this.actions.edit(s);
     if (act === "tree.delete") this.deleteSession(s);
   }
+}
+
+/** For a delete confirmation: the other sessions that use one of `gone` as
+ * their SSH gateway and cannot connect until another is chosen. */
+function gatewayDeleteNote(gone: Session[]): string {
+  const ids = new Set(gone.map((g) => g.id));
+  const left = state.sessions.filter((x) => !ids.has(x.id));
+  const users = [...new Set(gone.flatMap((g) => gatewayUsers(g.id, left)))];
+  if (!users.length) return "";
+  return `<p class="warn-text">삭제하는 세션을 SSH 게이트웨이로 쓰는 다른 세션 ${users.length}개는 게이트웨이를 다시 고를 때까지 연결할 수 없습니다.</p>${gatewayUserList(users)}`;
 }

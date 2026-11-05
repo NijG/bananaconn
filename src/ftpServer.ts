@@ -226,7 +226,7 @@ export function openFtpServer() {
           .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
           .join("")}</div>
         ${s.addresses.some(isPublicAddress) ? `<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷 어디에서나 접속을 시도할 수 있습니다. 필요할 때만 켜 두세요.</p>` : ""}
-        <p class="muted small">계정: <code>${esc(s.username || "anonymous")}</code>${s.anonymous && s.username ? " 또는 <code>anonymous</code>" : ""}</p>`;
+        <p class="muted small">계정: <code data-i18n-skip>${esc(s.username || "anonymous")}</code>${s.anonymous && s.username ? " 또는 <code>anonymous</code>" : ""}</p>`;
     }
     if (html !== drawnState) {
       drawnState = html;

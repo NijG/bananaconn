@@ -10,6 +10,7 @@ import { endpoint, parseTarget, unusableHost, type Session } from "./model";
 import { state } from "./store";
 import { confirmDialog, errorText, esc, modal, promptDialog, toast } from "./ui";
 import { userText } from "./i18n";
+import { forgetHostKey } from "./hostKeys";
 
 // ---- connecting through a gateway -----------------------------------------------------
 
@@ -22,10 +23,49 @@ export function gatewayOf(s: Session): Session | null {
   return gw;
 }
 
+/** Protocols that can reach their server through an SSH gateway session (SSH
+ * itself uses a jump host instead). */
+export const GATEWAY_PROTOCOLS: ReadonlySet<string> = new Set(["telnet", "rdp", "vnc"]);
+
+/** Whether a tunnel can log in to this session as a gateway: an SSH session
+ * that itself goes through no jump host or gateway (openSshTunnel's rule). */
+export const canBeGateway = (s: Session) => s.protocol === "ssh" && !String(s.options.jumpHost ?? "").trim() && !s.options.gateway;
+
+/** Saved SSH sessions that can be a gateway, by name; `current` stays listed. */
+export function gatewayChoices(current?: unknown): Session[] {
+  return state.sessions
+    .filter((s) => canBeGateway(s) || (s.protocol === "ssh" && s.id === current))
+    .sort((a, b) => a.name.localeCompare(b.name, "ko"));
+}
+
+/** Sessions that reach their server through `id` as their SSH gateway, in
+ * `sessions` (the saved list, or the list as an edit will leave it). */
+export function gatewayUsers(id: string, sessions: Session[] = state.sessions): Session[] {
+  return sessions.filter((s) => s.id !== id && s.options.gateway === id && GATEWAY_PROTOCOLS.has(s.protocol));
+}
+
+/** A few of `users` by name, then how many more. */
+export function gatewayUserList(users: Session[]): string {
+  const names = users.slice(0, 6).map((u) => `<li><span data-i18n-skip>${esc(u.name || u.host)}</span></li>`);
+  return `<ul class="clash-list">${names.join("")}${users.length > 6 ? `<li>외 ${users.length - 6}개</li>` : ""}</ul>`;
+}
+
+/** Ask before saving a gateway session in a form no tunnel can use (with a
+ * jump host, or no longer SSH: openSshTunnel refuses it), which leaves
+ * `users` unable to connect. */
+export function confirmGatewayBreak(users: Session[]): Promise<boolean> {
+  return confirmDialog({
+    title: "게이트웨이로 쓰이는 세션",
+    message: `다른 세션 ${users.length}개가 지금 바꾸는 세션을 SSH 게이트웨이로 씁니다. 점프 호스트를 거치거나 SSH가 아닌 세션은 게이트웨이가 될 수 없어서, 이대로 저장하면 그 세션들은 연결할 수 없습니다.${gatewayUserList(users)}`,
+    confirm: "그래도 저장",
+    danger: true,
+    focusCancel: true,
+  });
+}
+
 /** Select field listing saved SSH sessions, for the session editor. */
 export function gatewayField(current: unknown): string {
-  // A session that itself goes through a jump host or gateway cannot be one.
-  const ssh = state.sessions.filter((s) => s.protocol === "ssh" && ((!String(s.options.jumpHost ?? "").trim() && !s.options.gateway) || s.id === current)).sort((a, b) => a.name.localeCompare(b.name, "ko"));
+  const ssh = gatewayChoices(current);
   return `<label class="field"><span>SSH 게이트웨이 (선택)</span><select name="opt.gateway">
       <option value="">사용 안 함 (직접 연결)</option>
       ${ssh.map((s) => `<option value="${esc(s.id)}" data-i18n-skip ${s.id === current ? "selected" : ""}>${esc(s.name)} · ${esc(endpoint(s))}</option>`).join("")}
@@ -47,9 +87,10 @@ export async function openSshTunnel(
 ): Promise<TunnelInfo | null> {
   // The tunnel logs in to the gateway itself and cannot go through that
   // session's own jump host or gateway: say so instead of a connect failure.
-  if (String(gw.options.jumpHost ?? "").trim() || gw.options.gateway)
+  if (!canBeGateway(gw))
     throw new Error(`게이트웨이로 고른 세션 "${gw.name || gw.host}"은(는) 점프 호스트나 다른 게이트웨이를 거쳐 접속합니다. 게이트웨이에는 직접 접속할 수 있는 SSH 세션을 고르세요.`);
   const extra: { password?: string; trustedFingerprint?: string } = {};
+  let forgot = false;
   for (;;) {
     try {
       return await api.tunnelOpen({
@@ -79,12 +120,43 @@ export async function openSshTunnel(
         extra.trustedFingerprint = fp;
         continue;
       }
-      if (msg.startsWith("HOSTKEY_MISMATCH::"))
-        throw new Error(`게이트웨이 ${gw.host}의 호스트 키가 바뀌어 연결을 차단했습니다(중간자 공격일 수 있음). ~/.ssh/known_hosts를 확인하세요.`);
+      if (msg.startsWith("HOSTKEY_MISMATCH::")) {
+        const blocked = new Error(`게이트웨이 ${gw.host}의 호스트 키가 바뀌어 연결을 차단했습니다(중간자 공격일 수 있음). ~/.ssh/known_hosts를 확인하세요.`);
+        // A reinstalled gateway: forget its old key once; the next attempt then
+        // asks to trust the new one (above). Still mismatched after that (a key
+        // kept under another name): stop instead of asking again.
+        if (forgot) throw blocked;
+        const fp = msg.slice("HOSTKEY_MISMATCH::".length);
+        const wants = await confirmDialog({
+          title: "호스트 키가 바뀌었습니다",
+          icon: "ShieldAlert",
+          message: `게이트웨이 <b data-i18n-skip>${esc(gw.host)}</b>가 이전과 다른 호스트 키를 보냈습니다. 중간자 공격일 수 있으므로 연결을 차단했습니다.<br><br>
+            새 지문: <code class="fp">${esc(fp)}</code>`,
+          confirm: "저장된 키 지우기",
+          cancel: "닫기",
+          focusCancel: true,
+        });
+        if (!wants || !(await forgetHostKey(gw.host, gw.port || 22, gw.username))) throw blocked;
+        forgot = true;
+        continue;
+      }
+      // An encrypted key without its passphrase (checked on this PC, nothing sent).
+      if (msg === "NEED_PASSPHRASE" || msg === "BAD_PASSPHRASE") {
+        const res = await promptDialog({
+          title: msg === "BAD_PASSPHRASE" ? "키 암호가 맞지 않습니다" : "게이트웨이 키 암호",
+          label: `${gw.username ? userText(gw.username) : "사용자"}@${userText(gw.host)} 의 개인 키 암호`,
+          type: "password",
+          icon: "KeyRound",
+          confirm: "연결",
+        });
+        if (!res) return null;
+        extra.password = res.value;
+        continue;
+      }
       if (msg === "NEED_PASSWORD" || /인증에 실패/.test(msg)) {
         const res = await promptDialog({
           title: msg === "NEED_PASSWORD" ? "게이트웨이 비밀번호" : "게이트웨이 비밀번호가 올바르지 않습니다",
-          label: `${gw.username || "사용자"}@${gw.host} 의 비밀번호`,
+          label: `${gw.username ? userText(gw.username) : "사용자"}@${userText(gw.host)} 의 비밀번호`,
           type: "password",
           icon: "KeyRound",
           confirm: "연결",
@@ -281,7 +353,7 @@ export function openTunnelManager() {
         const gw = state.sessions.find((s) => s.id === t.gatewayId);
         if (!gw) throw new Error("SSH 세션이 삭제되었습니다");
         const info = await openSshTunnel(gw, t.targetHost, t.targetPort, t.id, t.localPort);
-        if (info) toast(`터널을 열었습니다: 127.0.0.1:${info.localPort} → ${info.target}`, "success");
+        if (info) toast(`터널을 열었습니다: 127.0.0.1:${info.localPort} → ${userText(info.target)}`, "success");
       }
     } catch (err) {
       toast(errorText(err), "error", 7000);

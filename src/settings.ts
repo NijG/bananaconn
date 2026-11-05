@@ -8,7 +8,7 @@ import { LIGHT_THEMES, TERM_THEMES } from "./themes";
 import { confirmDialog, esc, modal, toast } from "./ui";
 import { clearCommandHistory, commandHistoryCount } from "./cmdLine";
 import { aiSettingsSection, wireAiSettings } from "./ai/settings";
-import { checkForUpdate } from "./updates";
+import { checkForUpdate, refusedNasAccount } from "./updates";
 import { compile, DEFAULT_RISK_RULES, riskRules, type RiskRule } from "./riskRules";
 import { isLanguage, LANGUAGES, language as shownLanguage } from "./i18n";
 import { logFields, previewDefaultPath, runnableLogName, wireLogBrowse } from "./logOptions";
@@ -219,7 +219,8 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
         <label class="field"><span>NAS 계정 (공유 폴더가 Windows 계정을 받아 주지 않을 때 이 계정으로 로그인)</span><select name="updateCredentialId">
             <option value="">사용 안 함 (Windows 계정·저장된 자격 증명)</option>
             ${passwords.map((c) => `<option value="${esc(c.id)}" data-i18n-skip title="${esc(c.username)}" ${c.id === s.updateCredentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
-          </select>${passwords.length ? "" : `<small class="muted">자격 증명 보관함에 NAS 계정(비밀번호 방식)을 먼저 추가하세요.</small>`}</label>
+          </select>${passwords.length ? "" : `<small class="muted">자격 증명 보관함에 NAS 계정(비밀번호 방식)을 먼저 추가하세요.</small>`}
+          <small class="key-issue" data-nas-refused hidden>${icon("TriangleAlert", 12)}<span>NAS가 이 계정의 로그인을 거부해, 자동 확인에서는 이 계정을 쓰지 않습니다. 자격 증명 보관함에서 비밀번호를 고친 뒤 "지금 확인"을 누르세요.</span></small></label>
         ${check("autoUpdate", "새 버전 자동 확인 (시작할 때와 30분마다)", `새 버전이 있으면 설치할지 묻고, 상태 표시줄에도 업데이트 버튼이 나타납니다. 서명이 맞는 공식 빌드만 설치합니다.`)}
         <div class="row"><button type="button" class="btn" data-update-check>${icon("RefreshCw", 14)}지금 확인</button></div>
       </form>`,
@@ -353,13 +354,21 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
     }
   });
   renderRules();
+  // The chosen NAS account was refused on a check: automatic checks leave it out.
+  const nasSelect = m.root.querySelector<HTMLSelectElement>("[name=updateCredentialId]")!;
+  const showRefused = () => {
+    const line = m.root.querySelector<HTMLElement>("[data-nas-refused]");
+    if (line) line.hidden = !nasSelect.value || nasSelect.value !== refusedNasAccount();
+  };
+  nasSelect.addEventListener("change", showRefused);
+  showRefused();
   m.root.querySelector("[data-update-check]")!.addEventListener("click", () => {
     // Check the folder as typed, and keep it.
     updateSettings({
       updateFolder: m.root.querySelector<HTMLInputElement>("[name=updateFolder]")!.value.trim(),
-      updateCredentialId: m.root.querySelector<HTMLSelectElement>("[name=updateCredentialId]")!.value || null,
+      updateCredentialId: nasSelect.value || null,
     });
-    checkForUpdate(true);
+    void checkForUpdate(true).then(showRefused);
   });
   m.root.querySelector("[data-logs]")!.addEventListener("click", async () => {
     try {

@@ -93,6 +93,27 @@ const CRT_XML = `<?xml version="1.0" encoding="UTF-8"?>
     <key name="File 0"><string name="Path">${"$"}{VDS_CONFIG_PATH}\\Keys\\missing_app.ppk</string><binary name="Contents">50 75 54 54 59 2d 55 73 65 72 2d 4b 65 79 2d 46 69 6c 65 2d 33 3a 20 73 73 68 2d 65 64 32 35 35 31 39 0a 45 6e 63 72 79 70 74 69 6f 6e 3a 20 6e 6f 6e 65 0a 43 6f 6d 6d 65 6e 74 3a 20 70 72 65 76 69 65 77 0a</binary></key>
   </key>
 </VanDyke>`;
+// An OpenSSH config: shared settings under Host *, forwards on one host.
+const SSH_SAMPLE = [
+  "Host *",
+  "  ServerAliveInterval 30",
+  "Host web",
+  "  HostName 10.0.3.1",
+  "  User deploy",
+  "  LocalForward 8080 localhost:80",
+  "  DynamicForward 1080",
+  "  ForwardAgent yes",
+  "  Compression yes",
+  "Host db",
+  "  HostName 10.0.3.2",
+  "  ProxyJump web",
+].join("\n");
+// An Xshell Sessions folder: a key kept in Xshell's own store, a saved password, a plain one.
+const XSH_SAMPLE = [
+  { rel: "prod/api.xsh", text: "[CONNECTION]\r\nHost=10.0.2.1\r\nPort=22\r\nProtocol=SSH\r\n[CONNECTION:AUTHENTICATION]\r\nUserName=api\r\nMethod=1\r\nUserKey=id_rsa_2048\r\n" },
+  { rel: "prod/db.xsh", text: "[CONNECTION]\r\nHost=10.0.2.2\r\nPort=22\r\nProtocol=SSH\r\n[CONNECTION:AUTHENTICATION]\r\nUserName=dba\r\nPassword=preview\r\nUserKey=\r\n" },
+  { rel: "sw.xsh", text: "[CONNECTION]\r\nHost=10.0.2.3\r\nPort=23\r\nProtocol=TELNET\r\n" },
+];
 const CRT_SAMPLE = [
   { rel: "Linux/web01.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.11', 'S:"Username"=root', 'D:"[SSH2] Port"=00000016', 'S:"SSH2 Authentications V2"=publickey,password', 'D:"Use Global Public Key"=00000001', 'S:"Identity Filename V2"=']) },
   { rel: "Linux/db01.ini", text: crt(['S:"Protocol Name"=SSH2', 'S:"Hostname"=10.0.0.12', 'S:"Username"=dba', 'D:"Use Global Public Key"=00000000', 'S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Keys\\db.ppk']) },
@@ -166,7 +187,15 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
   await new Promise((r) => setTimeout(r, 60));
   switch (cmd) {
     case "sessions_load":
+      // Preview of a damaged sessions.json: localStorage "bx.mock.sessionsBroken" = "1".
+      if (localStorage.getItem("bx.mock.sessionsBroken"))
+        throw "세션 목록 형식이 올바르지 않습니다: expected `,` or `]` at line 1 column 12. 원본을 C:\\Users\\me\\AppData\\Roaming\\com.bananaconn.app\\sessions.json.bad-1793795507 에 보관했습니다.";
       return JSON.parse(localStorage.getItem(LS) ?? "[]");
+    case "sessions_reset":
+      if (!localStorage.getItem("bx.mock.sessionsBroken")) throw "세션 목록 파일을 이제 읽을 수 있습니다. 앱을 다시 시작하면 불러옵니다.";
+      localStorage.removeItem("bx.mock.sessionsBroken");
+      localStorage.setItem(LS, "[]");
+      return "C:\\Users\\me\\AppData\\Roaming\\com.bananaconn.app\\sessions.json.bad-1793795507";
     case "sessions_save":
       localStorage.setItem(LS, JSON.stringify(a.sessions));
       return;
@@ -265,6 +294,7 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       if (/SecureCRT.*XML/i.test(a.path)) return CRT_XML;
       if (/SSH2\.ini$/i.test(a.path)) return crt(['S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Keys\\id_ed25519', 'D:"Public Key Type"=00000000']);
       // The preview picker returns a fake path named after the dialog title.
+      if (/OpenSSH/.test(a.path)) return SSH_SAMPLE;
       if (/JSON/.test(a.path))
         return JSON.stringify({
           format: "bananaconn-sessions",
@@ -333,13 +363,21 @@ ${a.host}에 대한 Ping 통계:
         ? 'Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\Default%20Settings]\r\n"HostName"=""\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\core%20sw01]\r\n"HostName"="10.9.0.1"\r\n"PortNumber"=dword:00000016\r\n"Protocol"="ssh"\r\n"UserName"="netops"\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\console]\r\n"Protocol"="serial"\r\n"SerialLine"="COM4"\r\n"SerialSpeed"=dword:00002580\r\n'
         : "";
     case "import_scan":
-      return a.ext === "ini" ? CRT_SAMPLE : [];
+      return a.ext === "ini" ? CRT_SAMPLE : a.ext === "xsh" ? XSH_SAMPLE : [];
+    case "vault_protect_key":
+      ((window as any).__protected ??= []).push(a.keyPath);
+      return;
+    case "ai_detect_cli":
+      return [];
+    case "known_host_forget":
+      return true;
     case "import_store_key":
       return `C:\\Users\\me\\.ssh\\${a.name}`;
     case "import_check_keys":
       return a.paths.map((p: string) => ({
         path: p.replace("${VDS_CONFIG_PATH}", a.configDir ?? "C:\\Users\\me\\AppData\\Roaming\\VanDyke\\Config"),
         kind: /^capi::/i.test(p) ? "store" : /missing/i.test(p) ? "missing" : /\.ppk$/i.test(p) ? "putty" : /Identity$/.test(p) ? "foreign" : "openssh",
+        open: /open/i.test(p) && !(window as any).__protected?.includes(p),
       }));
     case "update_open_folder":
       return;

@@ -16,7 +16,7 @@ import { editSession } from "./sessionEditor";
 import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
 import { loadAll, savesSettled, state, subscribe, touchSession } from "./store";
-import { isLanguage, LANGUAGES, setLanguage, type Language } from "./i18n";
+import { isLanguage, LANGUAGES, setLanguage, userText, type Language } from "./i18n";
 import { confirmDialog, contextMenu, errorText, esc, setPressed, toast } from "./ui";
 import { openVault } from "./vault";
 
@@ -125,7 +125,7 @@ async function launchRdp(s: Session) {
       clipboard: o.clipboard !== false,
       drives: !!o.drives,
     });
-    toast(`원격 데스크톱 창에서 ${endpoint(s)} 에 연결합니다`, "success");
+    toast(`원격 데스크톱 창에서 ${userText(endpoint(s))} 에 연결합니다`, "success");
   } catch (err) {
     toast(errorText(err), "error");
   }
@@ -154,6 +154,7 @@ async function edit(existing: Session | null, defaults: Partial<Session> = {}) {
 
 // ---- sidebar & home ----------------------------------------------------------------
 const sidebar = new Sidebar($("#sidebar"), { connect: open, edit, openFiles });
+ws.editHandler = (s) => void edit(s);
 mountHome($("#home"), {
   create: (p: Protocol) => edit(null, { protocol: p }),
   connect: open,
@@ -416,7 +417,6 @@ function monitorChip(m: MonitorInfo | null | undefined): string {
     ? `<button class="sb-monitor action" data-monitor>${icon("Activity", 13)}${esc(text[m.kind])}</button>`
     : `<span class="sb-monitor muted">${icon("Activity", 13)}${esc(text[m.kind])}</span>`;
 }
-ws.duplicateHandler = (s) => open(s);
 ws.onChange(renderStatus);
 ftpServer.onChange(renderStatus);
 fileServers.onChange(renderStatus);
@@ -547,7 +547,7 @@ if (isTauri) {
       // Unsaved work is always asked about; open connections only if the user wants that.
       const work = ws.tabs.flatMap((t) => {
         const w = t.view.closeWarning?.();
-        return w ? [`<li><b>${esc(t.view.title())}</b>: ${esc(w)}</li>`] : [];
+        return w ? [`<li><b data-i18n-skip>${esc(t.view.title())}</b>: <span>${esc(w)}</span></li>`] : [];
       });
       if (!work.length && (!live.length || !state.settings.confirmClose)) return;
       event.preventDefault();
@@ -555,10 +555,10 @@ if (isTauri) {
         title: "BananaConn 종료",
         message: `${work.length ? `저장하지 않았거나 끝나지 않은 작업이 사라집니다.<ul class="clash-list">${work.slice(0, 6).join("")}</ul>` : ""}${
           live.length
-            ? `열려 있는 연결 ${live.length}개가 모두 끊어집니다.<br><span class="muted">${live
+            ? `열려 있는 연결 ${live.length}개가 모두 끊어집니다.<br><span class="muted" data-i18n-skip>${live
                 .slice(0, 5)
                 .map((t) => esc(t.view.title()))
-                .join(", ")}${live.length > 5 ? " 외" : ""}</span>`
+                .join(", ")}</span>${live.length > 5 ? ` 외 ${live.length - 5}개` : ""}`
             : ""
         }`,
         confirm: "종료",

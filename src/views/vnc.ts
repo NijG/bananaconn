@@ -7,7 +7,7 @@ import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { contextMenu, errorText, esc, h, promptDialog, toast, setPressed } from "../ui";
-import { patchSession, state } from "../store";
+import { patchSession, state, takeSavedSession } from "../store";
 
 type Quality = "fast" | "balanced" | "sharp";
 /** [JPEG quality, zlib compression] asked of the server. */
@@ -19,7 +19,7 @@ const ENCODING_NAMES: Record<number, string> = {
 import { GatewayLink } from "../tunnels";
 import { desktopHost, ViewAi } from "../ai/viewAi";
 import { detectFileProtocol, fileSessionFor, fileTransferBlockedReason } from "../transfer";
-import { tr } from "../i18n";
+import { tr, userText } from "../i18n";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 export class VncView implements View {
@@ -222,7 +222,7 @@ export class VncView implements View {
     this.authFailed = false;
     this.securityReason = "";
     this.overlay.hidden = false;
-    this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3>${esc(endpoint(this.session))}</h3><p>VNC 서버에 연결하는 중...</p></div>`;
+    this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3 data-i18n-skip>${esc(endpoint(this.session))}</h3><p>VNC 서버에 연결하는 중...</p></div>`;
     const proxyId = this.proxyId;
     try {
       const tunnelPort = await this.gateway.port();
@@ -317,7 +317,7 @@ export class VncView implements View {
     if (types.includes("username")) {
       username = this.session.username || state.credentials.find((c) => c.id === this.session.credentialId)?.username || "";
       if (!username) {
-        const res = await promptDialog({ title: "VNC 사용자 이름", label: `${this.session.host} 의 사용자 이름`, icon: "User", confirm: "다음" });
+        const res = await promptDialog({ title: "VNC 사용자 이름", label: `${userText(this.session.host)} 의 사용자 이름`, icon: "User", confirm: "다음" });
         if (rfb !== this.rfb) return;
         if (!res) {
           rfb.disconnect();
@@ -337,7 +337,7 @@ export class VncView implements View {
     if (password === null) {
       const res = await promptDialog({
         title: "VNC 비밀번호",
-        label: `${this.session.host} 의 VNC 비밀번호`,
+        label: `${userText(this.session.host)} 의 VNC 비밀번호`,
         type: "password",
         icon: "KeyRound",
         confirm: "연결",
@@ -415,6 +415,10 @@ export class VncView implements View {
   reconnect() {
     this.teardown();
     this.proxyId = crypto.randomUUID();
+    const credential = this.session.credentialId;
+    if (takeSavedSession(this.session)) this.ws.changed();
+    // A different saved login was chosen after a wrong one: use it, not the prompt.
+    if (this.session.credentialId !== credential) this.askPassword = false;
     this.connect();
   }
 

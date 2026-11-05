@@ -2,11 +2,11 @@
 // Windows Credential Manager by the backend; this UI only sends new values and
 // never displays stored ones.
 
-import { api, pickOpenFile, type Credential } from "./api";
+import { api, pickOpenFile, type Credential, type ImportKeyKind } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
-import { confirmDialog, errorText, esc, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { confirmDialog, errorText, esc, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
 
 /** A strong random password: at least one upper, lower, digit and symbol, the
  * rest mixed, shuffled. Ambiguous characters (O/0, l/1) are left out. */
@@ -22,6 +22,66 @@ function generatePassword(len = 20): string {
     [out[i], out[j]] = [out[j], out[i]];
   }
   return out.join("");
+}
+
+/** What is wrong with a key credential's file for logging in, or null when
+ * the logins can use it (import_check_keys, the same check as an import). */
+function keyIssue(kind: ImportKeyKind | undefined, hasSecret: boolean, open = false): string | null {
+  if (open) return OPEN_KEY;
+  switch (kind) {
+    case undefined:
+    case "openssh":
+    case "putty":
+      return null;
+    case "putty-encrypted":
+      return hasSecret ? null : "암호가 걸린 PuTTY 키입니다. 키 암호를 저장해야 터미널에서 쓸 수 있습니다";
+    case "missing":
+      return "키 파일이 없습니다. 경로를 확인하세요";
+    case "public":
+      return "공개 키 파일입니다. 개인 키 파일을 고르세요";
+    case "store":
+      return "Windows 인증서 저장소의 키는 쓸 수 없습니다";
+    default:
+      return "OpenSSH 형식이 아닙니다. 만든 프로그램에서 OpenSSH 형식으로 내보내세요";
+  }
+}
+
+/** Let only this user read a key file other accounts can read (ssh.exe
+ * ignores such a key and asks for a password), after the user agrees. True
+ * when it was changed. */
+export async function protectKeyFile(keyPath: string): Promise<boolean> {
+  const ok = await confirmDialog({
+    title: "키 파일 권한 고치기",
+    icon: "ShieldCheck",
+    message: `<code data-i18n-skip>${esc(keyPath)}</code><br><br>다른 사용자도 이 키 파일을 읽을 수 있어 OpenSSH가 키를 쓰지 않았습니다. 이 파일을 지금 Windows 사용자만 읽을 수 있게 바꿉니다(ssh-keygen이 만든 키와 같은 권한).`,
+    confirm: "권한 고치기",
+  });
+  if (!ok) return false;
+  try {
+    await api.vaultProtectKey(keyPath);
+    toast("키 파일을 이 사용자만 읽을 수 있게 바꿨습니다", "success");
+    return true;
+  } catch (err) {
+    toast(errorText(err), "error", 7000);
+    return false;
+  }
+}
+
+/** A private key other accounts can read: fixed with protectKeyFile. */
+const OPEN_KEY = "다른 사용자도 읽을 수 있는 파일이라 OpenSSH가 이 키를 쓰지 않습니다";
+
+/** Why a credential's key file cannot be used for logging in, or null (a
+ * password, or a usable key). For pickers outside the vault (session editor). */
+export async function credentialIssue(c: Credential | undefined): Promise<string | null> {
+  return (await credentialCheck(c)).issue;
+}
+
+/** The problem with a credential's key file, and the file when it is one
+ * protectKeyFile can fix (readable by other users). */
+export async function credentialCheck(c: Credential | undefined): Promise<{ issue: string | null; fixable?: string }> {
+  if (!c || c.kind !== "key" || !c.keyPath) return { issue: null };
+  const [res] = await api.importCheckKeys([c.keyPath], null).catch(() => []);
+  return { issue: keyIssue(res?.kind, c.hasSecret, res?.open), fixable: res?.open ? c.keyPath : undefined };
 }
 
 export function openVault(): Promise<void> {
@@ -51,6 +111,24 @@ export function openVault(): Promise<void> {
     const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
     const detailEl = m.root.querySelector<HTMLElement>(".vault-detail")!;
 
+    /** Each key file's kind, by path, read when the vault opens and when a
+     * path is chosen; a key whose file the logins cannot use is marked. */
+    const kinds = new Map<string, ImportKeyKind>();
+    /** Key files other accounts can read (OpenSSH ignores them). */
+    const open = new Set<string>();
+    const checkKeys = async (paths: string[]) => {
+      const todo = [...new Set(paths.filter(Boolean))];
+      if (!todo.length) return;
+      const res = await api.importCheckKeys(todo, null).catch(() => []);
+      todo.forEach((p, i) => {
+        if (!res[i]) return;
+        kinds.set(p, res[i].kind);
+        if (res[i].open) open.add(p);
+        else open.delete(p);
+      });
+    };
+    const issueOf = (c: Credential) => (c.kind === "key" && c.keyPath ? keyIssue(kinds.get(c.keyPath), c.hasSecret, open.has(c.keyPath)) : null);
+
     const search = m.root.querySelector<HTMLInputElement>(".list-search")!;
     /** Search terms: each must appear in the name or user name. */
     let terms: string[] = [];
@@ -62,6 +140,7 @@ export function openVault(): Promise<void> {
               (c) => `<button class="vault-item${c.id === selected && !draft ? " on" : ""}" data-id="${c.id}">
                 ${icon(c.kind === "key" ? "Key" : "Lock", 15)}
                 <span><b data-i18n-skip>${esc(c.name)}</b><small>${c.kind === "key" ? "SSH 키" : "비밀번호"}${c.username ? `<span data-i18n-skip> · ${esc(c.username)}</span>` : ""}</small></span>
+                ${issueOf(c) ? `<span class="vault-warn" title="${esc(issueOf(c)!)}">${icon("TriangleAlert", 14)}</span>` : ""}
               </button>`,
             )
             .join("")
@@ -97,7 +176,8 @@ export function openVault(): Promise<void> {
               ? `<label class="field"><span>개인 키 파일</span><div class="inline">
                    <input name="keyPath" value="${esc(c.keyPath ?? "")}" placeholder="C:\\Users\\...\\.ssh\\id_ed25519" spellcheck="false" />
                    <button type="button" class="btn" data-browse>${icon("FolderOpen", 14)}찾기</button>
-                   <button type="button" class="btn" data-gen>${icon("Sparkles", 14)}새로 만들기</button></div></label>
+                   <button type="button" class="btn" data-gen>${icon("Sparkles", 14)}새로 만들기</button></div>
+                   <small class="key-issue" hidden></small></label>
                  <label class="field"><span>키 암호 ${c.hasSecret ? '<em class="ok">저장됨</em>' : ""}</span>
                    <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "암호가 없으면 비워 두세요"}" /></label>
                  <div class="pubkey" hidden><span>공개 키 (서버의 ~/.ssh/authorized_keys 에 추가)</span>
@@ -133,18 +213,25 @@ export function openVault(): Promise<void> {
           renderDetail();
         }),
       );
-      if (isKey) showPublicKey(c.keyPath);
+      if (isKey) {
+        showPublicKey(c.keyPath);
+        showKeyIssue(c.keyPath, c.hasSecret);
+        // A path typed or pasted by hand is checked once the field is left.
+        field("keyPath")!.addEventListener("change", () => showKeyIssue(field("keyPath")!.value.trim(), c.hasSecret, true));
+      }
       form.querySelector("[data-browse]")?.addEventListener("click", async () => {
         const path = await pickOpenFile("개인 키 파일 선택", c.keyPath ?? undefined);
         if (path) {
           field("keyPath")!.value = path;
           showPublicKey(path);
+          showKeyIssue(path, c.hasSecret, true);
         }
       });
       form.querySelector("[data-gen]")?.addEventListener("click", () => generateKey(current(), (path, pass) => {
         field("keyPath")!.value = path;
         if (pass) field("secret")!.value = pass;
         showPublicKey(path);
+        showKeyIssue(path, c.hasSecret, true);
       }));
       form.querySelector("[data-copy]")?.addEventListener("click", () => {
         writeClipboard(detailEl.querySelector(".pubkey code")!.textContent ?? "");
@@ -221,6 +308,29 @@ export function openVault(): Promise<void> {
       });
     };
 
+    /** The status line under the key file field. `fresh`: read the file
+     * again (it was just chosen or written). */
+    const showKeyIssue = async (keyPath: string | null, hasSecret: boolean, fresh = false) => {
+      const line = detailEl.querySelector<HTMLElement>(".key-issue");
+      if (!line) return;
+      if (keyPath && (fresh || !kinds.has(keyPath))) await checkKeys([keyPath]);
+      // The form may have moved on to another credential meanwhile.
+      if (!line.isConnected) return;
+      const issue = keyPath ? keyIssue(kinds.get(keyPath), hasSecret, open.has(keyPath)) : null;
+      line.hidden = !issue;
+      line.innerHTML = issue ? `${icon("TriangleAlert", 12)}<span>${esc(issue)}</span>` : "";
+      // Fixable in place: only this user may read the file afterwards.
+      if (keyPath && open.has(keyPath)) {
+        const fix = h("button", { type: "button", class: "btn btn-sm" });
+        fix.textContent = "권한 고치기";
+        fix.addEventListener("click", async () => {
+          if (await protectKeyFile(keyPath)) showKeyIssue(keyPath, hasSecret, true);
+        });
+        line.appendChild(fix);
+      }
+      if (fresh) renderList();
+    };
+
     const showPublicKey = async (keyPath: string | null) => {
       const box = detailEl.querySelector<HTMLElement>(".pubkey");
       if (!box) return;
@@ -249,6 +359,8 @@ export function openVault(): Promise<void> {
 
     renderList();
     renderDetail();
+    // Every key file once; the list then marks the ones the logins cannot use.
+    checkKeys(state.credentials.filter((c) => c.kind === "key").map((c) => c.keyPath ?? "")).then(() => listEl.isConnected && renderList());
   });
 }
 

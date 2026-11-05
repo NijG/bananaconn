@@ -34,7 +34,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>排序與順序</b>：工作階段清單上方的排序按鈕可選擇依名稱（AP2 在 AP10 之前）、依位址（IP 依數字比較）、依最近連線或自訂。將工作階段拖曳到另一個工作階段的上方或下方即可放到該處；資料夾也可用同樣方式調整順序或移入其他資料夾。調整順序後會切換為自訂排序並保留該順序。${kbd("Alt+Up")} / ${kbd("Alt+Down")} 可將所選工作階段上下移動一格，資料夾選單中的「將此資料夾內容依名稱/位址排序」可一次整理。</li>
         <li><b>搜尋</b>：在上方的搜尋方塊中輸入名稱、主機、使用者或備註的一部分。</li>
         <li><b>多重選取</b>：${kbd("Ctrl")}+按一下可逐一選取，${kbd("Shift")}+按一下可選取範圍。也可以使用 ${kbd("Shift+↑/↓")} 與 ${kbd("Ctrl+A")}。${kbd("Esc")} 會清除選取。</li>
-        <li><b>批次作業</b>：選取多個後按右鍵 → 批次修改 (${kbd("F2")}：使用者、連接埠、認證、資料夾、按鍵輸入方式)、移到資料夾、刪除 (${kbd("Del")})、全部連線 (${kbd("Enter")})。</li>
+        <li><b>批次作業</b>：選取多個後按右鍵 → 批次修改 (${kbd("F2")}：使用者、連接埠、認證、資料夾、按鍵輸入方式、跳板主機 (SSH)、SSH 閘道 (Telnet、RDP、VNC))、移到資料夾、複製位址 (每行一個)、刪除 (${kbd("Del")})、全部連線 (${kbd("Enter")})。</li>
         <li><b>複製與貼上</b>：選取工作階段後按 ${kbd("Ctrl+C")}，再選取目標資料夾中的工作階段並按 ${kbd("Ctrl+V")}。每次貼上都會建立名為「名稱 (2)」、「名稱 (3)」的新工作階段。按右鍵 → 複製一份 也有相同效果。</li>
         <li><b>編輯</b>：${kbd("F2")} 或按右鍵 → 編輯。</li>
       </ul>`,
@@ -48,12 +48,12 @@ export const SECTIONS: HelpSection[] = [
       <table class="help-table">
         <tr><th>程式</th><th>要選擇的項目</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (可攜版：位於執行檔旁)</td></tr>
-        <tr><td>SecureCRT</td><td>工作階段資料夾 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包含資料夾結構、記錄檔名稱、自動記錄設定，以及公開金鑰登入使用的金鑰檔案)，或以 檔案 → 匯出設定 產生的 XML</td></tr>
+        <tr><td>SecureCRT</td><td>工作階段資料夾 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包含資料夾結構、記錄檔名稱、自動記錄設定，以及公開金鑰登入使用的金鑰檔案，經由其他工作階段的防火牆設定作為跳板主機，工作階段說明作為備註，以及 SSH 工作階段的 NO-OP 傳送間隔作為保持連線間隔)，或以 檔案 → 匯出設定 產生的 XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (若已開啟整個檔案加密，請先關閉並儲存)</td></tr>
-        <tr><td>PuTTY · KiTTY</td><td>直接讀取這台電腦的設定</td></tr>
-        <tr><td>WinSCP</td><td>這台電腦的設定，若沒有則選擇 <code>WinSCP.ini</code></td></tr>
-        <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 資料夾</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 檔案（Host、HostName、User、Port、ProxyJump、IdentityFile；與 ssh 相同，套用所有符合的 Host 區塊，先出現的值優先；<code>Host *</code> 等萬用字元只提供預設值，不建立工作階段）</td></tr>
+        <tr><td>PuTTY · KiTTY</td><td>直接讀取這台電腦的設定 (包含各工作階段指定的金鑰檔案、連接埠轉送、代理程式轉送、壓縮與保持連線間隔)</td></tr>
+        <tr><td>WinSCP</td><td>這台電腦的設定，若沒有則選擇 <code>WinSCP.ini</code> (包含金鑰檔案)</td></tr>
+        <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 資料夾。Xshell 金鑰儲存區中的金鑰無法關聯，請在 Xshell 的使用者金鑰管理員中以 OpenSSH 格式匯出，再於認證保管庫中指定</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 檔案（Host、HostName、User、Port、ProxyJump、IdentityFile、LocalForward、RemoteForward、DynamicForward、ForwardAgent、Compression、ServerAliveInterval；與 ssh 相同，套用所有符合的 Host 區塊，先出現的值優先，連接埠轉送則彙整所有符合區塊中的設定；<code>Host *</code> 等萬用字元只提供預設值，不建立工作階段）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 檔案</td></tr>
         <tr><td>遠端桌面</td><td>含有 <code>.rdp</code> 檔案的資料夾 (包含子資料夾)</td></tr>
         <tr><td>CSV</td><td>第一行為欄位名稱：Name, Protocol, Host, Port, Username, Folder, Domain (以逗號、分號或 Tab 分隔)。同一選單中的 <b>匯出工作階段清單 (CSV)</b> 會以此格式寫出。</td></tr>
@@ -68,6 +68,7 @@ export const SECTIONS: HelpSection[] = [
       <ul>
         <li><b>關閉分頁</b>：${kbd("Ctrl+F4")} 或 ${kbd("Ctrl+Shift+W")}，或以滑鼠中鍵按一下分頁。在確認視窗中按 ${kbd("Enter")} 即可關閉；勾選「不再詢問」後下次就會略過 (可在設定中重新開啟)。</li>
         <li><b>再開啟一次相同的工作階段</b>：在分頁上<b>按兩下</b>。適合為了監控而對同一部設備建立第二條連線。</li>
+        <li><b>分頁選單</b>：在分頁上按右鍵可以重新連線、編輯工作階段、複製位址 (user@host:port)、關閉其他分頁或關閉右側分頁。</li>
         <li><b>切換分頁</b>：${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}。分頁很多時，在分頁列上捲動滑鼠滾輪即可左右移動。拖曳分頁可調整順序。</li>
         <li><b>分割畫面</b>：上方的 單一畫面 / 左右分割 / 上下分割 / 四分割 按鈕。將分頁拖曳到想要的窗格中。</li>
         <li>分頁上的圓點顏色代表通訊協定，閃爍表示連線中，紅色表示發生錯誤。</li>
@@ -89,7 +90,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>畫面繪製</b> (設定 → 終端機)：「自動」會在有顯示卡的電腦上以 GPU (WebGL) 繪製，加快大量輸出的速度；在沒有顯示卡的伺服器與遠端工作階段中則使用標準繪製方式。只有畫面上可見的終端機會使用 GPU。</li>
         <li><b>片段與巨集</b>：將常用命令儲存在工具列的片段中，並使用「錄製」擷取輸入後重播。</li>
         <li><b>檔案</b> (SSH)：工具列中的檔案按鈕會在旁邊開啟同一部伺服器的 SFTP 窗格。</li>
-        <li><b>自動重新連線</b> (可在設定中關閉)：已登入的 SSH 或 Telnet 工作階段中斷時，稍候片刻後重新連線，持續失敗時等待時間會逐漸變長。登入失敗或在登入過程中中斷的連線不會重新連線：以錯誤的密碼反覆連線可能導致伺服器封鎖您的連線。</li>
+        <li><b>自動重新連線</b> (可在設定中關閉)：已登入的 SSH 或 Telnet 工作階段中斷時，稍候片刻後重新連線，持續失敗時等待時間會逐漸變長。登入失敗或在登入過程中中斷的連線不會重新連線：以錯誤的密碼反覆連線可能導致伺服器封鎖您的連線。在登入失敗視窗中用 <b>編輯工作階段</b> 修正登入資訊後，該分頁會立即重新連線；重新連線時一律使用最新儲存的工作階段設定。</li>
       </ul>`,
   },
   {
@@ -198,6 +199,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>TFTP</b>：將工作階段類型選為 TFTP (或在快速連線中選擇) 即可開啟 TFTP 分頁。TFTP 沒有登入與資料夾清單，因此請輸入<b>伺服器上的檔案名稱</b>並按一下「取得」，或選擇您電腦上的檔案並按一下「傳送」。區塊大小「自動」適用於大多數設備，不支援選項的舊伺服器會自動改用 512。若要讓設備將檔案傳送到您的電腦 (例如 <code>copy running-config tftp:</code>)，請開啟上方「伺服器」按鈕中的 <b>TFTP 伺服器</b>。</li>
         <li>透過 SFTP 傳送資料夾時會一次傳輸 4 個檔案，對於含有大量小檔案的資料夾 (尤其是遠距離連線) 會快很多。FTP 因為伺服器連線數限制而一次傳送一個，但傳輸期間仍可繼續瀏覽資料夾。</li>
         <li>在伺服器上的文字檔按兩下即可在內建編輯器中開啟；儲存時會直接寫回伺服器。</li>
+        <li><b>使用金鑰登入</b>（SFTP、資源監控、SSH 閘道）：有密語的金鑰若認證保管庫中沒有密語，會要求輸入，並可儲存到該金鑰。密語只用於在本機開啟金鑰，不會傳送到伺服器。伺服器拒絕金鑰時會要求輸入密碼，之後改用該密碼登入。</li>
       </ul>`,
   },
   {
@@ -238,9 +240,9 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>認證保管庫</b> (上方的鑰匙按鈕)：將密碼與 SSH 金鑰儲存在 Windows 認證管理員中，供編輯工作階段使用。已儲存的密碼絕不會顯示在畫面上。金鑰可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。</li>
+        <li><b>認證保管庫</b> (上方的鑰匙按鈕)：將密碼與 SSH 金鑰儲存在 Windows 認證管理員中，供編輯工作階段使用。已儲存的密碼絕不會顯示在畫面上。金鑰可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。認證保管庫與工作階段編輯器會對無法使用的金鑰檔案（不存在、其他格式、其他使用者也能讀取）提出警告；<b>修正權限</b>會將金鑰改為僅此使用者可讀取。終端機中 OpenSSH 忽略此類金鑰時，也可用通知中的<b>修正金鑰檔案權限</b>修正後重新連線。</li>
         <li><b>主密碼</b> (設定 → 安全性)：在應用程式啟動時以及離開一段時間後鎖定。</li>
-        <li>SSH/SFTP 主機金鑰會與 <code>~/.ssh/known_hosts</code> 比對；未知的金鑰會顯示指紋供確認。金鑰變更時會封鎖連線。</li>
+        <li>SSH/SFTP 主機金鑰會與 <code>~/.ssh/known_hosts</code> 比對；未知的金鑰會顯示指紋供確認。金鑰變更時會封鎖連線。確定伺服器已重新安裝時，可在該視窗中用 <b>刪除已儲存的金鑰</b> 刪除舊金鑰，下次連線時會顯示新指紋供確認後信任（終端機、檔案與 SSH 閘道）。</li>
       </ul>`,
   },
   {
@@ -249,7 +251,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "RefreshCw",
     body: `
       <p>啟動時以及執行期間<b>每 30 分鐘</b>（離開一段時間後回到視窗時也會）在 <b>GitHub</b>（github.com/NijG/bananaconn）上檢查新版本。因安全性原則無法連線到 GitHub 的電腦，請在「設定 → 更新」中指定 <b>NAS 更新資料夾</b>（存放新版本的共用資料夾），無法連線到 GitHub 時會檢查該資料夾。發現新版本後會跳出<b>詢問是否立即更新的視窗</b>。按「立即更新」後應用程式會關閉，安裝完成後重新開啟（已開啟的連線會中斷）。按「稍後」後，也可以隨時用狀態列右側的<b>更新</b>按鈕安裝。該視窗預設選取「稍後」，因此在終端機中輸入的 Enter 不會啟動更新。</p>
-      <p><b>出現「密碼不正確」而失敗時</b>：Windows 會以目前登入的 Windows 帳戶連線到共用資料夾，即使共用資料夾允許匿名 (來賓) 讀取，也不會改用來賓身分。請在檔案總管中開啟更新資料夾，輸入 NAS 帳戶並勾選「記住我的認證」，或在 設定 → 更新 的 <b>NAS 帳戶</b> 中從認證保管庫選擇帳戶。之後應用程式就會以該帳戶登入。</p>
+      <p><b>出現「密碼不正確」而失敗時</b>：Windows 會以目前登入的 Windows 帳戶連線到共用資料夾，即使共用資料夾允許匿名 (來賓) 讀取，也不會改用來賓身分。請在檔案總管中開啟更新資料夾，輸入 NAS 帳戶並勾選「記住我的認證」，或在 設定 → 更新 的 <b>NAS 帳戶</b> 中從認證保管庫選擇帳戶。之後應用程式就會以該帳戶登入。所選 NAS 帳戶被拒絕後，自動檢查不再以該帳戶登入（避免錯誤密碼累積導致帳戶被鎖定），並在設定中顯示此情況；修正密碼後按「立即檢查」即可再次使用。</p>
       <p>只會安裝由建置電腦簽章的檔案，因此他人放到共用資料夾中的檔案不會被安裝。也可以使用「立即檢查」馬上確認。</p>`,
   },
   {

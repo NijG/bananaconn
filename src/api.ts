@@ -278,6 +278,8 @@ export interface FileServerStatus {
 
 export const api = {
   sessionsLoad: () => call<Record<string, unknown>[]>("sessions_load"),
+  /** Empty list in place of an unreadable one; resolves with where the old file was kept. */
+  sessionsReset: () => call<string>("sessions_reset"),
   sessionsSave: (sessions: unknown[]) => call<void>("sessions_save", { sessions }),
   readTextFile: (path: string) => call<string>("read_text_file", { path }),
   /** Roaming AppData (where other tools keep their session files). */
@@ -288,9 +290,11 @@ export const api = {
   registryExport: (key: string) => call<string>("registry_export", { key }),
   /** The key files an import names, resolved (SecureCRT's ${VDS_CONFIG_PATH}
    * stands for `configDir`; ~, %VAR%) and checked, in the same order. */
-  importCheckKeys: (paths: string[], configDir: string | null) => call<{ path: string; kind: ImportKeyKind }[]>("import_check_keys", { paths, configDir }),
+  importCheckKeys: (paths: string[], configDir: string | null) => call<{ path: string; kind: ImportKeyKind; open: boolean }[]>("import_check_keys", { paths, configDir }),
   /** Save a key file an import carries in the .ssh folder (owner only); its path. */
   importStoreKey: (name: string, contents: number[]) => call<string>("import_store_key", { name, contents }),
+  /** Remove a server's recorded host keys from ~/.ssh/known_hosts (ssh-keygen -R); true when one was there. */
+  knownHostForget: (host: string, port: number, username: string) => call<boolean>("known_host_forget", { host, port, username }),
   /** The running app's version (tauri.conf.json). */
   appVersion: async () => (isTauri ? (await import("@tauri-apps/api/app")).getVersion() : "0.7.4"),
   /** Compare the update folder's signed latest.json with this version. */
@@ -451,6 +455,8 @@ export const api = {
   vaultGenerateKey: (path: string, keyType: string, passphrase: string, comment: string) =>
     call<string>("vault_generate_key", { path, keyType, passphrase, comment }),
   vaultPublicKey: (keyPath: string) => call<string>("vault_public_key", { keyPath }),
+  /** Make a key credential's file readable by this user only (ssh.exe ignores keys others can read). */
+  vaultProtectKey: (keyPath: string) => call<void>("vault_protect_key", { keyPath }),
   vaultReveal: (id: string) => call<string | null>("vault_reveal", { id }),
   vaultDefaultKeyDir: () => call<string>("vault_default_key_dir"),
 };

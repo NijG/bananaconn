@@ -659,6 +659,11 @@ kbd.word {
 .tree-empty p {
   margin: 0 0 6px;
 }
+/* The backend's message names a long file path: wrap it anywhere. */
+.tree-empty .tree-problem {
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
 
 /* ==========================================================================
    Tabs
@@ -2383,6 +2388,29 @@ code.fp {
 .vault-item small {
   color: var(--muted);
 }
+/* A key credential whose file the logins cannot use. */
+.vault-item .vault-warn {
+  margin-left: auto;
+  flex-direction: row;
+  color: var(--warn);
+}
+.vault-item .vault-warn .ico {
+  color: var(--warn);
+}
+.key-issue {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  color: var(--warn);
+  font-size: 12px;
+}
+.key-issue[hidden] {
+  display: none;
+}
+.overlay-card .key-issue {
+  justify-content: center;
+}
 .vault-detail .seg {
   align-self: flex-start;
 }
@@ -2435,6 +2463,20 @@ code.fp {
   flex-direction: column;
   gap: 8px;
   align-items: flex-end;
+}
+/* An action goes on its own line under the message, lined up with its text
+   (icon 16 px + gap 10 px), so a long label does not squeeze the message. */
+.toast:has(.toast-action) {
+  flex-wrap: wrap;
+}
+.toast:has(.toast-action) > span {
+  flex: 1 1 calc(100% - 26px);
+}
+.toast .toast-action {
+  flex: none;
+  margin-left: 26px;
+  padding: 4px 10px;
+  font-size: 12px;
 }
 .toast {
   display: flex;
@@ -2605,6 +2647,12 @@ code.fp {
 /* A warning line that runs as text (names and reasons in a list). */
 .import-warn {
   color: var(--warn);
+}
+/* One key file the import cannot use, with the sessions that name it. */
+.import-key {
+  display: inline-block;
+  padding-left: 14px;
+  overflow-wrap: anywhere;
 }
 .import-table {
   max-height: 320px;

@@ -3,6 +3,8 @@
 
 import { isTauri } from "./api";
 import { holdsSecret } from "./cmdLine";
+import { endpoint, type Session } from "./model";
+import { toast } from "./ui";
 
 // ---- clipboard history (this PC only) ------------------------------------------
 // Recent copies, newest first, so the user can paste something copied earlier.
@@ -98,4 +100,12 @@ export async function readClipboard(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/** Sessions' addresses ("user@host:port", the COM port for serial) on the
+ * clipboard, one per line: the tab menu and the session list share it. */
+export async function copyAddresses(sessions: Pick<Session, "protocol" | "host" | "port" | "username">[]) {
+  if (!sessions.length) return;
+  await writeClipboard(sessions.map(endpoint).join("\n"));
+  toast(sessions.length > 1 ? `주소 ${sessions.length}개를 복사했습니다` : "주소를 복사했습니다", "success", 2000);
 }

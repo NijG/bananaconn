@@ -14,6 +14,7 @@ import {
   parseSshConfig,
   parseWinScp,
   parseXshellFiles,
+  locateSecureCrt,
   secureCrtGlobalKey,
   type ParsedImport,
 } from "./importers";
@@ -77,7 +78,9 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
   const checks = raw.length ? await api.importCheckKeys(raw, parsed.configDir ?? null) : [];
   const checked = new Map(raw.map((r, i) => [r, checks[i]]));
   const keyLinks: { session: Session; keyPath: string; carried?: number[] }[] = [];
-  const keyProblems: { name: string; reason: string }[] = [];
+  /** Sessions whose key the logins cannot use, with that key file (absent for
+   * a key kept in the source's own store) and why. */
+  const keyProblems: { name: string; reason: string; path?: string }[] = [];
   let lockedPutty = 0;
   // A key file that is not on this PC but that the export itself carries is
   // saved to the .ssh folder on save, then linked.
@@ -89,12 +92,28 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
       keyLinks.push({ session, keyPath: c.path });
       if (c.kind === "putty-encrypted") lockedPutty++;
     } else if (c?.kind === "missing" && carried.has(k.keyPath)) keyLinks.push({ session, keyPath: k.keyPath, carried: carried.get(k.keyPath) });
-    else keyProblems.push({ name: session.name, reason: KEY_PROBLEMS[c?.kind ?? "unknown"] ?? "OpenSSH 형식이 아닙니다" });
+    else keyProblems.push({ name: session.name, reason: KEY_PROBLEMS[c?.kind ?? "unknown"] ?? "OpenSSH 형식이 아닙니다", path: c?.path ?? k.keyPath });
   }
+  for (const n of parsed.keyNotes ?? []) {
+    const session = target.get(n.sessionId);
+    if (session && freshIds.has(session.id)) keyProblems.push({ name: session.name, reason: n.reason });
+  }
+  // One line per key file: many sessions often share one (SecureCRT's key for
+  // all sessions), and the file is what needs fixing.
+  const byFile = new Map<string, typeof keyProblems>();
+  for (const p of keyProblems) {
+    const k = JSON.stringify([p.path ?? "", p.reason]);
+    byFile.set(k, [...(byFile.get(k) ?? []), p]);
+  }
+  const problemGroups = [...byFile.values()];
+  // Linked key files other accounts can read: OpenSSH ignores them until the
+  // vault fixes their permissions.
+  const openKeys = new Set(named.map((k) => checked.get(k.keyPath)).filter((c) => c?.open).map((c) => c!.path)).size;
   const carriedFiles = new Set(keyLinks.filter((k) => k.carried).map((k) => k.keyPath)).size;
   const linkedFresh = keyLinks.filter((k) => freshIds.has(k.session.id)).length;
   const repairs = new Set(keyLinks.filter((k) => !freshIds.has(k.session.id)).map((k) => k.session)).size;
   const savedPasswords = (parsed.savedPasswords ?? []).filter((id) => freshIds.has(id)).length;
+  const routeNotes = (parsed.routeNotes ?? []).filter((n) => freshIds.has(n.sessionId)).map((n) => ({ name: target.get(n.sessionId)!.name, route: n.route }));
   return new Promise((resolve) => {
     const counts = Object.entries(
       fresh.reduce<Record<string, number>>((acc, s) => ((acc[s.protocol] = (acc[s.protocol] ?? 0) + 1), acc), {}),
@@ -127,7 +146,7 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
         const p = PROTOCOLS[s.protocol];
         const flags = sensitiveOf(s);
         return `<tr><td><span class="proto-chip" style="--proto:${p.color}">${p.label}</span></td>
-          <td><span data-i18n-skip>${esc(s.name)}</span>${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}${esc([...new Set(flags.map(labelOf))].join(", "))}</small>` : ""}</td>
+          <td><span data-i18n-skip>${esc(s.name)}</span>${flags.length ? `<br><small class="warn-text">${icon("ShieldAlert", 12)}<span>${[...new Set(flags.map(labelOf))].map((l) => `<span>${esc(l)}</span>`).join(", ")}</span></small>` : ""}</td>
           <td class="mono" data-i18n-skip>${esc(endpoint(s))}</td><td class="muted" data-i18n-skip>${esc(s.folder || "—")}</td></tr>`;
       })
       .join("");
@@ -141,14 +160,28 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
           ${linkedFresh ? `<br><span class="muted">키 파일 ${linkedFresh}개를 자격 증명 보관함에 연결합니다. 비밀번호는 저장하지 않습니다.</span>` : ""}
           ${repairs ? `<br><span class="muted">이미 있는 세션 중 로그인 정보가 없는 ${repairs}개에 키 파일을 연결합니다.</span>` : ""}
           ${carriedFiles ? `<br><span class="muted">이 PC에 없는 키 파일 ${carriedFiles}개는 내보낸 파일에 든 것을 .ssh 폴더에 저장해 씁니다.</span>` : ""}
+          ${openKeys ? `<br><span class="import-warn">다른 사용자도 읽을 수 있는 키 파일 ${openKeys}개는 OpenSSH가 쓰지 않으니, 가져온 뒤 자격 증명 보관함에서 권한을 고치세요.</span>` : ""}
           ${lockedPutty ? `<br><span class="muted">암호가 걸린 PuTTY 키를 쓰는 세션 ${lockedPutty}개는 자격 증명 보관함에서 키 암호를 저장해야 연결됩니다.</span>` : ""}
           ${
             // Each name kept as written (data-i18n-skip), each reason a text of its own to translate.
             keyProblems.length
-              ? `<br><span class="import-warn">키 파일을 쓸 수 없는 세션 ${keyProblems.length}개: ${keyProblems
-                  .slice(0, 4)
-                  .map((p) => `<span data-i18n-skip>${esc(p.name)}</span> (<span>${esc(p.reason)}</span>)`)
-                  .join(", ")}${keyProblems.length > 4 ? " <span>외</span>" : ""}</span>`
+              ? `<br><span class="import-warn">키 파일을 쓸 수 없는 세션 ${keyProblems.length}개:</span>${problemGroups
+                  .slice(0, 3)
+                  .map((g) => {
+                    const { path, reason } = g[0];
+                    const names = g.slice(0, 3).map((p) => esc(p.name)).join(", ");
+                    return `<br><span class="import-warn import-key">${path ? `<code data-i18n-skip>${esc(path)}</code> ` : ""}(<span>${esc(reason)}</span>): <span data-i18n-skip>${names}</span>${g.length > 3 ? ` <span>외 ${g.length - 3}개 세션</span>` : ""}</span>`;
+                  })
+                  .join("")}${problemGroups.length > 3 ? " <span class=\"import-warn\">외</span>" : ""}`
+              : ""
+          }
+          ${
+            // Each name and route kept as written (data-i18n-skip).
+            routeNotes.length
+              ? `<br><span class="import-warn">다른 경로(방화벽·다른 세션)를 거쳐 접속하던 세션 ${routeNotes.length}개는 그 경로를 가져올 수 없어 직접 연결합니다:</span> ${routeNotes
+                  .slice(0, 3)
+                  .map((n) => `<span data-i18n-skip>${esc(n.name)} (${esc(n.route)})</span>`)
+                  .join(", ")}${routeNotes.length > 3 ? ` <span>외 ${routeNotes.length - 3}개 세션</span>` : ""}`
               : ""
           }
           ${savedPasswords ? `<br><span class="muted">원래 프로그램에 비밀번호가 저장되어 있던 세션 ${savedPasswords}개는 비밀번호를 가져오지 않으므로 연결할 때 입력해야 합니다.</span>` : ""}
@@ -281,11 +314,18 @@ export const importSecureCrtFolder = () =>
     const appData = await appDataDir();
     const dir = await pickFolder("SecureCRT 세션 폴더 선택 (Config\\Sessions)", appData ? `${appData}\\VanDyke\\Config\\Sessions` : undefined);
     if (!dir) return null;
-    // The configuration folder around Sessions keeps SSH2.ini, with the key file
-    // set for all sessions, and is what ${VDS_CONFIG_PATH} in key paths means.
-    const configDir = dir.replace(/[\\/]+$/, "").replace(/[\\/]Sessions$/i, "");
-    const ssh2 = await api.readTextFile(`${configDir}\\SSH2.ini`).catch(() => "");
-    return { ...parseSecureCrtFiles(await api.importScan(dir, "ini"), "SecureCRT", secureCrtGlobalKey(ssh2)), configDir };
+    // The configuration folder keeps SSH2.ini, with the key file set for all
+    // sessions, and is what ${VDS_CONFIG_PATH} in key paths means.
+    const ssh2Of = new Map<string, string>();
+    const exists = async (path: string) => {
+      const text = await api.readTextFile(path).catch(() => null);
+      if (text !== null) ssh2Of.set(path, text);
+      return text !== null;
+    };
+    const { configDir, scanDir, subFolders } = await locateSecureCrt(dir, exists);
+    const ssh2 = ssh2Of.get(`${configDir}\\SSH2.ini`) ?? "";
+    const root = ["SecureCRT", ...subFolders].join("/");
+    return { ...parseSecureCrtFiles(await api.importScan(scanDir, "ini"), root, secureCrtGlobalKey(ssh2)), configDir };
   });
 
 export const importSecureCrtXml = () =>

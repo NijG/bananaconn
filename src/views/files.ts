@@ -8,7 +8,8 @@ import { icon } from "../icons";
 import { actionFor } from "../keymap";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { natural } from "../sessionOrder";
-import { patchSession, reloadCredentials } from "../store";
+import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
+import { forgetHostKey } from "../hostKeys";
 import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
@@ -593,6 +594,9 @@ export class FilesView implements View, EditorHost {
   private readonly viewKey = crypto.randomUUID().slice(0, 8);
   /** A password typed at the prompt, saved to the vault once it worked. */
   private pendingCredential: string | null = null;
+  /** A key passphrase typed at the prompt, saved to the session's key
+   * credential once it opened the key and the login went through. */
+  private pendingPassphrase: string | null = null;
   /** Built-in editor tabs using this connection. */
   private editors = new Set<EditorView>();
   /** Files whose editor is being created (CodeMirror still loading). */
@@ -687,7 +691,8 @@ export class FilesView implements View, EditorHost {
       this.editing.length ? `내 PC 앱으로 편집 중인 파일 ${this.editing.length}개가 있습니다` : "",
       dirty ? `편집기에 저장하지 않은 파일 ${dirty}개가 있습니다(이 탭을 닫으면 서버에 저장할 수 없습니다)` : "",
     ];
-    return parts.filter(Boolean).join(", ") || null;
+    // " · " between them: the lookup translates each part (not at commas).
+    return parts.filter(Boolean).join(" · ") || null;
   }
 
   // ---- built-in editor ------------------------------------------------------------
@@ -966,6 +971,11 @@ export class FilesView implements View, EditorHost {
         this.pendingCredential = null;
         await this.saveCredential(pw);
       }
+      if (this.pendingPassphrase !== null) {
+        const pass = this.pendingPassphrase;
+        this.pendingPassphrase = null;
+        await this.savePassphrase(pass);
+      }
       // Jobs queued before a reconnect continue on the new connection.
       this.pump();
       await this.remotePane.load(this.remoteHome);
@@ -977,6 +987,24 @@ export class FilesView implements View, EditorHost {
 
   private async handleConnectError(msg: string, extra: ConnectExtra) {
     this.pendingCredential = null;
+    this.pendingPassphrase = null;
+    // The session's key is encrypted and its passphrase is not in the vault
+    // (or the one typed was wrong). It is checked on this PC, so asking again
+    // sends nothing to the server.
+    if (msg === "NEED_PASSPHRASE" || msg === "BAD_PASSPHRASE") {
+      const key = store.credentials.find((c) => c.id === this.session.credentialId)?.keyPath ?? "";
+      const res = await promptDialog({
+        title: msg === "BAD_PASSPHRASE" ? "키 암호가 맞지 않습니다" : "키 암호 입력",
+        label: "개인 키의 암호",
+        type: "password",
+        icon: "KeyRound",
+        confirm: "연결",
+        extra: `${key ? `<p class="muted small"><code data-i18n-skip>${esc(key)}</code></p>` : ""}<label class="check"><input type="checkbox" name="save" /> 자격 증명 보관함의 이 키에 암호 저장</label>`,
+      });
+      if (!res) return this.fail("키 암호 입력을 취소했습니다.");
+      if (res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked) this.pendingPassphrase = res.value;
+      return this.connect({ ...extra, password: res.value });
+    }
     if (msg.startsWith("FTPS_CERT::")) {
       // "FTPS_CERT::<sha256>::<detail>": the exact certificate the server sent.
       const rest = msg.slice("FTPS_CERT::".length);
@@ -1018,13 +1046,19 @@ export class FilesView implements View, EditorHost {
     }
     if (msg.startsWith("HOSTKEY_MISMATCH::")) {
       const fp = msg.slice("HOSTKEY_MISMATCH::".length);
-      modal({
+      const m = modal({
         title: "호스트 키가 바뀌었습니다",
         icon: "ShieldAlert",
         body: `<p class="modal-text danger-text"><b data-i18n-skip>${esc(this.session.host)}</b> 서버가 이전과 다른 호스트 키를 보냈습니다.
           중간자 공격일 수 있으므로 연결을 차단했습니다.<br><br>새 지문: <code class="fp">${esc(fp)}</code><br><br>
           서버를 다시 설치했거나 키를 교체한 것이 확실하다면, <code>~/.ssh/known_hosts</code>에서 이 서버의 줄을 지운 다음 다시 연결하세요.</p>`,
-        footer: `<button class="btn btn-primary" data-close>확인</button>`,
+        footer: `<button class="btn" data-forget>${icon("ShieldAlert", 14)}저장된 키 지우기</button><button class="btn btn-primary" data-close>확인</button>`,
+      });
+      // A reinstalled server: forget the old key; the reconnect then asks to trust the new one.
+      m.root.querySelector("[data-forget]")!.addEventListener("click", async () => {
+        if (!(await forgetHostKey(this.session.host, this.session.port || 22, this.session.username))) return;
+        m.close();
+        this.reconnect();
       });
       return this.fail("호스트 키 불일치로 연결을 차단했습니다.");
     }
@@ -1044,7 +1078,7 @@ export class FilesView implements View, EditorHost {
           value: "",
           icon: "KeyRound",
           confirm: "연결",
-          extra: `<label class="field"><span>${esc(this.session.host)} 의 비밀번호</span>
+          extra: `<label class="field"><span>${esc(userText(this.session.host))} 의 비밀번호</span>
                     <input name="pw" type="password" autocomplete="off" /></label>
                   ${saveRow}`,
         });
@@ -1056,7 +1090,7 @@ export class FilesView implements View, EditorHost {
       } else {
         const res = await promptDialog({
           title: retry ? "비밀번호가 올바르지 않습니다" : "비밀번호 입력",
-          label: `${this.session.username}@${this.session.host} 의 비밀번호`,
+          label: `${userText(this.session.username)}@${userText(this.session.host)} 의 비밀번호`,
           type: "password",
           icon: "KeyRound",
           confirm: "연결",
@@ -1070,6 +1104,19 @@ export class FilesView implements View, EditorHost {
       return this.connect({ ...extra, password });
     }
     this.fail(msg);
+  }
+
+  /** Keep the typed passphrase in the session's key credential. */
+  private async savePassphrase(passphrase: string) {
+    const cred = store.credentials.find((c) => c.id === this.session.credentialId);
+    if (!cred || cred.kind !== "key") return;
+    try {
+      await api.vaultSave(cred, passphrase);
+      await reloadCredentials();
+      toast("키 암호를 저장했습니다", "success");
+    } catch (err) {
+      toast(errorText(err), "error");
+    }
   }
 
   private async saveCredential(password: string) {
@@ -1102,7 +1149,7 @@ export class FilesView implements View, EditorHost {
   private showOverlay(kind: "connecting" | "error", msg = "") {
     this.overlay.hidden = false;
     if (kind === "connecting") {
-      this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3>${esc(endpoint(this.session))}</h3><p>서버에 연결하는 중...</p></div>`;
+      this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3 data-i18n-skip>${esc(endpoint(this.session))}</h3><p>서버에 연결하는 중...</p></div>`;
       return;
     }
     this.overlay.innerHTML = `<div class="overlay-card">${icon("WifiOff", 26)}<h3>연결하지 못했습니다</h3><p>${esc(msg)}</p>
@@ -1118,6 +1165,7 @@ export class FilesView implements View, EditorHost {
       }
     api.remoteDisconnect(this.remoteId).catch(() => {});
     this.remoteId = crypto.randomUUID();
+    if (takeSavedSession(this.session)) this.ws.changed();
     this.connect({});
   }
 

@@ -2,6 +2,7 @@
 // and formatting.
 
 import { icon } from "./icons";
+import { userText } from "./i18nTables";
 
 export function esc(s: unknown): string {
   return String(s ?? "")
@@ -71,7 +72,8 @@ const TOAST_ICON: Record<ToastKind, string> = {
  * trigger, a broadcast to many tabs) cannot fill the screen. */
 const TOAST_MAX = 5;
 
-export function toast(message: string, kind: ToastKind = "info", ms = 3800) {
+/** `action`: a button in the toast (clicking it closes the toast and runs it). */
+export function toast(message: string, kind: ToastKind = "info", ms = 3800, action?: { label: string; run: () => void }) {
   let host = document.getElementById("toasts");
   if (!host) {
     host = h("div", { id: "toasts" });
@@ -86,6 +88,16 @@ export function toast(message: string, kind: ToastKind = "info", ms = 3800) {
     t.classList.remove("show");
     setTimeout(() => t.remove(), 250);
   };
+  if (action) {
+    const btn = h("button", { class: "btn toast-action" });
+    btn.textContent = action.label;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      close();
+      action.run();
+    });
+    t.appendChild(btn);
+  }
   t.addEventListener("click", close);
   setTimeout(close, ms);
   // For a "working…" toast whose job may end before `ms`.
@@ -146,7 +158,8 @@ export function ensureNotifyPermission() {
   }
 }
 
-/** Show an OS notification when allowed, otherwise an in-app toast. `onClick`
+/** Show an OS notification when allowed, otherwise an in-app toast. `body`
+ * is the user's text (a tab title), kept as written in the toast. `onClick`
  * (focus the tab that finished) runs when the notification is clicked. */
 export function osNotify(title: string, body: string, onClick?: () => void) {
   try {
@@ -166,7 +179,7 @@ export function osNotify(title: string, body: string, onClick?: () => void) {
   } catch {
     // Fall through to the toast.
   }
-  toast(`${title} — ${body}`, "info", 5000);
+  toast(`${title} — ${userText(body)}`, "info", 5000);
 }
 
 /** A short beep (trigger rules). Best-effort: silent when audio is unavailable. */

@@ -2,14 +2,15 @@
 
 import { icon } from "./icons";
 import { proxyFields, proxyOptions, proxyProblem } from "./proxy";
-import { BAUD_RATES, defaultPort, newSession, normalizeFolder, parseTarget, PROTOCOL_ORDER, PROTOCOLS, unusableHost, serialSettings, type Protocol, type Session } from "./model";
+import { BAUD_RATES, badForwardLine, defaultPort, jumpHostOk, newSession, normalizeFolder, normalizeJumpHost, parseTarget, PROTOCOL_ORDER, PROTOCOLS, unusableHost, serialSettings, type Protocol, type Session } from "./model";
 import { allFolders, state, upsertSession } from "./store";
 import { api } from "./api";
-import { errorText, esc, modal, toast } from "./ui";
-import { gatewayField } from "./tunnels";
+import { errorText, esc, h, modal, toast } from "./ui";
+import { canBeGateway, confirmGatewayBreak, gatewayField, gatewayUsers } from "./tunnels";
 import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
-import { openVault } from "./vault";
+import { credentialCheck, openVault, protectKeyFile } from "./vault";
 import { checkReachable } from "./nettools";
+import { userText } from "./i18n";
 
 const VNC_QUALITY: [string, string][] = [
   ["fast", "빠르게 (기본: 화질을 낮추고 최대한 압축)"],
@@ -274,7 +275,8 @@ export function editSession(
                 ${creds.map((c) => `<option value="${c.id}" data-i18n-skip title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
               </select>
               <button type="button" class="btn" data-vault>${icon("KeyRound", 14)}관리</button>
-            </div></label>`
+            </div>
+            <small class="key-issue" hidden></small></label>`
           }
           <label class="field span-2"><span>폴더</span>
             <input name="folder" value="${esc(s.folder)}" list="folder-list" placeholder="예: 운영/웹서버 (슬래시로 하위 폴더)" />
@@ -294,6 +296,29 @@ export function editSession(
         await openVault();
         render();
       });
+      // A key credential whose file the login cannot use: said here, before
+      // the connection asks for a password instead.
+      const credSelect = form.querySelector<HTMLSelectElement>("[name=credentialId]");
+      const showCredIssue = async () => {
+        const line = form.querySelector<HTMLElement>(".key-issue");
+        if (!credSelect || !line) return;
+        const id = credSelect.value;
+        const { issue, fixable } = await credentialCheck(state.credentials.find((c) => c.id === id));
+        if (!line.isConnected || credSelect.value !== id) return;
+        line.hidden = !issue;
+        line.innerHTML = issue ? `${icon("TriangleAlert", 12)}<span>${esc(issue)}</span>` : "";
+        // Fixable here, as in the vault: only this user may read the file afterwards.
+        if (fixable) {
+          const fix = h("button", { type: "button", class: "btn btn-sm" });
+          fix.textContent = "권한 고치기";
+          fix.addEventListener("click", async () => {
+            if (await protectKeyFile(fixable)) showCredIssue();
+          });
+          line.appendChild(fix);
+        }
+      };
+      credSelect?.addEventListener("change", showCredIssue);
+      showCredIssue();
       // Serial: list the COM ports present now.
       const scan = async () => {
         const found = form.querySelector<HTMLElement>(".com-found");
@@ -303,7 +328,7 @@ export function editSession(
           const ports = await api.serialPorts();
           list.innerHTML = ports.map((p) => `<option value="${esc(p.name)}">${esc(p.description)}</option>`).join("");
           found.textContent = ports.length
-            ? `이 PC의 포트: ${ports.map((p) => p.name + (p.description ? ` (${p.description})` : "")).join(", ")}`
+            ? `이 PC의 포트: ${userText(ports.map((p) => p.name + (p.description ? ` (${p.description})` : "")).join(", "))}`
             : "찾은 COM 포트가 없습니다. USB 콘솔 케이블과 드라이버를 확인하세요.";
           const host = form.querySelector<HTMLInputElement>("[name=host]")!;
           if (!host.value && ports.length === 1) host.value = ports[0].name;
@@ -400,6 +425,23 @@ export function editSession(
         form.querySelector<HTMLInputElement>("[name='opt.wolMac']")?.focus();
         return;
       }
+      // Port forwards, checked as connecting reads them, so a typo shows now
+      // instead of stopping the connection.
+      const badForward = s.protocol === "ssh" ? badForwardLine(String(s.options.forwards ?? "")) : null;
+      if (badForward) {
+        toast(`포트 포워딩 줄의 형식이 올바르지 않습니다 (예: L 8080:localhost:80): ${userText(badForward)}`, "warn", 6000);
+        form.querySelector<HTMLTextAreaElement>("[name='opt.forwards']")?.focus();
+        return;
+      }
+      const jump = s.protocol === "ssh" ? normalizeJumpHost(String(s.options.jumpHost ?? "")) : "";
+      // Kept normalized: a value of spaces alone is no jump host anywhere, and an
+      // ssh:// URI is written as the same hop in the form the check takes.
+      if (s.protocol === "ssh" && s.options.jumpHost !== undefined) s.options.jumpHost = jump;
+      if (jump && !jumpHostOk(jump)) {
+        toast("점프 호스트 값이 올바르지 않습니다 (예: user@bastion:22, 여러 개는 쉼표로 구분)", "warn", 6000);
+        form.querySelector<HTMLInputElement>("[name='opt.jumpHost']")?.focus();
+        return;
+      }
       if (s.protocol === "serial") {
         s.host = s.host.toUpperCase();
         s.port = null;
@@ -441,6 +483,9 @@ export function editSession(
           return;
         }
         saved = applyEdits(original, s, current);
+        // A gateway of other sessions this edit leaves unusable as one.
+        const users = canBeGateway(current) && !canBeGateway(saved) ? gatewayUsers(saved.id) : [];
+        if (users.length && !(await confirmGatewayBreak(users))) return;
       }
       await upsertSession(saved);
       result = { session: saved, connect };

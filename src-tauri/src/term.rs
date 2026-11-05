@@ -824,7 +824,7 @@ pub async fn term_break(state: State<'_, TermState>, id: String) -> Result<(), S
 /// Values that reach ssh.exe as arguments. Anything starting with '-' would be
 /// parsed as an option (e.g. `-oProxyCommand=...` runs a command), so every
 /// user-, import- or file-supplied value is checked against a strict charset.
-fn safe_token(value: &str, what: &str, extra: &str) -> Result<(), String> {
+pub(crate) fn safe_token(value: &str, what: &str, extra: &str) -> Result<(), String> {
     let ok = !value.is_empty()
         && !value.starts_with('-')
         && value.chars().all(|c| c.is_ascii_alphanumeric() || "._-@:[]".contains(c) || extra.contains(c) || (!c.is_ascii() && !c.is_whitespace()));
@@ -899,6 +899,62 @@ pub(crate) fn ssh_config(host: &str, port: u16, username: &str) -> SshConfig {
         port: get("port").and_then(|p| p.parse().ok()).unwrap_or(port),
         hostname,
     }
+}
+
+/// How known_hosts names a server: the bare name on port 22, "[name]:port"
+/// on any other.
+fn known_host_name(host: &str, port: u16) -> String {
+    if port == 22 { host.to_string() } else { format!("[{host}]:{port}") }
+}
+
+/// Remove a server's recorded host keys from `file` with OpenSSH's own
+/// `ssh-keygen -R`, which also finds hashed entries and keeps the previous
+/// file as known_hosts.old. Each name is removed (the session's host as typed,
+/// which the SFTP client records, and the one ssh.exe resolves from
+/// ~/.ssh/config). True when one was there.
+fn forget_known_host(file: &Path, names: &[String]) -> Result<bool, String> {
+    use std::os::windows::process::CommandExt;
+    let mut found = false;
+    for name in names {
+        let out = std::process::Command::new("ssh-keygen")
+            .arg("-R")
+            .arg(name)
+            .arg("-f")
+            .arg(file)
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("ssh-keygen을 실행할 수 없습니다 (OpenSSH 클라이언트 필요): {e}"))?;
+        // "# Host … found: line N" for each entry removed.
+        found |= String::from_utf8_lossy(&out.stdout).contains(" found: ");
+        if !out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("not found") {
+            return Err(format!("호스트 키를 지울 수 없습니다: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+    }
+    Ok(found)
+}
+
+/// Forget the recorded host key of a server whose key has changed (the user
+/// confirmed it was reinstalled), so the next connection shows the new key's
+/// fingerprint for approval. Nothing is trusted here.
+#[tauri::command]
+pub async fn known_host_forget(host: String, port: u16, username: String) -> Result<bool, String> {
+    let host = host.trim().to_string();
+    safe_token(&host, "호스트", "")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = ssh_config(&host, port, &username);
+        let mut names = vec![known_host_name(&host, port)];
+        let resolved = known_host_name(&cfg.key_host, cfg.port);
+        if !names.contains(&resolved) {
+            names.push(resolved);
+        }
+        let file = crate::remote::known_hosts_path();
+        if !file.is_file() {
+            return Ok(false);
+        }
+        forget_known_host(&file, &names)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn open_ssh(app: &AppHandle, req: &OpenRequest, cred: Option<vault::Resolved>, out: Arc<OutPump>) -> Result<Arc<Session>, String> {
@@ -1470,6 +1526,52 @@ mod ssh_arg_tests {
 #[cfg(test)]
 mod tests {
     use super::AnsiStripper;
+
+    #[test]
+    fn known_host_names_follow_openssh() {
+        assert_eq!(super::known_host_name("10.0.0.5", 22), "10.0.0.5");
+        assert_eq!(super::known_host_name("web.lan", 2222), "[web.lan]:2222");
+    }
+
+    /// The real ssh-keygen removes the server's lines, plain and hashed, on its
+    /// own port only, and leaves the other servers alone.
+    #[test]
+    fn forgetting_a_host_key_removes_only_that_server() {
+        if std::process::Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bx-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("known_hosts");
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        std::fs::write(&file, format!("10.0.0.5 {key}
+[10.0.0.5]:2222 {key}
+other.lan {key}
+")).unwrap();
+        // A hashed entry for web.lan, written by ssh-keygen itself.
+        std::fs::write(dir.join("plain"), format!("web.lan {key}
+")).unwrap();
+        std::process::Command::new("ssh-keygen").arg("-H").arg("-f").arg(dir.join("plain")).output().unwrap();
+        let hashed = std::fs::read_to_string(dir.join("plain")).unwrap();
+        assert!(hashed.starts_with("|1|"), "{hashed}");
+        let mut all = std::fs::read_to_string(&file).unwrap();
+        all.push_str(&hashed);
+        std::fs::write(&file, &all).unwrap();
+
+        assert!(super::forget_known_host(&file, &["10.0.0.5".into()]).unwrap());
+        let left = std::fs::read_to_string(&file).unwrap();
+        assert!(!left.lines().any(|l| l.starts_with("10.0.0.5 ")), "{left}");
+        assert!(left.contains("[10.0.0.5]:2222") && left.contains("other.lan"), "{left}");
+        assert!(dir.join("known_hosts.old").exists(), "the previous file is kept");
+
+        assert!(super::forget_known_host(&file, &["web.lan".into()]).unwrap());
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("|1|"));
+        // Not there (any more): nothing removed, no error.
+        assert!(!super::forget_known_host(&file, &["10.0.0.5".into(), "nowhere.lan".into()]).unwrap());
+        assert!(std::fs::read_to_string(&file).unwrap().contains("other.lan"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn reads_the_windows_build_number() {

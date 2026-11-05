@@ -34,7 +34,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Sorting and order</b>: The sort button above the session list chooses by name (AP2 before AP10), by address (IPs compared as numbers), recently connected, or custom. Drag a session above or below another to put it there; folders are reordered, or moved into another folder, the same way. Reordering switches to the custom order, which is kept. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} move the selected session one place, and "Sort this folder by name/address" in a folder's menu tidies it in one go.</li>
         <li><b>Search</b>: Type part of a name, host, user or note into the search box at the top.</li>
         <li><b>Multi-select</b>: ${kbd("Ctrl")}+click to pick one at a time, ${kbd("Shift")}+click to pick a range. ${kbd("Shift+↑/↓")} and ${kbd("Ctrl+A")} also work. ${kbd("Esc")} clears the selection.</li>
-        <li><b>Bulk actions</b>: With several selected, right-click → Bulk edit (${kbd("F2")}: user, port, credential, folder, key mode), Move to folder, Delete (${kbd("Del")}), Connect all (${kbd("Enter")}).</li>
+        <li><b>Bulk actions</b>: With several selected, right-click → Bulk edit (${kbd("F2")}: user, port, credential, folder, key mode, jump host (SSH), SSH gateway (Telnet, RDP, VNC)), Move to folder, Copy addresses (one per line), Delete (${kbd("Del")}), Connect all (${kbd("Enter")}).</li>
         <li><b>Copy &amp; paste</b>: Select a session and press ${kbd("Ctrl+C")}, select a session in the target folder and press ${kbd("Ctrl+V")}. Each paste creates a new session named "Name (2)", "Name (3)". Right-click → Duplicate does the same.</li>
         <li><b>Edit</b>: ${kbd("F2")} or right-click → Edit.</li>
       </ul>`,
@@ -48,12 +48,12 @@ export const SECTIONS: HelpSection[] = [
       <table class="help-table">
         <tr><th>Program</th><th>What to choose</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (portable: next to the executable)</td></tr>
-        <tr><td>SecureCRT</td><td>Session folder <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (including folder structure, log file names, auto-logging settings and the key files used for public-key login), or an XML made with File → Export Settings</td></tr>
+        <tr><td>SecureCRT</td><td>Session folder <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (including folder structure, log file names, auto-logging settings and the key files used for public-key login, and a firewall that goes through another session as a jump host, session descriptions as notes, and an SSH session's NO-OP interval as its keepalive interval), or an XML made with File → Export Settings</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (if full-file encryption is on, turn it off and save first)</td></tr>
-        <tr><td>PuTTY · KiTTY</td><td>Reads this PC's settings directly</td></tr>
-        <tr><td>WinSCP</td><td>This PC's settings, or <code>WinSCP.ini</code> if none</td></tr>
-        <tr><td>Xshell</td><td>The <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> folder</td></tr>
-        <tr><td>OpenSSH</td><td>The <code>.ssh\\config</code> file (Host, HostName, User, Port, ProxyJump, IdentityFile; as ssh does, every matching Host block applies and the first value wins; wildcards such as <code>Host *</code> only supply defaults, not sessions)</td></tr>
+        <tr><td>PuTTY · KiTTY</td><td>Reads this PC's settings directly (including each session's key file, port forwards, agent forwarding, compression and keepalive interval)</td></tr>
+        <tr><td>WinSCP</td><td>This PC's settings, or <code>WinSCP.ini</code> if none (including key files)</td></tr>
+        <tr><td>Xshell</td><td>The <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> folder. Keys kept in Xshell's key store cannot be linked: export them in OpenSSH format from Xshell's User Key Manager and set them in the credential vault</td></tr>
+        <tr><td>OpenSSH</td><td>The <code>.ssh\\config</code> file (Host, HostName, User, Port, ProxyJump, IdentityFile, LocalForward, RemoteForward, DynamicForward, ForwardAgent, Compression, ServerAliveInterval; as ssh does, every matching Host block applies and the first value wins, while port forwards from all of them add up; wildcards such as <code>Host *</code> only supply defaults, not sessions)</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> file</td></tr>
         <tr><td>Remote Desktop</td><td>A folder containing <code>.rdp</code> files (subfolders included)</td></tr>
         <tr><td>CSV</td><td>Column names on the first line: Name, Protocol, Host, Port, Username, Folder, Domain (comma, semicolon or tab separated). <b>Export session list (CSV)</b> in the same menu writes this format.</td></tr>
@@ -68,6 +68,7 @@ export const SECTIONS: HelpSection[] = [
       <ul>
         <li><b>Close a tab</b>: ${kbd("Ctrl+F4")} or ${kbd("Ctrl+Shift+W")}, or middle-click the tab. Press ${kbd("Enter")} in the confirmation to close; check "Don't ask again" to skip it next time (can be turned back on in Settings).</li>
         <li><b>Open the same session again</b>: <b>Double-click</b> the tab. Handy for a second connection to the same device for monitoring.</li>
+        <li><b>Tab menu</b>: Right-click a tab to reconnect, edit its session, copy its address (user@host:port), close the other tabs or close the tabs to the right.</li>
         <li><b>Switch tabs</b>: ${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}. With many tabs, scroll the mouse wheel over the tab bar to move left and right. Drag tabs to reorder them.</li>
         <li><b>Split view</b>: The single / left-right / top-bottom / 4-way buttons at the top. Drag a tab into the pane you want.</li>
         <li>The tab dot color shows the protocol, blinking means connecting, and red means an error.</li>
@@ -89,7 +90,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Rendering</b> (Settings → Terminal): "Auto" draws with the GPU (WebGL) on PCs with a graphics card, speeding up heavy output, and uses the standard renderer on servers and remote sessions without one. Only terminals visible on screen use the GPU.</li>
         <li><b>Snippets &amp; macros</b>: Save frequently used commands under Snippets in the toolbar, and use "Record" to capture input and play it back.</li>
         <li><b>Files</b> (SSH): The Files button in the toolbar opens an SFTP pane for the same server alongside.</li>
-        <li><b>Automatic reconnect</b> (can be turned off in Settings): when a logged-in SSH or Telnet session drops, it waits a moment and reconnects, waiting longer each time it keeps failing. A connection whose login failed, or that ended during login, is not reconnected: connecting again and again with a wrong password can get the server to block you.</li>
+        <li><b>Automatic reconnect</b> (can be turned off in Settings): when a logged-in SSH or Telnet session drops, it waits a moment and reconnects, waiting longer each time it keeps failing. A connection whose login failed, or that ended during login, is not reconnected: connecting again and again with a wrong password can get the server to block you. Fixing the login with <b>Edit session</b> in the login-failed dialog reconnects that tab at once, and a reconnect always uses the session's latest saved settings.</li>
       </ul>`,
   },
   {
@@ -198,6 +199,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>TFTP</b>: Choose TFTP as the session type (or in Quick connect) to open a TFTP tab. TFTP has no login or folder listing, so type the <b>file name on the server</b> and click "Get", or pick a file on your PC and click "Send". Block size "Auto" suits most devices, and old servers that don't understand options automatically fall back to 512. To let a device send files to your PC (e.g. <code>copy running-config tftp:</code>), turn on the <b>TFTP server</b> under the "Servers" button at the top.</li>
         <li>Sending a folder over SFTP transfers 4 files at once, which is much faster for folders with many small files, especially over long distances. FTP sends one at a time because of server connection limits, but you can keep browsing folders during the transfer.</li>
         <li>Double-click a text file on the server to open it in the built-in editor; saving writes it straight back to the server.</li>
+        <li><b>Logging in with a key</b> (SFTP, resource monitor, SSH gateway): for a key with a passphrase that is not in the vault you are asked for the passphrase, and can save it with the key. The passphrase only opens the key on this PC and is never sent to the server. If the server refuses the key, you are asked for a password, which is then used instead of the key.</li>
       </ul>`,
   },
   {
@@ -238,9 +240,9 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Credential vault</b> (key button at the top): Stores passwords and SSH keys in Windows Credential Manager for use in the session editor. Saved passwords are never sent to the screen. Keys can be in OpenSSH or PuTTY (.ppk) format.</li>
+        <li><b>Credential vault</b> (key button at the top): Stores passwords and SSH keys in Windows Credential Manager for use in the session editor. Saved passwords are never sent to the screen. Keys can be in OpenSSH or PuTTY (.ppk) format. The vault and the session editor warn about key files that cannot be used (missing, another format, readable by other users); <b>Fix permissions</b> makes a key readable by this user only. When OpenSSH ignores such a key in the terminal, <b>Fix key file permissions</b> in the notice fixes it and reconnects.</li>
         <li><b>Master password</b> (Settings → Security): Locks the app on startup and after you've been away.</li>
-        <li>SSH/SFTP host keys are checked against <code>~/.ssh/known_hosts</code>; unknown keys show a fingerprint for confirmation. Changed keys block the connection.</li>
+        <li>SSH/SFTP host keys are checked against <code>~/.ssh/known_hosts</code>; unknown keys show a fingerprint for confirmation. Changed keys block the connection. If you are sure the server was reinstalled, <b>Remove saved key</b> in that dialog deletes the old key, and the next connection shows the new fingerprint for you to check and trust (terminal, files and SSH gateway).</li>
       </ul>`,
   },
   {
@@ -249,7 +251,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "RefreshCw",
     body: `
       <p>At startup and <b>every 30 minutes</b> while running (and when you come back to the window after a while), the app checks <b>GitHub</b> (github.com/NijG/bananaconn) for a new version. On a PC whose security policy blocks GitHub, set a <b>NAS update folder</b> (a shared folder new versions are published to) in Settings → Update; it is checked when GitHub cannot be reached. When a new version is found, a <b>window asks whether to update now</b>. "Update now" closes the app, installs and reopens it (open connections are closed). With "Later", the <b>Update</b> button on the right of the status bar installs it at any time. The window starts with "Later" selected, so an Enter typed for a terminal never starts an update.</p>
-      <p><b>When it fails with "the password is incorrect"</b>: Windows connects to a shared folder with the Windows account you are signed in with, and does not fall back to guest access even when the share allows anonymous (guest) reading. Open the update folder in Explorer, enter the NAS account and tick "Remember my credentials", or choose an account from the credential vault under <b>NAS account</b> in Settings → Update. The app then logs in with it.</p>
+      <p><b>When it fails with "the password is incorrect"</b>: Windows connects to a shared folder with the Windows account you are signed in with, and does not fall back to guest access even when the share allows anonymous (guest) reading. Open the update folder in Explorer, enter the NAS account and tick "Remember my credentials", or choose an account from the credential vault under <b>NAS account</b> in Settings → Update. The app then logs in with it. If the chosen NAS account is refused, automatic checks stop logging in with it (so wrong passwords do not pile up and lock the account) and Settings says so; after fixing its password, "Check now" uses it again.</p>
       <p>Only files signed by the build PC are installed, so files placed in the shared folder by others are not installed. You can also check right away with "Check now".</p>`,
   },
   {

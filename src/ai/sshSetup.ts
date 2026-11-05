@@ -8,7 +8,7 @@
 import { api, on, type SshKitEvent } from "../api";
 import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
-import { newSession, type Session } from "../model";
+import { jumpHop, newSession, type Session } from "../model";
 import { state, upsertSession } from "../store";
 import { gatewayOf } from "../tunnels";
 import { proxyOf } from "../proxy";
@@ -39,7 +39,7 @@ export function sshSessionFor(desktop: Session): { session: Session; existing: b
     s.notes = "Windows PowerShell (OpenSSH)";
   }
   const gw = gatewayOf(desktop);
-  if (gw) s.options.jumpHost = `${gw.username ? `${gw.username}@` : ""}${gw.host.trim()}:${gw.port ?? 22}`;
+  if (gw) s.options.jumpHost = jumpHop(gw);
   else for (const k of PROXY_KEYS) if (desktop.options[k] !== undefined) s.options[k] = desktop.options[k];
   return { session: s, existing: false };
 }

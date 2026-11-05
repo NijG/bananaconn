@@ -53,24 +53,58 @@ fn read_sessions(path: &Path) -> Result<Vec<Value>, String> {
 /// Copy an unreadable session file aside (once per distinct content), so a
 /// later save can never destroy the only copy.
 fn keep_aside(path: &Path, err: String) -> String {
-    let Ok(bytes) = fs::read(path) else { return err };
+    match keep_copy(path) {
+        Some(aside) => format!("{err}. 원본을 {} 에 보관했습니다.", aside.display()),
+        None => err,
+    }
+}
+
+/// The copy of `path` next to it ("sessions.json.bad-<time>"): an existing one
+/// with the same bytes, else a new one. None when it cannot be read or written.
+fn keep_copy(path: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(path).ok()?;
     let prefix = format!("{}.bad-", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
     let dir = path.parent().unwrap_or(Path::new("."));
     let existing = fs::read_dir(dir).into_iter().flatten().flatten().find(|e| {
         e.file_name().to_string_lossy().starts_with(&prefix) && fs::read(e.path()).is_ok_and(|b| b == bytes)
     });
-    let aside = match existing {
-        Some(e) => e.path(),
-        None => {
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let aside = dir.join(format!("{prefix}{stamp}"));
-            if fs::write(&aside, &bytes).is_err() {
-                return err;
-            }
-            aside
-        }
-    };
-    format!("{err}. 원본을 {} 에 보관했습니다.", aside.display())
+    if let Some(e) = existing {
+        return Some(e.path());
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let aside = dir.join(format!("{prefix}{stamp}"));
+    fs::write(&aside, &bytes).ok()?;
+    Some(aside)
+}
+
+/// Start an empty list in place of a session file that cannot be read, after
+/// the user chose to. Refused when the file reads fine now (a passing problem,
+/// such as another program holding it: restarting loads it) and when no copy
+/// of it can be kept, so this never destroys the only copy. Returns the copy.
+#[tauri::command]
+pub async fn sessions_reset(app: AppHandle) -> Result<String, String> {
+    let ticket = SAVE_TICKETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let path = store_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut kept = None;
+        save_in_order(&SAVED, ticket, || {
+            kept = Some(reset_unreadable(&path)?);
+            Ok(())
+        })?;
+        // A later save already replaced the file: nothing was reset.
+        kept.map(|p| p.display().to_string()).ok_or_else(|| "세션 목록이 그사이 다시 저장되었습니다. 앱을 다시 시작하세요.".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn reset_unreadable(path: &Path) -> Result<PathBuf, String> {
+    if read_sessions(path).is_ok() {
+        return Err("세션 목록 파일을 이제 읽을 수 있습니다. 앱을 다시 시작하면 불러옵니다.".into());
+    }
+    let aside = keep_copy(path).ok_or("세션 목록 파일의 사본을 보관할 수 없어 새로 시작하지 않았습니다.")?;
+    write_atomic(path, b"[]").map_err(|e| format!("세션 목록을 저장할 수 없습니다: {e}"))?;
+    Ok(aside)
 }
 
 /// Credential ids used by saved VNC sessions: the only ones whose password
@@ -159,7 +193,30 @@ pub(crate) fn decode_code_page(code_page: u32, bytes: &[u8], strict: bool) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_text, read_limited, save_in_order};
+    use super::{decode_text, read_limited, reset_unreadable, save_in_order};
+
+    /// Starting empty keeps the unreadable file aside (once per content) and
+    /// never touches a file that reads fine.
+    #[test]
+    fn reset_keeps_the_unreadable_file_and_refuses_a_readable_one() {
+        let dir = std::env::temp_dir().join(format!("bx-store-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        std::fs::write(&path, b"[{\"id\":\"a\"}").unwrap();
+        let aside = reset_unreadable(&path).unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), b"[{\"id\":\"a\"}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        // Readable now (the empty list): refused, left as it is.
+        assert!(reset_unreadable(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        // The same damaged content again shares the existing copy.
+        std::fs::write(&path, b"[{\"id\":\"a\"}").unwrap();
+        assert_eq!(reset_unreadable(&path).unwrap(), aside);
+        let copies = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".bad-")).count();
+        assert_eq!(copies, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn refuses_large_files_before_reading() {

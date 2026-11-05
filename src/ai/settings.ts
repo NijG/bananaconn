@@ -5,6 +5,7 @@ import { api } from "../api";
 import { icon } from "../icons";
 import { reloadCredentials, state, updateSettings } from "../store";
 import { confirmDialog, errorText, esc, modal, toast } from "../ui";
+import { userText } from "../i18n";
 import { AI_CLIS, AI_KINDS, ask, cliLabel, isLocal, kindInfo, providerLabel, providers, type AiKind, type AiProvider } from "./core";
 
 /** The AI page of the settings form (its two checkboxes are saved with the form). */
@@ -257,7 +258,7 @@ export function openProviderEditor(existing: AiProvider | null, saved: () => voi
     const started = performance.now();
     try {
       const answer = await ask(p, "Reply with the single word OK.", [{ role: "user", content: "ping" }], () => {}).done;
-      toast(`연결됐습니다 (${((performance.now() - started) / 1000).toFixed(1)}초): ${answer.trim().slice(0, 60)}`, "success", 6000);
+      toast(`연결됐습니다 (${((performance.now() - started) / 1000).toFixed(1)}초): ${userText(answer.trim().slice(0, 60))}`, "success", 6000);
     } catch (err) {
       toast(`연결하지 못했습니다: ${errorText(err)}`, "error", 8000);
     }

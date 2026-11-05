@@ -20,10 +20,16 @@ function addressKey(host: string): { rank: number; ip?: number[]; text: string }
   return { rank: h ? 2 : 3, text: h };
 }
 
-/** The eight 16-bit groups of an IPv6 address ("::" expanded). */
+/** The eight 16-bit groups of an IPv6 address ("::" expanded). An IPv4 tail
+ * ("::ffff:192.0.2.9") is the last two groups. */
 function ipv6Groups(h: string): number[] {
   const [head, tail = ""] = h.split("::");
-  const part = (s: string) => (s ? s.split(":").map((g) => (g.includes(".") ? 0 : parseInt(g, 16) || 0)) : []);
+  const group = (g: string): number[] => {
+    if (!g.includes(".")) return [parseInt(g, 16) || 0];
+    const [a = 0, b = 0, c = 0, d = 0] = g.split(".").map((n) => Number(n) || 0);
+    return [a * 256 + b, c * 256 + d];
+  };
+  const part = (s: string) => (s ? s.split(":").flatMap(group) : []);
   const a = part(head);
   const b = part(tail);
   return [...a, ...Array(Math.max(0, 8 - a.length - b.length)).fill(0), ...b];

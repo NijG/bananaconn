@@ -15,7 +15,7 @@
 // Every parser hands its sessions to add(), so all imports share one set of
 // rules (host field splitting, unusable hosts, ports, notes).
 
-import { parseTarget, PROTOCOLS, unusableHost, type Protocol, type Session } from "./model";
+import { forwardSpecOk, jumpHop, normalizeJumpHost, parseTarget, PROTOCOLS, unusableHost, type Protocol, type Session } from "./model";
 
 /** What a parser found: sessions to review, and entries it could not take. */
 export interface ParsedImport {
@@ -36,6 +36,14 @@ export interface ParsedImport {
    * the path its sessions name them with: used when that file is not on
    * this PC. */
   keyFiles?: { keyPath: string; contents: number[] }[];
+  /** Sessions that log in with a key the import cannot link (one kept in the
+   * source's own key store), with why: shown in the review, since they will
+   * ask for a password instead. */
+  keyNotes?: { sessionId: string; reason: string }[];
+  /** Sessions the source reached through a route the import cannot carry over
+   * (SecureCRT: a firewall, or another session not imported): they connect
+   * directly, which may not get through. `route`: the source's setting. */
+  routeNotes?: { sessionId: string; route: string }[];
 }
 
 const empty = (): ParsedImport => ({ sessions: [], skipped: [] });
@@ -59,6 +67,9 @@ function add(
     options?: Record<string, unknown>;
     keyPath?: string;
     savedPassword?: boolean;
+    keyNote?: string;
+    /** The source's own description of the session, kept in the notes. */
+    description?: string;
   },
   unsupported?: string,
 ) {
@@ -89,7 +100,7 @@ function add(
     username,
     credentialId: null,
     folder: s.folder ?? "",
-    notes: `${source}에서 가져옴`,
+    notes: [s.description?.trim(), `${source}에서 가져옴`].filter(Boolean).join("\n"),
     options: s.options ?? {},
     createdAt: Date.now(),
     lastUsed: null,
@@ -97,6 +108,7 @@ function add(
   const keyPath = s.keyPath?.trim();
   if (keyPath) (out.keyLinks ??= []).push({ sessionId: id, keyPath });
   if (s.savedPassword) (out.savedPasswords ??= []).push(id);
+  if (s.keyNote) (out.keyNotes ??= []).push({ sessionId: id, reason: s.keyNote });
 }
 
 // ---- MobaXterm.ini --------------------------------------------------------------------------
@@ -215,7 +227,8 @@ export function secureCrtGlobalKey(ssh2Ini: string): string | undefined {
 
 /** Session values from SecureCRT, however they were stored. `globalKey`: the
  * key file set for all sessions (SSH2.ini, or the SSH2 key of an export). */
-function crtSession(out: ParsedImport, get: (key: string) => string | undefined, name: string, folder: string, globalKey?: string) {
+function crtSession(out: ParsedImport, get: (key: string) => string | undefined, name: string, folder: string, globalKey?: string, firewalls?: CrtFirewall[]) {
+  const before = out.sessions.length;
   const protoName = (get("Protocol Name") ?? "").trim();
   const protocol = CRT_PROTOCOLS[protoName.toLowerCase()] ?? null;
   const num = (key: string) => {
@@ -250,6 +263,11 @@ function crtSession(out: ParsedImport, get: (key: string) => string | undefined,
       logLinePrefix: get("Custom Log Message Each Line") ?? "",
     });
   }
+  // "Send protocol NO-OP every N seconds" (Terminal > Anti-idle) keeps an SSH
+  // connection alive as the keepalive interval does here. Off, the session
+  // keeps BananaConn's default.
+  const noop = num("Idle NO-OP Timeout") ?? 0;
+  if (protocol === "ssh" && num("Idle NO-OP Check") === 1 && Number.isInteger(noop) && noop > 0 && noop <= 3600) options.keepalive = noop;
   // An SSH session keeps its port under its own protocol's key first.
   const port =
     protocol !== "ssh" ? num("Port") : protoName.toLowerCase() === "ssh1" ? (num("[SSH1] Port") ?? num("[SSH2] Port")) : (num("[SSH2] Port") ?? num("[SSH1] Port"));
@@ -271,26 +289,104 @@ function crtSession(out: ParsedImport, get: (key: string) => string | undefined,
   // A password SecureCRT kept is not imported: the review says which sessions
   // will ask for one.
   const savedPassword = protocol !== "serial" && (get("Session Password Saved") === "1" || !!get("Password V2")?.trim() || !!get("Password")?.trim());
-  add(out, "SecureCRT", { protocol, name, host, port, username: get("Username"), folder, options, keyPath, savedPassword }, protoName || undefined);
+  add(out, "SecureCRT", { protocol, name, host, port, username: get("Username"), folder, options, keyPath, savedPassword, description: get("Description") }, protoName || undefined);
+  // "Session:<folder/name>": reached through another session (a jump host).
+  // Another firewall (a proxy set up in SecureCRT by name) has no counterpart.
+  const firewall = (get("Firewall Name") ?? "").trim();
+  if (firewall && !/^none$/i.test(firewall) && protocol === "ssh" && out.sessions.length > before)
+    firewalls?.push({ session: out.sessions[before], name: firewall, via: /^session:(.+)$/i.exec(firewall)?.[1] });
+}
+
+/** A session SecureCRT reaches through another one ("Firewall Name" =
+ * "Session:Jump/Bastion"). */
+interface CrtFirewall {
+  session: Session;
+  /** The setting as written. */
+  name: string;
+  /** The session it goes through, for "Session:…". */
+  via?: string;
+}
+
+/** Point each such session's jump host at the session its firewall names,
+ * found among the imported ones by its path under Sessions (any case, either
+ * slash). A firewall naming a session that is not imported (or not SSH) is
+ * left out: the session then connects directly. The jump host is a security
+ * option, applied only when the review keeps those. */
+function linkCrtFirewalls(out: ParsedImport, firewalls: CrtFirewall[]) {
+  if (!firewalls.length) return;
+  const norm = (p: string) =>
+    p
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .join("/")
+      .toLowerCase();
+  // A session's path under Sessions: its folder without the import's root.
+  const byPath = new Map(out.sessions.map((s) => [norm([...s.folder.split("/").slice(1), s.name].join("/")), s]));
+  for (const { session, name, via } of firewalls) {
+    const jump = via ? byPath.get(norm(via)) : undefined;
+    if (!jump || jump === session || jump.protocol !== "ssh") {
+      // Said in the review: it will connect directly and may not get through.
+      (out.routeNotes ??= []).push({ sessionId: session.id, route: name });
+      continue;
+    }
+    session.options.jumpHost = jumpHop(jump);
+  }
+}
+
+/** Where SecureCRT's files are for a folder the user chose: its configuration
+ * folder (with SSH2.ini, and what ${VDS_CONFIG_PATH} stands for), the folder to
+ * scan for session files, and the session folders between Sessions and the
+ * chosen one (kept in the imported folder names). The choice may be the
+ * Sessions folder, a folder inside it, the configuration folder, or the
+ * VanDyke folder above it. A session folder may itself be called "Sessions":
+ * the real one is the one whose parent holds SSH2.ini. `exists` tells whether
+ * a file is there. */
+export async function locateSecureCrt(dir: string, exists: (path: string) => Promise<boolean>): Promise<{ configDir: string; scanDir: string; subFolders: string[] }> {
+  const parts = dir.replace(/[\\/]+$/, "").split(/[\\/]/);
+  const at = parts.map((p, i) => (p.toLowerCase() === "sessions" ? i : -1)).filter((i) => i > 0);
+  for (const i of at) if (await exists([...parts.slice(0, i), "SSH2.ini"].join("\\"))) return { configDir: parts.slice(0, i).join("\\"), scanDir: dir, subFolders: parts.slice(i + 1) };
+  const base = parts.join("\\");
+  for (const config of [base, `${base}\\Config`]) if (await exists(`${config}\\SSH2.ini`)) return { configDir: config, scanDir: `${config}\\Sessions`, subFolders: [] };
+  // No SSH2.ini anywhere (a copied Sessions folder): the first "Sessions" in
+  // the path, else the chosen folder itself.
+  const i = at[0];
+  return i ? { configDir: parts.slice(0, i).join("\\"), scanDir: dir, subFolders: parts.slice(i + 1) } : { configDir: base, scanDir: dir, subFolders: [] };
 }
 
 /** One session INI file. `rel` is its path under the Sessions folder.
  * `globalKey`: the key file SSH2.ini sets for all sessions. */
 export function parseSecureCrtFiles(files: { rel: string; text: string }[], rootFolder = "SecureCRT", globalKey?: string): ParsedImport {
   const out = empty();
+  const firewalls: CrtFirewall[] = [];
   for (const f of files) {
     const parts = f.rel.split("/");
     const file = parts.pop() ?? "";
     if (/^(__FolderData__|Default)\.ini$/i.test(file)) continue;
     const values = new Map<string, string>();
+    // A list (Z:"Name"=<count in hex>) has its items on the lines after it,
+    // each after a space: kept one per line.
+    let list: { key: string; left: number; items: string[] } | null = null;
     for (const line of f.text.replace(/^﻿/, "").split(/\r?\n/)) {
+      if (list && list.left > 0 && line.startsWith(" ")) {
+        list.items.push(line.slice(1));
+        if (--list.left === 0) values.set(list.key, list.items.join("\n"));
+        continue;
+      }
+      list = null;
       const m = line.match(/^([SDBZ]):"([^"]+)"=(.*)$/);
       if (!m) continue;
+      if (m[1] === "Z") {
+        const left = parseInt(m[3], 16) || 0;
+        values.set(m[2], "");
+        if (left > 0) list = { key: m[2], left, items: [] };
+        continue;
+      }
       values.set(m[2], m[1] === "D" ? String(parseInt(m[3], 16)) : m[3]);
     }
     if (!values.has("Protocol Name")) continue;
-    crtSession(out, (k) => values.get(k), file.replace(/\.ini$/i, ""), joinFolder(rootFolder, ...parts), globalKey);
+    crtSession(out, (k) => values.get(k), file.replace(/\.ini$/i, ""), joinFolder(rootFolder, ...parts), globalKey, firewalls);
   }
+  linkCrtFirewalls(out, firewalls);
   return out;
 }
 
@@ -308,13 +404,18 @@ export function parseSecureCrtXml(xml: string, rootFolder = "SecureCRT"): Parsed
     for (const child of [...node.children].filter((c) => c.tagName === "key")) {
       const name = child.getAttribute("name") ?? "";
       const values = new Map<string, string>();
-      for (const v of child.children) if (v.tagName !== "key") values.set(v.getAttribute("name") ?? "", v.textContent ?? "");
+      // An <array> holds one <string> per item: kept one per line.
+      for (const v of child.children)
+        if (v.tagName === "array") values.set(v.getAttribute("name") ?? "", [...v.children].map((i) => i.textContent ?? "").join("\n"));
+        else if (v.tagName !== "key") values.set(v.getAttribute("name") ?? "", v.textContent ?? "");
       if (values.has("Protocol Name")) {
-        if (name !== "Default") crtSession(out, (k) => values.get(k), name, joinFolder(rootFolder, ...path), globalKey);
+        if (name !== "Default") crtSession(out, (k) => values.get(k), name, joinFolder(rootFolder, ...path), globalKey, firewalls);
       } else walk(child, [...path, name]);
     }
   };
+  const firewalls: CrtFirewall[] = [];
   walk(sessions, []);
+  linkCrtFirewalls(out, firewalls);
   // The export's Files key holds the files its settings name, each as a Path
   // string and Contents in hex: kept for the key files the sessions use.
   const named = new Set((out.keyLinks ?? []).map((k) => k.keyPath));
@@ -469,6 +570,37 @@ function puttyProxy(v: Map<string, string>): Record<string, unknown> {
   return o;
 }
 
+/** PuTTY's port forwards ("L8080=localhost:80,4R9000=127.0.0.1:3000,D1080";
+ * a leading 4 or 6 limits the address family, a local address may come before
+ * the port) as BananaConn's lines ("L 8080:localhost:80"). Entries in another
+ * shape are left out. */
+export function puttyForwards(text: string): string {
+  const lines: string[] = [];
+  for (const entry of text.split(",").map((e) => e.trim()).filter(Boolean)) {
+    const m = /^[46]?([LRD])([^=\s]+)(?:=(\S*))?$/i.exec(entry);
+    if (!m) continue;
+    const kind = m[1].toUpperCase();
+    const spec = kind === "D" ? m[2] : m[3] ? `${m[2]}:${m[3]}` : "";
+    // One connecting would refuse would stop the session: leave it out.
+    if (forwardSpecOk(spec)) lines.push(`${kind} ${spec}`);
+  }
+  return lines.join("\n");
+}
+
+/** PuTTY's SSH settings that have a counterpart here: port forwards, agent
+ * forwarding (both security options, kept only when the review keeps them),
+ * compression and the keepalive interval (seconds; older versions: minutes). */
+function puttySsh(v: Map<string, string>): Record<string, unknown> {
+  const o: Record<string, unknown> = {};
+  const forwards = puttyForwards(v.get("PortForwardings") ?? "");
+  if (forwards) o.forwards = forwards;
+  if (v.get("AgentFwd") === "1") o.agentForward = true;
+  if (v.get("Compression") === "1") o.compression = true;
+  const secs = Number(v.get("PingIntervalSecs") ?? 0) || Number(v.get("PingInterval") ?? 0) * 60;
+  if (secs > 0 && secs <= 3600) o.keepalive = secs;
+  return o;
+}
+
 /** PuTTY or KiTTY sessions from `reg export` text. */
 export function parsePuttyReg(text: string, source: "PuTTY" | "KiTTY"): ParsedImport {
   const out = empty();
@@ -500,13 +632,21 @@ export function parsePuttyReg(text: string, source: "PuTTY" | "KiTTY"): ParsedIm
         folder: source,
         options: serial
           ? { baud: Number(v.get("SerialSpeed") ?? 9600), dataBits: Number(v.get("SerialDataBits") ?? 8), parity, stopBits: Number(v.get("SerialStopHalfbits") ?? 2) >= 4 ? 2 : 1, flow, keyMode: "network" }
-          : puttyProxy(v),
+          : { ...puttyProxy(v), ...(protocol === "ssh" ? puttySsh(v) : {}) },
+        // Connection → SSH → Auth → private key file (.ppk), linked as a key
+        // credential on import like SecureCRT's.
+        keyPath: protocol === "ssh" ? v.get("PublicKeyFile") : undefined,
       },
       proto,
     );
   }
   return out;
 }
+
+/** A path as WinSCP stores it: backslashes and colons written as %5C and %3A (other
+ * %XX bytes with them). Left as it is without those, so a path with an
+ * environment variable ("%USERPROFILE%\key.ppk") is not taken apart. */
+const winScpPath = (s: string) => (/%(5C|3A)/i.test(s) ? unescapeName(s) : s);
 
 /** WinSCP sessions from the registry export or WinSCP.ini ("Folder/Name" names). */
 export function parseWinScp(text: string): ParsedImport {
@@ -532,6 +672,7 @@ export function parseWinScp(text: string): ParsedImport {
         username: v.get("UserName"),
         folder: joinFolder("WinSCP", ...parts),
         options: protocol === "ftps" ? { ftpsMode: ftps === 1 ? "implicit" : "explicit" } : {},
+        keyPath: protocol === "sftp" ? winScpPath(v.get("PublicKeyFile") ?? "") : undefined,
       },
       fs === 6 ? "WebDAV" : fs === 7 ? "S3" : undefined,
     );
@@ -551,6 +692,10 @@ export function parseXshellFiles(files: { rel: string; text: string }[]): Parsed
     if (!conn) continue;
     const proto = (conn.get("Protocol") ?? "").toUpperCase();
     const protocol: Protocol | null = proto === "SSH" ? "ssh" : proto === "TELNET" ? "telnet" : null;
+    const auth = sections.get("CONNECTION:AUTHENTICATION");
+    // UserKey names a key in Xshell's own key store (Tools → User Key
+    // Manager), not a file: it cannot be linked, so the review says so.
+    const userKey = protocol === "ssh" ? (auth?.get("UserKey") ?? "").trim() : "";
     add(
       out,
       "Xshell",
@@ -559,8 +704,10 @@ export function parseXshellFiles(files: { rel: string; text: string }[]): Parsed
         name: file.replace(/\.xsh$/i, ""),
         host: conn.get("Host") ?? "",
         port: conn.get("Port"),
-        username: sections.get("CONNECTION:AUTHENTICATION")?.get("UserName"),
+        username: auth?.get("UserName"),
         folder: joinFolder("Xshell", ...parts),
+        savedPassword: !!(auth?.get("Password") ?? "").trim(),
+        keyNote: userKey ? "Xshell 키 저장소의 키입니다" : undefined,
       },
       proto || undefined,
     );
@@ -660,7 +807,34 @@ function csvRecords(text: string, sep: string): string[][] {
 // ---- OpenSSH client config (~/.ssh/config) ---------------------------------------------------
 
 /** The keywords an imported session takes from an OpenSSH config. */
-const SSH_CONFIG_KEYS = new Set(["hostname", "user", "port", "proxyjump", "identityfile"]);
+const SSH_CONFIG_KEYS = new Set([
+  "hostname", "user", "port", "proxyjump", "identityfile", "forwardagent", "compression", "serveraliveinterval",
+]);
+
+/** Forward keywords; unlike the others, every one that applies is used. */
+const SSH_FORWARDS: Record<string, "L" | "R" | "D"> = { localforward: "L", remoteforward: "R", dynamicforward: "D" };
+
+/** One ssh_config forward ("8080 localhost:80", "127.0.0.1:8080 db:5432",
+ * "1080") as a BananaConn line ("L 8080:localhost:80"). Unix socket paths and
+ * a one-argument RemoteForward (a reverse SOCKS proxy) have no counterpart. */
+function sshConfigForward(kind: "L" | "R" | "D", value: string): string | null {
+  const [listen, target, ...rest] = value.split(/\s+/).filter(Boolean);
+  if (!listen || rest.length) return null;
+  if (kind === "D") return !target && forwardSpecOk(listen) ? `D ${listen}` : null;
+  const spec = `${listen}:${target}`;
+  return target?.includes(":") && forwardSpecOk(spec) ? `${kind} ${spec}` : null;
+}
+
+/** The SSH settings of one ssh_config host, as puttySsh reads PuTTY's. */
+function sshConfigOptions(f: Record<string, string>, forwards: string[]): Record<string, unknown> {
+  const o: Record<string, unknown> = {};
+  if (forwards.length) o.forwards = forwards.join("\n");
+  if (/^yes$/i.test(f.forwardagent ?? "")) o.agentForward = true;
+  if (/^yes$/i.test(f.compression ?? "")) o.compression = true;
+  const secs = Number(f.serveraliveinterval ?? 0);
+  if (Number.isInteger(secs) && secs > 0 && secs <= 3600) o.keepalive = secs;
+  return o;
+}
 
 /** An ssh_config Host pattern list against a host name, as ssh matches it:
  * case-insensitive, "*" and "?" wildcards, and a matching "!pattern" rules the
@@ -692,8 +866,8 @@ function sshHostMatches(host: string, patterns: string[]): boolean {
  * imported. */
 export function parseSshConfig(text: string): ParsedImport {
   const out = empty();
-  type Block = { patterns: string[]; fields: Record<string, string> };
-  const blocks: Block[] = [{ patterns: ["*"], fields: {} }];
+  type Block = { patterns: string[]; fields: Record<string, string>; forwards: string[] };
+  const blocks: Block[] = [{ patterns: ["*"], fields: {}, forwards: [] }];
   // The block settings go into; null inside a Match block.
   let cur: Block | null = blocks[0];
   for (const raw of text.split(/\r?\n/)) {
@@ -706,10 +880,13 @@ export function parseSshConfig(text: string): ParsedImport {
     let value = m[2].trim();
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
     if (key === "host") {
-      cur = { patterns: value.split(/\s+/).filter(Boolean), fields: {} };
+      cur = { patterns: value.split(/\s+/).filter(Boolean), fields: {}, forwards: [] };
       blocks.push(cur);
     } else if (key === "match") cur = null;
-    else if (cur && SSH_CONFIG_KEYS.has(key) && !(key in cur.fields)) cur.fields[key] = value;
+    else if (cur && key in SSH_FORWARDS) {
+      const line = sshConfigForward(SSH_FORWARDS[key], value);
+      if (line) cur.forwards.push(line);
+    } else if (cur && SSH_CONFIG_KEYS.has(key) && !(key in cur.fields)) cur.fields[key] = value;
   }
 
   // Every name written literally on a Host line, once (ssh compares them
@@ -725,10 +902,15 @@ export function parseSshConfig(text: string): ParsedImport {
 
   for (const name of names) {
     const f: Record<string, string> = {};
-    for (const b of blocks) if (sshHostMatches(name, b.patterns)) for (const [k, v] of Object.entries(b.fields)) if (!(k in f)) f[k] = v;
+    const forwards: string[] = [];
+    for (const b of blocks)
+      if (sshHostMatches(name, b.patterns)) {
+        for (const [k, v] of Object.entries(b.fields)) if (!(k in f)) f[k] = v;
+        for (const line of b.forwards) if (!forwards.includes(line)) forwards.push(line);
+      }
     // HostName takes "%h" (the name given) and "%%".
     const host = f.hostname ? f.hostname.replace(/%([h%])/g, (_m, c: string) => (c === "h" ? name : "%")) : name;
-    const proxy = f.proxyjump && !/^none$/i.test(f.proxyjump) ? f.proxyjump : "";
+    const proxy = f.proxyjump && !/^none$/i.test(f.proxyjump) ? normalizeJumpHost(f.proxyjump) : "";
     // IdentityFile "none" disables key auth; "~" is expanded on import (importExport).
     const keyFile = f.identityfile && !/^none$/i.test(f.identityfile) ? f.identityfile : "";
     add(out, "OpenSSH", {
@@ -738,7 +920,7 @@ export function parseSshConfig(text: string): ParsedImport {
       port: f.port,
       username: f.user,
       folder: "OpenSSH",
-      options: proxy ? { jumpHost: proxy } : {},
+      options: { ...(proxy ? { jumpHost: proxy } : {}), ...sshConfigOptions(f, forwards) },
       keyPath: keyFile || undefined,
     });
   }

@@ -442,15 +442,35 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
     let (username, password, cred) = (l.username.as_str(), l.password, l.cred);
 
     let key_path = cred.as_ref().and_then(|c| c.key_path.clone());
+    // A key credential with a value typed at a prompt (asked only after a
+    // failure): for an encrypted key it is the passphrase; for a plain key the
+    // server refused the key, so it is the login password, tried instead of the
+    // key (one attempt each time the user types, not two).
+    let encrypted = match key_path.clone() {
+        Some(p) => tauri::async_runtime::spawn_blocking(move || vault::key_is_encrypted(Path::new(&p))).await.map_err(|e| e.to_string())?,
+        None => false,
+    };
+    let key_path = key_path.filter(|_| encrypted || password.is_none());
     let auth = if let Some(path) = key_path {
-        let passphrase = cred.as_ref().and_then(|c| c.passphrase.clone());
+        // The vault's passphrase, else the one typed at the prompt.
+        let passphrase = cred.as_ref().and_then(|c| c.passphrase.clone()).or(password);
         // Decrypting an encrypted key runs a bcrypt-pbkdf KDF (CPU-bound, up to
         // ~1 s); keep it off the async runtime so it does not stall other commands.
-        let (p, pass) = (path.clone(), passphrase);
-        let key = tauri::async_runtime::spawn_blocking(move || russh::keys::load_secret_key(&p, pass.as_deref()))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("개인 키를 불러올 수 없습니다 ({path}): {e}"))?;
+        let (p, pass) = (path.clone(), passphrase.clone());
+        let loaded = tauri::async_runtime::spawn_blocking(move || {
+            let key = russh::keys::load_secret_key(&p, pass.as_deref());
+            (key, encrypted)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        // A key that needs (another) passphrase is asked for again: decrypting
+        // it happens here, so a wrong one never reaches the server.
+        let key = match loaded {
+            (Ok(key), _) => key,
+            (Err(_), true) if passphrase.is_none() => return Err("NEED_PASSPHRASE".into()),
+            (Err(_), true) => return Err("BAD_PASSPHRASE".into()),
+            (Err(e), false) => return Err(format!("개인 키를 불러올 수 없습니다 ({path}): {e}")),
+        };
         let hash = handle.best_supported_rsa_hash().await.map_err(|e| e.to_string())?.flatten();
         handle
             .authenticate_publickey(username, PrivateKeyWithHashAlg::new(Arc::new(key), hash))

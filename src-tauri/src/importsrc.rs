@@ -83,6 +83,9 @@ pub struct KeyCheck {
     /// "unknown", "missing", or "store" (a key in the Windows certificate
     /// store, which is not a file).
     pub kind: &'static str,
+    /// A private key other accounts can read: OpenSSH for Windows ignores it
+    /// until its permissions are fixed (vault_protect_key).
+    pub open: bool,
 }
 
 /// The key files an import names, resolved and checked, in the same order.
@@ -105,7 +108,7 @@ fn check_key(raw: &str, config: Option<&Path>) -> KeyCheck {
     let raw = raw.trim();
     // SecureCRT's "capi::rawkey::my": a key in the Windows certificate store.
     if raw.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("capi::")) {
-        return KeyCheck { path: raw.to_string(), kind: "store" };
+        return KeyCheck { path: raw.to_string(), kind: "store", open: false };
     }
     let path = resolve_key_path(raw, config, dirs::home_dir().as_deref(), dirs::document_dir().as_deref());
     use crate::vault::KeyFileKind as K;
@@ -118,7 +121,10 @@ fn check_key(raw: &str, config: Option<&Path>) -> KeyCheck {
         K::Public => "public",
         K::Unknown => "unknown",
     };
-    KeyCheck { path, kind }
+    // ssh.exe reads an OpenSSH key itself; a PuTTY key reaches it only as the
+    // app's own protected copy, so its permissions do not matter.
+    let open = kind == "openssh" && crate::vault::others_can_read(Path::new(&path)) == Some(true);
+    KeyCheck { path, kind, open }
 }
 
 /// A key path as another tool wrote it, made absolute: SecureCRT's
@@ -285,7 +291,7 @@ mod tests {
         assert_eq!(check(r"${VDS_CONFIG_PATH}\Identity").kind, "foreign");
         assert_eq!(check(r"${VDS_CONFIG_PATH}\web.ppk").kind, "putty-encrypted");
         assert_eq!(check(r"${VDS_CONFIG_PATH}\nothing").kind, "missing");
-        assert_eq!(check("capi::rawkey::my"), KeyCheck { path: "capi::rawkey::my".into(), kind: "store" });
+        assert_eq!(check("capi::rawkey::my"), KeyCheck { path: "capi::rawkey::my".into(), kind: "store", open: false });
         assert_eq!(check("CAPI::RawKey::My").kind, "store");
         let _ = fs::remove_dir_all(dir);
     }
@@ -306,7 +312,9 @@ b3Bl
         assert_eq!(store_key(&dir, "web.ppk", other).unwrap(), dir.join("web-1.ppk"));
         assert_eq!(fs::read(&first).unwrap(), key);
         // A path in the name is not followed; odd characters are dropped.
-        assert_eq!(store_key(&dir, r"....evil key", other).unwrap().parent(), Some(dir.as_path()));
+        let outside = store_key(&dir, r"..\..\evil key", other).unwrap();
+        assert_eq!(outside.parent(), Some(dir.as_path()));
+        assert_eq!(outside.file_name().unwrap(), "evilkey");
         // Not a usable private key.
         assert!(store_key(&dir, "pub", b"ssh-ed25519 AAAAC3 me").is_err());
         assert!(store_key(&dir, "crt", b"---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----").is_err());

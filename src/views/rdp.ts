@@ -6,7 +6,7 @@ import { api, rdpOpen, type RdpEvent, type RdpFrames } from "../api";
 import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
-import { patchSession, reloadCredentials } from "../store";
+import { patchSession, reloadCredentials, takeSavedSession } from "../store";
 import { confirmDialog, errorText, esc, h, modal, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import { GatewayLink } from "../tunnels";
@@ -434,7 +434,7 @@ export class RdpView implements View {
   private showOverlay(kind: "progress" | "closed", text: string) {
     this.overlay.hidden = false;
     if (kind === "progress") {
-      this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3>${esc(endpoint(this.session))}</h3><p>${esc(text)}</p></div>`;
+      this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3 data-i18n-skip>${esc(endpoint(this.session))}</h3><p>${esc(text)}</p></div>`;
       return;
     }
     this.overlay.innerHTML = `<div class="overlay-card">${icon(this.state === "error" ? "WifiOff" : "Unlink", 26)}
@@ -447,6 +447,7 @@ export class RdpView implements View {
 
   reconnect() {
     this.cleanup();
+    if (takeSavedSession(this.session)) this.ws.changed();
     this.connect();
   }
 

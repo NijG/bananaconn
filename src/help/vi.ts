@@ -34,7 +34,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Sắp xếp và thứ tự</b>: Nút sắp xếp phía trên danh sách phiên cho phép chọn theo tên (AP2 trước AP10), theo địa chỉ (so sánh IP theo số), kết nối gần đây hoặc tùy chỉnh. Kéo một phiên lên trên hoặc xuống dưới phiên khác để đặt nó vào đó; thư mục cũng được đổi thứ tự, hoặc chuyển vào thư mục khác, theo cách tương tự. Đổi thứ tự sẽ chuyển sang thứ tự tùy chỉnh và giữ nguyên thứ tự đó. ${kbd("Alt+Up")} / ${kbd("Alt+Down")} chuyển phiên đang chọn lên hoặc xuống một vị trí, và "Sắp xếp thư mục này theo tên/địa chỉ" trong menu thư mục sắp xếp lại một lần.</li>
         <li><b>Tìm kiếm</b>: Nhập một phần tên, máy chủ, người dùng hoặc ghi chú vào ô tìm kiếm ở trên cùng.</li>
         <li><b>Chọn nhiều</b>: ${kbd("Ctrl")}+nhấp để chọn từng mục, ${kbd("Shift")}+nhấp để chọn một dải. ${kbd("Shift+↑/↓")} và ${kbd("Ctrl+A")} cũng dùng được. ${kbd("Esc")} bỏ chọn.</li>
-        <li><b>Thao tác hàng loạt</b>: Khi chọn nhiều mục, nhấp chuột phải → Sửa hàng loạt (${kbd("F2")}: người dùng, cổng, thông tin đăng nhập, thư mục, chế độ phím), Di chuyển vào thư mục, Xóa (${kbd("Del")}), Kết nối tất cả (${kbd("Enter")}).</li>
+        <li><b>Thao tác hàng loạt</b>: Khi chọn nhiều mục, nhấp chuột phải → Sửa hàng loạt (${kbd("F2")}: người dùng, cổng, thông tin đăng nhập, thư mục, chế độ phím, máy chủ trung gian (SSH), cổng SSH (Telnet, RDP, VNC)), Di chuyển vào thư mục, Sao chép địa chỉ (mỗi dòng một địa chỉ), Xóa (${kbd("Del")}), Kết nối tất cả (${kbd("Enter")}).</li>
         <li><b>Sao chép &amp; dán</b>: Chọn phiên và nhấn ${kbd("Ctrl+C")}, chọn một phiên trong thư mục đích và nhấn ${kbd("Ctrl+V")}. Mỗi lần dán tạo một phiên mới tên "Tên (2)", "Tên (3)". Nhấp chuột phải → Nhân bản cũng tương tự.</li>
         <li><b>Sửa</b>: ${kbd("F2")} hoặc nhấp chuột phải → Sửa.</li>
       </ul>`,
@@ -48,12 +48,12 @@ export const SECTIONS: HelpSection[] = [
       <table class="help-table">
         <tr><th>Chương trình</th><th>Cần chọn</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (bản portable: cạnh tệp thực thi)</td></tr>
-        <tr><td>SecureCRT</td><td>Thư mục phiên <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (gồm cấu trúc thư mục, tên tệp nhật ký, cài đặt tự động ghi nhật ký và tệp khóa dùng để đăng nhập bằng khóa công khai), hoặc tệp XML tạo bằng File → Export Settings</td></tr>
+        <tr><td>SecureCRT</td><td>Thư mục phiên <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (gồm cấu trúc thư mục, tên tệp nhật ký, cài đặt tự động ghi nhật ký và tệp khóa dùng để đăng nhập bằng khóa công khai, và tường lửa đi qua phiên khác thành máy chủ trung gian, mô tả phiên thành ghi chú, và khoảng gửi NO-OP của phiên SSH thành khoảng giữ kết nối), hoặc tệp XML tạo bằng File → Export Settings</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (nếu bật mã hóa toàn bộ tệp, hãy tắt và lưu trước)</td></tr>
-        <tr><td>PuTTY · KiTTY</td><td>Đọc trực tiếp cài đặt trên PC này</td></tr>
-        <tr><td>WinSCP</td><td>Cài đặt trên PC này, hoặc <code>WinSCP.ini</code> nếu không có</td></tr>
-        <tr><td>Xshell</td><td>Thư mục <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code></td></tr>
-        <tr><td>OpenSSH</td><td>Tệp <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile; giống ssh, áp dụng mọi khối Host khớp và giá trị đầu tiên được dùng; ký tự đại diện như <code>Host *</code> chỉ cung cấp giá trị mặc định, không tạo phiên)</td></tr>
+        <tr><td>PuTTY · KiTTY</td><td>Đọc trực tiếp cài đặt trên PC này (gồm cả tệp khóa của từng phiên, chuyển tiếp cổng, chuyển tiếp agent, nén và khoảng giữ kết nối)</td></tr>
+        <tr><td>WinSCP</td><td>Cài đặt trên PC này, hoặc <code>WinSCP.ini</code> nếu không có (gồm cả tệp khóa)</td></tr>
+        <tr><td>Xshell</td><td>Thư mục <code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code>. Không thể liên kết khóa trong kho khóa của Xshell: hãy xuất khóa ở định dạng OpenSSH từ trình quản lý khóa người dùng của Xshell rồi chỉ định trong Kho thông tin đăng nhập</td></tr>
+        <tr><td>OpenSSH</td><td>Tệp <code>.ssh\\config</code> (Host, HostName, User, Port, ProxyJump, IdentityFile, LocalForward, RemoteForward, DynamicForward, ForwardAgent, Compression, ServerAliveInterval; giống ssh, áp dụng mọi khối Host khớp và giá trị đầu tiên được dùng, còn chuyển tiếp cổng của mọi khối khớp đều được gộp lại; ký tự đại diện như <code>Host *</code> chỉ cung cấp giá trị mặc định, không tạo phiên)</td></tr>
         <tr><td>RDCMan</td><td>Tệp <code>.rdg</code></td></tr>
         <tr><td>Remote Desktop</td><td>Thư mục chứa tệp <code>.rdp</code> (bao gồm thư mục con)</td></tr>
         <tr><td>CSV</td><td>Tên cột ở dòng đầu: Name, Protocol, Host, Port, Username, Folder, Domain (phân tách bằng dấu phẩy, dấu chấm phẩy hoặc tab). <b>Xuất danh sách phiên (CSV)</b> trong cùng menu ghi theo định dạng này.</td></tr>
@@ -68,6 +68,7 @@ export const SECTIONS: HelpSection[] = [
       <ul>
         <li><b>Đóng tab</b>: ${kbd("Ctrl+F4")} hoặc ${kbd("Ctrl+Shift+W")}, hoặc nhấp chuột giữa vào tab. Nhấn ${kbd("Enter")} trong hộp xác nhận để đóng; đánh dấu "Không hỏi lại" để bỏ qua lần sau (có thể bật lại trong Cài đặt).</li>
         <li><b>Mở lại cùng phiên</b>: <b>Nhấp đúp</b> vào tab. Tiện khi cần kết nối thứ hai tới cùng thiết bị để giám sát.</li>
+        <li><b>Menu tab</b>: Nhấp chuột phải vào tab để kết nối lại, sửa phiên, sao chép địa chỉ (user@host:port), đóng các tab khác hoặc đóng các tab bên phải.</li>
         <li><b>Chuyển tab</b>: ${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}. Khi có nhiều tab, cuộn chuột trên thanh tab để di chuyển sang trái và phải. Kéo tab để sắp xếp lại.</li>
         <li><b>Chia màn hình</b>: Các nút một khung / trái-phải / trên-dưới / chia 4 ở trên cùng. Kéo tab vào khung bạn muốn.</li>
         <li>Màu chấm trên tab cho biết giao thức, nhấp nháy nghĩa là đang kết nối, còn màu đỏ nghĩa là có lỗi.</li>
@@ -89,7 +90,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>Kết xuất</b> (Cài đặt → Terminal): "Tự động" vẽ bằng GPU (WebGL) trên PC có card đồ họa, giúp tăng tốc khi đầu ra nhiều, và dùng trình kết xuất tiêu chuẩn trên máy chủ và phiên từ xa không có card đồ họa. Chỉ các terminal đang hiển thị trên màn hình mới dùng GPU.</li>
         <li><b>Đoạn lệnh &amp; macro</b>: Lưu các lệnh hay dùng trong Đoạn lệnh trên thanh công cụ, và dùng "Ghi" để ghi lại dữ liệu nhập rồi phát lại.</li>
         <li><b>Tệp</b> (SSH): Nút Tệp trên thanh công cụ mở khung SFTP của cùng máy chủ ở bên cạnh.</li>
-        <li><b>Tự động kết nối lại</b> (có thể tắt trong Cài đặt): khi một phiên SSH hoặc Telnet đã đăng nhập bị rớt, ứng dụng chờ một lát rồi kết nối lại, và chờ lâu hơn mỗi lần vẫn thất bại. Kết nối đăng nhập không thành công hoặc bị ngắt trong lúc đăng nhập sẽ không kết nối lại: kết nối lặp lại với mật khẩu sai có thể khiến máy chủ chặn bạn.</li>
+        <li><b>Tự động kết nối lại</b> (có thể tắt trong Cài đặt): khi một phiên SSH hoặc Telnet đã đăng nhập bị rớt, ứng dụng chờ một lát rồi kết nối lại, và chờ lâu hơn mỗi lần vẫn thất bại. Kết nối đăng nhập không thành công hoặc bị ngắt trong lúc đăng nhập sẽ không kết nối lại: kết nối lặp lại với mật khẩu sai có thể khiến máy chủ chặn bạn. Sửa thông tin đăng nhập bằng <b>Sửa phiên</b> trong hộp thoại đăng nhập thất bại sẽ kết nối lại tab đó ngay, và khi kết nối lại luôn dùng cài đặt phiên đã lưu mới nhất.</li>
       </ul>`,
   },
   {
@@ -198,6 +199,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>TFTP</b>: Chọn TFTP làm loại phiên (hoặc trong Kết nối nhanh) để mở tab TFTP. TFTP không có đăng nhập và danh sách thư mục, nên hãy nhập <b>tên tệp trên máy chủ</b> rồi nhấp "Nhận", hoặc chọn một tệp trên PC rồi nhấp "Gửi". Kích thước khối "Tự động" phù hợp với hầu hết thiết bị, và máy chủ cũ không hiểu tùy chọn sẽ tự động lùi về 512. Để thiết bị gửi tệp tới PC của bạn (VD <code>copy running-config tftp:</code>), hãy bật <b>Máy chủ TFTP</b> trong nút "Máy chủ" ở trên cùng.</li>
         <li>Gửi thư mục qua SFTP sẽ truyền 4 tệp cùng lúc, nhanh hơn nhiều với thư mục có nhiều tệp nhỏ, đặc biệt qua khoảng cách xa. FTP gửi từng tệp một do giới hạn kết nối của máy chủ, nhưng bạn vẫn có thể duyệt thư mục trong lúc truyền.</li>
         <li>Nhấp đúp vào tệp văn bản trên máy chủ để mở trong trình soạn thảo tích hợp; khi lưu, tệp được ghi thẳng lên máy chủ.</li>
+        <li><b>Đăng nhập bằng khóa</b> (SFTP, giám sát tài nguyên, cổng SSH): với khóa có cụm mật khẩu chưa lưu trong kho, ứng dụng sẽ hỏi cụm mật khẩu và có thể lưu cùng khóa. Cụm mật khẩu chỉ dùng để mở khóa trên PC này, không gửi tới máy chủ. Nếu máy chủ từ chối khóa, ứng dụng hỏi mật khẩu và sau đó đăng nhập bằng mật khẩu đó thay cho khóa.</li>
       </ul>`,
   },
   {
@@ -238,9 +240,9 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>Kho thông tin đăng nhập</b> (nút chìa khóa ở trên cùng): Lưu mật khẩu và khóa SSH trong Windows Credential Manager để dùng trong trình sửa phiên. Mật khẩu đã lưu không bao giờ được hiển thị ra màn hình. Khóa có thể ở định dạng OpenSSH hoặc PuTTY (.ppk).</li>
+        <li><b>Kho thông tin đăng nhập</b> (nút chìa khóa ở trên cùng): Lưu mật khẩu và khóa SSH trong Windows Credential Manager để dùng trong trình sửa phiên. Mật khẩu đã lưu không bao giờ được hiển thị ra màn hình. Khóa có thể ở định dạng OpenSSH hoặc PuTTY (.ppk). Kho và trình sửa phiên cảnh báo các tệp khóa không dùng được (không có tệp, định dạng khác, người dùng khác cũng đọc được); <b>Sửa quyền</b> đổi khóa để chỉ người dùng này đọc được. Khi OpenSSH bỏ qua khóa như vậy trong terminal, <b>Sửa quyền tệp khóa</b> trong thông báo sẽ sửa rồi kết nối lại.</li>
         <li><b>Mật khẩu chính</b> (Cài đặt → Bảo mật): Khóa ứng dụng khi khởi động và sau khi bạn rời đi.</li>
-        <li>Khóa máy chủ SSH/SFTP được đối chiếu với <code>~/.ssh/known_hosts</code>; khóa chưa biết sẽ hiển thị dấu vân tay để xác nhận. Khóa đã thay đổi sẽ chặn kết nối.</li>
+        <li>Khóa máy chủ SSH/SFTP được đối chiếu với <code>~/.ssh/known_hosts</code>; khóa chưa biết sẽ hiển thị dấu vân tay để xác nhận. Khóa đã thay đổi sẽ chặn kết nối. Nếu chắc chắn máy chủ đã được cài lại, nút <b>Xóa khóa đã lưu</b> trong hộp thoại đó sẽ xóa khóa cũ, và lần kết nối tiếp theo hiển thị dấu vân tay mới để bạn kiểm tra và tin cậy (terminal, tệp và cổng SSH).</li>
       </ul>`,
   },
   {
@@ -249,7 +251,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "RefreshCw",
     body: `
       <p>Khi khởi động và <b>mỗi 30 phút</b> trong lúc chạy (cả khi bạn quay lại cửa sổ sau một lúc), ứng dụng kiểm tra phiên bản mới trên <b>GitHub</b> (github.com/NijG/bananaconn). Với máy bị chính sách bảo mật chặn GitHub, hãy chỉ định <b>thư mục cập nhật NAS</b> (thư mục chia sẻ chứa các phiên bản mới) trong Cài đặt → Cập nhật; thư mục này được kiểm tra khi không kết nối được GitHub. Khi tìm thấy phiên bản mới, một <b>cửa sổ hỏi có cập nhật ngay không</b> sẽ hiện ra. "Cập nhật ngay" sẽ đóng ứng dụng, cài đặt rồi mở lại (các kết nối đang mở sẽ bị ngắt). Nếu chọn "Để sau", bạn có thể cài bất cứ lúc nào bằng nút <b>Cập nhật</b> bên phải thanh trạng thái. Cửa sổ chọn sẵn "Để sau", nên phím Enter gõ cho terminal không bao giờ bắt đầu cập nhật.</p>
-      <p><b>Khi thất bại với lỗi "mật khẩu không đúng"</b>: Windows kết nối tới thư mục chia sẻ bằng tài khoản Windows bạn đang đăng nhập, và không chuyển sang truy cập khách ngay cả khi thư mục chia sẻ cho phép đọc ẩn danh (khách). Hãy mở thư mục cập nhật trong Explorer, nhập tài khoản NAS và đánh dấu "Remember my credentials", hoặc chọn một tài khoản từ kho thông tin đăng nhập trong <b>Tài khoản NAS</b> tại Cài đặt → Cập nhật. Ứng dụng sẽ đăng nhập bằng tài khoản đó.</p>
+      <p><b>Khi thất bại với lỗi "mật khẩu không đúng"</b>: Windows kết nối tới thư mục chia sẻ bằng tài khoản Windows bạn đang đăng nhập, và không chuyển sang truy cập khách ngay cả khi thư mục chia sẻ cho phép đọc ẩn danh (khách). Hãy mở thư mục cập nhật trong Explorer, nhập tài khoản NAS và đánh dấu "Remember my credentials", hoặc chọn một tài khoản từ kho thông tin đăng nhập trong <b>Tài khoản NAS</b> tại Cài đặt → Cập nhật. Ứng dụng sẽ đăng nhập bằng tài khoản đó. Nếu tài khoản NAS đã chọn bị từ chối, kiểm tra tự động sẽ không đăng nhập lại bằng tài khoản đó (để mật khẩu sai không dồn lại và khóa tài khoản) và Cài đặt sẽ báo điều này; sau khi sửa mật khẩu, "Kiểm tra ngay" sẽ dùng lại.</p>
       <p>Chỉ các tệp được PC build ký mới được cài đặt, nên tệp do người khác đặt vào thư mục chia sẻ sẽ không được cài. Bạn cũng có thể kiểm tra ngay bằng "Kiểm tra ngay".</p>`,
   },
   {

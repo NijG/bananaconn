@@ -34,7 +34,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>排序与顺序</b>：会话列表上方的排序按钮可选择按名称（AP2 在 AP10 之前）、按地址（IP 按数字比较）、按最近连接或自定义。将会话拖到另一个会话的上方或下方即可放到那里；文件夹也可用同样方式调整顺序或移入其他文件夹。调整顺序后会切换为自定义排序并保留该顺序。${kbd("Alt+Up")} / ${kbd("Alt+Down")} 可将所选会话上下移动一格，文件夹菜单中的“将此文件夹内容按名称/地址排序”可一次整理。</li>
         <li><b>搜索</b>：在顶部搜索框中输入名称、主机、用户或备注的一部分。</li>
         <li><b>多选</b>：${kbd("Ctrl")}+单击逐个选择，${kbd("Shift")}+单击选择范围。${kbd("Shift+↑/↓")} 和 ${kbd("Ctrl+A")} 同样可用。${kbd("Esc")} 清除选择。</li>
-        <li><b>批量操作</b>：选中多个后，右键 → 批量编辑 (${kbd("F2")}：用户、端口、凭据、文件夹、按键模式)、移动到文件夹、删除 (${kbd("Del")})、全部连接 (${kbd("Enter")})。</li>
+        <li><b>批量操作</b>：选中多个后，右键 → 批量编辑 (${kbd("F2")}：用户、端口、凭据、文件夹、按键模式、跳板主机 (SSH)、SSH 网关 (Telnet、RDP、VNC))、移动到文件夹、复制地址 (每行一个)、删除 (${kbd("Del")})、全部连接 (${kbd("Enter")})。</li>
         <li><b>复制 &amp; 粘贴</b>：选中会话后按 ${kbd("Ctrl+C")}，在目标文件夹中选中一个会话后按 ${kbd("Ctrl+V")}。每次粘贴都会创建一个名为“名称 (2)”、“名称 (3)”的新会话。右键 → 复制副本效果相同。</li>
         <li><b>编辑</b>：${kbd("F2")} 或右键 → 编辑。</li>
       </ul>`,
@@ -48,12 +48,12 @@ export const SECTIONS: HelpSection[] = [
       <table class="help-table">
         <tr><th>程序</th><th>选择内容</th></tr>
         <tr><td>MobaXterm</td><td><code>%APPDATA%\\MobaXterm\\MobaXterm.ini</code> (便携版：位于可执行文件旁)</td></tr>
-        <tr><td>SecureCRT</td><td>会话文件夹 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包括文件夹结构、日志文件名、自动日志设置以及公钥登录使用的密钥文件)，或通过 文件 → 导出设置 生成的 XML</td></tr>
+        <tr><td>SecureCRT</td><td>会话文件夹 <code>%APPDATA%\\VanDyke\\Config\\Sessions</code> (包括文件夹结构、日志文件名、自动日志设置以及公钥登录使用的密钥文件，经由其他会话的防火墙设置作为跳板主机，会话说明作为备注，以及 SSH 会话的 NO-OP 发送间隔作为保活间隔)，或通过 文件 → 导出设置 生成的 XML</td></tr>
         <tr><td>mRemoteNG</td><td><code>%APPDATA%\\mRemoteNG\\confCons.xml</code> (如果开启了整个文件加密，请先关闭并保存)</td></tr>
-        <tr><td>PuTTY · KiTTY</td><td>直接读取本机设置</td></tr>
-        <tr><td>WinSCP</td><td>本机设置，没有时选择 <code>WinSCP.ini</code></td></tr>
-        <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 文件夹</td></tr>
-        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 文件（Host、HostName、User、Port、ProxyJump、IdentityFile；与 ssh 相同，应用所有匹配的 Host 块，先出现的值优先；<code>Host *</code> 等通配符只提供默认值，不创建会话）</td></tr>
+        <tr><td>PuTTY · KiTTY</td><td>直接读取本机设置 (包括各会话指定的密钥文件、端口转发、代理转发、压缩和保活间隔)</td></tr>
+        <tr><td>WinSCP</td><td>本机设置，没有时选择 <code>WinSCP.ini</code> (包括密钥文件)</td></tr>
+        <tr><td>Xshell</td><td><code>Documents\\NetSarang Computer\\&lt;version&gt;\\Xshell\\Sessions</code> 文件夹。Xshell 密钥库中的密钥无法关联，请在 Xshell 的用户密钥管理器中以 OpenSSH 格式导出，再在凭据库中指定</td></tr>
+        <tr><td>OpenSSH</td><td><code>.ssh\\config</code> 文件（Host、HostName、User、Port、ProxyJump、IdentityFile、LocalForward、RemoteForward、DynamicForward、ForwardAgent、Compression、ServerAliveInterval；与 ssh 相同，应用所有匹配的 Host 块，先出现的值优先，端口转发则汇总所有匹配块中的设置；<code>Host *</code> 等通配符只提供默认值，不创建会话）</td></tr>
         <tr><td>RDCMan</td><td><code>.rdg</code> 文件</td></tr>
         <tr><td>远程桌面</td><td>包含 <code>.rdp</code> 文件的文件夹 (包括子文件夹)</td></tr>
         <tr><td>CSV</td><td>第一行为列名：Name, Protocol, Host, Port, Username, Folder, Domain (以逗号、分号或制表符分隔)。同一菜单中的 <b>导出会话列表 (CSV)</b> 按此格式写出。</td></tr>
@@ -68,6 +68,7 @@ export const SECTIONS: HelpSection[] = [
       <ul>
         <li><b>关闭标签页</b>：${kbd("Ctrl+F4")} 或 ${kbd("Ctrl+Shift+W")}，或用鼠标中键单击标签页。在确认框中按 ${kbd("Enter")} 关闭；勾选“不再询问”下次将跳过确认 (可在设置中重新开启)。</li>
         <li><b>再次打开同一会话</b>：<b>双击</b>标签页。便于为监控而再建立一个到同一设备的连接。</li>
+        <li><b>标签页菜单</b>：右键单击标签页可以重新连接、编辑会话、复制地址 (user@host:port)、关闭其他标签页或关闭右侧标签页。</li>
         <li><b>切换标签页</b>：${kbd("Ctrl+Tab")} / ${kbd("Ctrl+Shift+Tab")}。标签页较多时，在标签栏上滚动鼠标滚轮可左右移动。拖动标签页可调整顺序。</li>
         <li><b>分屏</b>：顶部的 单屏 / 左右 / 上下 / 四分屏 按钮。将标签页拖到想要的窗格中。</li>
         <li>标签页圆点的颜色表示协议，闪烁表示正在连接，红色表示出错。</li>
@@ -89,7 +90,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>渲染</b> (设置 → 终端)：“自动”在有显卡的电脑上使用 GPU (WebGL) 绘制，加快大量输出；在没有显卡的服务器和远程会话中使用标准渲染器。只有屏幕上可见的终端才使用 GPU。</li>
         <li><b>片段 &amp; 宏</b>：将常用命令保存在工具栏的“片段”中，使用“录制”捕获输入并回放。</li>
         <li><b>文件</b> (SSH)：工具栏中的“文件”按钮会在旁边打开同一服务器的 SFTP 窗格。</li>
-        <li><b>自动重连</b> (可在设置中关闭)：已登录的 SSH 或 Telnet 会话断开时，稍等片刻后重新连接，持续失败时等待时间会逐渐变长。登录失败或在登录过程中断开的连接不会重连：用错误的密码反复连接可能导致服务器阻止您连接。</li>
+        <li><b>自动重连</b> (可在设置中关闭)：已登录的 SSH 或 Telnet 会话断开时，稍等片刻后重新连接，持续失败时等待时间会逐渐变长。登录失败或在登录过程中断开的连接不会重连：用错误的密码反复连接可能导致服务器阻止您连接。在登录失败窗口中用 <b>编辑会话</b> 修正登录信息后，该标签页会立即重新连接；重新连接时始终使用最新保存的会话设置。</li>
       </ul>`,
   },
   {
@@ -198,6 +199,7 @@ export const SECTIONS: HelpSection[] = [
         <li><b>TFTP</b>：将会话类型 (或快速连接) 选为 TFTP 即可打开 TFTP 标签页。TFTP 没有登录和文件夹列表，因此请输入<b>服务器上的文件名</b>并点击“获取”，或选择本机上的文件并点击“发送”。块大小“自动”适合大多数设备，不支持选项的旧服务器会自动回退到 512。要让设备向本机发送文件 (例如 <code>copy running-config tftp:</code>)，请在顶部“服务器”按钮下开启 <b>TFTP 服务器</b>。</li>
         <li>通过 SFTP 发送文件夹时一次传输 4 个文件，对于包含大量小文件的文件夹要快得多，在远距离传输时尤其明显。FTP 由于服务器连接数限制一次只发送一个，但在传输期间可以继续浏览文件夹。</li>
         <li>双击服务器上的文本文件即可在内置编辑器中打开；保存时直接写回服务器。</li>
+        <li><b>使用密钥登录</b>（SFTP、资源监控、SSH 网关）：带口令的密钥若凭据库中没有口令，会要求输入，并可保存到该密钥。口令只用于在本机打开密钥，不会发送到服务器。服务器拒绝密钥时会要求输入密码，之后改用该密码登录。</li>
       </ul>`,
   },
   {
@@ -238,9 +240,9 @@ export const SECTIONS: HelpSection[] = [
     icon: "KeyRound",
     body: `
       <ul>
-        <li><b>凭据库</b> (顶部的钥匙按钮)：将密码和 SSH 密钥保存在 Windows 凭据管理器中，供会话编辑器使用。已保存的密码绝不会显示在屏幕上。密钥可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。</li>
+        <li><b>凭据库</b> (顶部的钥匙按钮)：将密码和 SSH 密钥保存在 Windows 凭据管理器中，供会话编辑器使用。已保存的密码绝不会显示在屏幕上。密钥可以是 OpenSSH 格式或 PuTTY 格式 (.ppk)。凭据库和会话编辑器会对无法使用的密钥文件（不存在、其他格式、其他用户也能读取）给出警告；<b>修正权限</b>会将密钥改为仅此用户可读取。终端中 OpenSSH 忽略此类密钥时，也可用通知中的<b>修正密钥文件权限</b>修正后重新连接。</li>
         <li><b>主密码</b> (设置 → 安全)：在启动时以及您离开一段时间后锁定应用。</li>
-        <li>SSH/SFTP 主机密钥会与 <code>~/.ssh/known_hosts</code> 进行核对；未知密钥会显示指纹供确认。密钥已更改时会阻止连接。</li>
+        <li>SSH/SFTP 主机密钥会与 <code>~/.ssh/known_hosts</code> 进行核对；未知密钥会显示指纹供确认。密钥已更改时会阻止连接。确定服务器已重装时，可在该窗口中用 <b>删除已保存的密钥</b> 删除旧密钥，下次连接时会显示新指纹供确认后信任（终端、文件和 SSH 网关）。</li>
       </ul>`,
   },
   {
@@ -249,7 +251,7 @@ export const SECTIONS: HelpSection[] = [
     icon: "RefreshCw",
     body: `
       <p>启动时以及运行期间<b>每 30 分钟</b>（离开一段时间后回到窗口时也会）在 <b>GitHub</b>（github.com/NijG/bananaconn）上检查新版本。因安全策略无法访问 GitHub 的电脑，请在“设置 → 更新”中指定 <b>NAS 更新文件夹</b>（存放新版本的共享文件夹），无法访问 GitHub 时会检查该文件夹。发现新版本后会弹出<b>询问是否立即更新的窗口</b>。点击“立即更新”后应用会关闭，安装完成后重新打开（已打开的连接会断开）。点击“稍后”后，也可以随时用状态栏右侧的<b>更新</b>按钮安装。该窗口默认选中“稍后”，因此在终端中输入的 Enter 不会启动更新。</p>
-      <p><b>提示“密码不正确”而失败时</b>：Windows 会使用当前登录的 Windows 账户连接共享文件夹，即使共享允许匿名 (来宾) 读取，也不会回退到来宾访问。请在资源管理器中打开更新文件夹，输入 NAS 账户并勾选“记住我的凭据”，或在 设置 → 更新 的 <b>NAS 账户</b> 中从凭据库选择一个账户。之后应用将使用该账户登录。</p>
+      <p><b>提示“密码不正确”而失败时</b>：Windows 会使用当前登录的 Windows 账户连接共享文件夹，即使共享允许匿名 (来宾) 读取，也不会回退到来宾访问。请在资源管理器中打开更新文件夹，输入 NAS 账户并勾选“记住我的凭据”，或在 设置 → 更新 的 <b>NAS 账户</b> 中从凭据库选择一个账户。之后应用将使用该账户登录。所选 NAS 账户被拒绝后，自动检查不再用该账户登录（避免错误密码累积导致账户被锁定），并在设置中显示此情况；修正密码后点击“立即检查”即可再次使用。</p>
       <p>只会安装由构建电脑签名的文件，因此他人放入共享文件夹的文件不会被安装。也可以通过“立即检查”马上检查。</p>`,
   },
   {

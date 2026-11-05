@@ -917,3 +917,139 @@ async fn ssh_exe_logs_in_with_a_converted_putty_key() {
     drop(pair.master);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// SFTP, the monitor and gateways log in with an encrypted key: without its
+/// passphrase they ask for it, a wrong one is caught on this PC (never sent),
+/// and the one typed at the prompt opens the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_encrypted_key_asks_for_its_passphrase() {
+    use std::sync::Arc;
+    let base = std::env::temp_dir().join(format!("bx-key-pass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let mut rng = rand::rngs::ThreadRng::default();
+    let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+    let public = key.public_key().clone();
+    let path = base.join("id_locked");
+    let pem = key.encrypt(&mut rng, b"open sesame").unwrap().to_openssh(russh::keys::ssh_key::LineEnding::LF).unwrap();
+    std::fs::write(&path, pem.as_bytes()).unwrap();
+    assert!(crate::vault::key_is_encrypted(&path));
+
+    let config = Arc::new(russh::server::Config {
+        keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = KeyServer { key: public };
+    let accept = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (config, server) = (config.clone(), server.clone());
+            tokio::spawn(async move {
+                if let Ok(running) = russh::server::run_stream(config, s, server).await {
+                    let _ = running.await;
+                }
+            });
+        }
+    });
+    let kh = base.join("known_hosts");
+    let login = |password: Option<&str>, fp: Option<String>| crate::remote::SshLogin {
+        host: "127.0.0.1".into(),
+        port,
+        username: "tester".into(),
+        password: password.map(str::to_string),
+        cred: Some(crate::vault::Resolved { username: "tester".into(), password: None, key_path: Some(path.to_string_lossy().into_owned()), passphrase: None }),
+        trusted_fingerprint: fp,
+        known_hosts: kh.clone(),
+        proxy: None,
+        proxy_auth: Default::default(),
+    };
+    let fp = match crate::remote::ssh_login(login(None, None)).await {
+        Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
+        other => panic!("expected a host key prompt: {:?}", other.err()),
+    };
+    let err = |r: Result<_, String>| r.err().unwrap_or_default();
+    assert_eq!(err(crate::remote::ssh_login(login(None, Some(fp.clone()))).await), "NEED_PASSPHRASE");
+    assert_eq!(err(crate::remote::ssh_login(login(Some("wrong"), Some(fp.clone()))).await), "BAD_PASSPHRASE");
+    assert!(crate::remote::ssh_login(login(Some("open sesame"), Some(fp))).await.is_ok(), "the typed passphrase opens the key");
+    accept.abort();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Records each login attempt; accepts only the password "secret".
+#[derive(Clone, Default)]
+struct RecordingServer {
+    tries: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl russh::server::Handler for RecordingServer {
+    type Error = russh::Error;
+
+    async fn auth_publickey_offered(&mut self, _user: &str, _key: &russh::keys::ssh_key::PublicKey) -> Result<russh::server::Auth, Self::Error> {
+        self.tries.lock().unwrap().push("key");
+        Ok(russh::server::Auth::reject())
+    }
+
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<russh::server::Auth, Self::Error> {
+        self.tries.lock().unwrap().push("password");
+        Ok(if password == "secret" { russh::server::Auth::Accept } else { russh::server::Auth::reject() })
+    }
+}
+
+/// A plain key the server refuses: the password typed after that failure is
+/// tried instead of the key, so each attempt costs one failed login, not two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_password_replaces_a_refused_plain_key() {
+    use std::sync::Arc;
+    let base = std::env::temp_dir().join(format!("bx-key-pw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let key = russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap();
+    let path = base.join("id_plain");
+    std::fs::write(&path, key.to_openssh(russh::keys::ssh_key::LineEnding::LF).unwrap().as_bytes()).unwrap();
+
+    let config = Arc::new(russh::server::Config {
+        keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = RecordingServer::default();
+    let tries = server.tries.clone();
+    let accept = tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (config, server) = (config.clone(), server.clone());
+            tokio::spawn(async move {
+                if let Ok(running) = russh::server::run_stream(config, s, server).await {
+                    let _ = running.await;
+                }
+            });
+        }
+    });
+    let kh = base.join("known_hosts");
+    let login = |password: Option<&str>, fp: Option<String>| crate::remote::SshLogin {
+        host: "127.0.0.1".into(),
+        port,
+        username: "tester".into(),
+        password: password.map(str::to_string),
+        cred: Some(crate::vault::Resolved { username: "tester".into(), password: None, key_path: Some(path.to_string_lossy().into_owned()), passphrase: None }),
+        trusted_fingerprint: fp,
+        known_hosts: kh.clone(),
+        proxy: None,
+        proxy_auth: Default::default(),
+    };
+    let fp = match crate::remote::ssh_login(login(None, None)).await {
+        Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
+        other => panic!("expected a host key prompt: {:?}", other.err()),
+    };
+    let take = || std::mem::take(&mut *tries.lock().unwrap());
+    take();
+    assert!(crate::remote::ssh_login(login(None, Some(fp.clone()))).await.is_err());
+    assert_eq!(take(), ["key"], "first the key");
+    assert!(crate::remote::ssh_login(login(Some("wrong"), Some(fp.clone()))).await.is_err());
+    assert_eq!(take(), ["password"], "then the typed password alone");
+    assert!(crate::remote::ssh_login(login(Some("secret"), Some(fp))).await.is_ok());
+    assert_eq!(take(), ["password"]);
+    accept.abort();
+    let _ = std::fs::remove_dir_all(&base);
+}

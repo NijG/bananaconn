@@ -36,7 +36,10 @@ export class TftpView implements View {
       on<Progress>("tftp-progress", (p) => views.get(p.id)?.progress(p));
     }
     const p = PROTOCOLS.tftp;
-    const block = Number(session.options.blockSize) || 1428;
+    // A stored size the backend can take (a u16 it clamps to 8..65464); one
+    // from an edited backup outside that would fail every transfer.
+    const stored = Number(session.options.blockSize);
+    const block = Number.isInteger(stored) && stored >= 8 && stored <= 65464 ? stored : 1428;
     this.el = h(
       "div",
       { class: "view tftp-view" },

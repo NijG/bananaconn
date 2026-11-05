@@ -13,11 +13,20 @@ import { choiceDialog, confirmDialog, errorText, esc, toast } from "./ui";
 const credential = () => state.settings.updateCredentialId || null;
 
 /** "UPDATE_AUTH::<\\server\share>::<reason>" from updater.rs: the share
- * refused the account (not offline). */
-function authProblem(err: unknown): { share: string; reason: string } | null {
-  const m = /^UPDATE_AUTH::(.*?)::([\s\S]*)$/.exec(errorText(err));
-  return m ? { share: m[1], reason: m[2] } : null;
+ * refused the account (not offline). `badCredential`: it refused the NAS
+ * account chosen in the settings ("BADCRED::" before the reason). */
+function authProblem(err: unknown): { share: string; reason: string; badCredential: boolean } | null {
+  const m = /^UPDATE_AUTH::(.*?)::(BADCRED::)?([\s\S]*)$/.exec(errorText(err));
+  return m ? { share: m[1], reason: m[3], badCredential: !!m[2] } : null;
 }
+
+/** The NAS account the share refused on a check. Automatic checks (every 30
+ * minutes, on focus) leave it out until a check by hand succeeds or another
+ * account is chosen: each refused login counts toward the account's lockout. */
+let refusedCredential: string | null = null;
+
+/** The NAS account automatic checks leave out (refused), for the settings. */
+export const refusedNasAccount = () => refusedCredential;
 
 /** Windows logs in to a share with the user's own account and does not fall
  * back to guest access: say so, and offer the two ways out. */
@@ -26,7 +35,7 @@ async function authGuide(p: { share: string; reason: string }) {
   const choice = await choiceDialog({
     title: "업데이트 폴더에 로그인할 수 없습니다",
     icon: "KeyRound",
-    message: `<p><b data-i18n-skip>${esc(p.share)}</b>: ${esc(p.reason)}</p>
+    message: `<p><b data-i18n-skip>${esc(p.share)}</b>: <span>${esc(p.reason)}</span></p>
       <p>Windows는 공유 폴더에 지금 로그인한 Windows 계정으로 먼저 접속하고, 공유 폴더가 익명(게스트) 읽기를 허용해도 게스트로 넘어가지 않습니다(Windows 10/11 기본 보안 설정).</p>
       <ul>
         <li><b>폴더 열기</b>: 탐색기에서 폴더를 엽니다. 로그인 창에 NAS 계정을 입력하고 "자격 증명 기억"을 체크하면 다음부터는 바로 접속됩니다.</li>
@@ -114,12 +123,17 @@ let foundIn = "";
 /** The first source that answers. When none does, the error worth showing
  * is the settings folder's (a refused NAS login has its own guide); without a
  * folder, GitHub's, with the way out. */
-async function checkSources(): Promise<{ source: string; info: Awaited<ReturnType<typeof api.updateCheck>> }> {
+async function checkSources(manual: boolean): Promise<{ source: string; info: Awaited<ReturnType<typeof api.updateCheck>> }> {
   let shown: unknown = null;
+  const chosen = credential();
+  const login = manual || chosen !== refusedCredential ? chosen : null;
   for (const source of updateSources()) {
     try {
-      return { source, info: await api.updateCheck(source, credential()) };
+      const info = await api.updateCheck(source, login);
+      if (login && source === updateFolder()) refusedCredential = null;
+      return { source, info };
     } catch (err) {
+      if (login && authProblem(err)?.badCredential) refusedCredential = login;
       if (shown === null || source === updateFolder()) shown = err;
     }
   }
@@ -145,7 +159,7 @@ export async function checkForUpdate(manual: boolean) {
   update.checking = true;
   lastCheck = Date.now();
   try {
-    const { source, info } = await checkSources();
+    const { source, info } = await checkSources(manual);
     foundIn = source;
     update.current = info.current;
     update.available = info.available;
