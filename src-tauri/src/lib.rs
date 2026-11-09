@@ -26,6 +26,7 @@ pub mod proxy;
 mod rdp;
 mod remote;
 mod store;
+mod syslog;
 mod telnet;
 mod termlog;
 mod tftpclient;
@@ -86,6 +87,7 @@ pub fn run() {
         .manage(ftpserver::FtpServerState::default())
         .manage(tunnel::TunnelState::default())
         .manage(fileservers::FileServersState::default())
+        .manage(syslog::SyslogState::default())
         .manage(lock::LockState::default())
         .manage(monitor::MonitorState::default())
         .manage(tftpclient::TftpState::default())
@@ -156,11 +158,22 @@ pub fn run() {
             nettools::net_ping_cancel,
             nettools::net_ports,
             nettools::net_dns,
+            nettools::net_sweep,
+            nettools::net_sweep_cancel,
+            nettools::net_names,
+            nettools::net_watch,
+            nettools::net_watch_stop,
+            nettools::net_trace,
+            nettools::net_trace_stop,
+            nettools::net_stop_all,
             nettools::wake_on_lan,
             fileservers::file_server_start,
             fileservers::file_server_stop,
             fileservers::file_server_status,
             fileservers::file_server_active,
+            syslog::syslog_start,
+            syslog::syslog_stop,
+            syslog::syslog_status,
             lock::lock_status,
             lock::lock_unlock,
             lock::lock_lock,
@@ -207,10 +220,12 @@ pub fn run() {
         .build(context)
         .expect("error while running tauri application")
         .run(|app, event| {
-            // Sessions are not dropped when the process exits: close the logs.
+            // Sessions are not dropped when the process exits: close the logs
+            // (also the syslog file).
             if let tauri::RunEvent::Exit = event {
                 use tauri::Manager;
                 term::end_all_logs(&app.state::<term::TermState>());
+                syslog::end_on_exit(&app.state::<syslog::SyslogState>());
             }
         });
 }

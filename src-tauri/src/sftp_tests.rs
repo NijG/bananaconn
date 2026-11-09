@@ -135,7 +135,9 @@ impl russh_sftp::server::Handler for Fs {
         o.read(pflags.contains(OpenFlags::READ))
             .write(pflags.contains(OpenFlags::WRITE))
             .create(pflags.contains(OpenFlags::CREATE))
-            .truncate(pflags.contains(OpenFlags::TRUNCATE));
+            .truncate(pflags.contains(OpenFlags::TRUNCATE))
+            // SSH_FXF_EXCL, as OpenSSH maps it: O_EXCL.
+            .create_new(pflags.contains(OpenFlags::EXCLUDE));
         let f = o.open(&path).await.map_err(io)?;
         Ok(Handle { id, handle: self.handle(Open::File(f)) })
     }
@@ -257,6 +259,53 @@ fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// The in-process SSH/SFTP server serving `root`; returns its port and the
+/// most files it had open at once.
+async fn start_server(root: &Path) -> (u16, Arc<AtomicUsize>) {
+    let open_max = Arc::new(AtomicUsize::new(0));
+    let ssh = SshServer { root: root.to_path_buf(), open_now: Arc::default(), open_max: open_max.clone() };
+    let config = Arc::new(russh::server::Config {
+        keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let (config, ssh) = (config.clone(), ssh.clone());
+            tokio::spawn(async move {
+                if let Ok(running) = russh::server::run_stream(config, s, ssh).await {
+                    let _ = running.await;
+                }
+            });
+        }
+    });
+    (port, open_max)
+}
+
+/// "New file" creates an empty file, and never touches one that exists (the
+/// listing may be stale: the server is asked to create only).
+#[tokio::test(flavor = "multi_thread")]
+async fn sftp_new_file_never_overwrites() {
+    let base = std::env::temp_dir().join(format!("bx-sftp-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let served = base.join("server");
+    std::fs::create_dir_all(&served).unwrap();
+    std::fs::write(served.join("keep.conf"), b"important\n").unwrap();
+    let (port, _) = start_server(&served).await;
+    let kh = base.join("known_hosts");
+    let fp = match crate::remote::test_sftp_new_file(port, None, &kh, "/new.txt").await {
+        Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
+        other => panic!("expected a host key prompt: {other:?}"),
+    };
+    crate::remote::test_sftp_new_file(port, Some(fp.clone()), &kh, "/new.txt").await.expect("create");
+    assert_eq!(std::fs::read(served.join("new.txt")).unwrap(), b"");
+    let err = crate::remote::test_sftp_new_file(port, Some(fp), &kh, "/keep.conf").await.expect_err("an existing name");
+    assert_eq!(err, "같은 이름이 이미 있습니다");
+    assert_eq!(std::fs::read(served.join("keep.conf")).unwrap(), b"important\n", "left as it was");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sftp_folder_transfers_copy_several_files_at_once() {
     let base = std::env::temp_dir().join(format!("bx-sftp-par-{}", std::process::id()));
@@ -273,24 +322,7 @@ async fn sftp_folder_transfers_copy_several_files_at_once() {
     }
     std::fs::write(source.join("big.bin"), (0..600_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>()).unwrap();
 
-    let open_max = Arc::new(AtomicUsize::new(0));
-    let ssh = SshServer { root: served.clone(), open_now: Arc::default(), open_max: open_max.clone() };
-    let config = Arc::new(russh::server::Config {
-        keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
-        ..Default::default()
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        while let Ok((s, _)) = listener.accept().await {
-            let (config, ssh) = (config.clone(), ssh.clone());
-            tokio::spawn(async move {
-                if let Ok(running) = russh::server::run_stream(config, s, ssh).await {
-                    let _ = running.await;
-                }
-            });
-        }
-    });
+    let (server_port, open_max) = start_server(&served).await;
     let port = delayed_proxy(server_port).await;
 
     let kh = base.join("known_hosts");

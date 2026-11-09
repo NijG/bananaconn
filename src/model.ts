@@ -18,6 +18,8 @@ export interface Session {
   options: Record<string, unknown>;
   createdAt: number;
   lastUsed: number | null;
+  /** Kept on the home screen (set from the session's menu). */
+  pinned?: boolean;
 }
 
 export interface ProtocolInfo {
@@ -159,6 +161,7 @@ export function normalizeSession(input: unknown): Session | null {
     options: isRecord(raw.options) ? { ...raw.options } : {},
     createdAt: Number(raw.createdAt ?? Date.now()),
     lastUsed: raw.lastUsed ? Number(raw.lastUsed) : null,
+    ...(raw.pinned === true ? { pinned: true } : {}),
   };
 }
 

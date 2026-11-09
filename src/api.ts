@@ -59,7 +59,12 @@ export interface PasteEvent {
   id: string;
   sent: number;
   total: number;
-  state: "running" | "done" | "stopped" | "failed";
+  /** Lines left out on purpose: a password after an `enable` that asked for none. */
+  skipped: number;
+  /** "login": stopped at a login question (a console that had timed out).
+   * "noprompt": stopped as the device's prompt did not come back after a
+   * line (a console that logged out, a pager, no answer). */
+  state: "running" | "done" | "stopped" | "failed" | "login" | "noprompt";
 }
 
 export function mockEmit(event: string, payload: unknown) {
@@ -266,6 +271,23 @@ export interface SshKitEvent {
   text: string;
 }
 
+export interface SyslogStatus {
+  port: number;
+  lan: boolean;
+  addresses: string[];
+  /** The file every message is added to as it comes, if any. */
+  file: string | null;
+}
+
+/** One syslog message (syslog.rs): severity 0 (emergency) to 7 (debug), none without a <PRI>. */
+export interface SyslogMessage {
+  at: number;
+  from: string;
+  severity: number | null;
+  facility: number | null;
+  text: string;
+}
+
 export interface FileServerStatus {
   kind: FileServerKind;
   root: string;
@@ -424,6 +446,30 @@ export const api = {
   netPorts: (host: string, ports: number[]) =>
     call<{ port: number; open: boolean; ms: number | null; detail: string }[]>("net_ports", { host, ports }),
   netDns: (host: string) => call<{ addresses: string[]; ms: number }>("net_dns", { host }),
+  /** Ping every host of network/prefix (a /22 at most): those that answered
+   * (ms), and on this PC's own segment those that answered ARP only (ms null),
+   * with the MAC (12 hex digits) of the hosts on that segment.
+   * Progress arrives as "sweep-progress" { id, done, total }; fails with
+   * "CANCELLED" after netSweepCancel(id). */
+  netSweep: (id: string, network: string, prefix: number, timeoutMs: number) =>
+    call<{ ip: string; ms: number | null; mac: string | null }[]>("net_sweep", { id, network, prefix, timeoutMs }),
+  netSweepCancel: (id: string) => call<void>("net_sweep_cancel", { id }),
+  /** The DNS (or hosts file) names of IPv4 addresses, in their order: null for
+   * one without a name or not found within 4 seconds. */
+  netNames: (ips: string[]) => call<(string | null)[]>("net_names", { ips }),
+  /** Ping an IPv4 address every intervalMs until netWatchStop(id): each result
+   * comes as "watch-reply" { id, seq, ms } (ms null: no answer). */
+  netWatch: (id: string, ip: string, intervalMs: number) => call<void>("net_watch", { id, ip, intervalMs }),
+  netWatchStop: (id: string) => call<void>("net_watch_stop", { id }),
+  /** Trace the route to an IPv4 address (three echoes per hop, up to maxHops):
+   * each hop comes as "trace-hop" { id, ttl, addrs, ms } (ms null: no answer);
+   * resolves to how it ended; fails with "CANCELLED" after netTraceStop(id).
+   * `unreachable`: a router's IP status (11002 network, 11003 host, 11004
+   * protocol, 11005 port). */
+  netTrace: (id: string, ip: string, maxHops: number) => call<{ reached: boolean; unreachable: number | null; hops: number }>("net_trace", { id, ip, maxHops }),
+  netTraceStop: (id: string) => call<void>("net_trace_stop", { id }),
+  /** Stop every sweep and continuous ping (at page load: ones a reloaded page left). */
+  netStopAll: () => call<void>("net_stop_all"),
   /** Send a Wake-on-LAN magic packet to a MAC (optionally a subnet broadcast address and port). */
   wakeOnLan: (mac: string, broadcast?: string, port?: number) => call<void>("wake_on_lan", { mac, broadcast: broadcast ?? null, port: port ?? null }),
 
@@ -432,6 +478,11 @@ export const api = {
   fileServerStop: (kind: FileServerKind) => call<void>("file_server_stop", { kind }),
   fileServerStatus: () => call<FileServerStatus[]>("file_server_status"),
   fileServerActive: (kind: FileServerKind) => call<number>("file_server_active", { kind }),
+  /** Receive syslog (UDP) on a port, every message also added to `file` when given;
+   * messages come as "syslog-batch" { messages, dropped, unsaved, fileError }. */
+  syslogStart: (port: number, lan: boolean, file: string | null) => call<SyslogStatus>("syslog_start", { port, lan, file }),
+  syslogStop: () => call<void>("syslog_stop"),
+  syslogStatus: () => call<SyslogStatus | null>("syslog_status"),
 
   lockStatus: () => call<{ enabled: boolean; locked: boolean }>("lock_status"),
   lockUnlock: (password: string) => call<void>("lock_unlock", { password }),

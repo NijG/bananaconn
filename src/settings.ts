@@ -5,7 +5,7 @@ import { icon } from "./icons";
 import { state, updateSettings, type Settings, type TriggerRule } from "./store";
 import { appLock, openMasterPassword } from "./lock";
 import { LIGHT_THEMES, TERM_THEMES } from "./themes";
-import { confirmDialog, esc, modal, toast } from "./ui";
+import { confirmDialog, esc, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
 import { clearCommandHistory, commandHistoryCount } from "./cmdLine";
 import { aiSettingsSection, wireAiSettings } from "./ai/settings";
 import { checkForUpdate, refusedNasAccount } from "./updates";
@@ -78,10 +78,23 @@ function paginate(form: HTMLFormElement, start: string | undefined) {
   const body = document.createElement("div");
   body.className = "settings-pages";
   body.append(...pages.values());
+  // Search over every page: the settings as shown (in the language on
+  // screen), each found one listed as "page / setting"; picking one opens
+  // its page with the setting in view.
+  const search = h("input", { type: "search", class: "settings-search", placeholder: "설정 검색", spellcheck: "false", autocomplete: "off", "aria-label": "설정 검색" });
+  nav.prepend(search);
+  // data-clears-search: Esc on a hit clears the search (ui.ts modal), not the dialog.
+  const results = h("div", { class: "settings-results", role: "list", "data-clears-search": "" });
+  results.hidden = true;
+  body.append(results);
   form.replaceChildren(nav, body);
   form.classList.add("paged");
+  /** The page shown (again once the search is cleared). */
+  let shown = "general";
   const show = (id: string) => {
     if (!pages.has(id)) id = "general";
+    shown = id;
+    results.hidden = true;
     pages.forEach((el, key) => (el.hidden = key !== id));
     nav.querySelectorAll<HTMLElement>("[data-page]").forEach((b) => b.classList.toggle("on", b.dataset.page === id));
     body.scrollTop = 0;
@@ -93,8 +106,70 @@ function paginate(form: HTMLFormElement, start: string | undefined) {
   };
   nav.addEventListener("click", (e) => {
     const id = (e.target as HTMLElement).closest<HTMLElement>("[data-page]")?.dataset.page;
-    if (id) show(id);
+    if (id) {
+      search.value = "";
+      show(id);
+    }
   });
+  /** One setting: a field, a check box or the language row (the outermost
+   * one, not the parts of a group). */
+  const settings = () =>
+    [
+      ...body.querySelectorAll<HTMLElement>(
+        ".settings-page .field, .settings-page label.check, .settings-page .lang-row, .settings-page h4, .settings-page h5, .settings-page button.btn",
+      ),
+    ].filter(
+      // Not a part of another setting, not one hidden on its page (another AI
+      // provider's fields): it could not be shown; and not one with no name
+      // to list it by (a provider's "default" radio).
+      (el) => !el.parentElement?.closest(".field, label.check, .lang-row") && !el.closest("[hidden]:not(.settings-page)") && !!titleOf(el),
+    );
+  /** What a setting is called: a check box's bold title, a field's label. */
+  const titleOf = (el: HTMLElement) =>
+    (el.querySelector(":scope > span > b, :scope > span:first-child, :scope > b") ?? el).textContent?.trim().replace(/\s+/g, " ").slice(0, 80) ?? "";
+  const go = (el: HTMLElement) => {
+    search.value = "";
+    show(el.closest<HTMLElement>(".settings-page")!.dataset.page!);
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("settings-flash");
+    window.setTimeout(() => el.classList.remove("settings-flash"), 1600);
+    (el.matches("button") ? el : el.querySelector<HTMLElement>("input:not([type=hidden]), select, textarea"))?.focus({ preventScroll: true });
+  };
+  let found: HTMLElement[] = [];
+  search.addEventListener("input", () => {
+    const terms = searchTerms(search.value);
+    if (!terms.length) return show(shown);
+    pages.forEach((el) => (el.hidden = true));
+    nav.querySelectorAll<HTMLElement>("[data-page]").forEach((b) => b.classList.remove("on"));
+    // The words shown, and the fields' own names ("autoReconnect" → "auto
+    // reconnect"): an English word finds a setting whatever the screen language.
+    const hay = (el: HTMLElement) =>
+      `${el.textContent ?? ""} ${[...el.querySelectorAll("[name]")].map((x) => x.getAttribute("name")!.replace(/([a-z])([A-Z])/g, "$1 $2")).join(" ")}`.toLowerCase();
+    found = settings().filter((el) => matchesTerms(hay(el), terms));
+    results.hidden = false;
+    // Text taken from the page as shown (already in the screen's language).
+    results.innerHTML = found.length
+      ? found
+          .map((el, i) => {
+            const page = el.closest<HTMLElement>(".settings-page")!.dataset.page!;
+            const where = nav.querySelector(`[data-page="${page}"] span`)?.textContent ?? "";
+            return `<button type="button" class="settings-hit" role="listitem" data-hit="${i}" data-i18n-skip><small>${esc(where)}</small><span>${esc(titleOf(el))}</span></button>`;
+          })
+          .join("")
+      : `<p class="muted">일치하는 설정이 없습니다</p>`;
+  });
+  results.addEventListener("click", (e) => {
+    const i = (e.target as HTMLElement).closest<HTMLElement>("[data-hit]")?.dataset.hit;
+    if (i !== undefined && found[Number(i)]) go(found[Number(i)]);
+  });
+  search.addEventListener("keydown", (e) => {
+    // Enter opens the first one found (not the form's submit).
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (found.length && search.value.trim()) go(found[0]);
+    }
+  });
+  listKeys(search, results, ".settings-hit");
   let remembered: string | null = null;
   try {
     remembered = localStorage.getItem("bx.settingsPage");
@@ -190,6 +265,7 @@ export function openSettings(section?: "update" | "risk" | "shortcuts" | "ai") {
         </div>
         <h4 data-section="trigger">트리거</h4>
         <p class="muted small">터미널 출력을 줄마다 정규식으로 검사해, 맞으면 동작을 실행합니다. 알림은 토스트로 알리고, 소리는 짧은 소리를 내며, 자동 응답은 정해 둔 텍스트를 터미널로 보냅니다(줄바꿈은 \\n, 탭은 \\t). 예를 들어 묻는 말에 자동으로 응답을 보낼 수 있습니다.</p>
+        <p class="muted small">자동 응답은 로그인이 끝난 뒤에만 보내며, 줄바꿈 없이 기다리는 질문(Continue? (y/n), --More-- 등)에도 출력이 잠시 멈추면 줄마다 한 번 보냅니다. 로그인·비밀번호·인증 코드·호스트 키를 묻는 줄에는 보내지 않습니다. 거절된 값을 다시 보내 계정이 잠기거나 확인하지 않은 호스트 키를 받아들이는 일을 막기 위해서이며, 로그인 정보는 세션 편집의 사용자 이름과 자격 증명에 저장하세요.</p>
         <div class="risk-rules" data-trigger-rules></div>
         <div class="row">
           <button type="button" class="btn btn-sm" data-trigger-add>${icon("Plus", 14)}트리거 추가</button>

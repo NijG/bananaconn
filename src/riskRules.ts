@@ -66,7 +66,7 @@ export const DEFAULT_RISK_RULES: RiskRule[] = [
   warn(String.raw`\bip\s+link\s+set\s+(dev\s+)?\S+\s+down\b`, "네트워크 인터페이스 끄기 (원격 접속이 끊길 수 있음)"),
   warn(String.raw`\bifdown\s+\S+`, "네트워크 인터페이스 끄기 (원격 접속이 끊길 수 있음)"),
   warn(String.raw`^\s*(rmlv|rmvg|reducevg|rmdev|lvremove|vgremove)\b`, "볼륨·장치 제거 (AIX·HP-UX)"),
-  warn(String.raw`^\s*reload\b`, "장비 재시작"),
+  warn(String.raw`^\s*reload\b(?!\s+cancel\b)`, "장비 재시작"),
   warn(String.raw`^\s*(write\s+erase|erase\s+(startup-config|nvram:|flash:))`, "장비 설정 삭제"),
   // Options may come first: "delete /force /recursive flash:/dir" ("del" too).
   warn(String.raw`^\s*(delete|del|format)\s+(/\S+\s+)*(flash|bootflash|disk|nvram|usb)`, "장비 저장소 삭제·포맷"),

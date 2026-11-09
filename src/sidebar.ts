@@ -2,7 +2,7 @@
 // into folders and, in the manual order, to any place among their siblings.
 
 import { icon } from "./icons";
-import { actionFor } from "./keymap";
+import { actionFor, keyHint, withKey } from "./keymap";
 
 /** Row heights (.folder-row, .session-row) and when to draw only the rows in view. */
 const FOLDER_H = 30;
@@ -10,7 +10,7 @@ const SESSION_H = 42;
 const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
-import { endpoint, jumpHostOk, normalizeJumpHost, PROTOCOLS, sessionSearchText, type Session } from "./model";
+import { endpoint, jumpHostOk, normalizeJumpHost, parseTarget, PROTOCOLS, sessionSearchText, type Protocol, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { canBeGateway, confirmGatewayBreak, gatewayChoices, GATEWAY_PROTOCOLS, gatewayUserList, gatewayUsers } from "./tunnels";
 import { checkReachable, checkReachableMany } from "./nettools";
@@ -23,6 +23,7 @@ import {
   allFolders,
   deleteFolder,
   moveSessions,
+  pinSessions,
   placeFolder,
   placeSessions,
   sessionPositions,
@@ -40,7 +41,7 @@ import {
   upsertSessions,
 } from "./store";
 import { api } from "./api";
-import { confirmDialog, contextMenu, errorText, esc, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
+import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
 import { userText } from "./i18n";
 
 export interface SidebarActions {
@@ -115,7 +116,7 @@ export class Sidebar {
           <button class="icon-btn" data-a="sort" title="정렬">${icon("ArrowUpDown", 16)}</button>
           <button class="icon-btn" data-a="more" title="가져오기·내보내기">${icon("Download", 16)}</button>
           <button class="icon-btn" data-a="folder" title="새 폴더">${icon("FolderPlus", 16)}</button>
-          <button class="icon-btn" data-a="new" title="새 세션 (Ctrl+Shift+N)">${icon("Plus", 16)}</button>
+          <button class="icon-btn" data-a="new" title="${esc(withKey("새 세션", "app.newSession"))}">${icon("Plus", 16)}</button>
         </div>
       </div>
       <label class="side-search">${icon("Search", 14)}<input placeholder="이름·호스트 검색" spellcheck="false" /></label>
@@ -143,14 +144,47 @@ export class Sidebar {
     });
     // Re-filter once typing pauses, not on every key (thousands of sessions).
     let searchTimer = 0;
-    root.querySelector<HTMLInputElement>(".side-search input")!.addEventListener("input", (e) => {
-      const query = (e.target as HTMLInputElement).value.trim().toLowerCase();
+    const searchBox = root.querySelector<HTMLInputElement>(".side-search input")!;
+    const applySearch = () => {
       clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(() => {
-        this.query = query;
-        this.terms = searchTerms(query);
-        this.render();
-      }, 80);
+      const query = searchBox.value.trim().toLowerCase();
+      if (query === this.query) return;
+      this.query = query;
+      this.terms = searchTerms(query);
+      this.render();
+    };
+    searchBox.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(applySearch, 80);
+    });
+    // From the search box to the results without the mouse: Down goes to the
+    // first match, Enter connects the only match (or goes to the first of
+    // several, where Enter again connects), Esc clears the search.
+    searchBox.addEventListener("keydown", (e) => {
+      if (e.isComposing) return;
+      if (e.key === "Escape" && searchBox.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        searchBox.value = "";
+        applySearch();
+        return;
+      }
+      if (e.key !== "ArrowDown" && e.key !== "Enter") return;
+      // A held Enter repeats: one connection per press, not one per repeat.
+      if (e.key === "Enter" && e.repeat) return e.preventDefault();
+      e.preventDefault();
+      applySearch(); // the results of what is typed now, not 80 ms ago
+      const first = this.order[0];
+      // Nothing matched an address: Enter starts a session for it (as the button).
+      if (!first) return void (e.key === "Enter" && this.query && this.newFromSearch());
+      if (e.key === "Enter" && this.query && this.order.length === 1) {
+        const s = this.session(first);
+        if (s) this.actions.connect(s);
+        return;
+      }
+      this.select([first], first);
+      this.reveal(first);
+      this.tree.focus();
     });
     this.wireSessionRows();
     const redraw = () => {
@@ -169,7 +203,7 @@ export class Sidebar {
       e.preventDefault();
       contextMenu(e.clientX, e.clientY, [
         { label: "새 세션", icon: "Plus", action: () => this.actions.edit(null) },
-        { label: "맨 위에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession("") },
+        { label: "맨 위에 붙여넣기", icon: "ClipboardPaste", hint: keyHint("tree.paste"), disabled: !this.clip, action: () => this.pasteSession("") },
         "-",
         { label: "맨 위 단계를 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce("", "name") },
         { label: "맨 위 단계를 주소순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce("", "address") },
@@ -202,12 +236,42 @@ export class Sidebar {
     // The tree depends on only two settings; skip the full walk for unrelated
     // settings writes (AI run mode, "don't ask again", keybindings, …).
     subscribe("settings", () => {
+      // The new-session key may have been changed in the shortcut settings.
+      this.root.querySelector<HTMLElement>('[data-a="new"]')!.title = withKey("새 세션", "app.newSession");
       const key = `${state.settings.sessionSort}\0${state.settings.folderOrder.join("\0")}`;
       if (key === this.sortKey) return;
       this.sortKey = key;
       this.render();
     });
     this.render();
+  }
+
+  /** The search text read as an address ("10.0.0.5", "root@host:2222"), when
+   * it looks like one (a dot, @ or colon): a new session can start from it. As
+   * typed, not lower-cased (a user name keeps its case). */
+  private searchTarget() {
+    const raw = this.searchText();
+    return /[.@:]/.test(raw) ? parseTarget(raw) : null;
+  }
+
+  /** The search box's text as typed (the filter itself is lower-cased). */
+  private searchText(): string {
+    return this.root.querySelector<HTMLInputElement>(".side-search input")?.value.trim() ?? "";
+  }
+
+  /** A new session from the address searched for (nothing matched it): the
+   * editor opens filled in; nothing connects before the user saves. */
+  private newFromSearch(): boolean {
+    const t = this.searchTarget();
+    if (!t) return false;
+    // The protocol a well-known port stands for; otherwise the editor's default.
+    const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
+    // A URL's scheme names it outright ("telnet://10.0.0.5").
+    const scheme = /^([a-z]+):\/\//i.exec(this.searchText())?.[1].toLowerCase();
+    const named = scheme && scheme !== "serial" && scheme in PROTOCOLS ? (scheme as Protocol) : null;
+    const protocol = named ?? ((t.port && byPort[t.port]) || "ssh");
+    this.actions.edit(null, { protocol, host: t.host, username: t.username, ...(t.port ? { port: t.port } : {}) });
+    return true;
   }
 
   focusSearch() {
@@ -219,7 +283,9 @@ export class Sidebar {
     return matchesTerms(sessionSearchText(s), this.terms);
   }
 
-  private build(): FolderNode {
+  /** The folder tree with the sessions the search shows; `all`: every session
+   * and folder, as the tree is when nothing is searched. */
+  private build(all = false): FolderNode {
     const root: FolderNode = { name: "", path: "", children: new Map(), sessions: [] };
     // Sessions share a few folders: walk each folder path once.
     const nodes = new Map<string, FolderNode>([["", root]]);
@@ -236,8 +302,8 @@ export class Sidebar {
       nodes.set(path, node);
       return node;
     };
-    if (!this.query) allFolders().forEach(ensure);
-    for (const s of state.sessions) if (this.matches(s)) ensure(s.folder).sessions.push(s);
+    if (all || !this.query) allFolders().forEach(ensure);
+    for (const s of state.sessions) if (all || this.matches(s)) ensure(s.folder).sessions.push(s);
     return root;
   }
 
@@ -274,9 +340,10 @@ export class Sidebar {
         const p = PROTOCOLS[s.protocol];
         this.rowIndex.set(s.id, html.length);
         html.push(`<div class="session-row${this.picked.has(s.id) ? " selected" : ""}" data-session="${s.id}" draggable="true"
-            style="--depth:${depth};--proto:${p.color}" title="${esc(`${p.label} · ${endpoint(s)}${s.notes ? `\n${s.notes}` : ""}`)}">
+            style="--depth:${depth};--proto:${p.color}" title="${esc(rowTitle(s))}">
             <span class="proto-ico">${icon(p.icon, 15)}</span>
             <span class="srow-text"><span class="sname" data-i18n-skip>${esc(s.name)}</span><span class="shost" data-i18n-skip>${esc(endpoint(s))}</span></span>
+            ${s.pinned ? `<span class="row-pin" title="홈 화면에 고정됨">${icon("Pin", 12)}</span>` : ""}
             <button class="row-go" data-go title="연결" tabindex="-1">${icon("Play", 13)}</button></div>`);
         heights.push(SESSION_H);
         order.push(s.id);
@@ -300,7 +367,9 @@ export class Sidebar {
                <p class="muted small tree-problem">${esc(loadProblem)}</p>
                <button class="btn btn-sm" data-reset-sessions>${icon("RotateCcw", 14)}빈 목록으로 새로 시작…</button></div>`
           : this.query
-          ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(userText(this.query))}"와 일치하는 세션이 없습니다</p></div>`
+          ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(userText(this.searchText() || this.query))}"와 일치하는 세션이 없습니다</p>${
+              this.searchTarget() ? `<button class="btn btn-sm" data-new-from-search>${icon("Plus", 14)}이 주소로 새 세션 만들기…</button>` : ""
+            }</div>`
           : `<div class="tree-empty">${icon("Server", 26)}<p>저장된 세션이 없습니다</p>
                <button class="btn btn-primary btn-sm" data-first>${icon("Plus", 14)}첫 세션 만들기</button>
                <button class="btn btn-sm" data-import>${icon("Download", 14)}다른 프로그램에서 가져오기</button></div>`,
@@ -326,6 +395,7 @@ export class Sidebar {
     this.rows = [];
     this.tree.innerHTML = markup;
     this.tree.querySelector("[data-first]")?.addEventListener("click", () => this.actions.edit(null));
+    this.tree.querySelector("[data-new-from-search]")?.addEventListener("click", () => this.newFromSearch());
     this.tree.querySelector("[data-reset-sessions]")?.addEventListener("click", () => void this.resetSessionList());
     this.tree.querySelector("[data-import]")?.addEventListener("click", async (e) => {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -407,6 +477,43 @@ export class Sidebar {
     return this.visibleIds().flatMap((id) => (this.picked.has(id) && byId.get(id)) || []);
   }
 
+  /** Every session in a folder and its subfolders, in the order the tree shows
+   * them, whether or not a search or a closed folder hides them now: the
+   * tree's own folders walked as render() walks them (subfolders first, then
+   * the folder's own sessions). */
+  private folderSessions(path: string): Session[] {
+    let node: FolderNode | undefined = this.build(true);
+    for (const part of path.split("/").filter(Boolean)) node = node?.children.get(part);
+    if (!node) return [];
+    const mode = state.settings.sessionSort;
+    const bySession = sessionCompare(mode, mode === "manual" ? sessionPositions() : new Map());
+    const byFolder = folderCompare(mode, state.settings.folderOrder);
+    const out: Session[] = [];
+    const walk = (n: FolderNode) => {
+      for (const f of [...n.children.values()].sort((a, b) => byFolder(a.path, b.path))) walk(f);
+      out.push(...[...n.sessions].sort(bySession));
+    };
+    walk(node);
+    return out;
+  }
+
+  /** Open every session given (a folder's, or a multi-selection), asking first
+   * when there are many. */
+  private async connectAll(list: Session[]) {
+    if (list.length > 10) {
+      const ok = await confirmDialog({
+        title: "모두 연결",
+        message: `세션 ${list.length}개를 한꺼번에 엽니다. 계속할까요?`,
+        confirm: "모두 연결",
+        icon: "Play",
+        // Starts on Cancel: an Enter meant for the tree does not open them all.
+        focusCancel: true,
+      });
+      if (!ok) return;
+    }
+    list.forEach((s) => this.actions.connect(s));
+  }
+
   private visibleIds(): string[] {
     return this.order;
   }
@@ -455,15 +562,18 @@ export class Sidebar {
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         const n = this.picked.size;
+        const inside = this.folderSessions(path);
         contextMenu(e.clientX, e.clientY, [
           ...(n ? [{ label: `선택한 세션 ${n}개를 여기로 이동`, icon: "FolderSync", action: () => this.moveTo([...this.picked], path) }, "-" as const] : []),
           { label: "이 폴더에 새 세션", icon: "Plus", action: () => this.actions.edit(null, { folder: path }) },
+          { label: `이 폴더의 세션 ${inside.length}개 모두 연결`, icon: "Play", disabled: !inside.length, action: () => void this.connectAll(inside) },
           {
             label: "이 폴더의 세션 연결 확인",
             icon: "Activity",
-            action: () => void checkReachableMany(state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/")), (s) => this.actions.connect(s)),
+            disabled: !inside.length,
+            action: () => void checkReachableMany(inside, (s) => this.actions.connect(s)),
           },
-          { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession(path) },
+          { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: keyHint("tree.paste"), disabled: !this.clip, action: () => this.pasteSession(path) },
           { label: "하위 폴더 만들기", icon: "FolderPlus", action: () => this.newFolder(path) },
           { label: "이 폴더 안을 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "name") },
           { label: "이 폴더 안을 주소순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "address") },
@@ -535,19 +645,22 @@ export class Sidebar {
 
   private sessionMenu(s: Session, x: number, y: number) {
     contextMenu(x, y, [
-      { label: "연결", icon: "Play", hint: "Enter", action: () => this.actions.connect(s) },
+      { label: "연결", icon: "Play", hint: keyHint("tree.connect"), action: () => this.actions.connect(s) },
       ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, s) }] : []),
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
       ...(s.protocol !== "serial" && s.protocol !== "tftp" ? [{ label: "연결 확인", icon: "Activity", action: () => void checkReachable(s) }] : []),
       ...(String(s.options.wolMac ?? "").trim() ? [{ label: "Wake-on-LAN (전원 켜기)", icon: "Power", action: () => void this.wake(s) }] : []),
-      { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([s]) },
+      { label: "주소 복사", icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses([s]) },
+      s.pinned
+        ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }
+        : { label: "홈 화면에 고정", icon: "Pin", action: () => void pinSessions([s.id], true) },
       "-",
-      { label: "편집", icon: "Pencil", hint: "F2", action: () => this.actions.edit(s) },
-      { label: "복사", icon: "Copy", hint: "Ctrl+C", action: () => this.copySession(s) },
-      { label: "붙여넣기", icon: "ClipboardPaste", hint: "Ctrl+V", disabled: !this.clip, action: () => this.pasteSession(s.folder) },
+      { label: "편집", icon: "Pencil", hint: keyHint("tree.edit"), action: () => this.actions.edit(s) },
+      { label: "복사", icon: "Copy", hint: keyHint("tree.copy"), action: () => this.copySession(s) },
+      { label: "붙여넣기", icon: "ClipboardPaste", hint: keyHint("tree.paste"), disabled: !this.clip, action: () => this.pasteSession(s.folder) },
       { label: "복제", icon: "CopyPlus", action: () => this.pasteSession(s.folder, s) },
       "-",
-      { label: "삭제", icon: "Trash2", hint: "Del", danger: true, action: () => this.deleteSession(s) },
+      { label: "삭제", icon: "Trash2", hint: keyHint("tree.delete"), danger: true, action: () => this.deleteSession(s) },
     ]);
   }
 
@@ -568,15 +681,19 @@ export class Sidebar {
   private bulkMenu(x: number, y: number) {
     const list = this.pickedSessions();
     contextMenu(x, y, [
-      { label: `${list.length}개 세션 연결`, icon: "Play", hint: "Enter", action: () => list.forEach((s) => this.actions.connect(s)) },
+      { label: `${list.length}개 세션 연결`, icon: "Play", hint: keyHint("tree.connect"), action: () => void this.connectAll(list) },
       "-",
       { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
-      { label: "한꺼번에 수정…", icon: "Pencil", hint: "F2", action: () => this.bulkEdit(list) },
+      { label: "한꺼번에 수정…", icon: "Pencil", hint: keyHint("tree.edit"), action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
       // One per line, in the order shown: a list of hosts to paste elsewhere.
-      { label: `주소 ${list.length}개 복사`, icon: "ClipboardList", action: () => void copyAddresses(list) },
+      { label: `주소 ${list.length}개 복사`, icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses(list) },
+      // Unpin when every one is pinned already; otherwise pin them all.
+      list.every((s) => s.pinned)
+        ? { label: `${list.length}개 홈 화면 고정 해제`, icon: "PinOff", action: () => void pinSessions(list.map((s) => s.id), false) }
+        : { label: `${list.length}개 홈 화면에 고정`, icon: "Pin", action: () => void pinSessions(list.map((s) => s.id), true) },
       "-",
-      { label: `${list.length}개 삭제`, icon: "Trash2", hint: "Del", danger: true, action: () => this.bulkDelete(list) },
+      { label: `${list.length}개 삭제`, icon: "Trash2", hint: keyHint("tree.delete"), danger: true, action: () => this.bulkDelete(list) },
     ]);
   }
 
@@ -782,6 +899,8 @@ export class Sidebar {
           }
         </form>`,
       footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>적용</button>`,
+      // Only checked rows apply: with none checked there is nothing to lose.
+      beforeDismiss: () => !form.querySelector("[data-on]:checked") || confirmDiscard(),
     });
     const form = m.root.querySelector<HTMLFormElement>("[data-form]")!;
     form.querySelectorAll<HTMLInputElement>("[data-on]").forEach((box) =>
@@ -875,7 +994,7 @@ export class Sidebar {
     const taken = new Set(state.sessions.map((x) => x.name));
     let n = 2;
     while (taken.has(`${base} (${n})`)) n++;
-    const copy: Session = { ...structuredClone(from), id: crypto.randomUUID(), name: `${base} (${n})`, folder, lastUsed: null, createdAt: Date.now() };
+    const copy: Session = { ...structuredClone(from), id: crypto.randomUUID(), name: `${base} (${n})`, folder, lastUsed: null, createdAt: Date.now(), pinned: undefined };
     collapsed.delete(folder);
     saveCollapsed();
     await upsertSession(copy);
@@ -972,6 +1091,8 @@ export class Sidebar {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const i = this.selected ? ids.indexOf(this.selected) : -1;
+      // Up from the first row goes back to the search box (Down there comes here).
+      if (e.key === "ArrowUp" && !e.shiftKey && i === 0) return this.focusSearch();
       const next = ids[Math.max(0, Math.min(ids.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))];
       if (!next) return;
       // Shift+arrow extends the selection from the anchor.
@@ -988,12 +1109,22 @@ export class Sidebar {
       e.preventDefault();
       return this.select(ids, this.selected ?? ids[0] ?? null);
     }
+    if (act === "tree.copyAddress") {
+      e.preventDefault();
+      // The selected sessions, one address per line, as the menu copies them.
+      return void copyAddresses(this.picked.size > 1 ? this.pickedSessions() : s ? [s] : []);
+    }
     if (e.key === "Escape" && this.picked.size > 1) return this.select(this.selected ? [this.selected] : [], this.selected);
     if (this.picked.size > 1) {
       const list = this.pickedSessions();
       if (act === "tree.delete") return void this.bulkDelete(list);
       if (act === "tree.edit") return this.bulkEdit(list);
-      if (act === "tree.connect") return list.forEach((x) => this.actions.connect(x));
+      if (act === "tree.connect") {
+        // Default prevented: the same Enter must not go on to press the
+        // confirmation's button that connectAll() opens.
+        e.preventDefault();
+        return e.repeat ? undefined : void this.connectAll(list);
+      }
     }
     if (act === "tree.paste" && this.clip) {
       e.preventDefault();
@@ -1004,7 +1135,7 @@ export class Sidebar {
       e.preventDefault();
       return this.copySession(s);
     }
-    if (act === "tree.connect") this.actions.connect(s);
+    if (act === "tree.connect" && !e.repeat) this.actions.connect(s);
     if (act === "tree.edit") this.actions.edit(s);
     if (act === "tree.delete") this.deleteSession(s);
   }
@@ -1018,4 +1149,12 @@ function gatewayDeleteNote(gone: Session[]): string {
   const users = [...new Set(gone.flatMap((g) => gatewayUsers(g.id, left)))];
   if (!users.length) return "";
   return `<p class="warn-text">삭제하는 세션을 SSH 게이트웨이로 쓰는 다른 세션 ${users.length}개는 게이트웨이를 다시 고를 때까지 연결할 수 없습니다.</p>${gatewayUserList(users)}`;
+}
+
+/** A session row's tooltip: protocol, address and notes. The address and each
+ * note line are the user's, kept as written (the title is translated, piece by
+ * piece at " · " and line breaks). */
+function rowTitle(s: Session): string {
+  const notes = s.notes ? `\n${s.notes.split("\n").map(userText).join("\n")}` : "";
+  return `${PROTOCOLS[s.protocol].label} · ${userText(endpoint(s))}${notes}`;
 }

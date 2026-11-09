@@ -8,6 +8,7 @@ import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession, reloadCredentials, takeSavedSession } from "../store";
 import { confirmDialog, errorText, esc, h, modal, toast, setPressed } from "../ui";
+import { notesButton } from "../sessionNotes";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import { GatewayLink } from "../tunnels";
 import { desktopHost, ViewAi } from "../ai/viewAi";
@@ -34,6 +35,8 @@ const STAGE_TEXT: Record<string, string> = {
 };
 
 export class RdpView implements View {
+  /** The session's notes button in the bar. */
+  private notes: ReturnType<typeof notesButton>;
   el: HTMLElement;
   state: ViewState = "connecting";
   private id = "";
@@ -90,6 +93,9 @@ export class RdpView implements View {
     this.canvas = this.el.querySelector("canvas")!;
     this.ctx = this.canvas.getContext("2d", { alpha: false })!;
     this.overlay = this.el.querySelector(".view-overlay")!;
+    // The saved session's notes, while it has any (sessionNotes.ts).
+    this.notes = notesButton(session.id, (s) => this.ws.editHandler?.(s));
+    this.el.querySelector(".view-actions")!.prepend(this.notes.el);
     this.ai = new ViewAi(
       this.el,
       desktopHost({
@@ -836,6 +842,7 @@ export class RdpView implements View {
   }
 
   dispose() {
+    this.notes.dispose();
     this.ai.dispose();
     this.state = "closed";
     this.resizer.disconnect();

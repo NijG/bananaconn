@@ -6,7 +6,7 @@ import icon48 from "./assets/app-icon-48.png";
 import icon96 from "./assets/app-icon-96.png";
 import { icon } from "./icons";
 import { state } from "./store";
-import { errorText, h, modal, setScreenLocked, toast } from "./ui";
+import { closeContextMenu, errorText, h, modal, setScreenLocked, toast } from "./ui";
 
 let enabled = false;
 let screen: HTMLElement | null = null;
@@ -58,7 +58,7 @@ export async function lockNow() {
 function showLockScreen(problem?: string) {
   if (screen) return;
   // Menus live outside #app; one left open would stay reachable under the lock.
-  document.querySelectorAll(".ctx-menu").forEach((m) => m.remove());
+  closeContextMenu();
   setScreenLocked(true);
   screen = h(
     "div",

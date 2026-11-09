@@ -615,6 +615,13 @@ kbd.word {
   color: var(--muted);
   font-family: var(--mono);
 }
+/* A session pinned to the home screen: a quiet mark before the connect button. */
+.row-pin {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--muted);
+}
 .row-go {
   display: grid;
   place-items: center;
@@ -748,6 +755,20 @@ kbd.word {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.tab-badge {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--bg-4);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.tab-badge.alert {
+  background: color-mix(in srgb, var(--warn) 28%, transparent);
+  color: var(--text);
 }
 .tab-close {
   display: grid;
@@ -1032,6 +1053,11 @@ kbd.word {
   background: transparent;
   padding: 4px;
 }
+/* A regular expression that does not parse (while it is being typed). */
+.find-bar input.invalid,
+.find-bar input.invalid + .find-count {
+  color: var(--danger);
+}
 /* Buttons and the count keep their size; only the input gives up space. */
 .find-bar .tool,
 .find-bar .find-count {
@@ -1134,6 +1160,7 @@ kbd.word {
 }
 @container (max-width: 360px) {
   .pane-tools [data-p="home"],
+  .pane-tools [data-p="forward"],
   .pane-tools [data-p="mkdir"] {
     display: none;
   }
@@ -1801,6 +1828,10 @@ kbd.word {
   letter-spacing: 0.8px;
   color: var(--muted);
 }
+/* "최근 연결" under the pinned list: the gap the home sections keep. */
+#home .recent + h3 {
+  margin-top: 18px;
+}
 .proto-cards {
   display: grid;
   /* Nine protocols: three even rows at the usual window size. */
@@ -2408,6 +2439,191 @@ code.fp {
 .key-issue[hidden] {
   display: none;
 }
+/* How long a command took, at the right end of its line (terminal decoration). */
+.xterm .xterm-decoration-container .xterm-decoration.cmd-duration {
+  /* xterm sets display itself; the row's height is the line height (onRender). */
+  text-align: right;
+  padding-right: 4px;
+  box-sizing: border-box;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+/* Output comparison (diffView.ts): two inputs side by side, the result below. */
+.diff-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.diff-inputs textarea {
+  resize: vertical;
+  min-height: 120px;
+}
+/* Each side's heading: its name, where the text came from, and "file…". */
+.diff-side-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.diff-src {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-side-head .btn {
+  flex: none;
+  margin-left: auto;
+}
+/* Permissions (files.ts chmod): who × read/write/execute, and the octal mode. */
+.chmod-grid {
+  border-collapse: collapse;
+  margin: 2px 0;
+}
+.chmod-grid th,
+.chmod-grid td {
+  padding: 4px 14px;
+  text-align: center;
+  font-size: 12.5px;
+}
+.chmod-grid thead th {
+  font-weight: 500;
+  color: var(--muted);
+}
+.chmod-grid tbody th {
+  padding-left: 0;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.chmod-mode input {
+  max-width: 120px;
+}
+.chmod-mode input.invalid {
+  border-color: var(--danger);
+}
+/* The terminal find bar's "show all matching lines". */
+.match-list {
+  max-height: 55vh;
+  overflow: auto;
+  padding: 4px 0;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  font-size: 12.5px;
+}
+.match-row {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 1px 10px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.match-row:hover,
+.match-row:focus-visible {
+  background: var(--bg-3);
+  outline: none;
+}
+.match-row .ln {
+  flex: none;
+  min-width: 4.5em;
+  text-align: right;
+  color: var(--muted);
+}
+.match-row .tx {
+  min-width: 0;
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+.match-row mark {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: inherit;
+}
+/* "Every terminal tab": each tab's lines under its name, which stays in view. */
+.match-tab {
+  position: sticky;
+  top: -4px;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--bg-3);
+  font-family: var(--font);
+}
+.match-tab + .match-row {
+  margin-top: 2px;
+}
+.match-row + .match-tab {
+  margin-top: 6px;
+}
+.diff-options {
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0;
+}
+.diff-result {
+  max-height: 45vh;
+  overflow: auto;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  padding: 4px 0;
+}
+.diff-line {
+  white-space: pre;
+  padding: 0 10px 0 4px;
+  line-height: 1.45;
+}
+.diff-mark {
+  display: inline-block;
+  width: 1.4em;
+  color: var(--muted);
+  user-select: none;
+}
+.diff-add {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+.diff-add .diff-mark {
+  color: var(--ok);
+}
+.diff-del {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.diff-del .diff-mark {
+  color: var(--danger);
+}
+.diff-fold {
+  padding: 2px 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.diff-result > p {
+  margin: 8px 10px;
+}
+/* Vault: the sessions that log in with the credential shown. */
+.cred-used {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+.cred-used .ico {
+  flex: none;
+}
 .overlay-card .key-issue {
   justify-content: center;
 }
@@ -2571,6 +2787,10 @@ code.fp {
 }
 .ico-pad {
   width: 15px;
+}
+/* The label span grows (.ctx-item span); the icon's place keeps its width. */
+.ctx-item .ico-pad {
+  flex: none;
 }
 .ctx-sep {
   height: 1px;
@@ -2886,6 +3106,150 @@ code.fp {
   border-radius: var(--radius);
   overflow: hidden;
 }
+/* Syslog receiver: the port and LAN choice on one row, the messages below. */
+.syslog-form {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  align-items: end;
+}
+.syslog-file {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.syslog-file .check {
+  flex: none;
+}
+.syslog-file input[name="file"] {
+  flex: 1;
+  min-width: 0;
+}
+.syslog-saving {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
+}
+.syslog-saving code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.syslog-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.syslog-filter {
+  width: 220px;
+}
+.syslog-count {
+  flex: 1;
+}
+/* A count never breaks inside ("… 7" / "개"); the buttons go to a row of their own instead. */
+.syslog-count > span {
+  white-space: nowrap;
+}
+.syslog-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+.syslog-list {
+  /* Shorter on a low screen, so the whole window fits without scrolling
+     (receiving, with its addresses shown and the count on two lines). */
+  height: clamp(200px, calc(100vh - 520px), 340px);
+  overflow: auto;
+  /* The code keeps a scrolled-up view on its lines as rows go from the top
+     (syslog.ts); the browser's own anchoring would move it twice. */
+  overflow-anchor: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  font-size: 12.5px;
+}
+.syslog-row {
+  display: grid;
+  grid-template-columns: auto 104px 64px minmax(0, 1fr);
+  gap: 10px;
+  padding: 2px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+  /* Rows out of view are not laid out (a full list of 2000 under a flood). */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 21px;
+}
+.syslog-row time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.syslog-row .from {
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* A menu for the sender (its messages alone, network tools, a session). */
+  cursor: pointer;
+  text-decoration: underline dotted color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 3px;
+}
+.syslog-row .from:hover {
+  text-decoration-color: currentColor;
+}
+/* The sender the list shows alone; a click shows every sender again. */
+.syslog-only {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  padding: 2px 9px 2px 7px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.syslog-only code {
+  font-size: 12px;
+  padding: 0;
+  background: none;
+  color: inherit;
+}
+.syslog-only:hover {
+  filter: brightness(1.1);
+}
+.syslog-only[hidden] {
+  display: none;
+}
+/* Alerts for err-or-worse messages, on. */
+.syslog-bell.on {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: #f5c51840;
+}
+.syslog-row .sev {
+  color: var(--muted);
+}
+.syslog-row .tx {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.syslog-row.sev-0 .sev,
+.syslog-row.sev-1 .sev,
+.syslog-row.sev-2 .sev,
+.syslog-row.sev-3 .sev {
+  color: var(--danger);
+  font-weight: 600;
+}
+.syslog-row.sev-4 .sev {
+  color: var(--warn);
+}
+.syslog-row.sev-5 .sev {
+  color: var(--text-2);
+}
 .ftpd-log-box header {
   display: flex;
   align-items: center;
@@ -3028,6 +3392,10 @@ code.fp {
 .nettools-extra[type="number"] {
   max-width: 80px;
 }
+/* The subnet calculator's prefix box while the address carries its own ("/24"). */
+.nettools-extra:disabled {
+  opacity: 0.45;
+}
 .nettools-out {
   min-height: 160px;
   max-height: 340px;
@@ -3064,6 +3432,78 @@ code.fp {
 }
 .nettools-table svg {
   vertical-align: -2px;
+}
+.nettools-table .sweep-link {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline dotted color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 3px;
+}
+.nettools-table .sweep-link:hover {
+  text-decoration-color: currentColor;
+}
+.nettools-table .sweep-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+.nettools-table .sweep-name {
+  color: var(--text-2);
+}
+.nettools-cont {
+  white-space: nowrap;
+}
+.watch-head {
+  margin: 0 0 4px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.watch-state {
+  color: var(--ok);
+}
+.watch-state.down {
+  color: var(--danger);
+}
+.watch .muted.small {
+  margin: 0 0 8px;
+  font-variant-numeric: tabular-nums;
+}
+.watch-chart {
+  display: block;
+  width: 100%;
+  height: 64px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+.watch-chart rect {
+  fill: color-mix(in srgb, var(--ok) 75%, transparent);
+}
+.watch-chart rect.lost {
+  fill: color-mix(in srgb, var(--danger) 70%, transparent);
+}
+.watch-log {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 150px;
+  overflow: auto;
+  font-size: 12.5px;
+}
+.watch-log time {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nettools-table.subnet-table th {
+  width: 12em;
+  font-weight: normal;
+  color: var(--muted);
 }
 .nettools-list {
   margin: 0;
@@ -3126,7 +3566,8 @@ code.fp {
 .tool.recording svg {
   animation: pulse 1s infinite;
 }
-.macro-keys {
+.macro-keys,
+.snippet-preview {
   margin: 0;
   max-height: 180px;
   overflow: auto;
@@ -3203,6 +3644,11 @@ code.fp {
   background: var(--warn);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 30%, transparent);
 }
+/* A tab left out of it (tab menu), while broadcast is on: a hollow dot. */
+.tab.no-broadcast .tab-dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--muted);
+}
 
 /* Remote resource monitor in the status bar */
 .sb-monitor {
@@ -3224,6 +3670,19 @@ code.fp {
   padding: 0;
 }
 .sb-monitor.action:hover {
+  text-decoration: underline;
+}
+/* The tab count: opens the command palette with the open tabs. */
+.sb-tabs {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+.sb-tabs:hover {
+  color: var(--text);
   text-decoration: underline;
 }
 .sb-meter {
@@ -3679,6 +4138,81 @@ code.fp {
   overflow-y: auto;
   padding: 18px 20px;
 }
+/* Search over every settings page: the box above the menu, the list in place of a page. */
+.settings-nav .settings-search {
+  width: 100%;
+  margin-bottom: 8px;
+}
+.settings-results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-hit {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-hit small {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.settings-hit:hover,
+.settings-hit:focus-visible {
+  background: var(--bg-2);
+  outline: none;
+}
+/* A tab's session notes (sessionNotes.ts): the button, in the accent so a
+   warning written there is noticed, and the notes it opens. */
+.view-actions .notes-tool {
+  color: var(--accent);
+}
+.notes-pop {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(380px, calc(100vw - 16px));
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--bg-2);
+  box-shadow: var(--shadow);
+}
+.notes-pop header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.notes-text {
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.notes-pop .row {
+  justify-content: flex-end;
+}
+.settings-flash {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: var(--radius);
+}
 .settings-page {
   display: flex;
   flex-direction: column;
@@ -3694,7 +4228,8 @@ code.fp {
 }
 
 /* Paced paste to a device console: lines sent, time left, stop. */
-.paste-progress {
+.paste-progress,
+.repeat-progress {
   position: absolute;
   /* Over old output, below the toolbar: never over the prompt line or the toasts. */
   top: 52px;
@@ -3709,30 +4244,43 @@ code.fp {
   font-size: 12.5px;
   color: var(--text);
 }
-.paste-progress .pp-row {
+:is(.paste-progress, .repeat-progress) .pp-row {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-.paste-progress .pp-row .btn {
+:is(.paste-progress, .repeat-progress) .pp-row .btn {
   margin-left: auto;
 }
-.paste-progress b {
+:is(.paste-progress, .repeat-progress) b {
   font-variant-numeric: tabular-nums;
 }
-.paste-progress .pp-bar {
+:is(.paste-progress, .repeat-progress) .pp-bar {
   height: 4px;
   margin-top: 7px;
   border-radius: 2px;
   background: var(--line-2);
   overflow: hidden;
 }
-.paste-progress .pp-bar i {
+:is(.paste-progress, .repeat-progress) .pp-bar i {
   display: block;
   height: 100%;
   width: 0;
   background: var(--accent);
   transition: width 0.1s linear;
+}
+/* A command repeated at the prompt (term.repeat): the paste box's look, with the command. */
+.repeat-progress .pp-row > .ico {
+  flex: none;
+  color: var(--accent);
+}
+.repeat-progress .rp-command {
+  max-width: 360px;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
 }
 /* First lines of a multi-line paste, in the confirmation. */
 .paste-preview {

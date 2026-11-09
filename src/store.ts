@@ -5,7 +5,7 @@ import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder"
 import { api, type Credential } from "./api";
 import type { Language } from "./i18n";
 import type { RiskRule } from "./riskRules";
-import { SNIPPET_LIBRARY, SNIPPET_LIBRARY_VERSION } from "./snippetLibrary";
+import { SNIPPET_LIBRARY, SNIPPET_LIBRARY_V1_IDS, SNIPPET_LIBRARY_VERSION } from "./snippetLibrary";
 import { normalizeFolder, normalizeSession, type Session } from "./model";
 import { errorText, toast } from "./ui";
 
@@ -259,7 +259,7 @@ function readSnippets(): Snippet[] {
   }
   // Built-ins already offered once (all of version 1's, for lists seeded by
   // it) stay deleted if the user deleted them; only new ones are added.
-  if (!offered) offered = new Set(list && seen >= 1 ? SNIPPET_LIBRARY.map((s) => s.id) : []);
+  if (!offered) offered = new Set(list && seen >= 1 ? SNIPPET_LIBRARY_V1_IDS : []);
   const out = list ?? [];
   const ids = new Set(out.map((s) => s.id));
   for (const s of out) {
@@ -442,6 +442,17 @@ export async function patchSession(id: string, patch: Partial<Omit<Session, "id"
   if (!s) return;
   Object.assign(s, patch);
   if (options) s.options = { ...s.options, ...options };
+  await persistSessions();
+}
+
+/** Pin sessions to the home screen, or unpin them, with one save. */
+export async function pinSessions(ids: Iterable<string>, pinned: boolean) {
+  const set = new Set(ids);
+  for (const s of state.sessions) {
+    if (!set.has(s.id)) continue;
+    if (pinned) s.pinned = true;
+    else delete s.pinned;
+  }
   await persistSessions();
 }
 

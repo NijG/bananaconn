@@ -62,6 +62,9 @@ trait FtpOps: Send {
     fn size(&mut self, path: &str) -> FtpResult<usize>;
     fn retr_with(&mut self, path: &str, f: &mut dyn FnMut(&mut dyn Read) -> FtpResult<()>) -> FtpResult<()>;
     fn put(&mut self, path: &str, r: &mut dyn Read) -> FtpResult<u64>;
+    /// Upload appending to the file (APPE): creates a missing file, never
+    /// truncates one that exists.
+    fn append(&mut self, path: &str, r: &mut dyn Read) -> FtpResult<u64>;
     fn quit(&mut self) -> FtpResult<()>;
     /// A raw command; returns the reply body when it is one of `ok`.
     fn command(&mut self, cmd: &str, ok: &[suppaftp::Status]) -> FtpResult<String>;
@@ -99,6 +102,10 @@ macro_rules! impl_ftp_ops {
                 // it write whole 256 KB pieces (fewer TLS records and syscalls).
                 let mut big = std::io::BufReader::with_capacity(256 * 1024, r);
                 <$t>::put_file(self, path, &mut big)
+            }
+            fn append(&mut self, path: &str, r: &mut dyn Read) -> FtpResult<u64> {
+                let mut r = r;
+                <$t>::append_file(self, path, &mut r)
             }
             fn quit(&mut self) -> FtpResult<()> {
                 <$t>::quit(self)
@@ -150,6 +157,9 @@ impl FtpOps for DeadFtp {
         dead_ftp()
     }
     fn put(&mut self, _: &str, _: &mut dyn Read) -> FtpResult<u64> {
+        dead_ftp()
+    }
+    fn append(&mut self, _: &str, _: &mut dyn Read) -> FtpResult<u64> {
         dead_ftp()
     }
     fn quit(&mut self) -> FtpResult<()> {
@@ -951,13 +961,58 @@ fn join_remote(dir: &str, name: &str) -> String {
 fn perm_string(mode: u32, is_dir: bool) -> String {
     let mut s = String::with_capacity(10);
     s.push(if is_dir { 'd' } else { '-' });
-    for shift in [6, 3, 0] {
+    // setuid, setgid and sticky show in the execute place, as ls shows them:
+    // lower case with the execute bit ("rwsr-xr-x"), upper case without ("rwSr--r--").
+    for (shift, special, mark) in [(6, 0o4000, 's'), (3, 0o2000, 's'), (0, 0o1000, 't')] {
         let bits = (mode >> shift) & 7;
         s.push(if bits & 4 != 0 { 'r' } else { '-' });
         s.push(if bits & 2 != 0 { 'w' } else { '-' });
-        s.push(if bits & 1 != 0 { 'x' } else { '-' });
+        s.push(match (mode & special != 0, bits & 1 != 0) {
+            (true, true) => mark,
+            (true, false) => mark.to_ascii_uppercase(),
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
     }
     s
+}
+
+/// An octal permission mode as typed: three digits ("755", the special bits
+/// left as they are) or four ("4755", "0755": the special bits set too).
+fn parse_mode(text: &str) -> Option<(u32, bool)> {
+    if !(3..=4).contains(&text.len()) || !text.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return None;
+    }
+    u32::from_str_radix(text, 8).ok().map(|mode| (mode, text.len() == 4))
+}
+
+/// Create an empty file, only if nothing has that name (EXCLUDE: the server
+/// refuses rather than truncate a file made since the listing was read).
+async fn new_sftp_file(sftp: &SftpSession, path: &str) -> Result<(), String> {
+    use russh_sftp::protocol::OpenFlags;
+    match sftp.open_with_flags(path.to_string(), OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE).await {
+        Ok(mut file) => file.shutdown().await.map_err(|e| format!("작업에 실패했습니다: {e}")),
+        // SFTP v3 has no "already exists" status: look whether that is why.
+        Err(_) if sftp.symlink_metadata(path.to_string()).await.is_ok() => Err("같은 이름이 이미 있습니다".into()),
+        Err(e) => Err(format!("작업에 실패했습니다: {e}")),
+    }
+}
+
+/// Set an entry's permissions (chmod; the target of a link). With a three-digit
+/// mode its setuid, setgid and sticky bits are kept as they are.
+async fn chmod_sftp(sftp: &SftpSession, path: &str, mode: &str) -> Result<(), String> {
+    let (requested, with_special) = parse_mode(mode).ok_or("권한은 8진수 3~4자리로 입력하세요 (예: 755)")?;
+    let mode = if with_special {
+        requested
+    } else {
+        let current = sftp
+            .metadata(path.to_string())
+            .await
+            .map_err(|e| format!("{path} 정보를 읽을 수 없습니다: {e}"))?;
+        (current.permissions.unwrap_or(0) & 0o7000) | requested
+    };
+    let attrs = russh_sftp::protocol::FileAttributes { permissions: Some(mode), ..Default::default() };
+    sftp.set_metadata(path.to_string(), attrs).await.map_err(|e| format!("권한을 바꾸지 못했습니다: {e}"))
 }
 
 async fn list_sftp(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, String> {
@@ -1006,7 +1061,11 @@ async fn list_sftp(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, Str
                 entry.size = target.size.unwrap_or(entry.size);
                 entry.modified = target.mtime.map(u64::from).or(entry.modified);
             }
-            if let Some(p) = entry.perm.as_mut().filter(|_| entry.is_dir) {
+            // The target's permissions, as `ls -lL` shows them: chmod changes
+            // the target, and a link's own bits are rwxrwxrwx on Linux.
+            if let Some(p) = target.permissions {
+                entry.perm = Some(perm_string(p, entry.is_dir));
+            } else if let Some(p) = entry.perm.as_mut().filter(|_| entry.is_dir) {
                 // The type letter follows the target, as for folders.
                 p.replace_range(0..1, "d");
             }
@@ -1108,6 +1167,17 @@ impl FtpStatCache {
     }
 }
 
+/// Create an empty file over FTP, never emptying one that exists. The listing
+/// can miss it (servers hide dot files from LIST, Windows servers ignore
+/// case), so the upload appends nothing (APPE: creates a missing file and
+/// leaves an existing one as it is) rather than storing (STOR truncates).
+fn new_ftp_file(ftp: &mut dyn FtpOps, path: &str) -> Result<(), String> {
+    if ftp_exists(ftp, path)? {
+        return Err("같은 이름이 이미 있습니다".into());
+    }
+    ftp.append(path, &mut std::io::empty()).map(|_| ()).map_err(|e| format!("작업에 실패했습니다: {e}"))
+}
+
 /// Whether `path` already exists, judged from its parent folder's listing.
 fn ftp_exists(ftp: &mut dyn FtpOps, path: &str) -> Result<bool, String> {
     Ok(ftp_stat(ftp, path)?.is_some())
@@ -1154,6 +1224,8 @@ pub async fn remote_op(
                 "rename" => sftp.rename(path, target.unwrap_or_default()).await,
                 "delete" if is_dir == Some(true) => return delete_sftp_tree(sftp, &path).await,
                 "delete" => sftp.remove_file(path).await,
+                "chmod" => return chmod_sftp(sftp, &path, target.as_deref().unwrap_or_default()).await,
+                "newfile" => return new_sftp_file(sftp, &path).await,
                 _ => return Err("알 수 없는 작업입니다".into()),
             };
             res.map_err(|e| format!("작업에 실패했습니다: {e}"))
@@ -1175,6 +1247,7 @@ pub async fn remote_op(
                     }
                     "delete" if is_dir == Some(true) => delete_ftp_tree(ftp.as_mut(), &path),
                     "delete" => ftp.rm(&path).map_err(|e| format!("작업에 실패했습니다: {e}")),
+                    "newfile" => new_ftp_file(ftp.as_mut(), &path),
                     _ => Err("알 수 없는 작업입니다".into()),
                 })();
                 if res.is_err() {
@@ -2451,17 +2524,9 @@ pub async fn test_connect_sftp(req: &ConnectRequest) -> Result<Vec<FileEntry>, S
     list_sftp(sftp, &connected.home).await
 }
 
-/// Test helper: upload or download a folder over SFTP (several files at once)
-/// to 127.0.0.1:port as sf/sf-pass; returns (files, bytes, time taken).
+/// Test helper: an SFTP connection to 127.0.0.1:port as sf/sf-pass.
 #[cfg(test)]
-pub async fn test_sftp_folder(
-    port: u16,
-    trusted_fingerprint: Option<String>,
-    known_hosts: &Path,
-    remote: &str,
-    local: &Path,
-    upload: bool,
-) -> Result<(u32, u64, Duration), String> {
+async fn test_sftp_connect(port: u16, trusted_fingerprint: Option<String>, known_hosts: &Path) -> Result<Remote, String> {
     let req = ConnectRequest {
         id: "t".into(),
         protocol: "sftp".into(),
@@ -2478,6 +2543,29 @@ pub async fn test_sftp_folder(
         proxy: None,
     };
     let (conn, _) = connect_sftp(&req, &req.username, req.password.clone(), None, known_hosts.to_path_buf(), Default::default()).await?;
+    Ok(conn)
+}
+
+/// Test helper: "New file" (remote_op "newfile") over SFTP at `path`.
+#[cfg(test)]
+pub async fn test_sftp_new_file(port: u16, trusted_fingerprint: Option<String>, known_hosts: &Path, path: &str) -> Result<(), String> {
+    let conn = test_sftp_connect(port, trusted_fingerprint, known_hosts).await?;
+    let Remote::Sftp { sftp, .. } = &conn else { unreachable!() };
+    new_sftp_file(sftp, path).await
+}
+
+/// Test helper: upload or download a folder over SFTP (several files at once)
+/// to 127.0.0.1:port as sf/sf-pass; returns (files, bytes, time taken).
+#[cfg(test)]
+pub async fn test_sftp_folder(
+    port: u16,
+    trusted_fingerprint: Option<String>,
+    known_hosts: &Path,
+    remote: &str,
+    local: &Path,
+    upload: bool,
+) -> Result<(u32, u64, Duration), String> {
+    let conn = test_sftp_connect(port, trusted_fingerprint, known_hosts).await?;
     let Remote::Sftp { sftp, .. } = &conn else { unreachable!() };
     let mut rep = Reporter {
         app: None,
@@ -2678,10 +2766,100 @@ mod tests {
         }
     }
 
+    /// An FTP server in memory: LIST leaves out dot files (as vsftpd and
+    /// Pure-FTPd do by default), STOR truncates and APPE appends.
+    struct FakeFtp {
+        files: HashMap<String, Vec<u8>>,
+        cwd: String,
+    }
+
+    impl FtpOps for FakeFtp {
+        fn cwd(&mut self, path: &str) -> FtpResult<()> {
+            self.cwd = path.to_string();
+            Ok(())
+        }
+        fn list(&mut self) -> FtpResult<Vec<String>> {
+            Ok(self
+                .files
+                .iter()
+                .filter_map(|(p, b)| {
+                    let (dir, name) = split_remote(p);
+                    (dir == self.cwd && !name.starts_with('.')).then(|| format!("-rw-r--r-- 1 u g {} Jan 01 00:00 {name}", b.len()))
+                })
+                .collect())
+        }
+        fn put(&mut self, path: &str, r: &mut dyn Read) -> FtpResult<u64> {
+            let mut b = Vec::new();
+            r.read_to_end(&mut b).unwrap();
+            self.files.insert(path.to_string(), b);
+            Ok(0)
+        }
+        fn append(&mut self, path: &str, r: &mut dyn Read) -> FtpResult<u64> {
+            let mut b = Vec::new();
+            r.read_to_end(&mut b).unwrap();
+            self.files.entry(path.to_string()).or_default().extend(b);
+            Ok(0)
+        }
+        fn rm(&mut self, _: &str) -> FtpResult<()> {
+            unimplemented!()
+        }
+        fn rmdir(&mut self, _: &str) -> FtpResult<()> {
+            unimplemented!()
+        }
+        fn mkdir(&mut self, _: &str) -> FtpResult<()> {
+            unimplemented!()
+        }
+        fn rename(&mut self, _: &str, _: &str) -> FtpResult<()> {
+            unimplemented!()
+        }
+        fn size(&mut self, _: &str) -> FtpResult<usize> {
+            unimplemented!()
+        }
+        fn retr_with(&mut self, _: &str, _: &mut dyn FnMut(&mut dyn Read) -> FtpResult<()>) -> FtpResult<()> {
+            unimplemented!()
+        }
+        fn quit(&mut self) -> FtpResult<()> {
+            Ok(())
+        }
+        fn command(&mut self, _: &str, _: &[suppaftp::Status]) -> FtpResult<String> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn ftp_new_file_never_empties_an_existing_file() {
+        let mut ftp = FakeFtp {
+            files: HashMap::from([("/www/.htaccess".to_string(), b"deny from all\n".to_vec()), ("/www/index.html".to_string(), b"<html>".to_vec())]),
+            cwd: "/".into(),
+        };
+        // Listed: refused.
+        assert_eq!(new_ftp_file(&mut ftp, "/www/index.html"), Err("같은 이름이 이미 있습니다".into()));
+        assert_eq!(ftp.files["/www/index.html"], b"<html>");
+        // A dot file the listing leaves out: still left as it was.
+        assert_eq!(new_ftp_file(&mut ftp, "/www/.htaccess"), Ok(()));
+        assert_eq!(ftp.files["/www/.htaccess"], b"deny from all\n");
+        // A free name: an empty file.
+        assert_eq!(new_ftp_file(&mut ftp, "/www/new.txt"), Ok(()));
+        assert_eq!(ftp.files["/www/new.txt"], b"");
+    }
+
     #[test]
     fn formats_permissions_and_paths() {
         assert_eq!(perm_string(0o755, true), "drwxr-xr-x");
         assert_eq!(perm_string(0o640, false), "-rw-r-----");
+        // st_mode with the file type bits, and the special bits as ls shows them.
+        assert_eq!(perm_string(0o100755, false), "-rwxr-xr-x");
+        assert_eq!(perm_string(0o4755, false), "-rwsr-xr-x");
+        assert_eq!(perm_string(0o2644, false), "-rw-r-Sr--");
+        assert_eq!(perm_string(0o1777, true), "drwxrwxrwt");
+        assert_eq!(perm_string(0o1770, true), "drwxrwx--T");
+        assert_eq!(parse_mode("755"), Some((0o755, false)));
+        assert_eq!(parse_mode("0755"), Some((0o755, true)));
+        assert_eq!(parse_mode("4755"), Some((0o4755, true)));
+        assert_eq!(parse_mode("7555"), Some((0o7555, true)));
+        for bad in ["", "75", "75a", "8755", "-755", "+x", "u+x", "07555", "７５５"] {
+            assert_eq!(parse_mode(bad), None, "{bad}");
+        }
         assert_eq!(join_remote("/", "a"), "/a");
         assert_eq!(join_remote("/home/u", "a"), "/home/u/a");
     }

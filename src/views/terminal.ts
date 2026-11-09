@@ -1,6 +1,6 @@
 // Terminal view for SSH and Telnet sessions.
 
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type IBuffer, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -8,11 +8,16 @@ import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } f
 import type { PasteEvent } from "../api";
 import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
+import { addressPattern, findIps, findMacs, macFormats, macSearchPattern } from "../ipLinks";
+import { matchLines, type LineMatch, type OutputLine } from "../lineFilter";
+import { clockText, LineTimes } from "../lineTimes";
+import { splitTable, type CellLine } from "../tableCopy";
+import { notesButton } from "../sessionNotes";
 import { icon } from "../icons";
-import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Session } from "../model";
+import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Protocol, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
-import { addMacro, snippetMenu } from "../snippets";
-import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit, type RiskRule } from "../riskRules";
+import { addMacro, askSnippetValues, asksValues, snippetMenu } from "../snippets";
+import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit } from "../riskRules";
 import { patchSession, state, subscribe, takeSavedSession, updateSettings, type Snippet, type TriggerRule } from "../store";
 import { termTheme } from "../themes";
 import { KeywordHighlighter } from "../highlight";
@@ -27,28 +32,258 @@ import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands"
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
 import { forgetHostKey } from "../hostKeys";
-import { asksAtEnd, loginFailure, loginThrough, plainLines, unusableKey } from "../sshLogin";
+import { asksAtEnd, asksLogin, loginFailure, loginThrough, plainLines, SECRET_WORD, unusableKey, USER_WORD } from "../sshLogin";
 import { tr, userText } from "../i18n";
-import { actionFor, appTakesInTerminal, SNIPPET_PREFIX } from "../keymap";
+import { actionFor, appTakesInTerminal, keyHint, SNIPPET_PREFIX, withKey } from "../keymap";
 
 /** Editing keys in recorded macros, as private-use marks U+E100.. in this
  * order; each tab turns them into its own key mode's bytes. */
 const MARKED_KEYS: EditKey[] = ["Delete", "Home", "End", "Backspace"];
 
-import { beep, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, modal, osNotify, promptDialog, timestamp, toast, setPressed } from "../ui";
-import type { BroadcastInput, EditKey, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
+import { beep, canOsNotify, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, isScreenLocked, modal, osNotify, promptDialog, requestAttention, sheetCell, timestamp, toast, setPressed, type MenuItem } from "../ui";
+import type { BroadcastInput, EditKey, InputKind, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
 
 
+
+/** An output line that asks for a login or a secret ("Password:", "Username:",
+ * "Enter passphrase", "암호:", a one-time code): trigger rules never auto-answer
+ * it (see fireTrigger). Erring toward a match only costs an unsent rule. */
+const CREDENTIAL_PROMPT =
+  /pass(?:word|phrase|code|wd)|\bpass\b|passwort|kennwort|contrase(?:ñ|n)a|mot de passe|senha|has(?:ł|l)o|пароль|m(?:ậ|a)t kh(?:ẩ|a)u|パスワード|暗証|密码|密碼|口令|암호|비밀번호|인증 ?(?:번호|코드)|one[- ]time|verification code|\botp\b|\bpin\b|continue connecting|fingerprint|host key/i;
+/** A theme colour as xterm decorations take it (#RRGGBB): one with an alpha
+ * ("#f5c51840") is mixed over the background as it would show. */
+function opaque(color: string | undefined, background: string | undefined): string {
+  const hex = (c: string | undefined) => (c && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(c) ? c : null);
+  const fg = hex(color) ?? "#264f78";
+  if (fg.length === 7) return fg;
+  const bg = hex(background)?.slice(0, 7) ?? "#000000";
+  const a = parseInt(fg.slice(7, 9), 16) / 255;
+  const mix = (i: number) => Math.round(parseInt(fg.slice(i, i + 2), 16) * a + parseInt(bg.slice(i, i + 2), 16) * (1 - a));
+  return `#${[1, 3, 5].map((i) => mix(i).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** Words that ask for a login only on the prompt line itself ("login:",
+ * "Username", "계정"): too common to be held against the line above. */
+const LOGIN_WORD = /인증|로그인|아이디|계정|사용자 ?이름|\b(?:log ?in|user(?:\s*name)?|account|token|code|pin)\b/i;
+
+/** A line that ends asking for a login ("login:", "Username>"): a repeated
+ * command (term.repeat) is never sent there. */
+const LOGIN_END = /(?:log ?in|user ?(?:name|id)|로그인|아이디|계정|사용자 ?이름)\s*[:>]?\s*$/i;
+/** A line ending in a login question ("Username:", "login as:", "User:", full-width "：" too). */
+const USER_QUESTION = new RegExp(`\\b${USER_WORD}\\s*[:：?？]$`, "i");
+/** A login question with its answer typed after it, echoed ("Username: adm"). */
+const USER_ANSWERED = new RegExp(`^[^:：]{0,80}?\\b${USER_WORD}\\s*[:：]\\s*\\S`, "i");
+/** The same with ">" ("Username>admin"): before a login only (a host may be named "R1-login"). */
+const USER_ANSWERED_ANGLE = new RegExp(`^[^>]{0,80}?\\b${USER_WORD}\\s*>\\s*\\S`, "i");
+/** A secret asked with ">" ("Password>", "PIN>"): the word on its own right
+ * before it (not a host named "R1-PASS" or "FW-PIN"). The same words as the
+ * login check's (sshLogin), so a question is never a finished login there. */
+const SECRET_ANGLE = new RegExp(String.raw`(?:^|\s)${SECRET_WORD}\s*[>＞]$`, "i");
+/** ssh.exe asking about a host key: "... continue connecting (yes/no/[fingerprint])?",
+ * its "Please type 'yes', 'no' or the fingerprint:", an answer echoed after it. */
+const HOSTKEY_WORDS = /continue connecting|fingerprint|host key/i;
+/** A choice a command asks ("Change now? [Y/N]:", "Proceed with reload? [confirm]",
+ * "(yes/no)", "Destination filename [startup-config]?"), its short answer
+ * echoed after it or not. A space before the default's "[" (not a glob: "ls f[12]?"). */
+const CONFIRM_QUESTION = /(?:\?\s*(?:\[[^\]]*\]|\([^)]*\))|\s\[[^\]]*\]\?|[[(](?:y\/n|yes\/no)[\])])\s*:?(?:\s*[\w.:/-]{1,64})?$/i;
+/** A file command asking before it acts ("rm: remove regular file 'a'?",
+ * "cp: overwrite 'b'?": rm -i and cp -i, root's aliases on some systems). */
+const FILE_QUESTION = /^(?:rm|cp|mv|ln): .*\?(?:\s*\w{1,8})?$/;
+/** A shell prompt by its shape ("user@host:~/dir$", "[root@h tmp]#", "PS C:\…>", "C:\…>"):
+ * never a question, whatever words its host or directory name holds. */
+const SHELL_PROMPT_SHAPE = /^[\w.-]+@[\w.-]+[:~ ]|^\[[^\]\s]+[ @][^\]]*\][#$%]|^(?:PS )?[A-Za-z]:\\/;
+/** An answer echoed after a secret question ("********", "••••", a 6-digit code): left off before judging. */
+const ECHOED_SECRET = /([:：?？>＞])\s*(?:[*•●]+|\d{4,8})$/;
+/** A device's own command prompt, alone on its line ("router>", "R1#",
+ * "[root@h ~]#", "*A:PE1#", "$"): not a banner ("#### Authorized only ####",
+ * "[ Authorized users only ]", "%%% … %%%") or a boot status line
+ * ("Starting sshd:   [  OK  ]"). */
+const DEVICE_PROMPT = /^(?![^[]*\s\[\s*[\w ]+\s*\]$)(?:[#$>%]|(?:[^\s#[%=-]|\[\S)[^#]{0,78}[#>$%\]])$/;
+/** A question a command asks ("Do you want to continue? [Y/n]", "Proceed
+ * with reload? [confirm]", "Destination filename [startup-config]?",
+ * "(yes/no)"): an answer typed there is no command of its own. */
+const QUESTION = /\?\s*(?:\[[^\]]*\]|\([^)]*\))?\s*:?$|[[(](?:y\/n|yes\/no)[\])]\s*:?$/i;
+/** A pager waiting for a key ("--More--", "---- More ----", "---(more 12%)---", "(END)"). */
+const PAGER_PROMPT = /-+\s*\(?more\b[^-]*-+|press any key|\(END\)\s*$/i;
+/** Said when input waited on a dialog and the line changed kind meanwhile (see lineStill). */
+const LINE_CHANGED = "줄이 다른 종류(로그인 질문 등)로 바뀌어 보내지 않았습니다";
+/** Said when several lines would go into a login or password question (each an attempt). */
+const MANY_LINES_AT_LOGIN = "로그인·비밀번호를 묻는 줄에는 여러 줄을 보내지 않습니다";
+
+/** A command that undoes itself unless confirmed in time, with the minutes it
+ * gives, to offer the work timer for: Cisco's "reload in [hh:]mm" and
+ * "commit confirmed [n]" (Junos: minutes, 10 when not given; IOS XR counts
+ * seconds, so a number is read only on a device recognised as Junos). Null
+ * when it is not one, or when its time cannot be told for sure. `kind`: the
+ * operating system recognised on the device (devmon.rs). */
+export function selfUndoing(command: string, kind: string | undefined): { minutes: number; note: string } | null {
+  const line = command.trim();
+  const reload = /^(?:do\s+)?reload\s+in\s+(?:(\d{1,3}):)?(\d{1,4})(?:\s|$)/i.exec(line);
+  if (reload) {
+    const minutes = (reload[1] ? Number(reload[1]) * 60 : 0) + Number(reload[2]);
+    return minutes >= 1 && minutes <= 1440 ? { minutes, note: "reload cancel" } : null;
+  }
+  // Only the forms whose time is plain: an option before "confirmed" (Junos
+  // takes any order) or an unknown one after it ("minutes 5" on IOS XR) is
+  // left alone rather than read wrong.
+  const commit = /^commit\s+confirmed(?:\s+(\d{1,5}))?(?:\s+(?:comment|and-quit|synchronize)\b.*)?\s*$/i.exec(line);
+  if (commit) {
+    if (!commit[1]) return { minutes: 10, note: "commit" };
+    const n = Number(commit[1]);
+    return kind?.startsWith("juniper") && n >= 1 && n <= 1440 ? { minutes: n, note: "commit" } : null;
+  }
+  return null;
+}
+
+/** A command that confirms or cancels what a work timer waits for: "reload
+ * cancel", or a commit that is neither a check nor another confirmed one. */
+const SETTLES = /^(?:(?:do\s+)?reload\s+cancel|commit(?![^\r\n]*\bconfirmed\b)(?!\s+check\b)(?:\s.*)?)\s*$/i;
+
+/** The configuration backup last saved or compared per device (backupKey),
+ * offered first the next time. This PC's browser storage only; at most 200. */
+const LAST_BACKUP = "bx.lastConfigBackup";
+
+function lastBackup(key: string): string | undefined {
+  try {
+    const path = (JSON.parse(localStorage.getItem(LAST_BACKUP) ?? "{}") as Record<string, unknown>)[key];
+    return typeof path === "string" ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberBackup(key: string, path: string) {
+  try {
+    const map = JSON.parse(localStorage.getItem(LAST_BACKUP) ?? "{}") as Record<string, string>;
+    delete map[key];
+    map[key] = path;
+    // The newest last: the oldest go first once there are too many.
+    const keys = Object.keys(map);
+    for (const k of keys.slice(0, Math.max(0, keys.length - 200))) delete map[k];
+    localStorage.setItem(LAST_BACKUP, JSON.stringify(map));
+  } catch {
+    // Not kept: the picker starts where it likes.
+  }
+}
+
+/** A work timer's time left as m:ss (rounded up: 0:00 only at the end). */
+function timerClock(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** Row `y` as part of its logical line (a long line wraps over several rows),
+ * as the search addon reads it: the line's last row trimmed at the end; a
+ * row the line goes on from keeps its full width, less the blank cell xterm
+ * leaves where a wide character (Hangul, CJK) did not fit and moved down. */
+function rowText(buf: IBuffer, y: number): { text: string; continues: boolean } {
+  const line = buf.getLine(y);
+  if (!line) return { text: "", continues: false };
+  const next = buf.getLine(y + 1);
+  const continues = !!next?.isWrapped;
+  let text = line.translateToString(!continues);
+  if (continues) {
+    const last = line.getCell(line.length - 1);
+    if (last && last.getCode() === 0 && last.getWidth() === 1 && next?.getCell(0)?.getWidth() === 2) text = text.slice(0, -1);
+  }
+  return { text, continues };
+}
+
+/** A prompt without what changes on every command, so two runs at the same
+ * prompt match: a clock ("[10:00:01 admin@web ~]$"), EXOS's unsaved mark and
+ * command counter ("* X440G2-48p.5 #"). */
+function steadyPrompt(prompt: string): string {
+  return prompt
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, "")
+    .replace(/^\*\s+/, "")
+    .replace(/\.\d+(\s*[#>]\s*)$/, (_m, end: string) => end)
+    .trim();
+}
+
+/** A terminal's command marks and how to read them (TerminalView.commandBook). */
+interface CommandBook {
+  buf: IBuffer;
+  /** Still in the scrollback, oldest first. */
+  marks: IMarker[];
+  /** A line's text, its wrapped rows joined. */
+  text: (y: number) => string;
+  /** The mark is a command typed at a prompt. */
+  atPrompt: (m: IMarker) => boolean;
+}
+
+/** A command repeated at the prompt (TerminalView.toggleRepeat). */
+interface RepeatState {
+  /** The connection it runs on (TerminalView.runtimeId): a new one ends it. */
+  rid: string;
+  command: string;
+  /** The prompt it started at: runs go out only there. */
+  prompt: string;
+  everyMs: number;
+  total: number;
+  sent: number;
+  timer: number;
+  /** The line the last run was entered on: the prompt must come back below it. */
+  marker: IMarker | null;
+  /** When the next run is due (from then it waits for the prompt, a minute at most). */
+  dueAt: number;
+  waiting: boolean;
+}
+
+/** A terminal's connection and its broadcast peers' (TerminalView.sendScope). */
+interface SendScope {
+  rid: string;
+  peers: { tab: Tab; id: string | undefined }[];
+}
+
+/** `input` to each of `tabs` by broadcast: the tabs that took it (one whose
+ * line is of another kind holds it, see TerminalView.receiveInput). */
+function broadcastTo(tabs: Tab[], input: BroadcastInput): Tab[] {
+  const took: Tab[] = [];
+  for (const t of tabs) if (t.view.receiveBroadcast?.(input) === true) took.push(t);
+  return took;
+}
 
 /** Input that riskGate confirmed, to the other broadcast tabs it was
- * confirmed for; each still checks its own line against `hits`. */
-function deliverConfirmed(others: Tab[], input: BroadcastInput, hits: RiskHit[]) {
-  const rules = hits.map((h) => h.rule);
+ * confirmed for; each still checks its own line against `hits`. The tabs
+ * that took it. */
+function deliverConfirmed(others: Tab[], input: BroadcastInput, hits: RiskHit[], tag: string): Tab[] {
+  const took: Tab[] = [];
   for (const t of others) {
     if (t.view.state !== "connected") continue;
-    if (t.view instanceof TerminalView) t.view.receiveInput(input, rules);
-    else t.view.receiveBroadcast?.(input);
+    if (!(t.view instanceof TerminalView)) {
+      if (t.view.receiveBroadcast?.(input) === true) took.push(t);
+      continue;
+    }
+    // Recorded per tab as it went: sent with its own line, or held.
+    const r = t.view.receiveInput(input, hits);
+    if (r.sent) took.push(t);
+    void auditRisk(r.sent ? "SENT" : "NOT SENT", tag, t.session, r.hit ? [r.hit] : hits);
   }
+  return took;
+}
+
+/** A line of the risky-command record for each hit, for one session. */
+function auditRisk(event: string, tag: string, session: Session, hits: RiskHit[]): Promise<boolean> {
+  return Promise.all(hits.map((h) => api.riskAudit(tag ? `${event} ${tag}` : event, session.name || endpoint(session), endpoint(session), h.rule.note, h.line))).then(
+    () => true,
+    (err) => {
+      toast(errorText(err), "error");
+      return false;
+    },
+  );
+}
+
+/** Whether a screen line (its own prompt first, whatever it is) ends in
+ * the command that was confirmed, spacing aside: the command must start
+ * there, after the prompt or a space, not inside a longer word. */
+function endsInCommand(line: string, command: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\s+/g, " ");
+  const l = norm(line);
+  const cmd = norm(command);
+  if (!cmd || !l.endsWith(cmd)) return false;
+  const before = l.slice(0, l.length - cmd.length).trimEnd();
+  // Right after the prompt ("host:~$ "), not after another word ("$ sudo ").
+  return !before || PROMPT_END.test(before);
 }
 
 /** Asked once per app run. */
@@ -189,7 +424,7 @@ function showTopProcesses(id: string, title: string) {
     try {
       const sections = await api.monitorTop(id);
       view.innerHTML = sections
-        .map((s) => `<section><h3>${esc(s.title)}</h3><pre>${s.lines.map((l) => (header(l) ? `<b>${esc(l)}</b>` : esc(l))).join("\n")}</pre></section>`)
+        .map((s) => `<section><h3>${esc(s.title)}</h3><pre data-i18n-skip>${s.lines.map((l) => (header(l) ? `<b>${esc(l)}</b>` : esc(l))).join("\n")}</pre></section>`)
         .join("");
     } catch (err) {
       view.innerHTML = `<p class="top-error">${esc(errorText(err))}</p>`;
@@ -228,6 +463,8 @@ export class TerminalView implements View {
   private host: HTMLElement;
   private overlay: HTMLElement;
   private findBar: HTMLElement;
+  /** The session's notes button in the bar. */
+  private notes: ReturnType<typeof notesButton>;
   private resizeTimer = 0;
   private gotOutput = false;
   private disposed = false;
@@ -264,7 +501,8 @@ export class TerminalView implements View {
    * failed logins to a wrong password), and no auto-reconnect once it ends after
    * a password or host-key question — an authentication failure keeps failing
    * however often it is retried, and repeated tries get an account or address
-   * blocked. Other protocols are logged in once connected.
+   * blocked. Telnet and a serial console log in inside the connection: through
+   * at the device's own command prompt (inBandLoginThrough).
    * `loginText`: the latest output while the login is under way (last 8 KB).
    * `loginAsked`: ssh.exe asked for a password, passphrase or host-key answer.
    * `endBytes`: the connection's last output, read when it ends. */
@@ -285,6 +523,13 @@ export class TerminalView implements View {
   private notifySaw = false;
   /** Output since the last newline, for matching trigger rules line by line. */
   private triggerBuf = "";
+  /** "send" rules that already answered the unfinished line in triggerBuf (a
+   *  question waiting at the cursor); the line completing does not fire them again. */
+  private tailAnswered = new Set<string>();
+  private tailTimer = 0;
+  /** The last completed line of output (as on screen), for the credential
+   * check of the line after it. */
+  private lastLine = "";
   /** An OS guessed from the login banner when the resource monitor has not
    * recognised the device — enough for OS snippets and Up/Down history recall. */
   private osGuess?: string;
@@ -312,7 +557,7 @@ export class TerminalView implements View {
          <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state></span>
          <div class="view-actions">
-           <button class="tool" data-act="find" title="찾기 (Ctrl+Shift+F)">${icon("Search", 15)}</button>
+           <button class="tool" data-act="find" title="${esc(withKey("터미널에서 찾기", "term.find"))}">${icon("Search", 15)}</button>
            <button class="tool" data-act="log" title="로그 기록 켜기/끄기" aria-pressed="false">${icon("ScrollText", 15)}<span>로그</span></button>
            <button class="tool" data-act="save" title="출력 내용을 파일로 저장">${icon("Save", 15)}</button>
            <button class="tool" data-act="clear" title="화면 지우기">${icon("Eraser", 15)}</button>
@@ -328,10 +573,11 @@ export class TerminalView implements View {
            }
            <button class="tool" data-act="snippet" title="명령 스니펫·매크로 보내기">${icon("ClipboardType", 15)}<span>스니펫</span></button>
            <button class="tool" data-act="ai" title="AI: 명령 만들기·출력 설명·대화·파일 분석">${icon("Sparkles", 15)}<span>AI</span></button>
-           <button class="tool device-tool" data-act="device" title="자동으로 인식한 장비: 자주 쓰는 명령, 설정 백업, 상위 프로세스" hidden>${icon("Server", 15)}<span data-device-label></span></button>
+           <button class="tool device-tool" data-act="device" title="자동으로 인식한 장비: 자주 쓰는 명령, 설정 백업, 상위 프로세스" hidden>${icon("Server", 15)}<span data-device-label data-i18n-skip></span></button>
            <button class="tool" data-act="keys" title="Delete·Home·End 키를 보내는 방식 (네트워크 장비는 Ctrl-D·Ctrl-A·Ctrl-E)">${icon("Keyboard", 15)}<span data-keys-label></span></button>
            <button class="tool" data-act="sendfile" title="텍스트 파일 보내기 (설정 파일을 붙여넣듯이)">${icon("FileText", 15)}</button>
            ${session.protocol === "serial" ? `<button class="tool" data-act="break" title="Break 신호 보내기 (장비 ROMMON 진입 등)">${icon("Zap", 15)}<span>Break</span></button>` : ""}
+           ${session.protocol === "telnet" ? `<button class="tool" data-act="break" title="Break 보내기 (텔넷 Break 명령: 콘솔 서버가 장비 포트에 Break 신호로 전달, ROMMON 진입 등)">${icon("Zap", 15)}<span>Break</span></button>` : ""}
            <button class="tool" data-act="record" title="매크로 기록 시작/끝">${icon("Circle", 15)}<span>기록</span></button>
            <button class="tool" data-act="notify" title="작업 완료 알림: 출력이 멈추면(명령이 끝나면) 알립니다. 다른 탭을 보고 있을 때만 알림이 옵니다" aria-pressed="false">${icon("Bell", 15)}</button>
            <button class="tool" data-act="reconnect" title="다시 연결">${icon("RotateCw", 15)}</button>
@@ -343,6 +589,7 @@ export class TerminalView implements View {
          <span class="find-count" data-i18n-skip></span>
          <button class="tool find-case" data-find="case" title="대소문자 구분" aria-pressed="false">Aa</button>
          <button class="tool find-regex" data-find="regex" title="정규식" aria-pressed="false">.*</button>
+         <button class="tool" data-find="list" title="일치하는 줄 모두 보기 (Alt+Enter)">${icon("ListFilter", 14)}</button>
          <button class="tool" data-find="prev" title="이전">${icon("ArrowUp", 14)}</button>
          <button class="tool" data-find="next" title="다음">${icon("ArrowUp", 14, "flip")}</button>
          <button class="tool" data-find="close" title="닫기">${icon("X", 14)}</button>
@@ -352,6 +599,9 @@ export class TerminalView implements View {
     );
     this.host = this.el.querySelector(".term-host")!;
     this.overlay = this.el.querySelector(".view-overlay")!;
+    // The saved session's notes, while it has any (sessionNotes.ts).
+    this.notes = notesButton(session.id, (s) => this.ws.editHandler?.(s));
+    this.el.querySelector(".view-actions")!.prepend(this.notes.el);
     this.findBar = this.el.querySelector(".find-bar")!;
 
     const s = state.settings;
@@ -379,6 +629,124 @@ export class TerminalView implements View {
         }
       }),
     );
+    // "clear" and Ctrl+L blank the screen in place (ED 2) or drop the
+    // scrollback (ED 3), and "reset" (RIS) starts over: command marks there
+    // point at nothing now. Only for the normal screen — vi and less clear
+    // their own (alternate) screen, which holds no marks. Never consumed.
+    this.term.parser.registerCsiHandler({ final: "J" }, (params) => {
+      const buf = this.term.buffer.active;
+      if (buf.type !== "normal") return false;
+      const p = Array.isArray(params[0]) ? params[0][0] : params[0];
+      // The whole screen: ED 2, or ED 0 from its top left corner ("clear"
+      // on vt100 and linux terminals is ESC [H ESC [J).
+      const whole = p === 2 || (p === 0 && buf.cursorX === 0 && buf.cursorY === 0);
+      if (p === 3) this.dropCommandMarks(() => true);
+      else if (whole) {
+        const top = buf.baseY;
+        this.dropCommandMarks((m) => m.line >= top);
+        this.dropLineMarks();
+      }
+      // A repeated command that clears the screen ("clear; df -h"): its
+      // prompt comes back above the line it was entered on.
+      if (whole || p === 3) this.repeat?.marker?.dispose();
+      // What comes on erased lines next is new output. xterm frees the
+      // markers of the rows it erases, the time probe's among them (on the
+      // top row while there is no scrollback; ED 3 drops the scrollback it
+      // sits on otherwise): it goes first, the lines gone counted here.
+      const trimmed = this.trimmedLines();
+      if (trimmed !== null && (p === 0 || p === 2)) {
+        this.lineTimes.erased(trimmed + (p === 2 ? buf.baseY : buf.baseY + buf.cursorY + (buf.cursorX > 0 ? 1 : 0)));
+        if (this.timeProbe && this.timeProbe.line >= buf.baseY) this.dropProbe(trimmed);
+      } else if (trimmed !== null && p === 3) this.dropProbe(trimmed + Math.max(0, buf.length - this.term.rows));
+      return false;
+    });
+    // Lines moved about on the normal screen (insert or delete lines, scroll
+    // up or down, a scroll region, a reverse index at the top: vi and less on
+    // a console without an alternate screen): the rows from there down hold
+    // other lines now, whose times are no longer known. Never consumed.
+    // `down`: how many rows the lines below are pushed down (lines inserted),
+    // so rows past the last written one get lines too; null: no knowing.
+    const linesMove = (fromCursor: boolean, down: number | null) => {
+      const buf = this.term.buffer.active;
+      if (buf.type !== "normal") return false;
+      const trimmed = this.trimmedLines();
+      if (trimmed === null) return false;
+      const bottom = trimmed + buf.baseY + this.term.rows - 1;
+      this.lineTimes.unknown(trimmed + buf.baseY + (fromCursor ? buf.cursorY : 0), down === null ? bottom : Math.min(bottom, this.lineTimes.end + down));
+      return false;
+    };
+    const count = (params: (number | number[])[]) => Math.max(1, (Array.isArray(params[0]) ? params[0][0] : params[0]) || 1);
+    this.term.parser.registerCsiHandler({ final: "L" }, (params) => linesMove(true, count(params)));
+    this.term.parser.registerCsiHandler({ final: "M" }, () => linesMove(true, 0));
+    this.term.parser.registerCsiHandler({ final: "S" }, () => linesMove(false, 0));
+    this.term.parser.registerCsiHandler({ final: "T" }, (params) => linesMove(false, count(params)));
+    // A scroll region other than the whole screen (setting it back is
+    // nothing); one below the top row is remembered (see stampOutput).
+    this.term.parser.registerCsiHandler({ final: "r" }, (params) => {
+      const n = (i: number) => (Array.isArray(params[i]) ? params[i][0] : params[i]) ?? 0;
+      if (this.term.buffer.active.type === "normal") this.scrollRegion = n(0) > 1 ? n(0) - 1 : 0;
+      return n(0) > 1 || (n(1) > 0 && n(1) < this.term.rows) ? linesMove(false, null) : false;
+    });
+    // A soft reset (DECSTR) lets the region go.
+    this.term.parser.registerCsiHandler({ intermediates: "!", final: "p" }, () => {
+      // Only the screen in use is reset: the normal one keeps its region under vi.
+      if (this.term.buffer.active.type === "normal") this.scrollRegion = 0;
+      return false;
+    });
+    this.term.parser.registerEscHandler({ final: "M" }, () => (this.term.buffer.active.cursorY === 0 ? linesMove(false, 1) : false));
+    this.term.parser.registerEscHandler({ final: "c" }, () => {
+      this.dropCommandMarks(() => true);
+      this.dropLineMarks();
+      this.repeat?.marker?.dispose();
+      // The screen starts over: so does the record of when its lines came.
+      this.scrollRegion = 0;
+      this.lineTimes.reset();
+      this.timeProbe?.dispose();
+      this.timeProbe = undefined;
+      this.trimmed = 0;
+      this.timesStarted = false;
+      return false;
+    });
+    // IPv4 addresses in the output are links too, clicked as web links are:
+    // they open a menu (a new session for it, the network tools, a copy).
+    this.term.registerLinkProvider({
+      provideLinks: (y, callback) => {
+        const line = this.term.buffer.active.getLine(y - 1);
+        if (!line || !/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}/.test(line.translateToString(true))) return callback(undefined);
+        // The text with the screen cell of each character: a wide character
+        // (Hangul) takes two cells, so string positions are not columns.
+        let text = "";
+        const cells: number[] = [];
+        const reuse = this.term.buffer.active.getNullCell();
+        for (let x = 0; x < line.length; x++) {
+          const cell = line.getCell(x, reuse);
+          if (!cell || cell.getWidth() === 0) continue;
+          const chars = cell.getChars() || " ";
+          for (let k = 0; k < chars.length; k++) cells.push(x);
+          text += chars;
+        }
+        // Clicked as web links are: Ctrl+click unless the setting says a click.
+        const link = (index: number, length: number, open: (e: MouseEvent) => void) => ({
+          range: { start: { x: cells[index] + 1, y }, end: { x: cells[index + length - 1] + 1, y } },
+          text: text.slice(index, index + length),
+          activate: (e: MouseEvent) => {
+            if (state.settings.linkNeedsCtrl && !e.ctrlKey) {
+              if (!linkHintShown) {
+                linkHintShown = true;
+                toast("링크는 Ctrl+클릭으로 엽니다", "info", 3000);
+              }
+              return;
+            }
+            open(e);
+          },
+        });
+        const links = [
+          ...findIps(text).map((m) => link(m.index, m.length, (e) => this.addressMenu(m.ip, m.port, m.prefix, e.clientX, e.clientY))),
+          ...findMacs(text).map((m) => link(m.index, m.length, (e) => this.macMenu(m.hex, e.clientX, e.clientY))),
+        ];
+        callback(links.length ? links : undefined);
+      },
+    });
     this.term.open(this.host);
     this.applyThemeBackground();
     this.wireBlink();
@@ -448,6 +816,8 @@ export class TerminalView implements View {
       if (state.settings.copyOnSelect && this.term.hasSelection()) writeClipboard(this.term.getSelection());
     });
     this.term.attachCustomKeyEventHandler((e) => this.handleKey(e));
+    this.el.addEventListener("keydown", () => this.timerSeen(), true);
+    this.el.addEventListener("mousedown", () => this.timerSeen(), true);
     // Ctrl + wheel changes the font size (one step per wheel notch; touchpads
     // send many small deltas, so they are accumulated).
     let wheel = 0;
@@ -464,10 +834,48 @@ export class TerminalView implements View {
       },
       { capture: true, passive: false },
     );
-    this.host.addEventListener("contextmenu", async (e) => {
-      if (!state.settings.rightClickPaste) return;
+    this.host.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      this.paste();
+      if (state.settings.rightClickPaste) return void this.paste();
+      // Right-click paste is off: the app's own menu (not the WebView's, which
+      // xterm's input box under the pointer would otherwise bring up).
+      const run = (f: () => unknown) => () => {
+        f();
+        this.term.focus();
+      };
+      // When the line under the pointer arrived (a console message, a ping
+      // reply that prints no time of its own); a click copies it.
+      const row = this.rowAt(e.clientY);
+      const came = row === null ? null : this.lineTime(row);
+      const when = came === null ? "" : clockText(came);
+      contextMenu(e.clientX, e.clientY, [
+        { label: "복사", icon: "Copy", hint: keyHint("term.copy"), disabled: !this.term.hasSelection(), action: run(() => writeClipboard(this.term.getSelection())) },
+        { label: "붙여넣기", icon: "ClipboardPaste", hint: keyHint("term.paste"), action: run(() => this.paste()) },
+        { label: "전체 선택", hint: keyHint("term.selectAll"), action: run(() => this.term.selectAll()) },
+        { label: "선택 영역 비교", icon: "Columns2", hint: keyHint("term.compare"), disabled: !this.term.hasSelection(), action: () => this.compareSelection() },
+        { label: "표로 복사 (엑셀용)", icon: "Table", hint: keyHint("term.copyTable"), disabled: !this.term.hasSelection(), action: run(() => this.copyTable()) },
+        { label: "명령 출력 복사", icon: "ClipboardList", hint: keyHint("term.copyOutput"), action: run(() => this.copyCommandOutput()) },
+        { label: "이전 실행과 비교", icon: "History", hint: keyHint("term.compareRuns"), action: () => this.compareRuns() },
+        "-",
+        { label: "터미널에서 찾기", icon: "Search", hint: keyHint("term.find"), action: () => this.toggleFind(true) },
+        { label: "화면 지우기", icon: "Eraser", hint: keyHint("term.clear"), action: run(() => this.clearScreen()) },
+        this.repeatMenuItem(),
+        this.timerMenuItem(),
+        ...(when
+          ? [
+              "-" as const,
+              {
+                label: "이 줄을 받은 시각",
+                icon: "Clock",
+                hint: when,
+                action: run(() => {
+                  void writeClipboard(when);
+                  toast("시각을 복사했습니다", "success", 1500);
+                }),
+              },
+            ]
+          : []),
+      ]);
     });
     this.resizer.observe(this.host);
 
@@ -488,7 +896,7 @@ export class TerminalView implements View {
       detail: `${this.term.cols}×${this.term.rows}`,
       logPath: this.logPath,
       monitor: this.monitor,
-      device: this.device ? `${deviceTitle(this.device)}${this.device.name ? ` · ${this.device.name}` : ""}` : undefined,
+      device: this.device ? `${deviceTitle(this.device)}${this.device.name ? ` · ${userText(this.device.name)}` : ""}` : undefined,
     };
   }
 
@@ -545,7 +953,8 @@ export class TerminalView implements View {
     const button = this.el.querySelector<HTMLElement>('[data-act="device"]')!;
     button.hidden = false;
     button.querySelector("[data-device-label]")!.textContent = d.network ? deviceTitle(d) : d.name || deviceTitle(d);
-    button.title = `${deviceTitle(d)}${d.name ? ` · ${d.name}` : ""} — 자주 쓰는 명령, ${d.backup ? "설정 백업, " : ""}상위 프로세스`;
+    // The name is the device's own (its prompt): kept as written in the translated tooltip.
+    button.title = `${deviceTitle(d)}${d.name ? ` · ${userText(d.name)}` : ""} — 자주 쓰는 명령, ${d.backup ? "설정 백업, " : ""}상위 프로세스`;
     // AIX and HP-UX take ^H for Backspace (their login prompt prints ^? for DEL).
     if ((d.kind === "aix" || d.kind === "hpux") && !this.session.options.backspace) {
       this.setKeyOption("backspace", "ctrl-h");
@@ -559,16 +968,45 @@ export class TerminalView implements View {
     }
   }
 
+  /** `cd` to `path` in this shell, from the SFTP pane opened beside it:
+   * only at an idle command prompt of a session past its login, never into a
+   * question; not to a device recognised as other than a Unix shell (a
+   * switch's CLI, Windows). Only this tab, not broadcast. */
+  cdTo(path: string) {
+    // A control character in a folder name is no part of a path to the
+    // terminal: Ctrl+U, Ctrl+C or Enter in it would edit or end the line and
+    // run what follows, quotes or not.
+    if (/[\x00-\x1f\x7f-\x9f]/.test(path)) return void toast("폴더 이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000);
+    if (this.disposed || this.state !== "connected" || !this.loggedIn || this.inputKind() !== "shell") return void toast("명령 줄에서만 보낼 수 있습니다", "warn");
+    const kind = this.device?.kind;
+    if (kind && !["linux", "aix", "hpux", "solaris"].includes(kind)) return void toast("Linux·Unix 셸에서만 쓸 수 있습니다", "warn");
+    const prompt = this.idlePrompt();
+    if (prompt === null) return void toast("명령 프롬프트에서 아무것도 입력하지 않았을 때 보낼 수 있습니다", "warn", 5000);
+    // Not recognised: a shell's own prompt ends with "$" or "#" (not "C:\>", "R1>").
+    if (!kind && !/[$#]$/.test(prompt.trimEnd())) return void toast("Linux·Unix 셸에서만 쓸 수 있습니다", "warn");
+    // Single-quoted, so no character of the path means anything to the shell.
+    const quoted = `'${path.replace(/'/g, `'\\''`)}'`;
+    this.interruptRepeat();
+    this.sendInput(`cd ${quoted}\r`);
+    this.ws.focusView(this);
+  }
+
   /** Commands for the recognised device, config backup, top processes. */
   private deviceMenu() {
     const d = this.device;
     const sh = this.shared;
     if (!d || !sh) return;
     const r = this.el.querySelector<HTMLElement>('[data-act="device"]')!.getBoundingClientRect();
+    const rid = this.runtimeId;
     const commands = deviceCommands(d.kind).map(([label, command]) => ({
       label: `${label}  ·  ${command}`,
       icon: "ChevronRight",
       action: () => {
+        // Not into a connection made while the menu was open (a login prompt).
+        if (this.state !== "connected" || this.runtimeId !== rid || !this.loggedIn) return void toast("연결이 바뀌어 보내지 않았습니다", "warn");
+        // Not into a password question (enable, sudo) the line is at now.
+        if (this.inputKind() !== "shell") return void toast("명령 줄에서만 보낼 수 있습니다", "warn");
+        this.interruptRepeat();
         this.sendInput(`${command}\r`);
         this.term.focus();
       },
@@ -577,8 +1015,9 @@ export class TerminalView implements View {
       { label: `${deviceTitle(d)}${d.name ? ` · ${userText(d.name)}` : ""}`, icon: "Server", disabled: true },
       "-",
       ...(d.backup ? [{ label: "설정 백업 (running-config를 파일로 저장)…", icon: "Save", action: () => this.backupConfig() }] : []),
+      ...(d.backup ? [{ label: "설정을 백업 파일과 비교…", icon: "Columns2", action: () => void this.compareConfig() }] : []),
       ...(d.backup ? [{ label: "설정을 AI로 점검…", icon: "Sparkles", action: () => void this.aiConfigReview() }] : []),
-      { label: "상위 프로세스·리소스", icon: "Activity", action: () => showTopProcesses(sh.id, this.title()) },
+      { label: "상위 프로세스·리소스", icon: "Activity", action: () => showTopProcesses(sh.id, this.ws.nameOf(this)) },
       ...(commands.length ? ["-" as const, ...commands] : []),
     ]);
   }
@@ -612,6 +1051,7 @@ export class TerminalView implements View {
         // Replace what is typed on the line (Ctrl-U), never press Enter.
         const typed = this.assist.typedText();
         const data = (typed ? "\x15" : "") + command.replace(/[\r\n]+/g, " ");
+        this.interruptRepeat();
         this.assist.note(data);
         this.sendInput(data);
       },
@@ -638,12 +1078,17 @@ export class TerminalView implements View {
   private async runForAi(command: string, reason: string, timeoutMs = 30_000): Promise<{ output: string; timedOut: boolean }> {
     if (this.state !== "connected") throw new Error("연결이 끊어져 실행하지 않았습니다");
     if (this.aiRunning) throw new Error("다른 명령이 실행 중입니다");
+    this.interruptRepeat();
     if (this.term.buffer.active.type !== "normal") throw new Error("화면 전체를 쓰는 프로그램이 실행 중이라 실행하지 않았습니다");
+    // Never into a login or password prompt (each run would be a failed login).
+    if (!this.loggedIn || this.inputKind() !== "shell") throw new Error("로그인을 마친 다음 명령 줄에서 실행할 수 있습니다");
+    const rid = this.runtimeId;
     this.aiRunning = true;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const marker = this.term.registerMarker(0);
     try {
       await api.riskAudit("AI RUN", this.session.name || endpoint(this.session), endpoint(this.session), reason, command).catch(() => {});
+      if (this.state !== "connected" || this.runtimeId !== rid || !this.loggedIn) throw new Error("연결이 바뀌어 실행하지 않았습니다");
       // The prompt this line started with: the next one looks like it ("[root@host /]#" → "[root@host tmp]#").
       const prompt = this.assist.knownPrompt().trim();
       const stem = prompt.slice(0, Math.min(6, prompt.length));
@@ -784,9 +1229,47 @@ export class TerminalView implements View {
       const path = await pickSavePath(`${name}_${timestamp()}.cfg`, [{ name: "설정 파일", extensions: ["cfg", "txt", "conf"] }]);
       if (!path) return;
       await api.saveTextFile(path, text);
+      rememberBackup(this.backupKey, path);
       toast(`설정을 저장했습니다 (${text.split("\n").length}줄): ${userText(path)}`, "success", 6000);
     } catch (err) {
       toast(`설정 백업 실패: ${errorText(err)}`, "error", 6000);
+    }
+  }
+
+  /** Which device a remembered backup belongs to: the saved session, or the
+   * address of a quick connection. */
+  private get backupKey(): string {
+    const s = this.session;
+    return s.id.startsWith("quick-") ? `quick:${s.protocol}:${s.host.trim().toLowerCase()}:${s.port ?? ""}` : s.id;
+  }
+
+  /** The device's configuration as it is now against a backup file (one saved
+   * before a change, to see what the change did), side by side in the
+   * comparison window. The file last saved or compared for this device is
+   * offered first. Read through the resource monitor's connection, as the
+   * backup is: nothing is typed into this terminal. */
+  private async compareConfig() {
+    const d = this.device;
+    const sh = this.shared;
+    if (!d || !sh) return;
+    const path = await pickOpenFile("비교할 설정 백업 파일", lastBackup(this.backupKey));
+    if (!path || this.disposed) return;
+    let saved: string;
+    try {
+      saved = await api.readTextFile(path);
+    } catch (err) {
+      return void toast(errorText(err), "error", 6000);
+    }
+    if (saved.includes("\0")) return void toast("텍스트 파일이 아니라 비교할 수 없습니다", "warn");
+    rememberBackup(this.backupKey, path);
+    toast("장비에서 설정을 읽는 중…", "info", 2500);
+    try {
+      const now = await api.monitorBackup(sh.id);
+      const { openDiff } = await import("../diffView");
+      // Names as they are (a path, a device name and the time): the source titles are not translated.
+      openDiff({ title: path.split(/[\\/]/).pop() ?? path, text: saved }, { title: `${d.name || this.session.host} ${timestamp()}`, text: now });
+    } catch (err) {
+      toast(`설정을 읽지 못했습니다: ${errorText(err)}`, "error", 6000);
     }
   }
 
@@ -824,6 +1307,8 @@ export class TerminalView implements View {
     this.zoomTimer = window.setTimeout(() => badge.classList.remove("show"), 900);
   }
   private zoomTimer = 0;
+  /** The find button's tooltip as last set (the toolbar builds the same text). */
+  private findTitle = withKey("터미널에서 찾기", "term.find");
   /** Font size chosen with Ctrl+wheel / the zoom buttons, if any. */
   private zoomed: number | null = null;
 
@@ -900,7 +1385,7 @@ export class TerminalView implements View {
     const m = this.monitor;
     const sh = this.shared;
     if (!m) return;
-    if (m.kind === "stats" && sh) return showTopProcesses(sh.id, this.title());
+    if (m.kind === "stats" && sh) return showTopProcesses(sh.id, this.ws.nameOf(this));
     if (m.kind === "login" && sh) {
       if (m.needUser || (!this.session.username && !sh.user && this.session.protocol === "telnet")) {
         const u = await promptDialog({ title: "리소스 모니터링 로그인", label: "사용자 이름", icon: "Activity", confirm: "다음", value: sh.user });
@@ -947,7 +1432,17 @@ export class TerminalView implements View {
       try {
         const want = this.fit.proposeDimensions();
         if (!want || isNaN(want.cols) || isNaN(want.rows)) return;
-        if (want.cols !== this.term.cols || want.rows !== this.term.rows) this.fit.fit();
+        if (want.cols !== this.term.cols || want.rows !== this.term.rows) {
+          // New columns reflow the wrapped lines and renumber the rows: the
+          // line times are carried over by logical line.
+          const reflow = want.cols !== this.term.cols;
+          const keep = reflow ? this.timesBeforeReflow() : null;
+          this.fit.fit();
+          // xterm lets a scroll region go with the size.
+          this.scrollRegion = 0;
+          if (keep) this.timesAfterReflow(keep);
+          else if (reflow) this.timesUnknown();
+        }
       } catch {
         return;
       }
@@ -1050,6 +1545,10 @@ export class TerminalView implements View {
   /** Input for the connection. Typed while it is still being opened (a
    * Telnet connect, a gateway login), it waits and goes out once open. */
   sendInput(data: string) {
+    // An Enter or Ctrl+C from any path (typed, a snippet, an AI run, a device
+    // menu, a startup command) ends this line: the next starts its own
+    // broadcast (lineScope).
+    if (/[\r\n\x03]/.test(data)) this.setLineScope(null);
     if (this.opened !== this.runtimeId) {
       if (this.early.length < 1000) this.early.push(data);
       return;
@@ -1100,11 +1599,16 @@ export class TerminalView implements View {
     }
     this.pasteActive = false;
     this.renderPasteProgress(null);
-    const left = e.total - e.sent;
+    // Lines left out on purpose are not "not sent" ones the user must send again.
+    const skipped = e.skipped ?? 0;
+    const left = e.total - e.sent - skipped;
     const secs = Math.max(1, Math.round((Date.now() - this.pasteStarted) / 1000));
-    if (e.state === "stopped" && left) toast(`붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음)`, "warn");
+    if (e.state === "login") toast(`장비가 로그인을 물어 붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음). 로그인한 다음 다시 보내세요`, "warn", 10000);
+    else if (e.state === "noprompt") toast(`장비의 프롬프트가 다시 나타나지 않아 붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음). 화면을 확인한 다음 남은 줄을 다시 보내세요`, "warn", 10000);
+    else if (e.state === "stopped" && left) toast(`붙여넣기를 멈췄습니다 (${left}줄은 보내지 않음)`, "warn");
     else if (e.state === "failed") toast(`연결이 끊어져 붙여넣기를 마치지 못했습니다 (${left}줄은 보내지 않음)`, "error", 6000);
-    else if (e.state === "done" && e.total >= 20) toast(`${e.total}줄을 보냈습니다 (${secs}초)`, "success", 3000);
+    else if (e.state === "done" && e.total >= 20) toast(`${e.sent}줄을 보냈습니다 (${secs}초)`, "success", 3000);
+    if (skipped) toast("enable이 비밀번호를 묻지 않아서, 비밀번호로 보이는 다음 줄은 명령으로 보내지 않고 건너뛰었습니다", "info", 8000);
   }
 
   /** Lines sent, time left and a stop button over the terminal while a
@@ -1126,22 +1630,26 @@ export class TerminalView implements View {
       });
       this.host.parentElement!.appendChild(box);
     }
-    box.querySelector<HTMLElement>("[data-pp-count]")!.textContent = `${e.sent} / ${e.total}`;
-    box.querySelector<HTMLElement>(".pp-bar i")!.style.width = `${(100 * e.sent) / e.total}%`;
+    const done = e.sent + (e.skipped ?? 0);
+    box.querySelector<HTMLElement>("[data-pp-count]")!.textContent = `${done} / ${e.total}`;
+    box.querySelector<HTMLElement>(".pp-bar i")!.style.width = `${(100 * done) / e.total}%`;
     const elapsed = (Date.now() - this.pasteStarted) / 1000;
-    const eta = e.sent > 2 && elapsed > 0.5 ? Math.ceil(((e.total - e.sent) * elapsed) / e.sent) : 0;
+    // Lines still to send (those left out on purpose need no time).
+    const eta = e.sent > 2 && elapsed > 0.5 ? Math.ceil(((e.total - done) * elapsed) / e.sent) : 0;
     box.querySelector<HTMLElement>("[data-pp-eta]")!.textContent = eta ? tr(`약 ${eta}초 남음`) : "";
   }
 
   /** Send a text file (a configuration) as if it were pasted. */
   private async sendFile() {
     if (this.state !== "connected") return toast("연결된 다음에 보낼 수 있습니다", "warn");
+    // Taken before the file is picked: see sendScope.
+    const scope = this.inputScope();
     const path = await pickOpenFile("보낼 텍스트 파일");
     if (!path) return;
     try {
       const text = await api.readTextFile(path);
       if (!text) return toast("빈 파일입니다", "warn");
-      this.pasteFromUser(text, path.split(/[\\/]/).pop());
+      this.pasteFromUser(text, path.split(/[\\/]/).pop(), scope);
     } catch (err) {
       toast(errorText(err), "error", 6000);
     }
@@ -1158,27 +1666,75 @@ export class TerminalView implements View {
     if (this.acked) this.ack(rid, 0);
   }
 
-  receiveBroadcast(input: BroadcastInput) {
-    this.receiveInput(input, null);
+  receiveBroadcast(input: BroadcastInput): boolean {
+    return this.receiveInput(input, null).sent;
   }
 
-  /** Broadcast input; `confirmed`: the rules the sender's riskGate confirmed
-   * for this tab too (null when nothing was confirmed). An Enter runs what
-   * is on THIS tab's line, which may differ from the sender's (keys typed
-   * before broadcast was turned on): it is checked here, and a line that is
-   * risky beyond what was confirmed gets neither the Enter nor what follows. */
-  receiveInput(input: BroadcastInput, confirmed: RiskRule[] | null) {
+  /** The line (its first row) this tab last took broadcast input on: one the
+   * output has moved it to since is checked again (see receiveInput). */
+  private recvMark: IMarker | undefined;
+  /** That line up to the cursor when its first key came (its prompt). */
+  private recvPrefix = "";
+
+  /** The screen was cleared in place or reset: the line marks of broadcast
+   * point at whatever is drawn on those rows now, another line. */
+  private dropLineMarks() {
+    this.recvMark?.dispose();
+    this.recvMark = undefined;
+    this.lineScope?.mark?.dispose();
+  }
+
+  /** Broadcast input; `confirmed`: what the sender's riskGate confirmed for
+   * this tab too (null when nothing was confirmed). An Enter runs what is on
+   * THIS tab's line, which may differ from the sender's (keys typed before
+   * broadcast was turned on, its own history or completion): it is checked
+   * here, and a risky line other than the very one confirmed gets neither the
+   * Enter nor what follows. */
+  receiveInput(input: BroadcastInput, confirmed: RiskHit[] | null): { sent: boolean; hit: RiskHit | null } {
+    // Input for a line of another kind than this one is at now (it timed out
+    // to "Username:", it asks for a password) is held, and the sender sends
+    // this tab no more of that line. On the line this tab last took input on,
+    // only an Enter is checked: an answer echoed there may only look like a
+    // question. On a line the output moved it to, every key is: keys going
+    // into an unseen password (or out of one into a shell) would show only
+    // at its Enter. Nothing is sent to clear the line (Ctrl+U goes into an
+    // ssh.exe question as a character, and a device may bind it to something else).
+    const body = "editKey" in input ? "" : "keys" in input ? input.keys : input.paste;
+    const enterAt = body.search(/[\r\n]/);
+    if (input.kind) {
+      const sameLine = !!this.recvMark && !this.recvMark.isDisposed && this.recvMark.line === this.lineRow();
+      // On that line, what was there when its first key came (the prompt)
+      // still there: only the keys typed after it can make it look like a
+      // question ("show logging | include user: admin"), not the device.
+      const asItWas = sameLine && !!this.recvPrefix && (this.lineBeforeCursor(4000) ?? "").startsWith(this.recvPrefix);
+      if ((enterAt >= 0 || !sameLine) && !asItWas && this.inputKind() !== input.kind) {
+        if ("keys" in input && enterAt >= 0) toast(`${userText(this.ws.nameOf(this))}: 이 탭의 줄이 다른 종류(비밀번호 질문 등)라 동시 입력의 Enter를 보내지 않았습니다`, "warn", 6000);
+        else toast(`${userText(this.ws.nameOf(this))}: 이 탭의 줄이 다른 종류(비밀번호 질문 등)라 동시 입력을 보내지 않았습니다`, "warn", 6000);
+        return { sent: false, hit: null };
+      }
+      if (!sameLine) {
+        this.recvMark?.dispose();
+        this.recvMark = this.lineMark();
+        this.recvPrefix = (this.lineBeforeCursor(4000) ?? "").trimEnd();
+      }
+    }
+    this.interruptRepeat();
     if ("editKey" in input) {
       this.keyLine = input.editKey === "Backspace" ? keyLine(this.keyLine, "\b") : null;
-      return this.sendInput(this.editKeyBytes(input.editKey));
+      this.sendInput(this.editKeyBytes(input.editKey));
+      return { sent: true, hit: null };
     }
     const text = "keys" in input ? this.expandKeys(input.keys) : input.paste;
     // What lands on the line before the first Enter (a paste's line breaks are Enters too).
     const enter = /[\r\n]/.exec(text);
-    if (enter && (confirmed || state.settings.checkTypedCommands || "paste" in input)) {
+    let own: RiskHit | null = null;
+    // An answer to a password question is no command: never checked (and so
+    // never shown or recorded as one).
+    if (enter && input.kind !== "secret" && (confirmed || state.settings.checkTypedCommands || "paste" in input)) {
       const hit = this.enterRisk(text.slice(0, enter.index));
-      if (hit && !(confirmed?.includes(hit.rule) && hit.rule.action !== "block")) {
-        toast(`${userText(this.title())}: 줄에 위험한 명령이 있어 동시 입력의 Enter를 보내지 않았습니다 (${hit.rule.note}). 확인한 뒤 이 탭에서 직접 Enter를 누르세요`, "warn", 8000);
+      own = hit;
+      if (hit && !(hit.rule.action !== "block" && confirmed?.some((c) => c.rule === hit.rule && endsInCommand(hit.line, c.line)))) {
+        toast(`${userText(this.ws.nameOf(this))}: 줄에 위험한 명령이 있어 동시 입력의 Enter를 보내지 않았습니다 (${hit.rule.note}). 확인한 뒤 이 탭에서 직접 Enter를 누르세요`, "warn", 8000);
         // Keys before the Enter still arrive, so the line matches what was typed.
         if ("keys" in input && enter.index) {
           const head = input.keys.slice(0, input.keys.search(/[\r\n]/));
@@ -1186,7 +1742,7 @@ export class TerminalView implements View {
           this.keyLine = keyLine(this.keyLine, this.expandKeys(head));
           this.sendInput(this.expandKeys(head));
         }
-        return;
+        return { sent: false, hit };
       }
     }
     if ("keys" in input) {
@@ -1198,6 +1754,7 @@ export class TerminalView implements View {
     } else {
       this.pasteText(input.paste);
     }
+    return { sent: true, hit: own };
   }
 
   /** A recorded macro's editing-key marks as this tab's own bytes. */
@@ -1242,14 +1799,21 @@ export class TerminalView implements View {
    * that were confirmed, logged and audited, even if another tab connects
    * while the dialog is open. `source` names where the command came from;
    * `tag` marks the audit events ("" for snippets and macros). */
-  private async riskGate(hits: RiskHit[], source: string, tag: string): Promise<Tab[] | null> {
+  private async riskGate(hits: RiskHit[], source: string, tag: string, scope: SendScope & { kind?: InputKind | null; mark?: IMarker } = this.sendScope()): Promise<Tab[] | null> {
     // With broadcast on the same input also goes to these tabs.
-    const others = this.ws.mirrorTargets(this);
+    const same = this.stillSame(scope);
+    if (!same) {
+      toast("연결이 바뀌어 보내지 않았습니다", "warn");
+      return null;
+    }
+    // Before any login, no text goes to the other tabs (see mirrorTyped).
+    const prelogin = scope.kind === "prelogin";
+    const others = prelogin ? [] : same;
     const targets = [{ session: this.session, view: this as View }, ...others];
     const where = targets.map((t) => endpoint(t.session)).join(", ");
-    const audit = (event: string) =>
+    const audit = (event: string, to: { session: Session }[] = targets) =>
       Promise.all(
-        targets.flatMap((t) => hits.map((h) => api.riskAudit(tag ? `${event} ${tag}` : event, t.session.name || endpoint(t.session), endpoint(t.session), h.rule.note, h.line))),
+        to.flatMap((t) => hits.map((h) => api.riskAudit(tag ? `${event} ${tag}` : event, t.session.name || endpoint(t.session), endpoint(t.session), h.rule.note, h.line))),
       ).then(
         () => true,
         (err) => {
@@ -1288,25 +1852,220 @@ export class TerminalView implements View {
       await audit("CANCELLED");
       return null;
     }
-    if (this.state !== "connected") {
-      toast("연결이 끊어져 보내지 않았습니다", "warn");
-      return null;
-    }
-    // The log and the audit line are the condition for sending: when
-    // either cannot be written, nothing goes out.
-    const logged = await Promise.all(targets.map((t) => t.view.ensureLog?.() ?? Promise.resolve(false)));
-    if (logged.includes(false) || !(await audit("SENT"))) {
+    // Only to the connections the dialog was about: not to one that
+    // reconnected while it was open (it may be at a login prompt).
+    const changed = async () => {
       await audit("NOT SENT");
+      toast(this.state !== "connected" ? "연결이 끊어져 보내지 않았습니다" : "연결이 바뀌어 보내지 않았습니다", "warn");
+      return null;
+    };
+    let now = this.stillSame(scope);
+    if (!now) return changed();
+    // The log and the audit line are the condition for sending: when
+    // either cannot be written, nothing goes out. Recorded for the tabs it
+    // goes to now: "CONFIRMED" first, then "SENT" or "NOT SENT".
+    const to = [{ session: this.session, view: this as View }, ...now];
+    const logged = await Promise.all(to.map((t) => t.view.ensureLog?.() ?? Promise.resolve(false)));
+    if (logged.includes(false) || !(await audit("CONFIRMED", to))) {
+      await audit("NOT SENT", to);
       toast("로그를 켜거나 위험 명령 기록을 남길 수 없어 보내지 않았습니다", "error");
       return null;
     }
-    return others;
+    now = this.stillSame(scope);
+    if (!now) return changed();
+    // This tab's own line is another kind now (see lineStill).
+    if (scope.kind !== undefined && !this.lineStill(scope)) {
+      await audit("NOT SENT", to);
+      toast(LINE_CHANGED, "warn", 6000);
+      return null;
+    }
+    // Broadcast turned off or a tab left out meanwhile: not to it; before any
+    // login, no text to the other tabs (see mirrorTyped).
+    const live = new Set(this.ws.mirrorTargets(this, false));
+    now = prelogin ? [] : now.filter((t) => live.has(t));
+    // It goes out right after this returns, with nothing in between; each
+    // other tab is recorded as it is delivered (deliverConfirmed).
+    void audit("SENT", [{ session: this.session }]);
+    this.noteLeftOut(scope, now);
+    return now;
+  }
+
+  /** Where input typed here goes now: this connection and, with broadcast
+   * on, the other tabs' connections. Taken before a dialog, so that what it
+   * confirms goes only to the connections still the same afterwards: one
+   * that reconnected meanwhile may sit at a login or password prompt, where
+   * a command must never land. */
+  private sendScope(): SendScope {
+    return { rid: this.runtimeId, peers: this.ws.mirrorTargets(this).map((tab) => ({ tab, id: tab.view.connectionId?.() })) };
+  }
+
+  /** The scope's other tabs still on the same connection; null when this
+   * tab is not (disconnected, or reconnected since). */
+  private stillSame(scope: SendScope): Tab[] | null {
+    if (this.state !== "connected" || this.runtimeId !== scope.rid) return null;
+    return scope.peers.filter((p) => p.tab.view.state === "connected" && p.tab.view.connectionId?.() === p.id).map((p) => p.tab);
+  }
+
+  connectionId(): string {
+    return this.runtimeId;
+  }
+
+  /** What typing at the cursor goes into now, from the cursor line: a host
+   * key, secret or user name question (also after the login: an enable or
+   * sudo password), else a logged-in session ("shell") or one before its
+   * login ("prelogin"); null while not connected. */
+  inputKind(): InputKind | null {
+    if (this.state !== "connected") return null;
+    // A question is the line it ends with (its echoed answer aside: a user
+    // name shows, a password does not): all of it when it wraps in a narrow
+    // pane ("Enter passphrase for key '/home/…'"), its end when even longer.
+    const normal = this.term.buffer.active.type === "normal";
+    const line = normal ? (this.lineBeforeCursor(160) ?? this.lineBeforeCursor(4000)?.slice(-160) ?? "") : "";
+    const before = line.trimEnd();
+    const bare = before.replace(ECHOED_SECRET, "$1");
+    const shell = SHELL_PROMPT_SHAPE.test(before);
+    if (!shell && HOSTKEY_WORDS.test(bare) && (/[:：?？]$/.test(bare) || /\(yes\/no/i.test(bare))) return "hostkey";
+    // A [y/N] choice before a secret: "Change the password now? [y/N]:" asks no password.
+    if (!shell && (CONFIRM_QUESTION.test(bare) || FILE_QUESTION.test(before))) return "confirm";
+    // A secret before a user name: "[sudo] password for user:" asks a password.
+    if (CREDENTIAL_PROMPT.test(bare) && /[:：?？]$/.test(bare)) return "secret";
+    // A line shaped as a shell prompt is one, whatever its host or
+    // directory is named ("deploy@sso-login:~$", "PS C:\passwords>").
+    if (!shell) {
+      if (CREDENTIAL_PROMPT.test(bare) && SECRET_ANGLE.test(bare)) return "secret";
+      if (USER_QUESTION.test(before) || USER_ANSWERED.test(before) || (!this.loggedIn && (LOGIN_END.test(before) || USER_ANSWERED_ANGLE.test(before)))) return "user";
+      // A console that timed out to its welcome: the next Enter starts a login.
+      if (normal && !before && this.waitsToStart()) return "prelogin";
+    }
+    return this.loggedIn ? "shell" : "prelogin";
+  }
+
+  /** A console timed out to its welcome ("Press RETURN to get started."),
+   * the cursor on a blank line under it: what is typed next wakes it into a
+   * login (a line pasted there would go in as a user name and a password). */
+  private waitsToStart(): boolean {
+    const buf = this.term.buffer.active;
+    for (let y = buf.baseY + buf.cursorY - 1, n = 0; y >= 0 && n < 4; y--, n++) {
+      const text = buf.getLine(y)?.translateToString(true).trim() ?? "";
+      if (text) return /press (?:return|enter) to get started/i.test(text);
+    }
+    return false;
+  }
+
+  /** This line's broadcast: the tabs of the same kind of line when its first
+   * key was typed, kept until it ends (Enter, Ctrl+C), so no tab ever gets
+   * the end of a line without its start; a tab that comes to fit later
+   * joins at the next line. */
+  private lineScope: (SendScope & { kind: InputKind | null; mark: IMarker | undefined }) | null = null;
+
+  /** A new or no line scope (its marker freed). */
+  private setLineScope(scope: (SendScope & { kind: InputKind | null; mark: IMarker | undefined }) | null) {
+    if (this.lineScope?.mark && this.lineScope.mark !== scope?.mark) this.lineScope.mark.dispose();
+    this.lineScope = scope;
+  }
+
+  /** The cursor's line up to the cursor, its wrapped rows joined; null when
+   * longer than `max` characters. */
+  private lineBeforeCursor(max: number): string | null {
+    const buf = this.term.buffer.active;
+    const cursor = buf.baseY + buf.cursorY;
+    let text = buf.getLine(cursor)?.translateToString(true, 0, buf.cursorX) ?? "";
+    for (let y = cursor; y > 0 && buf.getLine(y)?.isWrapped; y--) {
+      if (text.length > max) return null;
+      text = rowText(buf, y - 1).text + text;
+    }
+    return text.length > max ? null : text;
+  }
+
+  /** A marker on the line the cursor is on now (its first row when it wraps). */
+  private lineMark(): IMarker | undefined {
+    const buf = this.term.buffer.active;
+    return this.term.registerMarker(this.lineRow() - (buf.baseY + buf.cursorY));
+  }
+
+  /** The buffer row the cursor's line starts on (a long line wraps over several). */
+  private lineRow(): number {
+    const buf = this.term.buffer.active;
+    let y = buf.baseY + buf.cursorY;
+    while (y > 0 && buf.getLine(y)?.isWrapped) y--;
+    return y;
+  }
+
+  /** A new line scope: the tabs and the kind of line as it starts now. */
+  private newLineScope() {
+    return { ...this.sendScope(), kind: this.inputKind(), mark: this.lineMark() };
+  }
+
+  /** This line's scope while the line is still the one it was taken on; else
+   * none (it is let go). A line on a connection made since is a new one; so
+   * is one the output moved to that asks something else (a key answered
+   * without Enter, then a password question). */
+  private currentLineScope() {
+    const s = this.lineScope;
+    if (!s) return null;
+    const moved = !s.mark || s.mark.isDisposed || s.mark.line !== this.lineRow();
+    if (s.rid === this.runtimeId && !(moved && this.inputKind() !== s.kind)) return s;
+    this.setLineScope(null);
+    return null;
+  }
+
+  /** Where input sent here (a paste, a snippet, a held Enter) goes, and the
+   * kind of line it goes to: this line's broadcast when one is under way, so
+   * no tab gets the end of a line without its start; else a new one. */
+  private inputScope(): SendScope & { kind: InputKind | null; mark?: IMarker } {
+    return this.currentLineScope() ?? { ...this.sendScope(), kind: this.inputKind() };
+  }
+
+  /** This tab's line is still what `scope` was taken at (after a dialog): the
+   * same line, which the user's own typing may make look otherwise, or one of
+   * the same kind. A console that timed out to "Username:" meanwhile is not:
+   * each line sent there would be a failed login. */
+  private lineStill(scope: { kind?: InputKind | null; mark?: IMarker }): boolean {
+    if (scope.mark && !scope.mark.isDisposed && scope.mark.line === this.lineRow()) return true;
+    return this.inputKind() === (scope.kind ?? null);
+  }
+
+  /** After a paste or snippet `sent` here and to `took`: ending in an Enter
+   * (or Ctrl+C), a new line starts; else its last line goes on, in the tabs
+   * it went to (the keys typed next go to them, not to others). */
+  private continueLine(scope: SendScope & { kind: InputKind | null }, took: Tab[], sent: string) {
+    const tabs = new Set(took);
+    this.setLineScope(!sent || /[\r\n\x03]$/.test(sent) ? null : { rid: scope.rid, peers: scope.peers.filter((p) => tabs.has(p.tab)), kind: scope.kind, mark: this.lineMark() });
+  }
+
+  /** Typed input to this line's broadcast tabs (see lineScope). */
+  private mirrorTyped(input: BroadcastInput, endsLine: boolean) {
+    if (!this.currentLineScope()) {
+      this.setLineScope(this.newLineScope());
+      if (this.ws.broadcast) this.ws.tabsChanged();
+    }
+    const scope = this.lineScope!;
+    if (endsLine) this.setLineScope(null);
+    if (!scope.kind) return;
+    // Before any login, between tabs nothing is known of: only the Enter or
+    // Ctrl+C that wakes a console, never text (a login question not
+    // recognised would take it).
+    if (scope.kind === "prelogin" && !("keys" in input && /^[\r\n\x03]+$/.test(input.keys))) return;
+    // Still connected the same way, and broadcast still on for them. The
+    // kind goes along: each receiver looks at its line (see receiveInput).
+    const live = new Set(this.ws.mirrorTargets(this, false));
+    const took = new Set(broadcastTo((this.stillSame(scope) ?? []).filter((t) => live.has(t)), { ...input, kind: scope.kind }));
+    // A tab that did not take it (its line is another kind now, it left
+    // broadcast, it reconnected) gets no more of this line.
+    scope.peers = scope.peers.filter((p) => took.has(p.tab));
+  }
+
+  /** Say so when some broadcast tabs of `scope` are left out of `sent`. */
+  private noteLeftOut(scope: SendScope, sent: Tab[]) {
+    const n = scope.peers.length - sent.length;
+    if (n > 0) toast(`동시 입력 대상 중 ${n}개 탭은 연결이 바뀌어 보내지 않았습니다`, "warn", 6000);
   }
 
   /** Keys the user typed here. Enter is CR or LF (Ctrl+J), and one key event
    * can bring text and Enter together (Alt+Enter is ESC CR): every Enter is
    * checked and ends the line, whatever came with it. */
   private typedInput(data: string) {
+    this.interruptRepeat();
     for (const part of data.split(/(?<=[\r\n])/)) {
       const enter = /[\r\n]$/.test(part) ? part.slice(-1) : "";
       const keys = enter ? part.slice(0, -1) : part;
@@ -1326,17 +2085,174 @@ export class TerminalView implements View {
   /** Typed input to the connection, the broadcast tabs and a macro being recorded. */
   private typedOut(data: string) {
     this.assist.note(data);
+    this.mirrorTyped({ keys: data }, /[\r\n\x03]/.test(data));
     this.sendInput(data);
-    this.ws.mirrorInput(this, { keys: data });
     this.recording?.push(data);
   }
 
-  /** Enter goes out now (typed, or held and confirmed): the command line ends. */
-  private enterSent() {
-    // The line on screen; before its echo arrives (fast typing, slow
-    // links), the keys pressed since the last Enter.
-    this.lsColors.submitted(this.assist.typedText() || this.keyLine || "", this.assist.knownPrompt());
+  /** Enter goes out now (typed, held and confirmed, or a repeated command's):
+   * the command line ends. `command`: the line on screen; before its echo
+   * arrives (fast typing, slow links), the keys pressed since the last Enter. */
+  private enterSent(command = this.assist.typedText() || this.keyLine || "") {
+    this.markCommand(command);
+    this.lsColors.submitted(command, this.assist.knownPrompt());
     this.keyLine = "";
+  }
+
+  /** Where commands were entered at the prompt, oldest first, to jump back to
+   * them in long output (term.prevCommand / term.nextCommand). xterm disposes
+   * a marker whose line leaves the scrollback. */
+  private commandMarks: IMarker[] = [];
+  /** The prompt each mark's command was typed at (copyCommandOutput). */
+  private markPrompts = new WeakMap<IMarker, string>();
+  /** The command line last jumped to, and where the view was then: pressing
+   * again goes on from it even when the view could not scroll (the last screen). */
+  private lastJump: { line: number; viewportY: number } | null = null;
+
+  /** A command was entered: remember its line. Not inside vi, less and other
+   * full-screen programs, and not for an empty Enter. Only the position is
+   * kept, never what was typed. */
+  private markCommand(command: string) {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal" || !command.trim()) return;
+    const cursor = buf.baseY + buf.cursorY;
+    // An answer to a password prompt ("[sudo] password for …:") is not a
+    // command: the command it belongs to stays marked and timed.
+    const before = buf.getLine(cursor)?.translateToString(true, 0, buf.cursorX) ?? "";
+    if (CREDENTIAL_PROMPT.test(before)) return;
+    // Typed at a prompt, not a repeated run: the work timer it may be for.
+    if (!this.repeat) this.offerTimer(command);
+    let y = cursor;
+    while (y > 0 && buf.getLine(y)?.isWrapped) y--;
+    const marker = this.term.registerMarker(y - cursor);
+    if (!marker) return;
+    // Marks at or below this line are from before a "clear" (the screen is
+    // blanked in place, so their rows were reused): they point at nothing now.
+    this.dropCommandMarks((m) => m.line >= marker.line);
+    this.commandMarks.push(marker);
+    if (this.commandMarks.length > 1000) this.commandMarks.shift()!.dispose();
+    // A new command: the next jump starts from where the view is.
+    this.lastJump = null;
+    // Timed until the prompt comes back (watchCommandEnd), when it is known.
+    const prompt = this.assist.knownPrompt().trimEnd();
+    if (prompt) this.markPrompts.set(marker, prompt);
+    clearTimeout(this.commandEndTimer);
+    this.runningCommand = prompt ? { marker, prompt, start: Date.now() } : null;
+  }
+
+  /** Dispose the command marks `which` picks (their ⏱ labels go with them). */
+  private dropCommandMarks(which: (m: IMarker) => boolean) {
+    this.commandMarks = this.commandMarks.filter((m) => {
+      if (m.isDisposed) return false;
+      if (!which(m)) return true;
+      m.dispose();
+      return false;
+    });
+    this.lastJump = null;
+  }
+
+  /** The command being timed: its line, the prompt it was entered at, and when. */
+  private runningCommand: { marker: IMarker; prompt: string; start: number } | null = null;
+  private commandEndTimer = 0;
+  private lastOutputAt = 0;
+
+  /** Output arrived while a command runs: once it pauses, see whether the
+   * prompt is back (the command is done). */
+  private watchCommandEnd() {
+    if (!this.runningCommand) return;
+    this.lastOutputAt = Date.now();
+    clearTimeout(this.commandEndTimer);
+    this.commandEndTimer = window.setTimeout(() => !this.disposed && this.commandEnded(), 300);
+  }
+
+  /** The cursor waits after the prompt the command was entered at (or one of
+   * the same device: "router#" → "router(config)#") on a later line: the
+   * command is done. A long one gets its time shown at the end of its line. */
+  private commandEnded() {
+    const run = this.runningCommand;
+    if (!run || run.marker.isDisposed) return void (this.runningCommand = null);
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return; // vi, less …: not back yet
+    const row = buf.baseY + buf.cursorY;
+    if (row <= run.marker.line) return;
+    // Up to the cursor's column (cells, so a wide character counts as two).
+    const before = (buf.getLine(row)?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd();
+    if (!before || !PROMPT_END.test(before)) return;
+    // The same prompt, or the same host's in another mode or folder ("router#"
+    // → "router(config)#", "user@web:~$" → "user@web:/tmp$"); not another
+    // host's ("router2#", the prompt of a server reached by ssh).
+    const host = (p: string) => /^[^\s(#>$%\]:]*/.exec(p)![0];
+    if (before !== run.prompt && !(host(run.prompt) && host(before) === host(run.prompt))) return;
+    this.runningCommand = null;
+    const ms = this.lastOutputAt - run.start;
+    if (ms >= 2000) this.showDuration(run.marker, ms);
+  }
+
+  /** "⏱ 12.4s" at the right end of a command's line, where it does not cover
+   * the command itself. */
+  private showDuration(marker: IMarker, ms: number) {
+    const s = ms / 1000;
+    const label =
+      s < 60 ? `⏱ ${s.toFixed(1)}s` : s < 3600 ? `⏱ ${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s` : `⏱ ${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+    const width = label.length + 1;
+    // Columns the line uses: up to its last non-blank cell (a wide character
+    // takes two, so the text's length would undercount).
+    const line = this.term.buffer.active.getLine(marker.line);
+    if (!line) return;
+    const cell = this.term.buffer.active.getNullCell();
+    let used = 0;
+    for (let x = line.length - 1; x >= 0; x--) {
+      if (line.getCell(x, cell)?.getChars().trim()) {
+        used = x + Math.max(1, cell.getWidth());
+        break;
+      }
+    }
+    if (used + width + 2 > this.term.cols) return;
+    const deco = this.term.registerDecoration({ marker, x: this.term.cols - width, width, layer: "top" });
+    deco?.onRender((el) => {
+      el.textContent = label;
+      el.classList.add("cmd-duration");
+      // Centred in the row: the line as high as the row xterm sized it to.
+      el.style.lineHeight = el.style.height;
+    });
+  }
+
+  /** Scroll to the previous (-1) or next (1) command line and flash it. */
+  private jumpCommand(dir: -1 | 1) {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return;
+    this.commandMarks = this.commandMarks.filter((m) => !m.isDisposed && m.line >= 0);
+    const lines = this.commandMarks.map((m) => m.line);
+    const atBottom = buf.viewportY >= buf.baseY;
+    const here =
+      this.lastJump && this.lastJump.viewportY === buf.viewportY
+        ? this.lastJump.line
+        : dir < 0 && atBottom
+          ? buf.baseY + buf.cursorY
+          : buf.viewportY;
+    const target = dir < 0 ? [...lines].reverse().find((l) => l < here) : lines.find((l) => l > here);
+    if (target === undefined) {
+      // Past the last command: back to the live end of the output.
+      if (dir > 0) this.term.scrollToBottom();
+      this.lastJump = null;
+      return;
+    }
+    this.term.scrollToLine(target);
+    this.lastJump = { line: target, viewportY: buf.viewportY };
+    this.flashLine(target);
+  }
+
+  /** Light up a buffer line briefly (the selection colour, made opaque). */
+  private flashLine(line: number) {
+    const buf = this.term.buffer.active;
+    const marker = this.term.registerMarker(line - (buf.baseY + buf.cursorY));
+    if (!marker) return;
+    const theme = this.term.options.theme ?? {};
+    const deco = this.term.registerDecoration({ marker, width: this.term.cols, backgroundColor: opaque(theme.selectionBackground, theme.background) });
+    window.setTimeout(() => {
+      deco?.dispose();
+      marker.dispose();
+    }, 900);
   }
 
   /** The command line the cursor is on, wrapped rows joined; null on a
@@ -1347,10 +2263,10 @@ export class TerminalView implements View {
     let y = buf.baseY + buf.cursorY;
     while (y > 0 && buf.getLine(y)?.isWrapped) y--;
     const parts: string[] = [];
-    for (let line = buf.getLine(y); line; line = buf.getLine(++y)) {
-      const last = !buf.getLine(y + 1)?.isWrapped;
-      parts.push(line.translateToString(last));
-      if (last) break;
+    for (; buf.getLine(y); y++) {
+      const { text, continues } = rowText(buf, y);
+      parts.push(text);
+      if (!continues) break;
     }
     return parts.join("");
   }
@@ -1372,14 +2288,24 @@ export class TerminalView implements View {
    * sent later, or never). */
   private holdRiskyEnter(enter: string): boolean {
     if (this.state !== "connected" || !state.settings.checkTypedCommands) return false;
+    // The tabs that got this line's keys (see lineScope), and its kind.
+    const line = this.inputScope();
+    // An answer to a password question is no command: never checked, shown or recorded.
+    if (line.kind === "secret") return false;
     const hit = this.enterRisk();
     if (!hit) return false;
-    void this.riskGate([hit], "직접 입력한 명령", "(typed)").then((others) => {
+    // The command after this tab's prompt, which the other tabs' lines must
+    // end in to get the Enter (their prompts differ).
+    const command = (this.assist.typedText() || this.keyLine || "").trim();
+    const confirmedHit = command ? { ...hit, line: command } : hit;
+    // The line goes on until the Enter goes out (sendInput ends it): if this
+    // is cancelled, an edit and another Enter still go to the same tabs.
+    void this.riskGate([hit], "직접 입력한 명령", "(typed)", line).then((others) => {
       if (others) {
         this.enterSent();
         this.sendInput(enter);
         this.assist.sent();
-        deliverConfirmed(others, { keys: enter }, [hit]);
+        deliverConfirmed(others, { keys: enter, kind: line.kind ?? undefined }, [confirmedHit], "(typed)");
         this.recording?.push(enter);
       }
       this.term.focus();
@@ -1390,20 +2316,412 @@ export class TerminalView implements View {
   /** Send a saved command; it follows broadcast like typed input does. */
   private async sendSnippet(s: Snippet) {
     if (this.state !== "connected") return toast("연결된 다음 보낼 수 있습니다", "warn");
+    // Its {{?name}} values first, if it has any: then sent only to the
+    // connections it was asked on (see sendScope), and the line it joins.
+    const scope = this.inputScope();
+    let text = s.text;
+    if (asksValues(s)) {
+      const filled = await askSnippetValues(s);
+      this.term.focus();
+      if (filled === null) return;
+      if (!this.stillSame(scope)) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
+      if (!this.lineStill(scope)) return toast(LINE_CHANGED, "warn", 6000);
+      text = filled;
+    }
+    this.interruptRepeat();
     // Macro text may hold editing-key marks; other tabs expand them their own way.
-    const marked = s.macro ? s.text : s.text.replace(/\r?\n/g, "\r") + (s.run ? "\r" : "");
+    const marked = s.macro ? s.text : text.replace(/\r?\n/g, "\r") + (s.run ? "\r" : "");
     const data = this.expandKeys(marked);
+    // Several lines into a login, password or host-key question: each would
+    // be an attempt; before a login, only when the user says so.
+    const enters = data.match(/\r\n?|\n/g)?.length ?? 0;
+    if ((scope.kind === "user" || scope.kind === "secret" || scope.kind === "hostkey") && enters > 1) return void toast(MANY_LINES_AT_LOGIN, "warn", 6000);
+    if (scope.kind === "prelogin" && enters > 1) {
+      if (!(await this.confirmBeforeLogin(enters))) return;
+      if (!this.stillSame(scope)) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
+      if (!this.lineStill(scope)) return toast(LINE_CHANGED, "warn", 6000);
+    }
     const hits = findRisks(data);
+    // Its first line joins what is already on the command line, as a paste's does.
+    const enterAt = s.macro ? -1 : data.search(/[\r\n]/);
+    const first = enterAt >= 0 && this.term.buffer.active.type === "normal" ? this.enterRisk(data.slice(0, enterAt)) : null;
+    if (first && !hits.some((h) => h.rule === first.rule)) hits.unshift(first);
     let confirmedOthers: Tab[] | null = null;
     if (hits.length) {
-      confirmedOthers = await this.riskGate(hits, `스니펫: <b data-i18n-skip>${esc(s.name)}</b>`, "");
-      if (!confirmedOthers) return;
+      confirmedOthers = await this.riskGate(hits, `스니펫: <b data-i18n-skip>${esc(s.name)}</b>`, "", scope);
+      if (!confirmedOthers) return void this.term.focus();
     }
+    const peers = confirmedOthers ?? this.stillSame(scope);
+    if (!peers) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
+    if (!confirmedOthers) this.noteLeftOut(scope, peers);
     this.sendInput(data);
-    if (confirmedOthers) deliverConfirmed(confirmedOthers, { keys: marked }, hits);
-    else this.ws.mirrorInput(this, { keys: marked });
+    const kind = scope.kind ?? undefined;
+    const live = new Set(this.ws.mirrorTargets(this, false));
+    const took = confirmedOthers
+      ? deliverConfirmed(confirmedOthers, { keys: marked, kind }, hits, "")
+      : kind !== "prelogin"
+        ? broadcastTo(peers.filter((t) => live.has(t)), { keys: marked, kind })
+        : [];
+    this.continueLine(scope, took, data);
     this.recording?.push(marked);
     this.term.focus();
+    // The lines it ran (the last one only with "Enter after sending"): the
+    // work timer one of them may be for.
+    if (!s.macro && this.term.buffer.active.type === "normal") {
+      const lines = text.split(/\r?\n/);
+      for (const line of s.run ? lines : lines.slice(0, -1)) this.offerTimer(line);
+    }
+  }
+
+  /** A command sent again every few seconds (term.repeat), as `watch` would
+   * on gear that has none. It goes out only at the prompt it started at, once
+   * the previous run's output has ended, and never to a login or password
+   * prompt. Input to this tab, a disconnect, or a prompt that does not come
+   * back stops it. Only this tab: not broadcast, not recorded. */
+  private repeat: RepeatState | null = null;
+  /** The last repeat's settings, offered the next time (this tab, not saved). */
+  private repeatLast = { command: "", every: 5, count: 60 };
+  /** When output last arrived: a prompt is judged only once output pauses. */
+  private lastRx = 0;
+
+  /** The prompt the cursor waits at with nothing typed, or null (output on
+   * the line, a full-screen program, a login, password or pager prompt). */
+  private idlePrompt(): string | null {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return null;
+    const line = buf.getLine(buf.baseY + buf.cursorY);
+    const before = (line?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd();
+    // Nothing after the cursor either (a command being edited in the middle).
+    if ((line?.translateToString(true) ?? "").trimEnd() !== before) return null;
+    if (!before || !PROMPT_END.test(before) || CREDENTIAL_PROMPT.test(before) || LOGIN_END.test(before) || PAGER_PROMPT.test(before)) return null;
+    // Known prompt plus more ("user@web:~$ ls >"): a command is typed on it.
+    const known = this.assist.knownPrompt().trimEnd();
+    if (this.assist.typedText() || (known && before !== known && before.startsWith(known))) return null;
+    return before;
+  }
+
+  /** A work timer (term.timer): a reminder at a set time, for a change that
+   * undoes itself unless confirmed in time ("reload in 10", "commit confirmed
+   * 10"). It shows its time left on the tab and warns a minute before and at
+   * the end, with a sound, a flashing taskbar button and a message (a Windows
+   * notification when the app is not in front or is locked). An ended timer
+   * stays on the tab, marked, until this tab is used. It runs whatever the
+   * connection does: the device's own countdown goes on. Nothing is sent. */
+  private timer: {
+    /** The end by the wall clock and by the monotonic one: the earlier is
+     * taken, so neither a clock change nor sleep makes the warning late. */
+    endWall: number;
+    endMono: number;
+    note: string;
+    warned: boolean;
+    ended: boolean;
+    tick: number;
+    /** One-off wake-ups at the warning and the end: a hidden window slows a
+     * repeating timer to once a minute, a one-off one far less. */
+    wakeups: number[];
+  } | null = null;
+  /** The last timer's settings, offered the next time (this tab, not saved). */
+  private timerLast = { minutes: 10, note: "" };
+
+  private timerLeft(): number {
+    const t = this.timer;
+    return t ? Math.min(t.endWall - Date.now(), t.endMono - performance.now()) : 0;
+  }
+
+  /** Start or stop the work timer, in the snippet and right-click menus. */
+  private timerMenuItem(): MenuItem {
+    return this.timer && !this.timer.ended
+      ? {
+          label: "작업 타이머 멈추기",
+          icon: "TimerOff",
+          hint: timerClock(this.timerLeft()),
+          action: () => {
+            this.stopTimer("작업 타이머를 멈췄습니다");
+            this.term.focus();
+          },
+        }
+      : { label: "작업 타이머…", icon: "Timer", hint: keyHint("term.timer"), action: () => void this.toggleTimer() };
+  }
+
+  /** term.timer: ask for the time and a note and start, or stop. */
+  private async toggleTimer() {
+    if (this.timer && !this.timer.ended) {
+      this.stopTimer("작업 타이머를 멈췄습니다");
+      return this.term.focus();
+    }
+    return this.openTimer();
+  }
+
+  /** The timer dialog, starting with `preset` (read from a command just
+   * sent) or the last settings; a timer it starts replaces one running. */
+  private async openTimer(preset?: { minutes: number; note: string; sent?: { wall: number; mono: number } }) {
+    const last = preset ?? this.timerLast;
+    const minutesOf = (v: string) => (/^\s*\d{1,4}\s*$/.test(v) ? Number(v) : NaN);
+    const res = await promptDialog({
+      title: "작업 타이머",
+      label: "시간(분)",
+      type: "number",
+      icon: "Timer",
+      confirm: "시작",
+      value: String(last.minutes),
+      extra: `<label class="field"><span>메모 (선택)</span><input name="note" maxlength="200" value="${esc(last.note)}" placeholder="예: reload cancel 입력" spellcheck="false" autocomplete="off"/></label>
+        <p class="muted small">끝나기 1분 전과 끝날 때 소리와 알림으로 알려 줍니다. 명령은 보내지 않습니다. 탭을 닫거나 앱을 끄면 타이머도 사라집니다.</p>`,
+      // Checked in the dialog: a wrong number keeps it open, note and all.
+      validate: (v) => {
+        const n = minutesOf(v);
+        return n >= 1 && n <= 1440 ? null : "시간은 1~1440분 사이의 정수로 입력하세요";
+      },
+    });
+    if (this.disposed) return;
+    this.term.focus();
+    if (!res) return;
+    const minutes = minutesOf(res.value);
+    const note = res.form.querySelector<HTMLInputElement>("[name=note]")!.value.trim();
+    this.timerLast = { minutes, note };
+    this.stopTimer();
+    // The OS notification needs the permission asked from a user action: this one.
+    ensureNotifyPermission();
+    const ms = minutes * 60_000;
+    // Offered for a command just sent: the device counts from then, not from
+    // this click (the dialog may have stood open a while). Edited, from now.
+    const from = preset?.sent && minutes === preset.minutes ? preset.sent : { wall: Date.now(), mono: performance.now() };
+    const left = Math.min(from.wall + ms - Date.now(), from.mono + ms - performance.now());
+    const wake = (after: number) => window.setTimeout(() => this.timerTick(), Math.max(0, after));
+    this.timer = {
+      endWall: from.wall + ms,
+      endMono: from.mono + ms,
+      note,
+      warned: left <= 60_000,
+      ended: false,
+      tick: window.setInterval(() => this.timerTick(), 1000),
+      wakeups: [...(left > 60_000 ? [wake(left - 60_000)] : []), wake(left)],
+    };
+    this.ws.badgeChanged(this);
+    toast(`작업 타이머를 시작했습니다 (${minutes}분)`, "success", 2000);
+  }
+
+  /** A command just entered here that a work timer is for ("reload in 10",
+   * "commit confirmed"): offered, its time and the command that settles it
+   * filled in, to start after a look; one that settles it ("reload cancel",
+   * "commit") while a timer runs: stopping it offered. Only offered: the
+   * dialog or the button is the user's to take. */
+  private offerTimer(command: string) {
+    const found = selfUndoing(command, this.device?.kind ?? this.osGuess);
+    if (found) {
+      const undo = { ...found, sent: { wall: Date.now(), mono: performance.now() } };
+      const message = undo.note === "reload cancel" ? `${undo.minutes}분 뒤 장비를 다시 시작하도록 예약하는 명령입니다` : `${undo.minutes}분 안에 commit으로 확정하지 않으면 설정이 되돌아가는 명령입니다`;
+      return void toast(message, "info", 12_000, { label: "작업 타이머…", run: () => void this.openTimer(undo) });
+    }
+    if (this.timer && !this.timer.ended && SETTLES.test(command.trim()))
+      toast("확정하거나 취소하는 명령을 보냈습니다. 작업 타이머를 멈출까요?", "info", 12_000, {
+        label: "타이머 멈추기",
+        run: () => {
+          this.stopTimer("작업 타이머를 멈췄습니다");
+          this.term.focus();
+        },
+      });
+  }
+
+  /** Its clocks and wake-ups stopped (an ended timer keeps its mark). */
+  private quietTimer() {
+    if (!this.timer) return;
+    clearInterval(this.timer.tick);
+    this.timer.wakeups.forEach((w) => clearTimeout(w));
+  }
+
+  private stopTimer(message?: string) {
+    if (!this.timer) return;
+    this.quietTimer();
+    this.timer = null;
+    this.ws.badgeChanged(this);
+    if (message) toast(message, "info", 1500);
+  }
+
+  /** This tab used (a key, a click): an ended timer's mark has been seen. */
+  private timerSeen() {
+    if (this.timer?.ended) this.stopTimer();
+  }
+
+  private timerTick() {
+    const t = this.timer;
+    if (!t || t.ended) return;
+    // From the clocks, not from counting ticks: a wake-up can come a little
+    // early or, after the PC slept, late.
+    const left = this.timerLeft();
+    if (left <= 250) {
+      this.quietTimer();
+      t.ended = true;
+      this.ws.badgeChanged(this);
+      return this.timerAlert("작업 타이머가 끝났습니다", t.note);
+    }
+    if (!t.warned && left <= 60_250) {
+      t.warned = true;
+      this.timerAlert("작업 타이머 1분 남음", t.note);
+    }
+    this.ws.badgeChanged(this);
+  }
+
+  /** The warning and the end: a sound and the taskbar button flashing, and
+   * the message in the app when it is in front and unlocked, else as a
+   * Windows notification that brings this tab back (a long message in the
+   * app when Windows notifications are not allowed). */
+  private timerAlert(title: string, note: string) {
+    const name = this.ws.nameOf(this);
+    const body = note ? `${name}: ${note}` : name;
+    beep();
+    requestAttention();
+    if ((!document.hasFocus() || isScreenLocked()) && canOsNotify()) osNotify(tr(title), body, () => this.ws.focusView(this));
+    else toast(`${title}: ${userText(body)}`, "warn", 30_000);
+  }
+
+  badge(): { text: string; alert: boolean; title: string } | null {
+    const t = this.timer;
+    if (!t) return null;
+    if (t.ended) return { text: "0:00", alert: true, title: t.note ? `작업 타이머가 끝났습니다: ${userText(t.note)}` : "작업 타이머가 끝났습니다" };
+    const left = Math.max(0, this.timerLeft());
+    return { text: timerClock(left), alert: left <= 60_000, title: t.note ? `작업 타이머: ${userText(t.note)}` : "작업 타이머" };
+  }
+
+  closeWarning(): string | null {
+    return this.timer && !this.timer.ended ? `작업 타이머가 ${timerClock(this.timerLeft())} 남아 있습니다` : null;
+  }
+
+  /** Start or stop the repeat, in the snippet and right-click menus. */
+  private repeatMenuItem(): MenuItem {
+    return this.repeat
+      ? { label: "반복 실행 멈추기", icon: "CircleStop", hint: keyHint("term.repeat"), action: () => this.stopRepeat("반복 실행을 멈췄습니다") }
+      : { label: "명령 반복 실행…", icon: "Repeat", hint: keyHint("term.repeat"), disabled: this.state !== "connected", action: () => void this.toggleRepeat() };
+  }
+
+  /** term.repeat: ask for the command and timing and start, or stop. */
+  private async toggleRepeat() {
+    if (this.repeat) return this.stopRepeat("반복 실행을 멈췄습니다");
+    if (this.state !== "connected") return void toast("연결된 다음 사용할 수 있습니다", "warn");
+    // Never before the login has gone through: no run may meet a login prompt.
+    if (!this.loggedIn) return void toast("로그인을 마친 다음 사용할 수 있습니다", "warn");
+    // A paced paste still going out line by line: a run would land between its lines.
+    if (this.pasteActive) return void toast("붙여넣기가 끝난 다음 시작할 수 있습니다", "warn");
+    // The connection and prompt it is asked at: it starts only if both are
+    // still there after the dialog (a reconnect meanwhile lands on a new screen).
+    const asked = { rid: this.runtimeId, prompt: this.idlePrompt() };
+    if (asked.prompt === null) return void toast("명령 프롬프트에서 아무것도 입력하지 않았을 때 시작할 수 있습니다", "warn", 5000);
+    const last = this.repeatLast;
+    const res = await promptDialog({
+      title: "명령 반복 실행",
+      label: "명령",
+      icon: "Repeat",
+      confirm: "시작",
+      value: last.command,
+      extra: `<div class="grid-2">
+          <label class="field"><span>간격(초)</span><input name="every" type="number" min="1" max="3600" value="${last.every}"/></label>
+          <label class="field"><span>횟수</span><input name="count" type="number" min="1" max="1000" value="${last.count}"/></label>
+        </div>
+        <p class="muted small">앞 결과가 끝나고 프롬프트가 돌아온 뒤에 보냅니다. 이 탭에 입력하거나, 연결이 끊기거나, 프롬프트가 1분 넘게 돌아오지 않으면 멈춥니다. 페이지 나눔(--More--)은 먼저 끄세요 (예: terminal length 0).</p>`,
+    });
+    if (!res) return;
+    const command = res.value.trim();
+    if (!command) return;
+    if (/[\x00-\x1f\x7f]/.test(command)) return void toast("한 줄 명령만 반복할 수 있습니다", "warn");
+    const hits = findRisks(`${command}\r`);
+    if (hits.length) return void toast(`위험 명령 규칙에 걸리는 명령은 반복할 수 없습니다 (${hits[0].rule.note})`, "warn", 6000);
+    const num = (name: string, min: number, max: number, fallback: number) =>
+      Math.min(max, Math.max(min, Math.trunc(Number(res.form.querySelector<HTMLInputElement>(`[name=${name}]`)!.value)) || fallback));
+    const every = num("every", 1, 3600, 5);
+    const count = num("count", 1, 1000, 60);
+    this.repeatLast = { command, every, count };
+    // Things may have moved on while the dialog was open.
+    const still = !this.repeat && this.state === "connected" && this.loggedIn && !this.pasteActive && this.runtimeId === asked.rid && this.idlePrompt() === asked.prompt;
+    if (!still) return void toast("대화 상자를 연 사이에 화면이 바뀌어 시작하지 않았습니다", "warn", 5000);
+    this.repeat = { rid: asked.rid, command, prompt: asked.prompt, everyMs: every * 1000, total: count, sent: 0, timer: 0, marker: null, dueAt: Date.now(), waiting: false };
+    this.repeatTick();
+    this.term.focus();
+  }
+
+  /** Send the next run when the prompt is back, or look again shortly. */
+  private repeatTick() {
+    const r = this.repeat;
+    if (!r || this.disposed) return;
+    clearTimeout(r.timer);
+    if (this.state !== "connected" || this.runtimeId !== r.rid || !this.loggedIn) return this.stopRepeat("연결이 끊어져 반복 실행을 멈췄습니다", "warn");
+    const buf = this.term.buffer.active;
+    const row = buf.baseY + buf.cursorY;
+    // Judged only once output pauses (a line of output can end in "#" or ">"),
+    // and not while a paced paste is going out.
+    if (Date.now() - this.lastRx >= 300 && buf.type === "normal" && !this.pasteActive) {
+      const before = (buf.getLine(row)?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd();
+      if (CREDENTIAL_PROMPT.test(before) || LOGIN_END.test(before)) return this.stopRepeat("로그인·비밀번호를 묻는 줄이 나타나 반복 실행을 멈췄습니다", "warn");
+      if (PAGER_PROMPT.test(before)) return this.stopRepeat("페이지 나눔(--More--)이 나타나 반복 실행을 멈췄습니다. 끈 다음 다시 시작하세요 (예: terminal length 0)", "warn");
+      const prompt = this.idlePrompt();
+      // Below the last run's line (a disposed marker scrolled out: long past it).
+      if (prompt !== null && (!r.marker || r.marker.isDisposed || row > r.marker.line)) {
+        // The same prompt, or the same device's ("router#" → "router(config)#");
+        // another host's (the run logged out or jumped) ends the repeat.
+        const host = (p: string) => /^[^\s(#>$%\]:]*/.exec(p)![0];
+        if (prompt !== r.prompt && !(host(r.prompt) && host(prompt) === host(r.prompt))) return this.stopRepeat("프롬프트가 바뀌어 반복 실행을 멈췄습니다", "warn");
+        if (Date.now() >= r.dueAt) return this.repeatRun(r);
+      }
+    }
+    if (Date.now() >= r.dueAt + 60_000) return this.stopRepeat("프롬프트가 1분 넘게 돌아오지 않아 반복 실행을 멈췄습니다", "warn");
+    const waiting = Date.now() >= r.dueAt;
+    if (waiting !== r.waiting) {
+      r.waiting = waiting;
+      this.renderRepeat();
+    }
+    r.timer = window.setTimeout(() => this.repeatTick(), waiting ? 300 : Math.min(500, Math.max(50, r.dueAt - Date.now())));
+  }
+
+  private repeatRun(r: RepeatState) {
+    r.marker?.dispose();
+    r.marker = this.term.registerMarker(0) ?? null;
+    this.enterSent(r.command);
+    this.sendInput(`${r.command}\r`);
+    r.sent++;
+    r.waiting = false;
+    if (r.sent >= r.total) return this.stopRepeat(tr(`반복 실행을 마쳤습니다 (${r.sent}회)`), "success");
+    r.dueAt = Date.now() + r.everyMs;
+    this.renderRepeat();
+    r.timer = window.setTimeout(() => this.repeatTick(), Math.min(500, r.everyMs));
+  }
+
+  /** End the repeat; `message` says why (none when the tab is closing). */
+  private stopRepeat(message?: string, kind: "info" | "warn" | "success" = "info") {
+    const r = this.repeat;
+    if (!r) return;
+    this.repeat = null;
+    clearTimeout(r.timer);
+    r.marker?.dispose();
+    this.renderRepeat();
+    if (message) toast(message, kind, 5000);
+  }
+
+  /** Input from the user or for them (keys, paste, snippet, AI) takes the line: the repeat stops. */
+  private interruptRepeat() {
+    if (this.repeat) this.stopRepeat("입력이 있어 반복 실행을 멈췄습니다");
+  }
+
+  /** Runs sent, the command and a stop button over the terminal while a repeat runs. */
+  private renderRepeat() {
+    const r = this.repeat;
+    let box = this.el.querySelector<HTMLElement>(".repeat-progress");
+    if (!r) return void box?.remove();
+    if (!box) {
+      box = h("div", { class: "repeat-progress", role: "status" });
+      box.innerHTML = `<div class="pp-row">${icon("Repeat", 13)}<span>반복 실행</span><b data-rp-count></b><span class="muted" data-rp-state></span>
+          <button type="button" class="btn sm" data-rp-stop>${icon("CircleStop", 13)}<span>중지</span></button></div>
+        <div class="rp-command mono" data-i18n-skip></div>
+        <div class="pp-bar"><i></i></div>`;
+      box.querySelector("[data-rp-stop]")!.addEventListener("click", () => {
+        this.stopRepeat("반복 실행을 멈췄습니다");
+        this.term.focus();
+      });
+      this.host.parentElement!.appendChild(box);
+    }
+    box.querySelector<HTMLElement>("[data-rp-count]")!.textContent = `${r.sent} / ${r.total}`;
+    box.querySelector<HTMLElement>("[data-rp-state]")!.textContent = r.waiting ? tr("프롬프트를 기다리는 중") : tr(`${r.everyMs / 1000}초마다`);
+    const command = box.querySelector<HTMLElement>(".rp-command")!;
+    command.textContent = r.command;
+    command.title = r.command;
+    box.querySelector<HTMLElement>(".pp-bar i")!.style.width = `${(100 * r.sent) / r.total}%`;
   }
 
   /** Start recording typed input as a macro, or stop and save it. */
@@ -1437,6 +2755,13 @@ export class TerminalView implements View {
    * box) must not re-render every terminal or undo this tab's zoom. */
   applySettings() {
     this.aiPanel?.refreshProviders();
+    // The find key may have changed in the shortcut settings. Compared with the
+    // last text set, not the attribute: on screen it holds the translation.
+    const findTitle = withKey("터미널에서 찾기", "term.find");
+    if (findTitle !== this.findTitle) {
+      this.findTitle = findTitle;
+      this.el.querySelector<HTMLElement>('[data-act="find"]')?.setAttribute("title", findTitle);
+    }
     const s = state.settings;
     const o = this.term.options;
     if (o.fontFamily !== s.fontFamily) o.fontFamily = s.fontFamily;
@@ -1467,14 +2792,19 @@ export class TerminalView implements View {
     this.closing = false;
     this.startupSent = false;
     this.triggerBuf = "";
+    this.tailAnswered.clear();
+    clearTimeout(this.tailTimer);
+    this.lastLine = "";
+    this.runningCommand = null;
+    clearTimeout(this.commandEndTimer);
     // A new TextDecoder so a partial multibyte character left over from a dropped
     // connection does not corrupt the first trigger line of this one.
     this.decoder = new TextDecoder();
     // A new login, not established until it has gone through (watchLogin). A
     // Telnet login runs inside the connection ("Username:", "Password:"), so it
-    // is read from the output the same way; a serial line has no login here.
+    // is read from the output the same way, and so is a serial console's.
     this.loginText = "";
-    this.captureLogin = this.session.protocol === "ssh" || this.session.protocol === "telnet";
+    this.captureLogin = this.session.protocol === "ssh" || this.session.protocol === "telnet" || this.session.protocol === "serial";
     this.loginDecoder = new TextDecoder();
     this.loginSeen = 0;
     clearTimeout(this.loginTimer);
@@ -1500,7 +2830,7 @@ export class TerminalView implements View {
     this.early = [];
     const p = this.session.protocol as "ssh" | "telnet" | "serial";
     // Text written into the terminal is not translated on screen; tr() does it here.
-    this.term.write(`\x1b[90m${tr(`${PROTOCOLS[p].label} ${endpoint(this.session)}에 연결하는 중...`)}\x1b[0m\r\n`);
+    this.writeNote(`\x1b[90m${tr(`${PROTOCOLS[p].label} ${endpoint(this.session)}에 연결하는 중...`)}\x1b[0m\r\n`);
     const rid = this.runtimeId;
     try {
       // Telnet can go through an SSH gateway (SSH has its own jump host option).
@@ -1552,7 +2882,7 @@ export class TerminalView implements View {
     } catch (err) {
       if (this.disposed || rid !== this.runtimeId) return;
       this.setState("error");
-      this.term.write(`\r\n\x1b[31m${tr(`연결 실패: ${errorText(err)}`)}\x1b[0m\r\n`);
+      this.writeNote(`\r\n\x1b[31m${tr(`연결 실패: ${errorText(err)}`)}\x1b[0m\r\n`);
       // A COM port that is not plugged in (yet): connect when it appears.
       if (/찾을 수 없습니다/.test(errorText(err)) && this.waitForPort(errorText(err))) return;
       this.showOverlay("연결하지 못했습니다", errorText(err));
@@ -1584,8 +2914,243 @@ export class TerminalView implements View {
     this.relog ||= !!this.logPath;
     this.logPath = null;
     setPressed(this.el.querySelector('.view-actions [data-act="log"]'), false);
-    this.term.write(`\r\n\x1b[90m──────── ${tr("다시 연결")} ────────\x1b[0m\r\n`);
+    this.writeNote(`\r\n\x1b[90m──────── ${tr("다시 연결")} ────────\x1b[0m\r\n`);
     this.connect();
+  }
+
+  /** A note of the app's own (connecting, failed, closed) on the screen, timed as output is. */
+  private writeNote(text: string) {
+    const at = Date.now();
+    this.term.write(text, () => this.stampOutput(at));
+  }
+
+  /** When the output's lines arrived (see LineTimes), numbered from the
+   * output's start: `trimmed` lines have left the scrollback so far, told by
+   * how far `timeProbe` (a marker) has moved up since it was looked at. The
+   * probe sits on the scrollback's last row, which the screen's own edits
+   * (insert or delete a line, scroll a region) never move: only lines
+   * leaving the scrollback, its erasure (ED 3) and a reflow do. With no
+   * scrollback yet it sits on the top row, which those edits can only push
+   * down or delete: either is taken as lost, never as lines gone. */
+  private lineTimes = new LineTimes();
+  private timeProbe: IMarker | undefined;
+  private probeLine = 0;
+  private trimmed = 0;
+  /** Output has been recorded since the terminal started (or was reset). */
+  private timesStarted = false;
+
+  /** The lines dropped from the scrollback so far; null when that is no
+   * longer known (the screen was cleared or reset, more output than the
+   * scrollback came at once and took the probe with it, it moved down, or
+   * there is scrollback and no probe on it). */
+  private trimmedLines(): number | null {
+    const p = this.timeProbe;
+    // No probe: lines leave the scrollback only once it is full.
+    if (!p) {
+      const buf = this.term.buffer.normal;
+      const full = buf.length >= (this.term.options.scrollback ?? 1000) + this.term.rows;
+      return this.timesStarted && full ? null : this.trimmed;
+    }
+    const moved = p.isDisposed ? -1 : this.probeLine - p.line;
+    if (moved < 0) return null;
+    this.trimmed += moved;
+    this.probeLine = p.line;
+    return this.trimmed;
+  }
+
+  /** The probe let go before xterm frees it (an erase), with the lines that
+   * have left the scrollback by then: `trimmed`. Placed again at the next output. */
+  private dropProbe(trimmed: number) {
+    this.trimmed = trimmed;
+    this.timeProbe?.dispose();
+    this.timeProbe = undefined;
+  }
+
+  /** The probe on the scrollback's last row (the top row while there is no
+   * scrollback); placed only while the normal screen is in use, as a marker
+   * goes on the screen shown. `trimmedLines()` has counted up to now. */
+  private placeProbe() {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return;
+    const at = Math.max(0, buf.baseY - 1);
+    if (this.timeProbe && !this.timeProbe.isDisposed && this.timeProbe.line === at) return;
+    this.timeProbe?.dispose();
+    this.timeProbe = this.term.registerMarker(at - (buf.baseY + buf.cursorY));
+    this.probeLine = this.timeProbe?.line ?? at;
+  }
+
+  /** Output written at `at` has been drawn: the lines it reached on the
+   * normal screen have arrived then (also when it went on to start vi or
+   * less, whose own screen is gone when they end). */
+  private stampOutput(at: number) {
+    if (this.disposed) return;
+    const buf = this.term.buffer.normal;
+    const active = this.term.buffer.active.type === "normal";
+    const row = buf.baseY + buf.cursorY;
+    // The last line with anything on it: not the empty one after a line break.
+    const end = buf.cursorX > 0 ? row : row - 1;
+    // The last one drawn below the cursor (a status line, a progress bar, a
+    // menu: the cursor moved back up after it), or -1.
+    let below = -1;
+    for (let y = buf.baseY + this.term.rows - 1; y > row; y--) {
+      if (buf.getLine(y)?.translateToString(true)) {
+        below = y;
+        break;
+      }
+    }
+    let trimmed = this.trimmedLines();
+    if (trimmed === null) {
+      // Lost: the lines still there came at times no longer known, which
+      // are never shown as this output's.
+      this.lineTimes.reset();
+      this.lineTimes.skip(Math.max(end, below));
+      this.trimmed = trimmed = 0;
+      this.timeProbe?.dispose();
+      this.timeProbe = undefined;
+    }
+    if (active) this.placeProbe();
+    // A scroll region below the top row: lines move inside it with every
+    // line break at its bottom and no sign of it here, so what is on the
+    // screen has no known time until the region is let go.
+    if (this.scrollRegion) this.lineTimes.unknown(trimmed + buf.baseY + this.scrollRegion, trimmed + buf.baseY + this.term.rows - 1);
+    else {
+      this.lineTimes.wrote(trimmed + end, at);
+      // Rows from the cursor down to what is drawn below it: what lands there
+      // later (lines pushed in above a progress bar) shows no time, never
+      // this one's.
+      if (below > end) this.lineTimes.unknown(trimmed + end + 1, trimmed + below);
+    }
+    this.lineTimes.forget(trimmed);
+    this.timesStarted = true;
+  }
+
+  /** The top row (from 0) of a scroll region set below the screen's top
+   * (CSI r), or 0 while there is none. */
+  private scrollRegion = 0;
+
+  /** Before the columns change: the line times by logical line (a wrapped
+   * line is one), which the reflow keeps while it renumbers the rows. */
+  private timesBeforeReflow(): { byLine: Map<number, number | null>; coveredLine: number; cursorLine: number } | null {
+    const trimmed = this.trimmedLines();
+    const snap = this.lineTimes.snapshot();
+    if (trimmed === null || !snap.lines.length) return null;
+    const { of, first, cursor } = this.logicalLines();
+    if (!of.length) return null;
+    const byLine = new Map<number, number | null>();
+    for (let i = 0; i < snap.lines.length; i++) {
+      const r = snap.lines[i] - trimmed;
+      if (r >= of.length) continue;
+      // An entry inside a wrapped line tells the lines after it.
+      const k = r < 0 ? 0 : first[of[r]] === r ? of[r] : of[r] + 1;
+      byLine.set(k, snap.times[i]);
+    }
+    const cr = snap.covered - trimmed;
+    return { byLine, coveredLine: cr < 0 ? -1 : of[Math.min(cr, of.length - 1)], cursorLine: cursor };
+  }
+
+  /** After the columns changed: the line times put back on the rows their
+   * lines are on now. The cursor's line is the same line before and after
+   * (blank rows below it come and go), so lines the reflow pushed out of
+   * the scrollback are counted off the top from it; anything else
+   * unexpected leaves the lines without a time. */
+  private timesAfterReflow(keep: NonNullable<ReturnType<TerminalView["timesBeforeReflow"]>>) {
+    const { first, last, cursor } = this.logicalLines();
+    const gone = keep.cursorLine - cursor;
+    const probe = this.timeProbe;
+    if (gone < 0 || probe?.isDisposed) return this.timesUnknown();
+    const lines: number[] = [];
+    const times: (number | null)[] = [];
+    for (const k of [...keep.byLine.keys()].sort((a, b) => a - b)) {
+      const line = Math.max(0, k - gone);
+      if (line >= first.length) continue;
+      const t = keep.byLine.get(k) ?? null;
+      // Two now on the same line (lines gone off the top): the later tells it.
+      if (lines.length && lines[lines.length - 1] === first[line]) times[times.length - 1] = t;
+      else {
+        lines.push(first[line]);
+        times.push(t);
+      }
+    }
+    const ck = keep.coveredLine - gone;
+    this.lineTimes.restore(lines, times, ck < 0 ? -1 : last[Math.min(ck, last.length - 1)]);
+    // Numbered from the rows as they are now; the probe moved with its line.
+    this.trimmed = 0;
+    if (probe) this.probeLine = probe.line;
+    this.placeProbe();
+  }
+
+  /** The record no longer matches the rows (they were renumbered and could
+   * not be followed): the lines there now show no time; later ones do. */
+  private timesUnknown() {
+    const buf = this.term.buffer.normal;
+    const row = buf.baseY + buf.cursorY;
+    this.lineTimes.reset();
+    this.lineTimes.skip(buf.cursorX > 0 ? row : row - 1);
+    this.trimmed = 0;
+    this.timeProbe?.dispose();
+    this.timeProbe = undefined;
+    this.placeProbe();
+  }
+
+  /** The normal screen's logical lines: each row's line (a wrapped row
+   * belongs to the line it continues) and each line's first and last row. */
+  private logicalLines(): { of: Int32Array; first: number[]; last: number[]; cursor: number } {
+    const buf = this.term.buffer.normal;
+    const of = new Int32Array(buf.length);
+    const first: number[] = [];
+    const last: number[] = [];
+    for (let y = 0; y < buf.length; y++) {
+      if (!first.length || !buf.getLine(y)?.isWrapped) {
+        first.push(y);
+        last.push(y);
+      } else last[last.length - 1] = y;
+      of[y] = first.length - 1;
+    }
+    const row = Math.min(buf.baseY + buf.cursorY, buf.length - 1);
+    return { of, first, last, cursor: row < 0 ? 0 : of[row] };
+  }
+
+  /** The screen and scrollback cleared but for the cursor's row (xterm's
+   * clear, which frees every marker): that row, now the first, keeps when it came. */
+  private clearScreen() {
+    const buf = this.term.buffer.active;
+    const normal = buf.type === "normal";
+    // xterm leaves a screen with its cursor at the very top alone.
+    const cleared = normal && !(buf.baseY === 0 && buf.cursorY === 0);
+    const row = buf.baseY + buf.cursorY;
+    const kept = normal ? this.lineTime(row) : null;
+    const blank = !buf.getLine(row)?.translateToString(true).trim();
+    this.term.clear();
+    if (!cleared) return;
+    this.timeProbe?.dispose();
+    this.timeProbe = undefined;
+    this.trimmed = 0;
+    this.lineTimes.reset();
+    // The row left: its time, or none when not known.
+    if (kept !== null) this.lineTimes.wrote(0, kept);
+    else if (!blank) this.lineTimes.skip(0);
+    this.placeProbe();
+  }
+
+  /** The buffer row under the pointer at `clientY`, or null off the rows. */
+  private rowAt(clientY: number): number | null {
+    const screen = this.term.element?.querySelector(".xterm-screen");
+    if (!screen) return null;
+    const r = screen.getBoundingClientRect();
+    if (!r.height) return null;
+    const y = Math.floor(((clientY - r.top) / r.height) * this.term.rows);
+    return y < 0 || y >= this.term.rows ? null : this.term.buffer.active.viewportY + y;
+  }
+
+  /** When the line at buffer `row` arrived (its first row, when it wraps), or
+   * null: a blank row, vi's screen, or one from before the record. */
+  private lineTime(row: number): number | null {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return null;
+    while (row > 0 && buf.getLine(row)?.isWrapped) row--;
+    if (!buf.getLine(row)?.translateToString(true).trim()) return null;
+    const trimmed = this.trimmedLines();
+    return trimmed === null ? null : this.lineTimes.at(trimmed + row);
   }
 
   /** Output of connection `rid`. Acknowledged once xterm has processed it, so
@@ -1595,13 +3160,19 @@ export class TerminalView implements View {
     const n = bytes.length;
     // The highlighter always follows the escape state (alternate screen,
     // program colours), so turning it on mid-session is right at once.
+    this.lastRx = Date.now();
     this.checkDelEcho(bytes);
     // An ls listing being coloured (lsColors.ts) is left as the server sent it.
     const shown = this.highlighter.process(bytes, state.settings.highlightKeywords && !this.lsColors.listing);
-    this.term.write(shown, () => this.ack(rid, n));
+    const at = Date.now();
+    this.term.write(shown, () => {
+      this.ack(rid, n);
+      this.stampOutput(at);
+    });
     this.sniffOs(bytes);
     this.watchLogin(bytes);
     this.onOutput(bytes);
+    this.watchCommandEnd();
     if (!this.gotOutput) {
       this.gotOutput = true;
       if (this.state === "connecting") this.setState("connected");
@@ -1681,7 +3252,7 @@ export class TerminalView implements View {
    * password question). */
   private watchLogin(bytes: Uint8Array) {
     // Telnet keeps its last output too: its login runs inside the connection.
-    if (this.session.protocol !== "ssh" && this.session.protocol !== "telnet") return;
+    if (this.session.protocol !== "ssh" && this.session.protocol !== "telnet" && this.session.protocol !== "serial") return;
     const keep = 4096;
     if (bytes.length >= keep) this.endBytes = bytes.slice(bytes.length - keep);
     else {
@@ -1706,7 +3277,20 @@ export class TerminalView implements View {
       }
     }
     if (asksAtEnd(lines)) this.loginAsked = true;
-    else if (loginThrough(lines)) this.loginTimer = window.setTimeout(() => this.loginComplete(), 1500);
+    // Telnet and a serial console log in inside the connection: through only
+    // once the device's own command prompt shows (inBandLoginThrough).
+    else if (loginThrough(lines) && (this.session.protocol === "ssh" || this.inBandLoginThrough(lines))) this.loginTimer = window.setTimeout(() => this.loginComplete(), 1500);
+  }
+
+  /** A Telnet or serial login (inside the connection) went through: the
+   * device's own command prompt shows, with no failure in the last lines; a
+   * login question ending in ">" ("Login ID>") is none, nor is a banner. */
+  private inBandLoginThrough(lines: string[]): boolean {
+    const shown = lines.filter((l) => l.trim());
+    // A failure anywhere in the last lines ("Login incorrect" and a note after it).
+    if (shown.slice(-4).some((l) => loginFailure([l]))) return false;
+    const last = (shown[shown.length - 1] ?? "").trim();
+    return DEVICE_PROMPT.test(last) && !asksLogin(last);
   }
 
   /** ssh.exe could not use the session's key file and went on to other ways of
@@ -1728,8 +3312,8 @@ export class TerminalView implements View {
     toast(`키 파일을 쓰지 못했습니다 (${why}): ${userText(key.path)}. 비밀번호를 물어도 모르면 입력하지 마세요. 틀린 비밀번호를 여러 번 넣으면 서버가 접속을 차단할 수 있습니다.`, "warn", fix ? 30000 : 15000, fix);
   }
 
-  /** The login went through (SSH and Telnet: see watchLogin; serial: once
-   * connected). Only now is the connection established: what needs a logged-in
+  /** The login went through (watchLogin). Only now is the connection
+   * established: what needs a logged-in
    * session starts, and a later drop may auto-reconnect. */
   private loginComplete() {
     clearTimeout(this.loginTimer);
@@ -1737,6 +3321,10 @@ export class TerminalView implements View {
     if (this.loggedIn || this.disposed || this.state !== "connected") return;
     this.loggedIn = true;
     this.loggedInAt = Date.now();
+    // Broadcast now reaches it from logged-in tabs (the tab bar shows which).
+    this.ws.changed();
+    // A question already waiting (after the login) was left for now (answerTail).
+    queueMicrotask(() => !this.disposed && this.answerTail(state.settings.triggers ?? []));
     this.startMonitor({}, true);
     this.runStartupCommands();
     // The SFTP browser opens next to a new SSH session (Settings).
@@ -1808,6 +3396,9 @@ export class TerminalView implements View {
   /** When each "send" trigger last auto-sent, to rate-limit it and stop a rule
    *  that matches its own echo from looping. Keyed by pattern. */
   private sendTriggerAt = new Map<string, number>();
+  /** "send" rules that matched a login prompt and were not sent (fireTrigger):
+   *  the user is told once per rule in this tab. */
+  private credentialRuleWarned = new Set<string>();
   /** React to server output: arm the "done" notification, and match trigger
    * rules line by line. Only decodes when one of those is actually in use. */
   private onOutput(bytes: Uint8Array) {
@@ -1828,7 +3419,7 @@ export class TerminalView implements View {
       if (!this.notifyDone || !this.notifySaw || this.disposed) return;
       this.notifySaw = false;
       if (this.isOnScreen() && document.hasFocus()) return; // you are watching it
-      osNotify(tr("작업 완료"), this.title(), () => this.ws.focusView(this));
+      osNotify(tr("작업 완료"), this.ws.nameOf(this), () => this.ws.focusView(this));
     }, 4000);
   }
 
@@ -1846,37 +3437,494 @@ export class TerminalView implements View {
     this.triggerBuf = parts.pop() ?? "";
     // Keep the running tail bounded (a program printing no newlines).
     if (this.triggerBuf.length > 4096) this.triggerBuf = this.triggerBuf.slice(-4096);
-    for (const line of parts) {
-      if (!line) continue;
-      for (const rule of rules) {
-        if (!rule.enabled || !rule.pattern) continue;
-        let re = this.triggerRe.get(rule.pattern);
-        if (re === undefined) {
-          try {
-            re = new RegExp(rule.pattern);
-          } catch {
-            re = null; // a malformed pattern never matches
-          }
-          this.triggerRe.set(rule.pattern, re);
+    // The first completed line is the one that was unfinished before: "send"
+    // rules that answered it there are done with it.
+    const answered = this.tailAnswered;
+    if (parts.length) this.tailAnswered = new Set();
+    // Rules match (and alerts show) the text as on screen: no colour codes, and
+    // a cursor move to a row (the Windows pseudo-console) starts a new line.
+    // Each rule acts at most once per line of output (a repaint packing many
+    // rows into one line must not raise a toast per row).
+    parts.forEach((raw, i) => {
+      const fired = new Set<string>();
+      for (const line of plainLines(raw)) {
+        if (!line) continue;
+        const context = `${this.lastLine}\n${line}`;
+        this.lastLine = line;
+        for (const rule of rules) {
+          if (!rule.enabled || !rule.pattern || fired.has(rule.pattern)) continue;
+          if (i === 0 && rule.action === "send" && answered.has(rule.pattern)) continue;
+          const re = this.ruleRe(rule.pattern);
+          if (!re || !re.test(line)) continue;
+          fired.add(rule.pattern);
+          this.fireTrigger(rule, line, context);
         }
-        if (!re || !re.test(line)) continue;
-        this.fireTrigger(rule, line);
       }
+    });
+    // The unfinished last line is looked at once output pauses (below).
+    clearTimeout(this.tailTimer);
+    if (this.triggerBuf) this.tailTimer = window.setTimeout(() => !this.disposed && this.answerTail(state.settings.triggers ?? []), 250);
+  }
+
+  /** A trigger pattern, compiled once; null for a malformed one (never matches). */
+  private ruleRe(pattern: string): RegExp | null {
+    let re = this.triggerRe.get(pattern);
+    if (re === undefined) {
+      try {
+        re = new RegExp(pattern);
+      } catch {
+        re = null;
+      }
+      this.triggerRe.set(pattern, re);
+    }
+    return re;
+  }
+
+  /** "send" rules also answer the unfinished last line: a question waiting at
+   * the cursor ("Continue? (y/n) ", "--More--") has no line break until it is
+   * answered. Looked at once output has paused (a prompt split across reads is
+   * whole by then), only after the login (never ssh's host-key question or a
+   * login prompt), and once per line: the line completing later does not
+   * answer again. Rate-limited (it sent under a second ago): dropped, which is
+   * what stops a rule that matches its own echo or a re-asked question. */
+  private answerTail(rules: TriggerRule[]) {
+    clearTimeout(this.tailTimer);
+    if (!this.loggedIn) return; // loginComplete() looks again
+    const rows = plainLines(this.triggerBuf);
+    const tail = rows[rows.length - 1] ?? "";
+    if (!tail.trim()) return;
+    // What the credential check reads: the unfinished output and the line before
+    // it, so "Enter your one-time code" above a bare "> " still counts.
+    const context = [this.lastLine, ...rows].join("\n");
+    for (const rule of rules) {
+      if (!rule.enabled || !rule.pattern || rule.action !== "send" || this.tailAnswered.has(rule.pattern)) continue;
+      const re = this.ruleRe(rule.pattern);
+      if (!re || !re.test(tail)) continue;
+      this.tailAnswered.add(rule.pattern);
+      this.fireTrigger(rule, tail, context);
     }
   }
 
-  private fireTrigger(rule: TriggerRule, line: string) {
-    if (rule.action === "alert") toast(`${userText(this.title())}: ${userText(line.trim().slice(0, 200))}`, "warn", 6000);
+  /** Run a rule's action for a matching line; `context`: the text around it
+   * that the credential check reads. */
+  private fireTrigger(rule: TriggerRule, line: string, context = line) {
+    if (rule.action === "alert") toast(`${userText(this.ws.nameOf(this))}: ${userText(line.trim().slice(0, 200))}`, "warn", 6000);
     else if (rule.action === "beep") beep();
-    else if (rule.action === "send" && rule.value && this.state === "connected") {
+    // Sends only once logged in: before that the output is the login itself
+    // (ssh's host-key question, login prompts), which no rule may answer.
+    else if (rule.action === "send" && rule.value && this.state === "connected" && this.loggedIn) {
       // A send writes to the terminal; its echo and the server's reply can match
       // the same rule again, so an unguarded "send" rule can loop and flood the
       // server. Let one rule auto-send at most once a second to break the loop.
       const now = Date.now();
       if (now - (this.sendTriggerAt.get(rule.pattern) ?? 0) < 1000) return;
+      // Never to a login, password or host-key question: every prompt line is
+      // answered once, so a refused value would go again to each new prompt
+      // (repeated failed logins that lock accounts), a late match (the prompt
+      // line completed by the user's own answer) would put the secret in the
+      // shell, and a host key must be the user's own decision. Saved
+      // credentials are typed once per connection by the backend instead.
+      if (CREDENTIAL_PROMPT.test(context) || CREDENTIAL_PROMPT.test(line) || LOGIN_WORD.test(line)) {
+        if (!this.credentialRuleWarned.has(rule.pattern)) {
+          this.credentialRuleWarned.add(rule.pattern);
+          toast("로그인·비밀번호·호스트 키를 묻는 줄에는 트리거의 자동 응답을 보내지 않습니다. 로그인 정보는 세션 편집의 사용자 이름과 자격 증명에 저장하세요", "warn", 8000);
+        }
+        return;
+      }
       this.sendTriggerAt.set(rule.pattern, now);
       this.sendInput(rule.value.replace(/\\n/g, "\r").replace(/\\t/g, "\t"));
     }
+  }
+
+  /** A MAC address clicked in the output: copy it in another vendor's notation,
+   * or find it on screen in any of them. */
+  private macMenu(hex: string, x: number, y: number) {
+    contextMenu(x, y, [
+      ...macFormats(hex).map((f) => ({ label: f.text, icon: "Copy", hint: f.style, action: () => void writeClipboard(f.text) })),
+      "-" as const,
+      { label: "이 MAC을 모든 형식으로 찾기", icon: "Search", action: () => this.findInTerminal(macSearchPattern(hex), true) },
+      // Which switch's output holds it (a MAC table, an ARP table on each).
+      ...(this.otherTerminals().length
+        ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", action: () => this.matchList(macSearchPattern(hex), { regex: true, caseSensitive: false }, true) }]
+        : []),
+    ]);
+  }
+
+  /** The output as logical lines (a wrapped line joined into one) and the
+   * buffer row each starts on. */
+  private *outputLines(): Generator<OutputLine> {
+    const buf = this.term.buffer.active;
+    let row = 0;
+    let parts: string[] = [];
+    for (let y = 0; y < buf.length; y++) {
+      const line = buf.getLine(y);
+      if (!line) continue;
+      if (!line.isWrapped && parts.length) {
+        yield { row, text: parts.join("") };
+        parts = [];
+      }
+      if (!parts.length) row = y;
+      parts.push(rowText(buf, y).text);
+    }
+    if (parts.length) yield { row, text: parts.join("") };
+  }
+
+  /** The find bar's "show all matching lines": every line of the output with
+   * what is searched for (case and regex as set there), to read or copy at
+   * once, as "| include" would on the device; a click goes to the line. */
+  private showMatchingLines() {
+    const input = this.findBar.querySelector("input")!;
+    const on = (f: string) => !!this.findBar.querySelector(`[data-find="${f}"]`)?.classList.contains("on");
+    if (!input.value) return void toast("찾을 내용을 입력하세요", "info");
+    this.matchList(input.value, { regex: on("regex"), caseSensitive: on("case") }, false);
+  }
+
+  /** This output's lines matching `query` (see matchLines), at most `limit`,
+   * and `line(row)`: where a listed row is now (output arriving meanwhile
+   * pushes the oldest lines out of the scrollback, moving every row up by as
+   * many as the anchor moved), -1 once it is gone. Null for a regular
+   * expression that does not compile. */
+  findLines(query: string, opts: { regex: boolean; caseSensitive: boolean }, limit: number) {
+    const res = matchLines(this.outputLines(), query, opts, limit);
+    if (!res) return null;
+    const anchor = this.term.registerMarker(0);
+    const anchorAt = anchor?.line ?? 0;
+    return {
+      ...res,
+      line: (row: number) => (anchor && !anchor.isDisposed ? row - (anchorAt - anchor.line) : -1),
+      dispose: () => anchor?.dispose(),
+    };
+  }
+
+  /** The row of the line reading exactly `text` (a listed match) nearest to
+   * `near`, or -1 when no line reads so any more. */
+  locateLine(near: number, text: string): number {
+    const want = text.trimEnd();
+    let best = -1;
+    for (const l of this.outputLines()) {
+      if (l.text.trimEnd() !== want) continue;
+      if (best < 0 || Math.abs(l.row - near) < Math.abs(best - near)) best = l.row;
+    }
+    return best;
+  }
+
+  /** Show buffer `line`: scrolled to, flashed, this terminal focused. */
+  revealLine(line: number) {
+    this.term.scrollToLine(line);
+    this.flashLine(line);
+    this.term.focus();
+  }
+
+  /** The other terminal tabs' views, in tab order (for "every terminal tab"). */
+  private otherTerminals(): TerminalView[] {
+    return this.ws.tabs.map((t) => t.view).filter((v): v is TerminalView => v instanceof TerminalView && v !== this && !v.disposed);
+  }
+
+  /** Every line matching `query`, to read or copy at once, as "| include"
+   * would on the device: in this terminal, or in every terminal tab
+   * (`everywhere`: which switch's output holds a MAC address), each tab's
+   * under its name. A click goes to the line, in its tab. */
+  private matchList(query: string, opts: { regex: boolean; caseSensitive: boolean }, everywhere: boolean) {
+    const LIMIT = 5000;
+    const views = everywhere ? this.ws.tabs.map((t) => t.view).filter((v): v is TerminalView => v instanceof TerminalView && !v.disposed) : [this];
+    const groups: { view: TerminalView; name: string; res: NonNullable<ReturnType<TerminalView["findLines"]>> }[] = [];
+    let left = LIMIT;
+    let more = false;
+    for (const view of views) {
+      const res = view.findLines(query, opts, left);
+      // A regex that does not compile: the find bar already says so.
+      if (!res) return groups.forEach((g) => g.res.dispose());
+      more ||= res.more;
+      if (!res.matches.length) {
+        res.dispose();
+        continue;
+      }
+      left -= res.matches.length;
+      groups.push({ view, name: this.ws.nameOf(view), res });
+    }
+    const total = LIMIT - left;
+    if (!total) return void toast(everywhere ? "어느 터미널 탭에도 일치하는 줄이 없습니다" : "일치하는 줄이 없습니다", "info");
+    const marked = (m: LineMatch) => {
+      let out = "";
+      let at = 0;
+      for (const [start, end] of m.ranges) {
+        if (start < at) continue;
+        out += `${esc(m.text.slice(at, start))}<mark>${esc(m.text.slice(start, end))}</mark>`;
+        at = end;
+      }
+      return out + esc(m.text.slice(at));
+    };
+    const rows = (g: (typeof groups)[number], gi: number) =>
+      g.res.matches.map((x, i) => `<button type="button" class="match-row" data-g="${gi}" data-i="${i}" data-i18n-skip><span class="ln">${x.row + 1}</span><span class="tx">${marked(x) || " "}</span></button>`).join("");
+    // The tab names are the user's own (never translated); the counts are not.
+    const list = groups
+      .map((g, gi) => (everywhere ? `<div class="match-tab"><b data-i18n-skip>${esc(g.name)}</b><span class="muted">${g.res.matches.length}개 줄</span></div>` : "") + rows(g, gi))
+      .join("");
+    const others = !everywhere && this.otherTerminals().length > 0;
+    const m = modal({
+      title: everywhere ? "모든 터미널 탭에서 일치하는 줄" : "일치하는 줄",
+      icon: "ListFilter",
+      width: 860,
+      body: `<p class="muted small"><span>${total}개 줄</span>${everywhere ? ` · <span>${groups.length}개 탭</span>` : ""}${more ? ` · <span>처음 ${LIMIT}줄만 보여 줍니다</span>` : ""}</p>
+        <div class="match-list mono">${list}</div>`,
+      footer: `<button class="btn" data-close>닫기</button>${others ? `<button class="btn" data-everywhere>${icon("Search", 14)}모든 터미널 탭에서</button>` : ""}<button class="btn" data-copy>${icon("Copy", 14)}모두 복사</button>`,
+      onClose: () => groups.forEach((g) => g.res.dispose()),
+    });
+    m.root.querySelector(".match-list")!.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>("[data-i]");
+      if (!el) return;
+      const g = groups[Number(el.dataset.g)];
+      const x = g.res.matches[Number(el.dataset.i)];
+      // Where the row is now, before closing frees the anchors.
+      const mapped = g.res.line(x.row);
+      m.close();
+      if (g.view.disposed || !this.ws.tabs.some((t) => t.view === g.view)) return void toast("그 탭은 이미 닫혔습니다", "info");
+      // The listed line itself, near where it should be: a cleared screen,
+      // a reflow (new columns) or a reset moves lines in ways the anchor
+      // does not follow, and another line must not be shown for it.
+      const line = g.view.locateLine(mapped < 0 ? x.row : mapped, x.text);
+      if (line < 0) return void toast("그 줄은 스크롤 기록에서 이미 사라졌습니다", "info");
+      this.ws.focusView(g.view);
+      g.view.revealLine(line);
+    });
+    m.root.querySelector("[data-everywhere]")?.addEventListener("click", () => {
+      m.close();
+      this.matchList(query, opts, true);
+    });
+    m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
+      const lines = (g: (typeof groups)[number]) => g.res.matches.map((x) => x.text.trimEnd()).join("\n");
+      void writeClipboard(everywhere ? groups.map((g) => `[${g.name}]\n${lines(g)}`).join("\n\n") : lines(groups[0]));
+      toast(`${total}줄을 복사했습니다`, "success", 2000);
+    });
+  }
+
+  /** Case and regex as the user had them before findInTerminal set its own. */
+  private findRestore: { regex: boolean; matchCase: boolean } | null = null;
+
+  /** Open the find bar on `text` (a regular expression when `regex`), case ignored. */
+  private findInTerminal(text: string, regex: boolean) {
+    // The user's own case and regex choice comes back when the bar closes
+    // (unless they change it meanwhile).
+    if (!this.findRestore) {
+      const on = (f: string) => !!this.findBar.querySelector(`[data-find="${f}"]`)?.classList.contains("on");
+      this.findRestore = { regex: on("regex"), matchCase: on("case") };
+    }
+    setPressed(this.findBar.querySelector('[data-find="regex"]'), regex);
+    setPressed(this.findBar.querySelector('[data-find="case"]'), false);
+    this.term.clearSelection();
+    this.toggleFind(true);
+    const input = this.findBar.querySelector("input")!;
+    input.value = text;
+    input.dispatchEvent(new Event("input"));
+  }
+
+  /** What to do with an address clicked in the output. Nothing connects from
+   * here: a new session opens in the editor first. */
+  private addressMenu(ip: string, port: number | null, prefix: number | null, x: number, y: number) {
+    const address = port ? `${ip}:${port}` : ip;
+    // A port names the protocol when it is a well-known one ("10.0.0.5:3389");
+    // another (":443" in netstat output) is not taken for a terminal's port.
+    const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
+    const known = port ? byPort[port] : undefined;
+    const protocol: Protocol = known ?? (this.session.protocol === "telnet" ? "telnet" : "ssh");
+    contextMenu(x, y, [
+      { label: "이 주소로 새 세션 만들기…", icon: "Plus", hint: address, action: () => this.ws.newSessionHandler?.({ protocol, host: ip, ...(known ? { port } : {}) }) },
+      { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip)) },
+      // IPv4 only, as the trace is.
+      ...(ip.includes(":") ? [] : [{ label: "경로 추적", icon: "Waypoints", hint: ip, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "trace", null, true)) }]),
+      // With the prefix written next to it ("/24", a netmask) when there is one.
+      { label: "서브넷 계산", icon: "Network", hint: prefix !== null ? `${ip}/${prefix}` : undefined, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "subnet", prefix)) },
+      { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(address) },
+      // Which device's output holds it (an ARP table, a neighbor list on each).
+      ...(this.otherTerminals().length ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", hint: ip, action: () => this.matchList(addressPattern(ip), { regex: true, caseSensitive: false }, true) }] : []),
+    ]);
+  }
+
+  /** The command marks still in the scrollback, oldest first, and how to read
+   * them (copyCommandOutput, compareRuns).
+   *
+   * Every Enter is marked (markCommand), not only commands at the prompt: an
+   * answer ("[Y/n] y") or keys typed ahead while output still runs land
+   * inside a command's output. A command is a mark whose line starts with
+   * the prompt it was typed at, that prompt not being a question the
+   * previous command asked. */
+  private commandBook(): CommandBook {
+    const buf = this.term.buffer.active;
+    const marks = this.commandMarks.filter((m) => !m.isDisposed && m.line >= 0);
+    const text = (y: number) => {
+      let t = rowText(buf, y);
+      let s = t.text;
+      for (let r = y + 1; t.continues; r++) s += (t = rowText(buf, r)).text;
+      return s;
+    };
+    const atPrompt = (m: IMarker) => {
+      const p = this.markPrompts.get(m);
+      return !!p && !QUESTION.test(p) && text(m.line).startsWith(p);
+    };
+    return { buf, marks, text, atPrompt };
+  }
+
+  /** The command meant now: the one last jumped to (term.prevCommand /
+   * nextCommand) while the view is still there, else the latest one typed
+   * at a prompt. An index into `book.marks`, which must not be empty. */
+  private currentCommand(book: CommandBook): number {
+    const { buf, marks, atPrompt } = book;
+    const jumped = this.lastJump && this.lastJump.viewportY === buf.viewportY ? marks.findIndex((m) => m.line === this.lastJump!.line) : -1;
+    if (jumped >= 0) return jumped;
+    let i = marks.length - 1;
+    while (i > 0 && !atPrompt(marks[i]) && marks.slice(0, i).some(atPrompt)) i--;
+    return i;
+  }
+
+  /** term.copyOutput: the output of the command meant now (currentCommand).
+   * A command still running gives what it printed so far. */
+  private copyCommandOutput() {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return void toast("화면 전체를 쓰는 프로그램 안에서는 쓸 수 없습니다", "info");
+    const book = this.commandBook();
+    if (!book.marks.length) return void toast("복사할 명령이 없습니다. 프롬프트에서 입력한 명령이 기록된 다음 쓸 수 있습니다", "info", 5000);
+    const i = this.currentCommand(book);
+    const { lines, running } = this.outputOf(book, i);
+    this.flashLine(book.marks[i].line);
+    if (!lines.length) return void toast("그 명령은 출력이 없습니다", "info");
+    void writeClipboard(lines.map((l) => l.trimEnd()).join("\n"));
+    toast(running ? `명령 출력 ${lines.length}줄을 복사했습니다 (실행 중: 지금까지의 출력)` : `명령 출력 ${lines.length}줄을 복사했습니다`, "success", 3000);
+  }
+
+  /** term.compareRuns: the output of the command meant now (currentCommand)
+   * against the last time the same command was typed at the same prompt
+   * ("show interfaces status" before and after a change), line by line in
+   * the comparison window. Only runs the scrollback still holds are found. */
+  private compareRuns() {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return void toast("화면 전체를 쓰는 프로그램 안에서는 쓸 수 없습니다", "info");
+    const book = this.commandBook();
+    const i = book.marks.length ? this.currentCommand(book) : -1;
+    const mark = book.marks[i];
+    if (!mark || !book.atPrompt(mark)) return void toast("비교할 명령이 없습니다. 프롬프트에서 입력한 명령이 기록된 다음 쓸 수 있습니다", "info", 5000);
+    const prompt = steadyPrompt(this.markPrompts.get(mark)!);
+    // The command as typed after its own prompt, blanks evened out.
+    const command = (m: IMarker) =>
+      book
+        .text(m.line)
+        .slice((this.markPrompts.get(m) ?? "").length)
+        .trim()
+        .replace(/\s+/g, " ");
+    const now = command(mark);
+    let j = i - 1;
+    while (j >= 0 && !(steadyPrompt(this.markPrompts.get(book.marks[j]) ?? "") === prompt && book.atPrompt(book.marks[j]) && command(book.marks[j]) === now)) j--;
+    this.flashLine(mark.line);
+    if (j < 0) return void toast("이 명령을 같은 프롬프트에서 앞서 실행한 기록이 없습니다 (터미널에 남아 있는 출력에서만 찾습니다)", "info", 5000);
+    const latest = this.outputOf(book, i);
+    // Half an output would show as lines removed.
+    if (latest.running) return void toast("명령이 아직 실행 중입니다. 끝난 다음 비교하세요", "info", 4000);
+    const earlier = this.outputOf(book, j);
+    // Named by the command line as shown and when it ran (both the user's
+    // own text: shown as text, never translated).
+    const side = (m: IMarker, lines: string[]) => {
+      const came = this.lineTime(m.line);
+      return { title: `${book.text(m.line).trim()}${came === null ? "" : ` (${clockText(came)})`}`, text: lines.map((l) => l.trimEnd()).join("\n") };
+    };
+    void import("../diffView").then((d) => d.openDiff(side(book.marks[j], earlier.lines), side(mark, latest.lines)));
+  }
+
+  /** Command `i`'s output, from the line after it to the line where its
+   * prompt comes back: the next line that starts with the prompt it was
+   * typed at, or the next mark that does (other marks inside it are not
+   * ends). Lines wrapped over several rows are joined; blank lines at the
+   * end are left out. `running`: its prompt has not come back yet. */
+  private outputOf(book: CommandBook, i: number): { lines: string[]; running: boolean } {
+    const { buf, marks, text, atPrompt } = book;
+    const mark = marks[i];
+    const prompt = this.markPrompts.get(mark) ?? "";
+    // The command's own line may wrap over several rows.
+    let from = mark.line;
+    while (buf.getLine(from + 1)?.isWrapped) from++;
+    from++;
+    // The prompt the cursor waits at now (its first row).
+    const cursorRow = buf.baseY + buf.cursorY;
+    let promptRow = cursorRow;
+    while (promptRow > 0 && buf.getLine(promptRow)?.isWrapped) promptRow--;
+    const later = new Set(marks.slice(i + 1).filter(atPrompt).map((m) => m.line));
+    // A prompt as short as "$" or "#" also starts lines of output ("$HOME …"):
+    // only a longer one ("user@web:~$", "router#") is looked for in the text.
+    const findable = prompt.length >= 3;
+    let end = -1;
+    for (let y = from; y <= promptRow; y++) {
+      if (buf.getLine(y)?.isWrapped) continue;
+      if (later.has(y) || (findable && y < promptRow && text(y).startsWith(prompt))) {
+        end = y;
+        break;
+      }
+    }
+    // Back at a prompt (another host's after "exit" counts), also one with
+    // the next command being typed after it ("R1#sh"): the line the cursor
+    // waits at is no output. Otherwise the command still runs.
+    const typingAtPrompt = findable && promptRow > mark.line && text(promptRow).startsWith(prompt);
+    const idle = typingAtPrompt || PROMPT_END.test((buf.getLine(cursorRow)?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd());
+    const running = end < 0 && !idle;
+    let to = end >= 0 ? end - 1 : running ? cursorRow : promptRow - 1;
+    // A two-line prompt drawn with box lines ("┌──(user㉿host)-[~]" over
+    // "└─$"): its first line is no output either.
+    const first = mark.line > 0 ? text(mark.line - 1) : "";
+    if (!running && /^[└╰]/.test(prompt) && /^[┌╭]/.test(first) && to >= from && text(to) === first) to--;
+    const lines: string[] = [];
+    for (let y = from; y <= to; y++) {
+      if (buf.getLine(y)?.isWrapped && lines.length) {
+        lines[lines.length - 1] += rowText(buf, y).text;
+        continue;
+      }
+      lines.push(rowText(buf, y).text);
+    }
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    return { lines, running };
+  }
+
+  /** term.copyTable: the selected lines, whole (from the selection's first
+   * row to its last, wrapped rows joined), as a tab-separated table a
+   * spreadsheet pastes one value per cell; columns as tableCopy.ts reads them
+   * from the header, by screen cell so wide characters keep them aligned. */
+  private copyTable() {
+    const pos = this.term.hasSelection() ? this.term.getSelectionPosition() : undefined;
+    if (!pos) return void toast("표로 복사할 줄을 머리글 줄부터 먼저 선택하세요", "info", 4000);
+    const buf = this.term.buffer.active;
+    // Buffer rows, from 0 (xterm's docs say 1, its selection service gives 0).
+    // A selection ending at the very start of a row does not take that row.
+    let first = pos.start.y;
+    let last = pos.end.x === 0 && pos.end.y > first ? pos.end.y - 1 : pos.end.y;
+    while (first > 0 && buf.getLine(first)?.isWrapped) first--;
+    while (buf.getLine(last + 1)?.isWrapped) last++;
+    const nul = buf.getNullCell();
+    const lines: CellLine[] = [];
+    for (let y = first; y <= last; y++) {
+      const line = buf.getLine(y);
+      if (!line) continue;
+      const cells: CellLine = [];
+      for (let x = 0; x < line.length; x++) {
+        const c = line.getCell(x, nul);
+        if (!c) break;
+        // The right half of a wide character is "", so a position stays a column.
+        cells.push(c.getWidth() === 0 ? "" : c.getChars() || " ");
+      }
+      // The blank xterm leaves at a row's end where a wide character moved down.
+      const next = buf.getLine(y + 1);
+      if (next?.isWrapped && line.getCell(line.length - 1)?.getCode() === 0 && next.getCell(0)?.getWidth() === 2) cells.pop();
+      if (line.isWrapped && lines.length) lines[lines.length - 1].push(...cells);
+      else lines.push(cells);
+    }
+    const rows = splitTable(lines);
+    if (!rows) return void toast("머리글과 함께 두 줄 이상 선택하세요", "info", 4000);
+    const columns = Math.max(...rows.map((r) => r.length));
+    void writeClipboard(rows.map((r) => r.map(sheetCell).join("\t")).join("\n"));
+    toast(`표로 복사했습니다 (${rows.length}행 × ${columns}열). 엑셀에 붙여 넣으세요`, "success", 3500);
+  }
+
+  /** term.compare: the selection goes into the output comparison (the first
+   * one is kept; the second opens it). */
+  private compareSelection() {
+    const text = this.term.getSelection();
+    if (!text.trim()) return void toast("비교할 부분을 먼저 선택하세요", "info", 3000);
+    void import("../diffView").then((m) => m.takeForDiff({ title: this.ws.nameOf(this), text }));
   }
 
   /** Toggle "notify when the task finishes" for this tab. */
@@ -1919,7 +3967,7 @@ export class TerminalView implements View {
     this.stopMonitor();
     clearTimeout(this.loginTimer);
     this.setState("closed");
-    this.term.write(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
+    this.writeNote(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
     // A serial line ends with an error only when the port went away.
     if (code && this.waitForPort("연결이 끊어졌습니다.")) return;
     if (this.session.protocol === "ssh" && code) {
@@ -1941,7 +3989,7 @@ export class TerminalView implements View {
     if (this.session.protocol === "telnet" && code) {
       const lines = plainLines(new TextDecoder().decode(this.endBytes));
       if (loginFailure(lines)) return this.showLoginFailure("auth");
-      if (!loginThrough(lines)) {
+      if (!this.loggedIn || !loginThrough(lines)) {
         return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
       }
     }
@@ -2018,9 +4066,18 @@ export class TerminalView implements View {
     if (!raw) return;
     this.startupSent = true;
     const text = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join("\r") + "\r";
-    // A short wait lets the login banner and first prompt settle first.
+    // A short wait lets the login banner and first prompt settle first. Only
+    // into the logged-in connection it was meant for: one made meanwhile (a
+    // quick drop and reconnect) may be at a login prompt.
+    const rid = this.runtimeId;
     window.setTimeout(() => {
-      if (!this.disposed && this.state === "connected") this.pasteText(text);
+      if (this.disposed || this.state !== "connected" || this.runtimeId !== rid || !this.loggedIn || this.inputKind() !== "shell") {
+        // Not sent: the next login sends them instead.
+        this.startupSent = false;
+        return;
+      }
+      this.interruptRepeat();
+      this.pasteText(text);
     }, 600);
   }
 
@@ -2061,8 +4118,7 @@ export class TerminalView implements View {
   }
 
   private setState(s: ViewState) {
-    // A serial line is ready once connected (SSH and Telnet: watchLogin).
-    if (s === "connected" && this.state !== "connected" && this.session.protocol === "serial") queueMicrotask(() => this.loginComplete());
+    if (s !== "connected" && this.repeat) this.stopRepeat("연결이 끊어져 반복 실행을 멈췄습니다", "warn");
     this.state = s;
     const label: Record<ViewState, string> = {
       connecting: "연결 중",
@@ -2114,7 +4170,7 @@ export class TerminalView implements View {
         case "save":
           return this.saveOutput();
         case "clear":
-          return this.term.clear();
+          return this.clearScreen();
         case "zoomin":
         case "zoomout":
           return this.zoom(act === "zoomin" ? 1 : -1);
@@ -2146,7 +4202,7 @@ export class TerminalView implements View {
         case "ai":
           return this.aiMenu();
         case "snippet":
-          return snippetMenu(this.el.querySelector('[data-act="snippet"]')!, (s) => this.sendSnippet(s), this.device?.kind ?? this.osGuess);
+          return snippetMenu(this.el.querySelector('[data-act="snippet"]')!, (s) => this.sendSnippet(s), this.device?.kind ?? this.osGuess, [this.repeatMenuItem(), this.timerMenuItem()]);
         case "record":
           return this.toggleRecording();
         case "notify":
@@ -2162,11 +4218,33 @@ export class TerminalView implements View {
     const caseBtn = this.findBar.querySelector<HTMLElement>('[data-find="case"]')!;
     const regexBtn = this.findBar.querySelector<HTMLElement>('[data-find="regex"]')!;
     const find = (dir: "next" | "prev") => {
-      const opts = { caseSensitive: caseBtn.classList.contains("on"), regex: regexBtn.classList.contains("on"), decorations: { matchOverviewRuler: "#f5c518", activeMatchColorOverviewRuler: "#f5c518", activeMatchBackground: "#f5c51866", matchBackground: "#f5c51833" } };
+      const regex = regexBtn.classList.contains("on");
+      // The search addon builds the RegExp unguarded: a pattern still being
+      // typed ("(ab") would throw on every key and leave the old count shown.
+      let bad = false;
+      if (regex && input.value) {
+        try {
+          new RegExp(input.value, "g");
+        } catch {
+          bad = true;
+        }
+      }
+      input.classList.toggle("invalid", bad);
+      input.setAttribute("aria-invalid", String(bad));
+      if (bad) {
+        this.search.clearDecorations();
+        count.textContent = tr("잘못된 정규식");
+        return;
+      }
+      const opts = { caseSensitive: caseBtn.classList.contains("on"), regex, decorations: { matchOverviewRuler: "#f5c518", activeMatchColorOverviewRuler: "#f5c518", activeMatchBackground: "#f5c51866", matchBackground: "#f5c51833" } };
       if (dir === "next") this.search.findNext(input.value, opts);
       else this.search.findPrevious(input.value, opts);
     };
     input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && e.altKey) {
+        e.preventDefault();
+        return this.showMatchingLines();
+      }
       if (e.key === "Enter") find(e.shiftKey ? "prev" : "next");
       if (e.key === "Escape") this.toggleFind(false);
     });
@@ -2174,9 +4252,11 @@ export class TerminalView implements View {
     this.findBar.addEventListener("click", (e) => {
       const f = (e.target as HTMLElement).closest<HTMLElement>("[data-find]")?.dataset.find;
       if (f === "close") this.toggleFind(false);
+      else if (f === "list") this.showMatchingLines();
       else if (f === "case" || f === "regex") {
         const btn = f === "case" ? caseBtn : regexBtn;
         setPressed(btn, !btn.classList.contains("on"));
+        this.findRestore = null; // the user's own choice now
         find("next"); // re-run with the new case/regex setting
       } else if (f === "next" || f === "prev") find(f);
     });
@@ -2195,6 +4275,11 @@ export class TerminalView implements View {
     } else {
       this.search.clearDecorations();
       this.findBar.querySelector<HTMLElement>(".find-count")!.textContent = "";
+      if (this.findRestore) {
+        setPressed(this.findBar.querySelector('[data-find="regex"]'), this.findRestore.regex);
+        setPressed(this.findBar.querySelector('[data-find="case"]'), this.findRestore.matchCase);
+        this.findRestore = null;
+      }
       this.term.focus();
     }
     this.layout();
@@ -2261,13 +4346,45 @@ export class TerminalView implements View {
   }
 
   private async paste() {
+    // Taken before the clipboard is read: see sendScope.
+    const scope = this.inputScope();
     const text = await readClipboard();
-    if (text) this.pasteFromUser(text);
+    if (text) this.pasteFromUser(text, undefined, scope);
+  }
+
+  /** Several lines at a line before any login (or a console's welcome): the
+   * device may ask for a login, and each line would then go in as a user
+   * name or a password, a failed login each. Sent only when the user says so. */
+  /** `paced`: the lines go as a paced paste, which stops at a login question (a snippet's do not). */
+  private async confirmBeforeLogin(lines: number, paced = false): Promise<boolean> {
+    const ok = await confirmDialog({
+      title: "로그인 전입니다",
+      icon: "TriangleAlert",
+      danger: true,
+      message: `<p><b>${esc(`${lines}줄을 보냅니다: ${userText(this.ws.nameOf(this))}`)}</b></p>
+        <p>이 탭은 아직 로그인 전이거나 로그인을 기다리는 콘솔입니다. 장비가 로그인을 물으면 각 줄이 사용자 이름이나 비밀번호로 들어가 로그인 실패가 됩니다.</p>
+        ${paced ? `<p class="muted small">장비 콘솔에서 한 줄씩 보낼 때는 로그인을 묻는 줄이 나타나면 거기서 멈춥니다.</p>` : ""}`,
+      confirm: "그래도 보내기",
+      cancel: "취소",
+      focusCancel: true,
+    });
+    if (this.disposed) return false;
+    this.term.focus();
+    return ok;
   }
 
   /** `file`: the name of the file being sent (the confirmation names it). */
-  private async pasteFromUser(text: string, file?: string) {
-    const lines = text.replace(/\r?\n$/, "").split(/\r?\n|\r/);
+  private async pasteFromUser(text: string, file?: string, scope = this.inputScope()) {
+    if (this.state !== "connected") return void toast("연결된 다음에 붙여넣을 수 있습니다", "warn");
+    // The kind of line it is pasted at (see inputKind), for the broadcast tabs.
+    const kind = scope.kind;
+    this.interruptRepeat();
+    const lines = text.replace(/(?:\r\n|\r|\n)$/, "").split(/\r?\n|\r/);
+    // Several lines into a login, password or host-key question: each would be an attempt.
+    if (lines.length > 1 && (kind === "user" || kind === "secret" || kind === "hostkey")) return void toast(MANY_LINES_AT_LOGIN, "warn", 6000);
+    // Before a login, or at a console's welcome: only when the user says so.
+    const beforeLogin = lines.length > 1 && kind === "prelogin";
+    if (beforeLogin && !(await this.confirmBeforeLogin(lines.length, this.paced))) return;
     // A pasted line break is an Enter: those lines run at once, so they go
     // through riskGate like a snippet (one line with a trailing line break
     // too). The text after the last break waits on the line for the user's
@@ -2275,22 +4392,24 @@ export class TerminalView implements View {
     // configuration file do not make it an unreadable macro.
     // A full-screen program (vi, less) owns the screen: nothing runs there.
     const breakAt = this.term.buffer.active.type === "normal" ? text.search(/[\r\n][^\r\n]*$/) : -1;
-    const runs = breakAt < 0 ? "" : text.slice(0, breakAt + 1);
+    // A password pasted at its question is no command: never checked, shown or recorded.
+    const runs = breakAt < 0 || kind === "secret" ? "" : text.slice(0, breakAt + 1);
     const hits = runs ? findRisks(runs).filter((h) => h.rule !== UNREADABLE_MACRO) : [];
     // The first line joins what is already on the command line.
     const first = runs ? this.enterRisk(runs.slice(0, runs.search(/[\r\n]/))) : null;
     if (first && !hits.some((h) => h.rule === first.rule)) hits.unshift(first);
     if (hits.length) {
-      const others = await this.riskGate(hits, file ? `텍스트 파일: <b data-i18n-skip>${esc(file)}</b>` : "붙여넣기", "(paste)");
+      const others = await this.riskGate(hits, file ? `텍스트 파일: <b data-i18n-skip>${esc(file)}</b>` : "붙여넣기", "(paste)", scope);
       if (this.disposed) return; // the tab may have been closed while the dialog was up
       this.term.focus();
       if (!others) return;
       this.pasteText(text);
-      deliverConfirmed(others, { paste: text }, hits);
+      this.continueLine(scope, deliverConfirmed(others, { paste: text, kind: kind ?? undefined }, hits, "(paste)"), text);
       this.recording?.push(text.replace(/\r?\n/g, "\r"));
       return;
     }
-    if (lines.length > 1 && state.settings.confirmMultiPaste) {
+    // (Asked already when before a login.)
+    if (lines.length > 1 && state.settings.confirmMultiPaste && !beforeLogin) {
       const preview = lines.slice(0, 6).map((l) => esc(l.length > 120 ? `${l.slice(0, 120)}…` : l)).join("\n");
       const how = this.paced
         ? state.settings.pasteMode === "fixed"
@@ -2302,7 +4421,7 @@ export class TerminalView implements View {
       const ok = await confirmDialog({
         title: file ? "텍스트 파일 보내기" : "여러 줄 붙여넣기",
         icon: "ClipboardPaste",
-        message: `<p><b>${esc(`${lines.length}줄을 보냅니다: ${userText(this.title())}`)}</b></p>
+        message: `<p><b>${esc(`${lines.length}줄을 보냅니다: ${userText(this.ws.nameOf(this))}`)}</b></p>
           ${file ? `<p class="muted small">${esc(`파일: ${userText(file)}`)}</p>` : ""}
           <pre class="paste-preview" data-i18n-skip>${preview}${lines.length > 6 ? "\n…" : ""}</pre>
           ${how ? `<p class="muted small">${how}</p>` : ""}`,
@@ -2313,8 +4432,17 @@ export class TerminalView implements View {
       this.term.focus();
       if (!ok) return;
     }
+    // Only to the connections it was meant for (a reconnect meanwhile may
+    // sit at a login prompt, where each line would be a failed login).
+    const peers = this.stillSame(scope);
+    if (!peers) return void toast("연결이 바뀌어 보내지 않았습니다", "warn");
+    // A file picked or a dialog answered meanwhile: still the same kind of line.
+    if (!this.lineStill(scope)) return void toast(LINE_CHANGED, "warn", 6000);
+    this.noteLeftOut(scope, peers);
     this.pasteText(text);
-    this.ws.mirrorInput(this, { paste: text });
+    const live = new Set(this.ws.mirrorTargets(this, false));
+    const took = kind !== "prelogin" ? broadcastTo(peers.filter((t) => live.has(t)), { paste: text, kind: kind ?? undefined }) : [];
+    this.continueLine(scope, took, text);
     this.recording?.push(text.replace(/\r?\n/g, "\r"));
   }
 
@@ -2396,10 +4524,11 @@ export class TerminalView implements View {
           this.delSentAt = buf.type === "normal" ? Date.now() : 0;
           this.delSentRow = buf.baseY + buf.cursorY;
         }
+        this.interruptRepeat();
         this.sendInput(bytes);
         // The line a Backspace edits; other editing keys move within it.
         this.keyLine = e.key === "Backspace" ? keyLine(this.keyLine, "\b") : null;
-        this.ws.mirrorInput(this, { editKey: e.key as EditKey });
+        this.mirrorTyped({ editKey: e.key as EditKey }, false);
         // Recorded as the key, not these bytes: replayed in another tab it
         // becomes that tab's bytes.
         this.recording?.push(String.fromCharCode(0xe100 + MARKED_KEYS.indexOf(e.key as EditKey)));
@@ -2432,6 +4561,40 @@ export class TerminalView implements View {
         return false;
       case "term.find":
         this.toggleFind(true);
+        return false;
+      case "term.compare":
+        e.preventDefault();
+        this.compareSelection();
+        return false;
+      case "term.repeat":
+        e.preventDefault();
+        void this.toggleRepeat();
+        return false;
+      case "term.timer":
+        e.preventDefault();
+        void this.toggleTimer();
+        return false;
+      case "term.copyTable":
+        e.preventDefault();
+        this.copyTable();
+        return false;
+      case "term.copyOutput":
+        // In vi, less … the key is the program's (no command marks there).
+        if (this.term.buffer.active.type !== "normal") break;
+        e.preventDefault();
+        this.copyCommandOutput();
+        return false;
+      case "term.compareRuns":
+        if (this.term.buffer.active.type !== "normal") break;
+        e.preventDefault();
+        this.compareRuns();
+        return false;
+      case "term.prevCommand":
+      case "term.nextCommand":
+        // In vi, tmux, mc … the key is the program's (no command marks there).
+        if (this.term.buffer.active.type !== "normal") break;
+        e.preventDefault();
+        this.jumpCommand(act === "term.prevCommand" ? -1 : 1);
         return false;
       case "term.selectAll":
         this.term.selectAll();
@@ -2477,6 +4640,8 @@ export class TerminalView implements View {
   dispose() {
     this.disposed = true;
     this.closing = true;
+    this.notes.dispose();
+    this.stopTimer();
     this.stopAutoReconnect();
     clearTimeout(this.notifyTimer);
     clearTimeout(this.loginTimer);
@@ -2488,6 +4653,7 @@ export class TerminalView implements View {
     clearTimeout(this.ackTimer);
     cancelAnimationFrame(this.layoutFrame);
     this.stopMonitor();
+    this.stopRepeat();
     allViews.delete(this);
     if (this.runtimeId) {
       api.termClose(this.runtimeId).catch(() => {});

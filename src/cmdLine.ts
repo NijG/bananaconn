@@ -5,6 +5,7 @@
 import { COMMAND_DICTIONARY } from "./cmdDictionary";
 import { findTypedRisk } from "./riskRules";
 import { groupForKind } from "./snippetLibrary";
+import { snippetVars } from "./snippetVars";
 import { state } from "./store";
 
 /** A prompt that ends where a command starts: shells ($ # % >) and network
@@ -280,7 +281,8 @@ function scan(host: string, typed: string, group: string | undefined): Candidate
     for (let i = list.length - 1; i >= 0; i--) add(list[i], "history");
   }
   // A recognised device: the user's own snippets and its library group only, that group first.
-  const snippets = state.snippets.filter((s) => !s.macro && !/[\r\n]/.test(s.text) && (!group || !s.group || s.group === group));
+  // One that asks for values ({{?name}}) is sent from the snippet menu, not typed in.
+  const snippets = state.snippets.filter((s) => !s.macro && !/[\r\n]/.test(s.text) && !snippetVars(s.text).length && (!group || !s.group || s.group === group));
   for (const s of snippets) if (s.group && s.group === group) add(s.text.trim(), "snippet");
   for (const s of snippets) if (!s.group) add(s.text.trim(), "snippet");
   for (const s of snippets) if (s.group && s.group !== group) add(s.text.trim(), "snippet");

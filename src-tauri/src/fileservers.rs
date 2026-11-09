@@ -101,11 +101,11 @@ pub(crate) fn resolve_in_root(root: &Path, request: &str, must_exist: bool) -> O
     check.starts_with(root).then_some(check)
 }
 
-fn bind_addr(lan: bool, port: u16) -> String {
+pub(crate) fn bind_addr(lan: bool, port: u16) -> String {
     if lan { format!("0.0.0.0:{port}") } else { format!("127.0.0.1:{port}") }
 }
 
-fn addresses(scheme: &str, port: u16, lan: bool) -> Vec<String> {
+pub(crate) fn addresses(scheme: &str, port: u16, lan: bool) -> Vec<String> {
     let mut out = Vec::new();
     if lan
         && let Some(ip) = StdUdpSocket::bind("0.0.0.0:0")

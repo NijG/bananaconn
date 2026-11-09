@@ -44,7 +44,7 @@ export function sshSessionFor(desktop: Session): { session: Session; existing: b
   return { session: s, existing: false };
 }
 
-const codeBox = (act: string, text = "") => `<div class="ssh-setup-script"><pre data-code="${act}">${esc(text)}</pre>
+const codeBox = (act: string, text = "") => `<div class="ssh-setup-script"><pre data-code="${act}" data-i18n-skip>${esc(text)}</pre>
   <button class="btn" data-act="${act}">${icon("Copy", 14)}<span>복사</span></button></div>`;
 
 /** The dialog: one line to run on the remote PC, its progress, then the SSH session. */

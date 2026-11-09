@@ -19,13 +19,49 @@ interface Item {
 }
 
 /** Open the palette. Only one at a time. */
-export function openCommandPalette(opts: { runAction: (id: string) => void; openSession: (s: Session) => void }): void {
+export function openCommandPalette(opts: {
+  runAction: (id: string) => void;
+  openSession: (s: Session) => void;
+  /** Open tabs to switch to (the shown one left out), in tab-bar order. */
+  tabs?: { id: string; title: string; endpoint: string; session: Session }[];
+  showTab?: (id: string) => void;
+  /** Sessions of recently closed tabs, newest first, to open again. */
+  closed?: Session[];
+  reopen?: (s: Session) => void;
+}): void {
   if (document.querySelector(".cmdk-backdrop")) return;
 
   // Sessions first (most recently used), then the app-wide commands. Per-tab
   // "go to tab N" entries are left out — they would only clutter the list.
   const items: Item[] = [];
-  for (const s of [...state.sessions].sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0))) {
+  // Tabs already open first: picking one switches to it instead of opening the
+  // same device a second time.
+  for (const t of opts.tabs ?? []) {
+    const info = PROTOCOLS[t.session.protocol];
+    items.push({
+      label: t.title,
+      sub: `${tr("열린 탭")} · ${info.label} · ${t.endpoint}`,
+      icon: "AppWindow",
+      keys: [],
+      // "탭" / "tab" (the word in the screen language) lists the open tabs.
+      hay: `${t.title} ${t.endpoint} ${sessionSearchText(t.session)} 열린 탭 ${tr("열린 탭")}`.toLowerCase(),
+      run: () => opts.showTab?.(t.id),
+    });
+  }
+  for (const s of opts.closed ?? []) {
+    const info = PROTOCOLS[s.protocol];
+    const ep = endpoint(s);
+    items.push({
+      label: s.name || s.host,
+      sub: `${tr("닫은 탭")} · ${info.label} · ${ep}`,
+      icon: "RotateCcw",
+      keys: [],
+      hay: `${sessionSearchText(s)} 닫은 탭 ${tr("닫은 탭")}`.toLowerCase(),
+      run: () => opts.reopen?.(s),
+    });
+  }
+  // Pinned sessions (the home screen's) come first, then by last use.
+  for (const s of [...state.sessions].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || (b.lastUsed ?? 0) - (a.lastUsed ?? 0))) {
     const info = PROTOCOLS[s.protocol];
     const ep = endpoint(s);
     // Session names are the user's own data — never run them through translation.

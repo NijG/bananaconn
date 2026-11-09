@@ -5,15 +5,20 @@ import { api, on, openWithDefaultApp, type FileEntry, type TransferProgress } fr
 import { proxyOf } from "../proxy";
 import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
-import { actionFor } from "../keymap";
-import { endpoint, PROTOCOLS, type Session } from "../model";
+import { actionFor, keyHint, withKey } from "../keymap";
+import { defaultPort, endpoint, PROTOCOLS, type Session } from "../model";
 import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
 import { forgetHostKey } from "../hostKeys";
-import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed } from "../ui";
+import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed, type MenuItem } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
 import { userText } from "../i18n";
+import { hasPendingDiff, openDiff, pendingTitle, takeForDiff, type DiffSide } from "../diffView";
+
+/** The file last taken for a comparison (Pane.fileKey), to tell it from another of the same name. */
+let takenKey: string | null = null;
+import { notesButton } from "../sessionNotes";
 
 type Side = "local" | "remote";
 type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean; trustedCert?: string };
@@ -44,6 +49,56 @@ function isSafeLocalName(name: string): boolean {
   // Every Windows device name the backend (local_component) rejects: COM0/LPT0
   // and the superscripts ¹²³, and the console streams CONIN$/CONOUT$.
   return !/^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])$/.test(stem);
+}
+
+/** The mode an "-rwsr-xr-x" listing string stands for (setuid, setgid and
+ * sticky included), or null when there is none. */
+function modeOf(perm: string | null): number | null {
+  if (!perm || !/^[-dl][-r][-w][-xsS][-r][-w][-xsS][-r][-w][-xtT]$/.test(perm)) return null;
+  let mode = 0;
+  [0o4000, 0o2000, 0o1000].forEach((special, i) => {
+    const [r, w, x] = perm.slice(1 + 3 * i, 4 + 3 * i);
+    const shift = 6 - 3 * i;
+    if (r === "r") mode |= 4 << shift;
+    if (w === "w") mode |= 2 << shift;
+    if ("xst".includes(x)) mode |= 1 << shift;
+    if ("sStT".includes(x)) mode |= special;
+  });
+  return mode;
+}
+
+/** Bookmarked remote folders, per server ("sftp://user@host:port", FTP and
+ * FTPS as "ftp://…"): a saved session, a quick connection and the SFTP pane
+ * of an SSH tab to the same server share them. Kept on this PC. */
+const BOOKMARKS = "bx.folderBookmarks";
+const MAX_BOOKMARKS = 30;
+
+function bookmarkMap(): Record<string, string[]> {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(BOOKMARKS) ?? "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    // Only lists of paths survive a damaged or hand-edited entry.
+    return Object.fromEntries(
+      Object.entries(raw as Record<string, unknown>).map(([k, v]) => [k, Array.isArray(v) ? v.filter((p): p is string => typeof p === "string") : []]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function folderBookmarks(server: string): string[] {
+  return bookmarkMap()[server] ?? [];
+}
+
+function saveFolderBookmarks(server: string, paths: string[]) {
+  const all = bookmarkMap();
+  if (paths.length) all[server] = paths.slice(0, MAX_BOOKMARKS);
+  else delete all[server];
+  try {
+    localStorage.setItem(BOOKMARKS, JSON.stringify(all));
+  } catch {
+    toast("즐겨찾기를 저장하지 못했습니다", "error");
+  }
 }
 
 /** A remote file opened in a local app, watched for saves. */
@@ -87,6 +142,8 @@ class Pane {
   entries: FileEntry[] = [];
   selected = new Set<string>();
   private anchor: string | null = null;
+  /** The row the arrow keys move from (the last one clicked or moved to). */
+  private cursor: string | null = null;
   private sortKey: SortKey = "name";
   private sortDir = 1;
   private listEl: HTMLElement;
@@ -115,9 +172,11 @@ class Pane {
       `<header class="pane-head">
          <span class="pane-title">${icon(remote ? "Server" : "HardDrive", 15)}${remote ? "원격 서버" : "내 PC"}</span>
          <div class="pane-tools">
-           <button class="tool" data-p="up" title="상위 폴더 (Backspace)">${icon("ArrowUp", 15)}</button>
+           <button class="tool" data-p="back" title="${esc(withKey("이전 폴더로", "files.back"))}" disabled>${icon("ArrowLeft", 15)}</button>
+           <button class="tool" data-p="forward" title="${esc(withKey("다음 폴더로", "files.forward"))}" disabled>${icon("ArrowRight", 15)}</button>
+           <button class="tool" data-p="up" title="${esc(withKey("상위 폴더", "files.parent"))}">${icon("ArrowUp", 15)}</button>
            <button class="tool" data-p="home" title="홈 폴더">${icon("House", 15)}</button>
-           <button class="tool" data-p="refresh" title="새로 고침 (F5)">${icon("RefreshCw", 15)}</button>
+           <button class="tool" data-p="refresh" title="${esc(withKey("새로 고침", "files.refresh"))}">${icon("RefreshCw", 15)}</button>
            <button class="tool" data-p="mkdir" title="새 폴더">${icon("FolderPlus", 15)}</button>
            <button class="btn btn-sm btn-accent" data-p="send" title="${remote ? "선택한 항목을 내 PC로 내려받기" : "선택한 항목을 서버로 올리기"}">
              ${remote ? `${icon("Download", 14)}<span class="btn-label">다운로드</span>` : `<span class="btn-label">업로드</span>${icon("Upload", 14)}`}
@@ -128,6 +187,7 @@ class Pane {
          <input class="path-input" spellcheck="false" />
          <label class="pane-filter" title="이름으로 거르기">${icon("Search", 13)}<input placeholder="필터" spellcheck="false" /></label>
          <button class="tool" data-p="hidden" title="숨김 파일(.으로 시작) 표시">${icon("Eye", 15)}</button>
+         ${remote ? `<button class="tool" data-p="bookmarks" title="즐겨찾는 폴더">${icon("Star", 15)}</button>` : ""}
        </div>
        <div class="file-head" style="--cols:${remote ? "var(--cols-remote)" : "var(--cols-local)"}">
          <button data-sort="name">이름</button><button data-sort="size">크기</button>
@@ -176,14 +236,37 @@ class Pane {
     return parent || "/";
   }
 
-  async load(path: string) {
+  /** The step the newest load request takes (with `requested`). */
+  private requestedNav: "back" | "forward" | undefined;
+  /** Folders gone through (as a browser's back and forward), newest last. */
+  private back: string[] = [];
+  private forward: string[] = [];
+  /** A listing has been shown (the first load is not a step to go back to). */
+  private visited = false;
+
+  /** Back or forward one folder (Alt+Left/Right, the mouse's side buttons). */
+  private goBack() {
+    const to = this.back[this.back.length - 1];
+    if (to !== undefined) void this.load(to, "back");
+  }
+  private goForward() {
+    const to = this.forward[this.forward.length - 1];
+    if (to !== undefined) void this.load(to, "forward");
+  }
+
+  /** `nav`: a step back or forward through the history (others start a new branch). */
+  async load(path: string, nav?: "back" | "forward") {
     // "C:" alone means the current folder of drive C to Windows, while joins
     // would put files in C: — always use the drive's root.
-    if (this.side === "local") path = path.replace(/^([A-Za-z]:)$/, "$1\\");
+    // One spelling per folder (bookmarks, history and "same folder" compare
+    // strings): no trailing separator, except a drive's root or "/".
+    if (this.side === "local") path = path.replace(/\\+$/, "").replace(/^([A-Za-z]:)$/, "$1\\");
+    else path = path.replace(/\/+$/, "") || "/";
     // The latest request wins: a refresh after an upload or a reconnect must
     // not be dropped because an older listing is still in flight.
     const seq = ++this.loadSeq;
     this.requested = path;
+    this.requestedNav = nav;
     this.pendingLoads++;
     this.el.classList.add("busy");
     try {
@@ -191,20 +274,39 @@ class Pane {
         this.side === "local" ? await api.localList(path) : await api.remoteList(this.owner.remoteId, path);
       if (seq !== this.loadSeq) return;
       this.entries = list;
-      if (path !== this.path) {
+      // Windows names ignore case: "c:\\users" is the folder shown as "C:\\Users".
+      const same = this.side === "local" ? path.toLowerCase() === this.path.toLowerCase() : path === this.path;
+      if (!same) {
         this.filter = "";
         this.filterInput.value = "";
       }
       // A refresh of the same folder (after a transfer) keeps the selection.
-      if (path !== this.path) {
+      if (!same) {
         this.selected.clear();
         this.anchor = null;
+        this.cursor = null;
         // A new folder starts at its top, not at the old folder's scroll position.
         this.listEl.scrollTop = 0;
       } else {
         const names = new Set(list.map((e) => e.path));
         for (const p of this.selected) if (!names.has(p)) this.selected.delete(p);
       }
+      // History changes only once the folder is shown: a refused or failed
+      // step leaves it as it was.
+      if (this.visited && !same) {
+        if (nav === "back") {
+          this.back.pop();
+          this.forward.push(this.path);
+        } else if (nav === "forward") {
+          this.forward.pop();
+          this.back.push(this.path);
+        } else {
+          this.back.push(this.path);
+          this.forward = [];
+        }
+        if (this.back.length > 50) this.back.shift();
+      }
+      this.visited = true;
       this.path = path;
       this.render();
     } catch (err) {
@@ -224,7 +326,8 @@ class Pane {
 
   /** Reload the folder being shown, or the one being opened right now. */
   refresh() {
-    return this.load(this.requested ?? this.path);
+    // A refresh while a back or forward step is loading stays that step.
+    return this.requested !== null ? this.load(this.requested, this.requestedNav) : this.load(this.path);
   }
 
   /** Entries after the hidden-file and name filters. */
@@ -232,6 +335,35 @@ class Pane {
     // "log 2025" finds "app-2025-10.log", as the session searches match.
     const terms = searchTerms(this.filter);
     return this.entries.filter((e) => (Pane.showHidden || !e.name.startsWith(".")) && matchesTerms(e.name.toLowerCase(), terms));
+  }
+
+  /** The star in the remote path bar: bookmark the folder shown (or take it
+   * off), and go to any bookmarked folder. */
+  private bookmarkMenu() {
+    const btn = this.el.querySelector<HTMLElement>('[data-p="bookmarks"]')!;
+    const r = btn.getBoundingClientRect();
+    const server = this.owner.bookmarkKey;
+    const list = folderBookmarks(server);
+    const here = this.path;
+    const save = (paths: string[]) => {
+      saveFolderBookmarks(server, paths);
+      setPressed(btn, !!here && paths.includes(here));
+    };
+    contextMenu(r.left, r.bottom + 4, [
+      list.includes(here)
+        ? { label: "이 폴더를 즐겨찾기에서 빼기", icon: "X", action: () => save(list.filter((p) => p !== here)) }
+        : {
+            label: "이 폴더를 즐겨찾기에 추가",
+            icon: "Star",
+            disabled: !here || list.length >= MAX_BOOKMARKS,
+            hint: list.length >= MAX_BOOKMARKS ? `${MAX_BOOKMARKS}개까지` : undefined,
+            action: () => save([...list, here]),
+          },
+      "-",
+      ...(list.length
+        ? list.map((p) => ({ label: p, icon: "Folder", userLabel: true, action: () => void this.load(p) }))
+        : [{ label: "즐겨찾는 폴더가 없습니다", disabled: true }]),
+    ]);
   }
 
   syncHiddenButton() {
@@ -261,6 +393,9 @@ class Pane {
     for (const p of [...this.selected]) if (!shown.has(p)) this.selected.delete(p);
     if (this.anchor && !shown.has(this.anchor)) this.anchor = null;
     this.pathInput.value = this.path || (this.side === "local" ? "내 PC (드라이브)" : "/");
+    this.el.querySelector<HTMLButtonElement>('[data-p="back"]')!.disabled = !this.back.length;
+    this.el.querySelector<HTMLButtonElement>('[data-p="forward"]')!.disabled = !this.forward.length;
+    if (this.side === "remote") setPressed(this.el.querySelector('[data-p="bookmarks"]'), !!this.path && folderBookmarks(this.owner.bookmarkKey).includes(this.path));
     this.el.querySelectorAll<HTMLElement>("[data-sort]").forEach((b) => {
       b.classList.toggle("sorted", b.dataset.sort === this.sortKey);
       b.dataset.dir = this.sortDir > 0 ? "asc" : "desc";
@@ -348,9 +483,38 @@ class Pane {
       this.selected = new Set([path]);
       this.anchor = path;
     }
+    this.cursor = path;
     this.listEl.querySelectorAll<HTMLElement>(".file-row").forEach((r) =>
       r.classList.toggle("selected", this.selected.has(r.dataset.path!)),
     );
+    this.renderFoot();
+  }
+
+  /** Arrow keys, Home and End: move the selection over the rows as shown
+   * (Shift: extend it from the anchor), keeping the row in view. */
+  private moveCursor(key: string, extend: boolean) {
+    const n = this.rows.length;
+    if (!n) return;
+    const at = this.cursor ? this.rows.findIndex((r) => r.path === this.cursor) : -1;
+    const i =
+      key === "Home" ? 0 : key === "End" ? n - 1 : at < 0 ? (key === "ArrowUp" ? n - 1 : 0) : Math.max(0, Math.min(n - 1, at + (key === "ArrowDown" ? 1 : -1)));
+    const path = this.rows[i].path;
+    if (extend && this.anchor) {
+      const a = this.rows.findIndex((r) => r.path === this.anchor);
+      const [x, y] = a < 0 ? [i, i] : [Math.min(a, i), Math.max(a, i)];
+      this.selected = new Set(this.rows.slice(x, y + 1).map((r) => r.path));
+    } else {
+      this.selected = new Set([path]);
+      this.anchor = path;
+    }
+    this.cursor = path;
+    // Rows are ROW_H high whether all are drawn or only those in view, below
+    // the list's own top padding.
+    const top = i * ROW_H + (parseFloat(getComputedStyle(this.listEl).paddingTop) || 0);
+    if (top < this.listEl.scrollTop) this.listEl.scrollTop = top;
+    else if (top + ROW_H > this.listEl.scrollTop + this.listEl.clientHeight) this.listEl.scrollTop = top + ROW_H - this.listEl.clientHeight;
+    if (n > VIRTUAL_MIN) this.drawWindow();
+    this.listEl.querySelectorAll<HTMLElement>(".file-row").forEach((r) => r.classList.toggle("selected", this.selected.has(r.dataset.path!)));
     this.renderFoot();
   }
 
@@ -369,6 +533,8 @@ class Pane {
   private wire() {
     this.el.querySelector(".pane-tools")!.addEventListener("click", (e) => {
       const act = (e.target as HTMLElement).closest<HTMLElement>("[data-p]")?.dataset.p;
+      if (act === "back") this.goBack();
+      if (act === "forward") this.goForward();
       if (act === "up") this.load(this.parent(this.path));
       if (act === "home") this.owner.goHome(this.side);
       if (act === "refresh") this.refresh();
@@ -396,6 +562,7 @@ class Pane {
         this.render();
       }
     });
+    this.el.querySelector('[data-p="bookmarks"]')?.addEventListener("click", () => this.bookmarkMenu());
     this.el.querySelector('[data-p="hidden"]')!.addEventListener("click", () => {
       Pane.showHidden = !Pane.showHidden;
       localStorage.setItem("bx.showHidden", Pane.showHidden ? "1" : "0");
@@ -460,6 +627,13 @@ class Pane {
       e.stopPropagation();
       this.owner.send(other, this.owner.pane(other).selection());
     });
+    // The mouse's back and forward buttons, as in a browser or Explorer.
+    this.el.addEventListener("mouseup", (e) => {
+      if (e.button !== 3 && e.button !== 4) return;
+      e.preventDefault();
+      if (e.button === 3) this.goBack();
+      else this.goForward();
+    });
     this.el.addEventListener("keydown", (e) => {
       // Keys on a focused button/field belong to that control, not the selection.
       if ((e.target as HTMLElement).closest("input, textarea, select, button")) return;
@@ -472,6 +646,10 @@ class Pane {
       } else if (act === "files.parent") {
         e.preventDefault();
         this.load(this.parent(this.path));
+      } else if (act === "files.back" || act === "files.forward") {
+        e.preventDefault();
+        if (act === "files.back") this.goBack();
+        else this.goForward();
       } else if (act === "files.delete" && sel.length) {
         this.remove(sel);
       } else if (act === "files.rename" && sel.length === 1) {
@@ -483,6 +661,9 @@ class Pane {
         e.preventDefault();
         this.selected = new Set(this.visible().map((x) => x.path));
         this.render();
+      } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        this.moveCursor(e.key, e.shiftKey);
       }
     });
   }
@@ -490,6 +671,10 @@ class Pane {
   private menu(x: number, y: number, target?: FileEntry) {
     const sel = this.selection();
     const remote = this.side === "remote";
+    // The folder a "cd" in the terminal beside goes to: the one clicked, or
+    // the one shown.
+    const cdTarget = target?.isDir ? target.path : this.path;
+    const term = remote ? this.owner.terminal : undefined;
     contextMenu(x, y, [
       ...(target?.isDir ? [{ label: "열기", icon: "FolderOpen", action: () => this.load(target.path) }] : []),
       ...(remote && target && !target.isDir
@@ -505,13 +690,76 @@ class Pane {
         action: () => this.owner.send(this.side, sel),
       },
       "-",
-      { label: "이름 바꾸기", icon: "Pencil", hint: "F2", disabled: sel.length !== 1, action: () => this.rename(sel[0]) },
+      { label: "이름 바꾸기", icon: "Pencil", hint: keyHint("files.rename"), disabled: sel.length !== 1, action: () => this.rename(sel[0]) },
       { label: "경로 복사", icon: "Copy", disabled: !sel.length, action: () => writeClipboard(sel.map((s) => s.path).join("\n")) },
+      this.compareItem(sel),
+      ...(term?.cdTo && cdTarget
+        ? [{ label: "터미널에서 이 폴더로 이동 (cd)", icon: "SquareTerminal", hint: cdTarget.split("/").filter(Boolean).pop() || "/", userHint: true, action: () => term.cdTo?.(cdTarget) }]
+        : []),
+      ...(remote && this.owner.canChmod ? [{ label: "권한 변경…", icon: "LockKeyhole", hint: "chmod", disabled: !sel.length, action: () => this.chmod(sel) }] : []),
       { label: "새 폴더", icon: "FolderPlus", action: () => this.mkdir() },
-      { label: "새로 고침", icon: "RefreshCw", hint: "F5", action: () => this.refresh() },
+      ...(remote ? [{ label: "새 파일", icon: "FilePlus", hint: "편집기로 열기", action: () => void this.newFile() }] : []),
+      { label: "새로 고침", icon: "RefreshCw", hint: keyHint("files.refresh"), action: () => this.refresh() },
       "-",
-      { label: "삭제", icon: "Trash2", hint: "Del", danger: true, disabled: !sel.length, action: () => this.remove(sel) },
+      { label: "삭제", icon: "Trash2", hint: keyHint("files.delete"), danger: true, disabled: !sel.length, action: () => this.remove(sel) },
     ]);
+  }
+
+  /** Compare files as text (a configuration backup with the one on the
+   * server): two selected here, or one with what was taken before (a file of
+   * the other pane or another tab, or a terminal selection; term.compare). */
+  private compareItem(sel: FileEntry[]): MenuItem {
+    const usable = (sel.length === 1 || sel.length === 2) && sel.every((s) => !s.isDir);
+    if (!usable) return { label: "파일 비교", icon: "Columns2", hint: "파일 1~2개 선택", disabled: true };
+    const label = sel.length === 2 ? "선택한 두 파일 비교" : hasPendingDiff() ? "담아 둔 내용과 비교" : "비교할 내용으로 담기";
+    // Too big to read for it: said here, as "Edit" does, not after a click.
+    if (sel.some((s) => s.size > EDITOR_MAX)) return { label, icon: "Columns2", hint: "5MB 이하만", disabled: true };
+    return { label, icon: "Columns2", action: () => void this.compare(sel) };
+  }
+
+  private async compare(files: FileEntry[]) {
+    if (files.length === 2) {
+      const [a, b] = await Promise.all(files.map((f) => this.textOf(f)));
+      if (a && b) openDiff(a, b);
+      return;
+    }
+    // The file kept already, unchanged since: compared with itself it would
+    // only say "the same". Another server at the same address (a tunnel's
+    // port) or the file saved since is another one.
+    const key = this.fileKey(files[0]);
+    if (pendingTitle() === this.titleOf(files[0]) && takenKey === key) return void toast("이미 담아 둔 파일입니다. 비교할 다른 파일을 고르세요", "info");
+    const one = await this.textOf(files[0]);
+    if (one) takenKey = key;
+    if (one) takeForDiff(one, "비교할 첫 파일을 담았습니다. 비교할 다른 파일을 오른쪽 클릭해 \"담아 둔 내용과 비교\"를 고르세요 (터미널의 선택 영역 비교도 됩니다)");
+  }
+
+  /** Which file, where, as it is now: the connection, the path, its size and time. */
+  private fileKey(e: FileEntry): string {
+    return [this.side === "remote" ? this.owner.remoteId : "local", e.path, e.size, e.modified ?? ""].join("\n");
+  }
+
+  /** How a comparison names the file: "host:/path" on the server, the path here. */
+  private titleOf(entry: FileEntry): string {
+    return this.side === "remote" ? `${this.owner.serverLabel}:${entry.path}` : entry.path;
+  }
+
+  /** A file as text for the comparison, named by where it is; null (and
+   * said why) when it is too big or not text. */
+  private async textOf(entry: FileEntry): Promise<DiffSide | null> {
+    const refuse = (why: string, kind: "warn" | "error" = "warn") => {
+      // Two phrases: the name kept as written, the reason translated.
+      toast(`${userText(entry.name)} — ${why}`, kind, 6000);
+      return null;
+    };
+    if (entry.size > EDITOR_MAX) return refuse("5MB보다 큰 파일은 비교할 수 없습니다");
+    try {
+      const text = this.side === "remote" ? (await api.remoteReadText(this.owner.remoteId, entry.path)).text : await api.readTextFile(entry.path);
+      // The local reading decodes whatever it gets: a binary file shows here.
+      if (text.includes("\0")) return refuse("텍스트 파일이 아니라 비교할 수 없습니다");
+      return { title: this.titleOf(entry), text };
+    } catch (err) {
+      return refuse(errorText(err), "error");
+    }
   }
 
   private async op(op: string, path: string, target?: string, isDir?: boolean) {
@@ -529,6 +777,26 @@ class Pane {
     } catch (err) {
       toast(errorText(err), "error");
     }
+  }
+
+  /** An empty file on the server, then opened in the built-in editor. The
+   * server creates it only while the name is free: it never overwrites. */
+  private async newFile() {
+    const res = await promptDialog({ title: "새 파일", label: "파일 이름", icon: "FilePlus", confirm: "만들기" });
+    const name = res?.value.trim();
+    if (!name) return;
+    if (name === "." || name === ".." || name.includes("/") || /[\x00-\x1f]/.test(name)) return toast("쓸 수 없는 이름입니다", "warn");
+    // An FTP server may be a Windows one, where names ignore case.
+    const key = (n: string) => (this.owner.isFtp ? n.toLowerCase() : n);
+    if (this.entries.some((e) => key(e.name) === key(name))) return toast(`같은 이름(${userText(name)})이 이미 있습니다`, "warn");
+    const path = this.join(this.path, name);
+    try {
+      await this.op("newfile", path);
+    } catch (err) {
+      return toast(errorText(err), "error");
+    }
+    await this.refresh();
+    this.owner.openEditor({ name, path, isDir: false, isLink: false, size: 0, modified: null, perm: null });
   }
 
   /** Drive roots in the local drive list cannot be renamed or deleted. */
@@ -553,6 +821,88 @@ class Pane {
     } catch (err) {
       toast(errorText(err), "error");
     }
+  }
+
+  /** chmod on the server (SFTP): one mode for every selected entry, nothing
+   * inside a folder. Three digits leave setuid, setgid and sticky as they
+   * are (the backend keeps them); four set them too. */
+  private chmod(entries: FileEntry[]) {
+    const start = modeOf(entries[0].perm) ?? (entries[0].isDir ? 0o755 : 0o644);
+    // One entry: its own special bits as the fourth digit. Several: three
+    // digits, so each keeps its own (one's setuid is not copied to the rest).
+    const startDigits = entries.length === 1 && start & 0o7000 ? 4 : 3;
+    const octal = (mode: number, digits: number) => mode.toString(8).padStart(digits, "0");
+    const who = [["소유자(u)", 6], ["그룹(g)", 3], ["기타(o)", 0]] as const;
+    const what = [["읽기(r)", 4], ["쓰기(w)", 2], ["실행(x)", 1]] as const;
+    const m = modal({
+      title: "권한 변경",
+      icon: "LockKeyhole",
+      body: `<form class="form" data-form>
+          <p class="muted small">${entries.length === 1 ? `<b data-i18n-skip>${esc(entries[0].name)}</b>` : `<span>${entries.length}개 항목</span> · <span>선택한 항목 모두에 같은 권한을 적용합니다</span>`}</p>
+          <table class="chmod-grid">
+            <thead><tr><th></th>${what.map(([label]) => `<th>${label}</th>`).join("")}</tr></thead>
+            <tbody>${who
+              .map(([label, shift]) => `<tr><th>${label}</th>${what.map(([, bit]) => `<td><input type="checkbox" data-bit="${bit << shift}"/></td>`).join("")}</tr>`)
+              .join("")}</tbody>
+          </table>
+          <label class="field chmod-mode"><span>8진수</span><input name="mode" class="mono" inputmode="numeric" maxlength="4" spellcheck="false" autocomplete="off"/></label>
+          <p class="muted small">세 자리(755)면 setuid·setgid·sticky 비트는 그대로 두고, 네 자리(4755, 0755)면 함께 바꿉니다. 폴더 안의 항목은 바뀌지 않습니다.</p>
+          ${entries.some((e) => e.isLink) ? `<p class="muted small">링크는 링크가 가리키는 대상의 권한이 바뀝니다.</p>` : ""}
+        </form>`,
+      footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>적용</button>`,
+    });
+    const form = m.root.querySelector<HTMLFormElement>("[data-form]")!;
+    const input = form.querySelector<HTMLInputElement>("[name=mode]")!;
+    const boxes = [...form.querySelectorAll<HTMLInputElement>("[data-bit]")];
+    const valid = (text: string) => /^[0-7]{3,4}$/.test(text);
+    const showBits = (mode: number) => boxes.forEach((b) => (b.checked = (mode & Number(b.dataset.bit)) !== 0));
+    // Typed digits tick the boxes; ticking a box rewrites the digits (keeping
+    // a typed fourth, special digit).
+    input.addEventListener("input", () => {
+      const ok = valid(input.value.trim());
+      input.classList.toggle("invalid", !ok && input.value.trim() !== "");
+      if (ok) showBits(parseInt(input.value.trim(), 8));
+    });
+    boxes.forEach((b) =>
+      b.addEventListener("change", () => {
+        const text = input.value.trim();
+        // Only a valid fourth digit is kept; anything else falls back to three
+        // digits (special bits left as they are), never to a "0…" that clears them.
+        const four = valid(text) && text.length === 4;
+        const special = four ? parseInt(text, 8) & 0o7000 : 0;
+        const bits = boxes.reduce((acc, x) => acc | (x.checked ? Number(x.dataset.bit) : 0), 0);
+        input.value = octal(special | bits, four ? 4 : 3);
+        input.classList.remove("invalid");
+      }),
+    );
+    input.value = octal(startDigits === 4 ? start : start & 0o777, startDigits);
+    showBits(start);
+    setTimeout(() => input.select(), 40);
+    const submit = async () => {
+      const mode = input.value.trim();
+      if (!valid(mode)) {
+        input.classList.add("invalid");
+        return void toast("권한은 8진수 3~4자리로 입력하세요 (예: 755)", "warn");
+      }
+      m.close();
+      let changed = 0;
+      for (const e of entries) {
+        try {
+          await this.op("chmod", e.path, mode);
+          changed++;
+        } catch (err) {
+          toast(errorText(err), "error");
+          break;
+        }
+      }
+      if (changed) toast(`권한을 ${mode}(으)로 바꿨습니다`, "success", 2500);
+      await this.refresh();
+    };
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      void submit();
+    });
+    m.root.querySelector("[data-ok]")!.addEventListener("click", () => void submit());
   }
 
   private async remove(entries: FileEntry[]) {
@@ -588,6 +938,26 @@ const EDITOR_MAX = 5 * 1024 * 1024;
 
 export class FilesView implements View, EditorHost {
   el: HTMLElement;
+  /** Which server the folder bookmarks belong to (see BOOKMARKS). */
+  get bookmarkKey(): string {
+    const s = this.session;
+    const family = s.protocol === "sftp" ? "sftp" : "ftp";
+    // The login the server sees: the credential's user when the session names none.
+    const user = s.username || (s.credentialId ? (store.credentials.find((c) => c.id === s.credentialId)?.username ?? "") : "");
+    return `${family}://${user}@${s.host.trim().toLowerCase()}:${s.port ?? defaultPort(s.protocol, s.options)}`;
+  }
+  /** An FTP or FTPS server (its file names may ignore case: a Windows server). */
+  get isFtp(): boolean {
+    return this.session.protocol === "ftp" || this.session.protocol === "ftps";
+  }
+  /** The server as a comparison names a file of it ("host:/path"). */
+  get serverLabel(): string {
+    return this.session.host.trim();
+  }
+  /** Permissions can be set on this server (SFTP; FTP has no standard command). */
+  get canChmod(): boolean {
+    return this.session.protocol === "sftp";
+  }
   state: ViewState = "connecting";
   remoteId = crypto.randomUUID();
   /** Stable for the view's lifetime (remoteId changes on reconnect). */
@@ -618,10 +988,14 @@ export class FilesView implements View, EditorHost {
   private polling = false;
   /** Remote paths whose edit is being prepared (download + open). */
   private opening = new Set<string>();
+  /** The session's notes button in the bar. */
+  private notes: ReturnType<typeof notesButton>;
 
   constructor(
     private session: Session,
     private ws: Workspace,
+    /** The terminal this was opened beside (an SSH tab's SFTP), for "cd here". */
+    readonly terminal?: View & { cdTo?(path: string): void },
   ) {
     routeProgress();
     const p = PROTOCOLS[session.protocol];
@@ -656,6 +1030,9 @@ export class FilesView implements View, EditorHost {
       if (id) this.cancelJob(id);
     });
     this.overlay = this.el.querySelector(".view-overlay")!;
+    // The saved session's notes, while it has any (sessionNotes.ts).
+    this.notes = notesButton(session.id, (s) => this.ws.editHandler?.(s));
+    this.el.querySelector(".view-actions")!.prepend(this.notes.el);
     this.el.querySelector('[data-act="reconnect"]')!.addEventListener("click", () => this.reconnect());
     this.el.querySelector(".transfers-toggle")!.addEventListener("click", () =>
       this.el.querySelector(".transfers")!.classList.toggle("collapsed"),
@@ -879,7 +1256,7 @@ export class FilesView implements View, EditorHost {
     box.hidden = !this.editing.length;
     box.innerHTML = this.editing
       .map(
-        (w) => `<span class="edit-chip" title="${esc(w.remote)}">${icon("ExternalLink", 13)}<span data-i18n-skip>${esc(w.name)}</span>
+        (w) => `<span class="edit-chip" title="${esc(userText(w.remote))}">${icon("ExternalLink", 13)}<span data-i18n-skip>${esc(w.name)}</span>
           <button class="tool" data-stop="${esc(w.remote)}" title="편집 감시 끝내기">${icon("X", 12)}</button></span>`,
       )
       .join("");
@@ -903,7 +1280,7 @@ export class FilesView implements View, EditorHost {
       protocol: this.session.protocol,
       endpoint: endpoint(this.session),
       state: this.state,
-      detail: running ? `전송 대기 ${running}건` : this.remotePane.path,
+      detail: running ? `전송 대기 ${running}건` : userText(this.remotePane.path),
     };
   }
 
@@ -1081,6 +1458,12 @@ export class FilesView implements View, EditorHost {
           extra: `<label class="field"><span>${esc(userText(this.session.host))} 의 비밀번호</span>
                     <input name="pw" type="password" autocomplete="off" /></label>
                   ${saveRow}`,
+          // Enter in the name box goes on to the password, not out with none
+          // (an empty password is a login attempt of its own, or anonymous FTP).
+          validate: (_, form) => {
+            const pw = form.querySelector<HTMLInputElement>("input[name=pw]")!;
+            return !pw.value && document.activeElement !== pw ? pw : null;
+          },
         });
         if (!res) return this.fail("로그인 정보 입력을 취소했습니다.");
         this.session.username = res.value.trim();
@@ -1398,6 +1781,7 @@ export class FilesView implements View, EditorHost {
 
   dispose() {
     this.disposed = true;
+    this.notes.dispose();
     if (this.editTimer) clearInterval(this.editTimer);
     this.localPane.dispose();
     this.remotePane.dispose();

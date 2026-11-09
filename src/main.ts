@@ -4,9 +4,10 @@ import "./styles.css";
 import { api, isTauri, revealInExplorer } from "./api";
 import { fileServerBadges, fileServers, initFileServers, openFileServer } from "./fileServers";
 import { ftpServer, ftpServerBadge, initFtpServer, openFtpServer } from "./ftpServer";
+import { initSyslog, openSyslog, syslog, syslogBadge } from "./syslog";
 import { mountHome } from "./home";
 import { appLock, initLock, lockNow } from "./lock";
-import { openNetworkTools } from "./nettools";
+import { openNetworkTools, setNewSessionHandler } from "./nettools";
 import { openCommandPalette } from "./palette";
 import { fileSessionFor } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
@@ -22,7 +23,7 @@ import { openVault } from "./vault";
 
 import { Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
 import { checkForUpdate, installUpdate, loadVersion, onUpdateChange, startAutoUpdate, updateBadge } from "./updates";
-import { ACTIONS, actionFor } from "./keymap";
+import { ACTIONS, actionFor, withKey } from "./keymap";
 // Loaded on first use: noVNC probes the video decoder when imported, and
 // help, the editor and the importers are big; none of it is needed at startup.
 const openHelp = (section?: string) =>
@@ -81,7 +82,7 @@ function openFiles(s: Session, beside?: View) {
   if (!beside) return open(files);
   addWhenLoaded(async () => {
     const { FilesView } = await loadFiles();
-    ws.addBeside(files, new FilesView(files, ws), beside);
+    ws.addBeside(files, new FilesView(files, ws, beside), beside);
   });
 }
 
@@ -147,17 +148,39 @@ function open(s: Session) {
   });
 }
 
-async function edit(existing: Session | null, defaults: Partial<Session> = {}) {
+/** `beforeConnect`: run when the session is saved to connect, before its tab opens. */
+async function edit(existing: Session | null, defaults: Partial<Session> = {}, beforeConnect?: () => void) {
   const res = await editSession(existing, defaults);
-  if (res?.connect) open(res.session);
+  if (!res?.connect) return;
+  beforeConnect?.();
+  open(res.session);
 }
 
 // ---- sidebar & home ----------------------------------------------------------------
 const sidebar = new Sidebar($("#sidebar"), { connect: open, edit, openFiles });
 ws.editHandler = (s) => void edit(s);
+ws.newSessionHandler = (defaults) => void edit(null, defaults);
+setNewSessionHandler((defaults, beforeConnect) => void edit(null, defaults, beforeConnect));
+// A sweep or continuous ping a reloaded page left running ends (nettools.rs net_stop_all).
+void api.netStopAll().catch(() => {});
+// A quick connection's settings in a new session's editor (the open tab stays as it is).
+ws.saveAsHandler = (s) =>
+  void edit(null, {
+    protocol: s.protocol,
+    name: s.name,
+    host: s.host,
+    port: s.port,
+    username: s.username,
+    credentialId: s.credentialId,
+    // A file tab opened from a saved session keeps that session's folder.
+    folder: s.folder,
+    notes: s.notes,
+    options: structuredClone(s.options),
+  });
 mountHome($("#home"), {
   create: (p: Protocol) => edit(null, { protocol: p }),
   connect: open,
+  edit: (s: Session) => void edit(s),
   vault: () => openVault(),
 });
 
@@ -271,7 +294,7 @@ $("#btn-broadcast").addEventListener("click", () => {
     !ws.broadcast
       ? "동시 입력을 껐습니다"
       : n > 1
-        ? `동시 입력을 켰습니다. 연결된 터미널 ${n}개 모두에 같은 입력이 전달됩니다(탭에 표시).`
+        ? `동시 입력을 켰습니다. 연결된 터미널 ${n}개 중 같은 종류의 줄(셸, 로그인 질문 등)에 있는 탭에 같은 입력이 전달됩니다(탭에 표시).`
         : "동시 입력을 켰습니다. 지금은 연결된 터미널이 하나라서 전달할 곳이 없습니다. 터미널을 더 열면 함께 입력됩니다.",
     ws.broadcast ? "warn" : "info",
     5000,
@@ -285,6 +308,8 @@ $("#btn-server").addEventListener("click", (e) => {
     { label: "FTP 서버", icon: "Server", hint: ftpServer.status ? "실행 중" : "", action: () => openFtpServer() },
     { label: "TFTP 서버", icon: "Upload", hint: on("tftp") || "네트워크 장비용", action: () => openFileServer("tftp") },
     { label: "HTTP 서버", icon: "Globe", hint: on("http") || "브라우저로 내려받기", action: () => openFileServer("http") },
+    "-",
+    { label: "Syslog 수신", icon: "ScrollText", hint: syslog.status ? "실행 중" : "장비 로그 받기", action: () => openSyslog() },
   ]);
 });
 $("#btn-lock").addEventListener("click", () => lockNow());
@@ -294,6 +319,7 @@ $("#btn-tools").addEventListener("click", (e) => {
   contextMenu(r.left, r.bottom + 4, [
     { label: "SSH 터널", icon: "Waypoints", hint: "포트 포워딩", action: () => openTunnelManager() },
     { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools() },
+    { label: "서브넷 계산", icon: "Network", action: () => openNetworkTools("", "subnet") },
   ]);
 });
 $("#btn-settings").addEventListener("click", () => openSettings());
@@ -305,9 +331,9 @@ function renderStatus() {
   document.querySelectorAll<HTMLElement>("[data-layout]").forEach((b) => setPressed(b, b.dataset.layout === ws.layout));
   setPressed($("#btn-broadcast"), ws.broadcast);
   const tab = ws.activeTab;
-  $("#btn-server").classList.toggle("live", !!ftpServer.status || !!fileServers.status("tftp") || !!fileServers.status("http"));
-  const right = `${ftpServerBadge()}${fileServerBadges()}${ws.broadcast ? `<span class="sb-warn">${icon("Radio", 13)}동시 입력 켜짐</span>` : ""}
-    <span>탭 ${ws.tabs.length}개</span>${updateBadge()}`;
+  $("#btn-server").classList.toggle("live", !!ftpServer.status || !!fileServers.status("tftp") || !!fileServers.status("http") || !!syslog.status);
+  const right = `${ftpServerBadge()}${fileServerBadges()}${syslogBadge()}${ws.broadcast ? `<span class="sb-warn">${icon("Radio", 13)}동시 입력 켜짐</span>` : ""}
+    ${ws.tabs.length ? `<button class="sb-tabs" data-tabs title="${esc(withKey("열린 탭 찾기", "app.commandPalette"))}">탭 ${ws.tabs.length}개</button>` : `<span>탭 0개</span>`}${updateBadge()}`;
   if (!tab) {
     setStatus(bar, `<div class="sb-left"><span class="sb-dot idle"></span><span>준비됨 · 저장된 세션 ${state.sessions.length}개</span></div><div class="sb-right">${right}</div>`);
     return;
@@ -316,11 +342,11 @@ function renderStatus() {
   const p = PROTOCOLS[st.protocol];
   setStatus(bar, `<div class="sb-left">
       <span class="sb-dot ${st.state}"></span>
-      <b style="color:${p.color}">${p.label}</b><span>${esc(st.endpoint)}</span>
+      <b style="color:${p.color}">${p.label}</b><span data-i18n-skip>${esc(st.endpoint)}</span>
       <span class="muted">${STATE_TEXT[st.state]}</span>
       ${st.detail ? `<span class="muted">${esc(st.detail)}</span>` : ""}
-      ${st.logPath ? `<button class="sb-log" title="${esc(st.logPath)}">${icon("ScrollText", 13)}로그 기록 중</button>` : ""}
-      ${st.device ? `<span class="sb-device" title="자동으로 인식한 장비">${icon("Server", 13)}${esc(st.device)}</span>` : ""}
+      ${st.logPath ? `<button class="sb-log" title="${esc(userText(st.logPath))}">${icon("ScrollText", 13)}로그 기록 중</button>` : ""}
+      ${st.device ? `<span class="sb-device" title="자동으로 인식한 장비">${icon("Server", 13)}<span data-i18n-skip>${esc(st.device)}</span></span>` : ""}
       ${monitorChip(st.monitor)}
     </div><div class="sb-right">${right}</div>`);
 }
@@ -342,6 +368,8 @@ $("#statusbar").addEventListener("click", (e) => {
     const path = tab?.view.status().logPath;
     if (path) revealInExplorer(path);
   } else if (target.closest("[data-monitor]")) tab?.view.monitorAction?.();
+  // The tab count opens the command palette, which lists the open tabs.
+  else if (target.closest("[data-tabs]")) GLOBAL_ACTIONS["app.commandPalette"]();
   else if (target.closest("[data-update]")) installUpdate(ws.tabs.filter((t) => t.view.state === "connected").length);
 });
 subscribe("sessions", () => {
@@ -420,11 +448,13 @@ function monitorChip(m: MonitorInfo | null | undefined): string {
 ws.onChange(renderStatus);
 ftpServer.onChange(renderStatus);
 fileServers.onChange(renderStatus);
+syslog.onChange(renderStatus);
 $("#statusbar").addEventListener("click", (e) => {
   const t = e.target as HTMLElement;
   if (t.closest("[data-ftp-server]")) openFtpServer();
   const kind = t.closest<HTMLElement>("[data-file-server]")?.dataset.fileServer;
   if (kind === "tftp" || kind === "http") openFileServer(kind);
+  if (t.closest("[data-syslog]")) openSyslog();
 });
 
 // ---- keyboard shortcuts (keymap.ts; the user can change them) ----------------------
@@ -440,6 +470,15 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
         if (GLOBAL_ACTIONS[id]?.() === false) toast("지금은 쓸 수 없는 명령입니다", "info", 2500);
       },
       openSession: open,
+      tabs: (() => {
+        const titles = ws.tabTitles();
+        return ws.tabs
+          .filter((t) => t !== ws.activeTab)
+          .map((t) => ({ id: t.id, title: titles.get(t.id)!, endpoint: t.view.status().endpoint, session: t.session }));
+      })(),
+      showTab: (id) => ws.activate(id),
+      closed: ws.recentlyClosed(),
+      reopen: (s) => ws.reopenClosed(s),
     }),
   "app.quickConnect": () => quickTarget.focus(),
   "app.toggleSidebar": () => toggleSidebar(),
@@ -450,6 +489,8 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.clipboardHistory": () => void import("./clipHistory").then((m) => m.openClipboardHistory()),
   "app.tunnels": () => openTunnelManager(),
   "app.netTools": () => openNetworkTools(),
+  "app.subnet": () => openNetworkTools("", "subnet"),
+  "app.compare": () => void import("./diffView").then((m) => m.openDiffFromMenu()),
   "app.lock": () => (appLock.enabled ? void lockNow() : false),
   "app.checkUpdate": () => void checkForUpdate(true),
   "tab.next": () => ws.cycle(1),
@@ -547,7 +588,7 @@ if (isTauri) {
       // Unsaved work is always asked about; open connections only if the user wants that.
       const work = ws.tabs.flatMap((t) => {
         const w = t.view.closeWarning?.();
-        return w ? [`<li><b data-i18n-skip>${esc(t.view.title())}</b>: <span>${esc(w)}</span></li>`] : [];
+        return w ? [`<li><b data-i18n-skip>${esc(ws.nameOf(t.view))}</b>: <span>${esc(w)}</span></li>`] : [];
       });
       if (!work.length && (!live.length || !state.settings.confirmClose)) return;
       event.preventDefault();
@@ -557,7 +598,7 @@ if (isTauri) {
           live.length
             ? `열려 있는 연결 ${live.length}개가 모두 끊어집니다.<br><span class="muted" data-i18n-skip>${live
                 .slice(0, 5)
-                .map((t) => esc(t.view.title()))
+                .map((t) => esc(ws.nameOf(t.view)))
                 .join(", ")}</span>${live.length > 5 ? ` 외 ${live.length - 5}개` : ""}`
             : ""
         }`,
@@ -579,4 +620,5 @@ loadAll()
   .catch((err) => toast(`세션 목록을 불러오지 못했습니다: ${errorText(err)}`, "error"));
 initFtpServer().catch((err) => console.warn("ftp server status", err));
 initFileServers().catch((err) => console.warn("file server status", err));
+initSyslog().catch((err) => console.warn("syslog status", err));
 renderStatus();

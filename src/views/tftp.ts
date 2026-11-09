@@ -7,6 +7,7 @@ import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession } from "../store";
 import { errorText, esc, formatBytes, h, toast } from "../ui";
+import { notesButton } from "../sessionNotes";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 type Progress = { id: string; done: number; total: number | null };
@@ -21,6 +22,8 @@ const BLOCKS: [number, string][] = [
 ];
 
 export class TftpView implements View {
+  /** The session's notes button in the bar. */
+  private notes: ReturnType<typeof notesButton>;
   el: HTMLElement;
   state: ViewState = "connected";
   private running: string | null = null;
@@ -47,6 +50,7 @@ export class TftpView implements View {
          <span class="proto-chip" style="--proto:${p.color}">${icon(p.icon, 14)}${p.label}</span>
          <span class="view-endpoint" data-i18n-skip>${esc(endpoint(session))}</span>
          <span class="view-state" data-state>연결 없이 파일 단위로 주고받음</span>
+         <div class="view-actions"></div>
        </div>
        <div class="tftp-body">
          <section class="tftp-card">
@@ -71,6 +75,9 @@ export class TftpView implements View {
          </section>
        </div>`,
     );
+    // The saved session's notes, while it has any (sessionNotes.ts).
+    this.notes = notesButton(session.id, (s) => this.ws.editHandler?.(s));
+    this.el.querySelector(".view-actions")!.prepend(this.notes.el);
     const $ = <T extends HTMLElement>(sel: string) => this.el.querySelector<T>(sel)!;
     $("[data-get]").addEventListener("click", () => this.get());
     $("[data-put]").addEventListener("click", () => this.put());
@@ -173,6 +180,7 @@ export class TftpView implements View {
 
   dispose() {
     this.disposed = true;
+    this.notes.dispose();
     if (this.running) api.tftpCancel(this.running).catch(() => {});
   }
 }

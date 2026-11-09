@@ -11,7 +11,7 @@
 import { api, on } from "../api";
 import { state } from "../store";
 import { confirmDialog, esc } from "../ui";
-import { language } from "../i18n";
+import { language, userText } from "../i18n";
 import type { Attached } from "./attach";
 
 export type AiKind = "anthropic" | "openai" | "gemini" | "compatible" | "ollama" | "cli";
@@ -254,7 +254,7 @@ export async function confirmSend(p: AiProvider, text: string, skip: { skip: boo
       ${
         media.length
           ? `<p class="muted small">첨부한 이미지·PDF는 가릴 수 없어 그대로 보냅니다.</p><div class="ai-attach-row">${media
-              .map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(a.name)}" />` : `<span class="ai-chip" data-i18n-skip>${esc(a.name)}</span>`))
+              .map((a) => (a.preview ? `<img class="ai-thumb" src="${a.preview}" alt="" title="${esc(userText(a.name))}" />` : `<span class="ai-chip" data-i18n-skip>${esc(a.name)}</span>`))
               .join("")}</div>`
           : ""
       }`,

@@ -3,8 +3,9 @@
 import { icon } from "./icons";
 import { saveSnippets, state, type Snippet } from "./store";
 import { groupForKind } from "./snippetLibrary";
-import { confirmDialog, contextMenu, esc, listKeys, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
+import { confirmDialog, confirmDiscard, contextMenu, enterSubmits, esc, formValues, listKeys, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
 import { tr } from "./i18n";
+import { fillSnippetVars, snippetVars } from "./snippetVars";
 
 /** Recorded keystrokes made readable: Enter ⏎, Tab ⇥, Esc ␛, other controls ^X. */
 export function showKeys(data: string): string {
@@ -21,6 +22,76 @@ export function showKeys(data: string): string {
     .join("");
 }
 
+/** The values last typed for each snippet's {{?name}}, offered the next time
+ * it is sent (while the app runs; not saved). */
+const lastValues = new Map<string, string>();
+
+/** Whether sending `s` asks for values first ({{?name}} in its text; never a macro). */
+export function asksValues(s: Snippet): boolean {
+  return !s.macro && snippetVars(s.text).length > 0;
+}
+
+/** Ask for the values of `s`'s {{?name}}s and give its text with them filled
+ * in; null when cancelled. Each value starts as the one typed last time, else
+ * the default written in the snippet. One without a default must be given. */
+export function askSnippetValues(s: Snippet): Promise<string | null> {
+  const vars = snippetVars(s.text);
+  const key = (name: string) => `${s.id}\n${name}`;
+  return new Promise((resolve) => {
+    let result: string | null = null;
+    const m = modal({
+      title: "스니펫 값 입력",
+      icon: "Braces",
+      width: 520,
+      body: `<form class="form snippet-vars" autocomplete="off" novalidate>
+          <p class="muted small"${s.group ? "" : " data-i18n-skip"}>${esc(s.name)}</p>
+          ${vars
+            .map(
+              (v, i) => `<label class="field"><span data-i18n-skip>${esc(v.name)}</span>
+                <input name="v${i}" value="${esc(lastValues.get(key(v.name)) ?? v.value)}" spellcheck="false" autocomplete="off"/></label>`,
+            )
+            .join("")}
+          <div class="field"><span>보낼 내용</span><pre class="mono snippet-preview" data-i18n-skip></pre></div>
+        </form>`,
+      footer: `<button class="btn" data-close>취소</button><button class="btn btn-primary" data-ok>${icon("Send", 14)}보내기</button>`,
+      onClose: () => resolve(result),
+    });
+    const form = m.root.querySelector<HTMLFormElement>("form")!;
+    const inputs = vars.map((_, i) => form.querySelector<HTMLInputElement>(`[name=v${i}]`)!);
+    const ok = m.root.querySelector<HTMLButtonElement>("[data-ok]")!;
+    const preview = form.querySelector<HTMLElement>(".snippet-preview")!;
+    const values = () => new Map(vars.map((v, i) => [v.name, inputs[i].value]));
+    /** The first box still to fill: one without a default, left empty. */
+    const missing = () => inputs.find((el, i) => !vars[i].hasDefault && !el.value.trim());
+    const update = () => {
+      // Exactly what goes out, the Enter added on sending aside; a value
+      // still to give shows as its {{?name}}.
+      const given = new Map([...values()].filter(([, v], i) => vars[i].hasDefault || v.trim()));
+      preview.textContent = fillSnippetVars(s.text, given);
+      ok.disabled = !!missing();
+    };
+    const send = () => {
+      const empty = missing();
+      if (empty) return void empty.focus();
+      const v = values();
+      for (const [name, value] of v) lastValues.set(key(name), value);
+      result = fillSnippetVars(s.text, v);
+      m.close();
+    };
+    form.addEventListener("input", update);
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      send();
+    });
+    // Enter in any box: to the first one still empty, else send.
+    enterSubmits(form, send);
+    ok.addEventListener("click", send);
+    update();
+    // The first box still to fill, else the first one, its text selected to type over.
+    setTimeout(() => (missing() ?? inputs[0])?.select(), 40);
+  });
+}
+
 /** Save a recorded macro. */
 export function addMacro(name: string, keys: string) {
   saveSnippets([...state.snippets, { id: crypto.randomUUID(), name, text: keys, run: false, macro: true }]);
@@ -30,12 +101,17 @@ export function addMacro(name: string, keys: string) {
  * The user's own snippets come first, then the group for the operating system
  * recognised in this tab (`kind`, devmon.rs); every other group is one click
  * further, so the menu stays short with the whole library loaded. */
-export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kind?: string) {
+/** `extra`: the terminal's own sending items, above the manager. */
+export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kind?: string, extra: MenuItem[] = []) {
   const r = anchor.getBoundingClientRect();
   const entry = (s: Snippet): MenuItem => ({
     label: s.name,
+    // The built-in library's names are translated; the user's own are not (as in the keymap).
+    userLabel: !s.group,
     icon: s.macro ? "Circle" : s.run ? "Play" : "ClipboardType",
-    hint: s.macro ? "매크로" : s.text.split("\n")[0].slice(0, 28),
+    hint: s.macro ? "매크로 재생" : s.text.split("\n")[0].slice(0, 28),
+    // The command is the user's (or a device's) text: never translated.
+    userHint: !s.macro,
     action: () => send(s),
   });
   const groups = [...new Set(state.snippets.flatMap((s) => (s.group ? [s.group] : [])))];
@@ -57,6 +133,7 @@ export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kin
       }
     }
     items.push("-");
+    items.push(...extra);
     items.push({ label: "스니펫 관리…", icon: "Pencil", action: () => openSnippetManager() });
     contextMenu(r.left, r.bottom + 4, items);
   };
@@ -79,11 +156,16 @@ export function openSnippetManager() {
         </aside>
         <section class="vault-detail"></section>
       </div>
-      <p class="vault-note">${icon("Info", 14)}터미널 툴바의 스니펫 버튼으로 보냅니다. 동시 입력이 켜져 있으면 보이는 모든 터미널로 갑니다.</p>`,
+      <p class="vault-note">${icon("Info", 14)}터미널 툴바의 스니펫 버튼으로 보냅니다. 동시 입력이 켜져 있으면 같은 종류의 줄에 있는 다른 터미널에도 갑니다.</p>`,
     footer: `<button class="btn" data-close>닫기</button>`,
+    beforeDismiss: () => formValues(detail) === detailShown || confirmDiscard(),
   });
   const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
   const detail = m.root.querySelector<HTMLElement>(".vault-detail")!;
+  /** The edit form's values when its snippet was opened or last saved (see the
+   * vault's); `shownFor` names that snippet. */
+  let detailShown = "[]";
+  let shownFor: string | null = "";
   const search = m.root.querySelector<HTMLInputElement>(".list-search")!;
   /** Search terms: each must appear in the name, text or group. A built-in
    * snippet (one with a group) is shown translated, so its name is searched
@@ -98,7 +180,16 @@ export function openSnippetManager() {
   const unsaved = new Set<string>();
   const commit = () => saveSnippets(list.filter((s) => !unsaved.has(s.id)).map((s) => ({ ...s })));
 
-  const render = () => {
+  /** `listOnly`: the search changed: the edit form (and its typing) stays. */
+  const render = (listOnly = false) => {
+    if (!listOnly) {
+      const key = selected;
+      queueMicrotask(() => {
+        if (key === shownFor) return;
+        shownFor = key;
+        detailShown = formValues(detail);
+      });
+    }
     // The user's own snippets first, then one section per operating system.
     const visible = list.filter(shown);
     const groups = [...new Set(visible.flatMap((s) => (s.group ? [s.group] : [])))];
@@ -117,11 +208,15 @@ export function openSnippetManager() {
         ].join("")
       : `<p class="muted small pad">${list.length ? "일치하는 스니펫이 없습니다." : "스니펫이 없습니다."}</p>`;
     listEl.querySelectorAll<HTMLElement>("[data-id]").forEach((b) =>
-      b.addEventListener("click", () => {
+      b.addEventListener("click", async () => {
+        // The one already open: nothing to switch, the typing stays.
+        if (b.dataset.id === selected) return;
+        if (formValues(detail) !== detailShown && !(await confirmDiscard("저장하지 않은 내용이 있습니다. 저장하지 않고 다른 항목으로 넘어갈까요?", "저장하지 않고 넘어가기"))) return;
         selected = b.dataset.id!;
         render();
       }),
     );
+    if (listOnly) return;
     const s = list.find((x) => x.id === selected);
     if (!s) {
       detail.innerHTML = `<div class="empty-state">${icon("ClipboardType", 30)}<p>왼쪽에서 스니펫을 고르거나 새로 만드세요.</p></div>`;
@@ -136,9 +231,10 @@ export function openSnippetManager() {
         ${
           s.macro
             ? `<div class="field"><span>기록된 키 입력 (터미널 툴바에서 다시 기록)</span>
-                 <pre class="macro-keys mono">${esc(showKeys(s.text))}</pre></div>`
+                 <pre class="macro-keys mono" data-i18n-skip>${esc(showKeys(s.text))}</pre></div>`
             : `<label class="field"><span>보낼 내용 (여러 줄 가능)</span>
                  <textarea name="text" rows="6" spellcheck="false" class="mono">${esc(s.text)}</textarea></label>
+               <p class="muted small">{{?이름}}을 넣으면 보낼 때 값을 묻습니다 (예: show interface {{?인터페이스}}). 기본값은 {{?횟수=5}}처럼 씁니다.</p>
                <label class="check"><input type="checkbox" name="run" ${s.run ? "checked" : ""}/> 보낸 뒤 Enter 로 실행</label>`
         }
         <div class="row end">
@@ -162,6 +258,7 @@ export function openSnippetManager() {
       }
       unsaved.delete(s.id);
       commit();
+      shownFor = "";
       render();
       toast("저장했습니다", "success");
     });
@@ -188,9 +285,10 @@ export function openSnippetManager() {
   listKeys(search, listEl, "[data-id]");
   search.addEventListener("input", () => {
     terms = searchTerms(search.value);
-    render();
+    render(true);
   });
-  m.root.querySelector("[data-new]")!.addEventListener("click", () => {
+  m.root.querySelector("[data-new]")!.addEventListener("click", async () => {
+    if (formValues(detail) !== detailShown && !(await confirmDiscard("저장하지 않은 내용이 있습니다. 저장하지 않고 다른 항목으로 넘어갈까요?", "저장하지 않고 넘어가기"))) return;
     // A new snippet must be visible in the list it is added to.
     search.value = "";
     terms = [];

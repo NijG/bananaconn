@@ -190,6 +190,62 @@ const GROUPS: [group: string, entries: Entry[]][] = [
       ["hw-config", "실행 중인 설정", "display current-configuration"],
     ],
   ],
+  // Telephone systems (PBX). Avaya Communication Manager: SAT commands, and
+  // two for the server's Linux shell.
+  [
+    "Avaya CM",
+    [
+      ["avc-ipsta", "등록된 IP 전화기", "list registered-ip-stations"],
+      ["avc-station", "내선 목록", "list station"],
+      ["avc-trunk", "트렁크 그룹 목록", "list trunk-group"],
+      ["avc-mg", "미디어 게이트웨이", "list media-gateway"],
+      ["avc-health", "시스템 상태", "status health"],
+      ["avc-alarms", "알람", "display alarms"],
+      ["avc-errors", "오류 기록", "display errors"],
+      ["avc-options", "라이선스 기능", "display system-parameters customer-options"],
+      ["avc-swver", "소프트웨어 버전 (서버 셸)", "swversion"],
+      ["avc-statapp", "애플리케이션 상태 (서버 셸)", "statapp"],
+    ],
+  ],
+  [
+    "Cisco CUCM",
+    [
+      ["cucm-ver", "버전", "show version active"],
+      ["cucm-status", "시스템 상태", "show status"],
+      ["cucm-svc", "서비스 상태", "utils service list"],
+      ["cucm-dbrep", "DB 복제 상태", "utils dbreplication runtimestate"],
+      ["cucm-ntp", "NTP 상태", "utils ntp status"],
+      ["cucm-net", "네트워크 설정", "show network eth0"],
+      ["cucm-hw", "하드웨어", "show hardware"],
+    ],
+  ],
+  [
+    "Cisco CME·CUBE",
+    [
+      ["cme-nomore", "페이지 나눔 끄기", "terminal length 0"],
+      ["cme-ephone", "등록된 SCCP 전화기", "show ephone registered"],
+      ["cme-sipreg", "SIP 전화기 등록 정보", "show voice register all"],
+      ["cme-registrar", "SIP 등록 서버 상태", "show sip-ua status registrar"],
+      ["cme-ports", "음성 포트 요약", "show voice port summary"],
+      ["cme-dialpeer", "다이얼 피어 요약", "show dial-peer voice summary"],
+      ["cme-calls", "현재 음성 통화", "show call active voice brief"],
+      ["cme-sipcalls", "SIP 통화 (CUBE)", "show sip-ua calls"],
+      ["cme-dsp", "DSP 상태", "show voice dsp group all"],
+    ],
+  ],
+  [
+    "Asterisk·FreePBX",
+    [
+      ["ast-ver", "버전", 'asterisk -rx "core show version"'],
+      ["ast-uptime", "가동 시간", 'asterisk -rx "core show uptime"'],
+      ["ast-pjep", "PJSIP 엔드포인트 (내선)", 'asterisk -rx "pjsip show endpoints"'],
+      ["ast-pjreg", "PJSIP 트렁크 등록", 'asterisk -rx "pjsip show registrations"'],
+      ["ast-sippeers", "SIP 피어 (chan_sip)", 'asterisk -rx "sip show peers"'],
+      ["ast-chan", "현재 통화 채널", 'asterisk -rx "core show channels"'],
+      ["ast-modules", "FreePBX 모듈 목록", "fwconsole ma list"],
+      ["ast-log", "Asterisk 로그 최근 50줄", "tail -n 50 /var/log/asterisk/full"],
+    ],
+  ],
 ];
 
 /** Every built-in snippet, grouped by operating system. */
@@ -215,5 +271,10 @@ export function groupForKind(kind: string | undefined): string | undefined {
   return undefined;
 }
 
+/** The ids version 1 of the library offered (0.7.29 and before), for a list
+ * seeded by it with no record of what it was offered (store.ts): those were
+ * offered already, while later ones were not. */
+export const SNIPPET_LIBRARY_V1_IDS = "s-disk s-mem s-top lin-topmem lin-uptime lin-os lin-kernel lin-vmstat lin-inode lin-du lin-ip lin-route lin-ports lin-dns lin-failed lin-journal lin-dmesg lin-last lin-time aix-level aix-df aix-vmstat aix-svmon aix-paging aix-topcpu aix-lsvg aix-lspv aix-errpt aix-prtconf aix-ifconfig aix-route aix-listen hp-uname hp-bdf hp-vmstat hp-swap hp-topcpu hp-machinfo hp-disks hp-vg hp-syslog hp-netif hp-route sol-release sol-df sol-vmstat sol-prstat sol-swap sol-zpool sol-svcs sol-ifconfig win-sysinfo win-ip win-ports win-tasks win-route win-disk win-services win-events win-whoami ios-termlen ios-version ios-ipbrief ios-status ios-vlan ios-cdp ios-route ios-mac ios-stp ios-log ios-cpu ios-run ios-env nx-termlen nx-version nx-intbrief nx-vpc nx-pc nx-route nx-log nx-env asa-pager asa-version asa-ipbrief asa-conn asa-xlate asa-failover asa-vpn asa-cpu asa-route fg-status fg-perf fg-ha fg-int fg-route fg-session fg-ipsec fg-arp aru-version aru-system aru-intbrief aru-vlans aru-lldp aru-log aru-run jun-version jun-terse jun-route jun-alarms jun-hw jun-log jun-config hw-nomore hw-version hw-ipbrief hw-intbrief hw-route hw-cpu hw-log hw-config".split(" ");
+
 /** Version of the library above; raise it when entries are added (store.ts adds the new ones once). */
-export const SNIPPET_LIBRARY_VERSION = 2;
+export const SNIPPET_LIBRARY_VERSION = 3;

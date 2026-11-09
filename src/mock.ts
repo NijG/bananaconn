@@ -28,6 +28,18 @@ const utf8 = (s: string) => new TextEncoder().encode(s);
 // Backspace (DEL or ^H) erases a character, Ctrl-U the line, Enter starts a
 // new prompt; cursor and function keys are ignored.
 const mockLines = new Map<string, string>();
+/** Sweeps the preview's "Stop" ended. */
+const sweepsCancelled = new Set<string>();
+/** The mock syslog receiver: a batch of device messages every second while it runs. */
+let syslogMock: { status: { port: number; lan: boolean; addresses: string[]; file: string | null }; timer: number } | null = null;
+const SYSLOG_SAMPLES: [string, number, string][] = [
+  ["10.0.0.2", 189, "52: *Nov  8 10:00:01: %LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to down"],
+  ["10.0.0.2", 189, "53: *Nov  8 10:00:02: %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/1, changed state to down"],
+  ["10.0.0.3", 187, "11: *Nov  8 10:00:03: %SYS-3-CPUHOG: Task is running for (2004)msecs"],
+  ["10.0.0.4", 30, "dhcpd: DHCPACK on 10.0.0.77 to 00:15:5d:01:02:03"],
+  ["10.0.0.3", 190, "12: *Nov  8 10:00:04: %SEC_LOGIN-6-LOGIN_SUCCESS: Login Success [user: admin]"],
+];
+
 function mockLine(id: string, data: string): string {
   let line = mockLines.get(id) ?? "";
   let out = "";
@@ -318,10 +330,83 @@ ${a.host}에 대한 Ping 통계:
     패킷: 보냄 = ${a.count}, 받음 = ${a.count}, 손실 = 0 (0% 손실)`;
     case "net_ports":
       return a.ports.map((p: number) => ({ port: p, open: p === 22 || p === 80, ms: p === 22 || p === 80 ? 3 : null, detail: p === 22 || p === 80 ? "열림" : "닫힘 (연결 거부)" }));
+    case "net_sweep": {
+      // The host addresses of the range, as nettools.rs sweep_targets has them.
+      const num = String(a.network).split(".").reduce((n: number, o: string) => n * 256 + Number(o), 0);
+      const size = 2 ** (32 - a.prefix);
+      const net = Math.floor(num / size) * size;
+      const hosts = a.prefix >= 31 ? Array.from({ length: size }, (_, i) => net + i) : Array.from({ length: size - 2 }, (_, i) => net + 1 + i);
+      const total = hosts.length;
+      const dotted = (n: number) => [24, 16, 8, 0].map((k) => Math.floor(n / 2 ** k) % 256).join(".");
+      // A Stop that came before the start counts (as in nettools.rs).
+      for (let i = 1; i <= 10; i++) {
+        if (sweepsCancelled.has(a.id)) throw "CANCELLED";
+        await new Promise((r) => setTimeout(r, 200));
+        if (sweepsCancelled.has(a.id)) throw "CANCELLED";
+        mockEmit("sweep-progress", { id: a.id, done: Math.round((total * i) / 10), total });
+      }
+      // Eight that answer ping, the fourth of them off this segment (no MAC),
+      // and one that answers ARP only (no round trip).
+      const mac = (n: number) => `00155d${(n % 16777216).toString(16).padStart(6, "0")}`;
+      return [0, 1, 9, 10, 19, 30, 53, 99, 199]
+        .filter((i) => i < total)
+        .map((i, k) => ({ ip: dotted(hosts[i]), ms: k === 5 ? null : (k % 4) + 1, mac: k % 4 === 3 && k !== 5 ? null : mac(hosts[i]) }));
+    }
+    case "net_sweep_cancel":
+      sweepsCancelled.add(a.id);
+      return;
+    case "net_watch": {
+      // Answers, then down for 6 (a reload), then back; until stopped.
+      for (let seq = 1; !sweepsCancelled.has(a.id) && seq < 3600; seq++) {
+        const lost = seq % 20 >= 8 && seq % 20 < 14;
+        mockEmit("watch-reply", { id: a.id, seq, ms: lost ? null : 1 + (seq % 5) });
+        await new Promise((r) => setTimeout(r, Math.max(50, a.intervalMs / 4)));
+      }
+      return;
+    }
+    case "net_stop_all":
+      return;
+    case "net_watch_stop":
+    case "net_trace_stop":
+      sweepsCancelled.add(a.id);
+      return;
+    case "net_trace": {
+      // Two hops on the way, one that does not answer, then the target.
+      const route = [["192.168.0.1"], ["10.10.0.1", "10.10.0.2"], [], [a.ip]];
+      for (let i = 0; i < route.length && i < a.maxHops; i++) {
+        await new Promise((r) => setTimeout(r, 300));
+        if (sweepsCancelled.has(a.id)) throw "CANCELLED";
+        const silent = !route[i].length;
+        mockEmit("trace-hop", { id: a.id, ttl: i + 1, addrs: route[i], ms: silent ? [null, null, null] : [i, i + 1, i === 0 ? 0 : null] });
+      }
+      return { reached: a.maxHops >= route.length, unreachable: null, hops: Math.min(route.length, a.maxHops) };
+    }
+    case "net_names":
+      await new Promise((r) => setTimeout(r, 600));
+      return a.ips.map((ip: string, i: number) => (i % 3 === 2 ? null : `host-${ip.split(".").pop()}.lan`));
     case "net_dns":
       return { addresses: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"], ms: 12 };
     case "file_server_status":
       return [];
+    case "syslog_status":
+      return syslogMock?.status ?? null;
+    case "syslog_stop":
+      if (syslogMock) clearInterval(syslogMock.timer);
+      syslogMock = null;
+      return;
+    case "syslog_start": {
+      if (syslogMock) throw "Syslog 수신이 이미 실행 중입니다";
+      let n = 0;
+      const timer = window.setInterval(() => {
+        const messages = [0, 1].map(() => {
+          const [from, pri, text] = SYSLOG_SAMPLES[n++ % SYSLOG_SAMPLES.length];
+          return { at: Date.now(), from, severity: pri % 8, facility: Math.floor(pri / 8), text };
+        });
+        mockEmit("syslog-batch", { messages, dropped: 0, unsaved: 0, fileError: null });
+      }, 1000);
+      syslogMock = { status: { port: a.port, lan: a.lan, addresses: [`udp://127.0.0.1:${a.port}`], file: a.file ?? null }, timer };
+      return syslogMock.status;
+    }
     case "file_server_active":
       return 0;
     case "file_server_start": {

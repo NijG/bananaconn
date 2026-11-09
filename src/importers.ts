@@ -945,7 +945,7 @@ export function parseCsv(text: string): ParsedImport {
   if (at.host < 0) throw new Error("CSV 첫 줄에 호스트 열(Host, Hostname, Address 중 하나)이 있어야 합니다");
   for (const c of records.slice(1)) {
     // "'=x": the formula guard exportCsv (and other tools) put in front.
-    const get = (i: number) => (i >= 0 ? c[i] ?? "" : "").replace(/^'(?=[=+\-@])/, "");
+    const get = (i: number) => (i >= 0 ? c[i] ?? "" : "").replace(/^'(?='*[=+\-@\t\r])/, "");
     const proto = get(at.proto).toLowerCase() || "ssh";
     const protocol = CSV_PROTOCOLS[proto] ?? null;
     add(

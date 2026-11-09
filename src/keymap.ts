@@ -50,6 +50,8 @@ export const ACTIONS: ActionDef[] = [
   g("app.clipboardHistory", "클립보드 히스토리", [], { note: "최근 복사한 내용에서 골라 붙여넣기" }),
   g("app.tunnels", "SSH 터널 관리자"),
   g("app.netTools", "네트워크 도구"),
+  g("app.subnet", "서브넷 계산", [], { note: "IP와 접두사로 네트워크·호스트 범위 계산" }),
+  g("app.compare", "출력 비교", [], { note: "두 내용을 줄 단위로 비교" }),
   g("app.lock", "앱 잠그기", [], { note: "마스터 비밀번호를 설정했을 때" }),
   g("app.checkUpdate", "업데이트 확인"),
   // Tabs and panes
@@ -72,6 +74,14 @@ export const ACTIONS: ActionDef[] = [
   t("term.copySelection", "선택 영역 복사", ["Ctrl+C"], { note: "선택 영역이 없으면 원격으로 Ctrl+C를 보냄" }),
   t("term.paste", "붙여넣기", ["Ctrl+Shift+V", "Ctrl+V"]),
   t("term.find", "터미널에서 찾기", ["Ctrl+Shift+F"]),
+  t("term.prevCommand", "이전 명령 줄로", ["Ctrl+Shift+Up"], { note: "긴 출력에서 명령을 입력한 줄로 이동" }),
+  t("term.nextCommand", "다음 명령 줄로", ["Ctrl+Shift+Down"]),
+  t("term.copyOutput", "명령 출력 복사", ["Ctrl+Shift+O"], { note: "마지막 명령(또는 이동해 간 명령)의 출력만" }),
+  t("term.compareRuns", "이전 실행과 비교", [], { note: "마지막 명령(또는 이동해 간 명령)의 출력을 같은 명령을 앞서 실행했을 때와 줄 단위로 비교 (변경 전후 확인)" }),
+  t("term.compare", "선택 영역 비교", ["Ctrl+Shift+D"], { note: "두 번 담으면 비교 창이 열림" }),
+  t("term.copyTable", "표로 복사 (엑셀용)", ["Ctrl+Shift+X"], { note: "선택한 줄을 머리글 기준 열로 나눠 탭으로 구분" }),
+  t("term.timer", "작업 타이머", [], { note: "정한 시간 1분 전과 끝날 때 알림 (reload in·commit confirmed 확인용) · 다시 누르면 멈춤" }),
+  t("term.repeat", "명령 반복 실행", [], { note: "프롬프트에서 같은 명령을 몇 초마다 다시 보냄 · 다시 누르면 멈춤" }),
   t("term.complete", "명령 후보 목록", ["Ctrl+Space"], { note: "입력 중인 명령이 있을 때" }),
   t("term.aiCommand", "AI: 명령 만들기", ["Ctrl+Shift+A"]),
   t("term.aiExplain", "AI: 선택 영역·화면 출력 설명", ["Ctrl+Shift+E"]),
@@ -93,6 +103,7 @@ export const ACTIONS: ActionDef[] = [
   { id: "tree.delete", label: "삭제", scope: "tree", keys: ["Delete"] },
   { id: "tree.selectAll", label: "모두 선택", scope: "tree", keys: ["Ctrl+A"] },
   { id: "tree.copy", label: "세션 복사", scope: "tree", keys: ["Ctrl+C"] },
+  { id: "tree.copyAddress", label: "주소 복사", scope: "tree", keys: ["Ctrl+Shift+C"] },
   { id: "tree.paste", label: "세션 붙여넣기", scope: "tree", keys: ["Ctrl+V"] },
   { id: "tree.moveUp", label: "세션을 위로 옮기기", scope: "tree", keys: ["Alt+Up"] },
   { id: "tree.moveDown", label: "세션을 아래로 옮기기", scope: "tree", keys: ["Alt+Down"] },
@@ -100,6 +111,8 @@ export const ACTIONS: ActionDef[] = [
   { id: "files.refresh", label: "새로 고침", scope: "files", keys: ["F5"] },
   { id: "files.open", label: "열기", scope: "files", keys: ["Enter"] },
   { id: "files.parent", label: "상위 폴더", scope: "files", keys: ["Backspace"] },
+  { id: "files.back", label: "이전 폴더로", scope: "files", keys: ["Alt+Left"] },
+  { id: "files.forward", label: "다음 폴더로", scope: "files", keys: ["Alt+Right"] },
   { id: "files.rename", label: "이름 바꾸기", scope: "files", keys: ["F2"] },
   { id: "files.delete", label: "삭제", scope: "files", keys: ["Delete"] },
   { id: "files.selectAll", label: "모두 선택", scope: "files", keys: ["Ctrl+A"] },
@@ -188,6 +201,16 @@ export function bindings(id: string): string[] {
   const own = state.settings.keybindings?.[id];
   if (own) return own;
   return byId(id)?.keys ?? [];
+}
+
+/** The key an action is bound to now, for a menu hint ("" when it has none):
+ * a hint written into the menu would go stale once the user changes it. */
+export const keyHint = (id: string) => bindings(id)[0] ?? "";
+
+/** A button's tooltip with the key of its action now: "새 세션 (Ctrl+Shift+N)". */
+export function withKey(label: string, id: string): string {
+  const key = keyHint(id);
+  return key ? `${label} (${key})` : label;
 }
 
 /** Chord → action per scope, and the chords a terminal hands to the app.

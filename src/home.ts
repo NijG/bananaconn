@@ -14,17 +14,30 @@ const PROTO_GROUPS: { label: string; protos: Protocol[] }[] = [
   { label: "원격 화면", protos: ["rdp", "vnc"] },
 ];
 import { ACTIONS, bindings } from "./keymap";
-import { state, subscribe } from "./store";
+import { pinSessions, state, subscribe } from "./store";
+import { copyAddresses } from "./clipboard";
 
 /** The shortcuts the home screen lists (their current keys). */
 const HOME_KEYS = ["app.newSession", "app.quickConnect", "tab.next", "tab.close", "term.find", "app.toggleSidebar"];
-import { esc, relativeTime } from "./ui";
+import { contextMenu, esc, relativeTime } from "./ui";
+import { natural } from "./sessionOrder";
+
+/** One session on the home screen; `aside`: text on the right, if any. */
+function sessionButton(s: Session, aside: string): string {
+  const info = PROTOCOLS[s.protocol];
+  return `<button class="recent-item" data-id="${s.id}" style="--proto:${info.color}">
+    <span class="proto-ico">${icon(info.icon, 16)}</span>
+    <span class="ri-text" data-i18n-skip><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
+    ${aside ? `<span class="ri-time">${aside}</span>` : ""}</button>`;
+}
 
 export function mountHome(
   root: HTMLElement,
-  actions: { create(p: Protocol): void; connect(s: Session): void; vault(): void },
+  actions: { create(p: Protocol): void; connect(s: Session): void; edit(s: Session): void; vault(): void },
 ) {
   const render = () => {
+    // Pinned from the session's menu, by name: a fixed place, unlike recent.
+    const pinned = state.sessions.filter((s) => s.pinned).sort((a, b) => natural.compare(a.name, b.name));
     const recent = [...state.sessions]
       .filter((s) => s.lastUsed)
       .sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0))
@@ -50,18 +63,15 @@ export function mountHome(
         </section>
         <div class="home-cols">
           <section>
+            ${
+              pinned.length
+                ? `<h3>고정한 세션</h3><div class="recent">${pinned.map((s) => sessionButton(s, "")).join("")}</div>`
+                : ""
+            }
             <h3>최근 연결</h3>
             ${
               recent.length
-                ? `<div class="recent">${recent
-                    .map((s) => {
-                      const info = PROTOCOLS[s.protocol];
-                      return `<button class="recent-item" data-id="${s.id}" style="--proto:${info.color}">
-                        <span class="proto-ico">${icon(info.icon, 16)}</span>
-                        <span class="ri-text" data-i18n-skip><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
-                        <span class="ri-time">${relativeTime(s.lastUsed)}</span></button>`;
-                    })
-                    .join("")}</div>`
+                ? `<div class="recent">${recent.map((s) => sessionButton(s, relativeTime(s.lastUsed))).join("")}</div>`
                 : `<p class="muted">아직 연결한 세션이 없습니다. 위에서 프로토콜을 골라 시작하세요.</p>`
             }
           </section>
@@ -84,6 +94,26 @@ export function mountHome(
       b.addEventListener("click", () => {
         const s = state.sessions.find((x) => x.id === b.dataset.id);
         if (s) actions.connect(s);
+      }),
+    );
+    // The same few actions the session's menu in the tree has, so a pinned
+    // session can be unpinned where it is shown.
+    root.querySelectorAll<HTMLElement>("[data-id]").forEach((b) =>
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const s = state.sessions.find((x) => x.id === b.dataset.id);
+        if (!s) return;
+        // The Menu key reports no pointer position: open at the button.
+        const r = b.getBoundingClientRect();
+        const [x, y] = e.clientX || e.clientY ? [e.clientX, e.clientY] : [r.left + 24, r.bottom];
+        contextMenu(x, y, [
+          { label: "연결", icon: "Play", action: () => actions.connect(s) },
+          { label: "세션 편집…", icon: "Pencil", action: () => actions.edit(s) },
+          { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([s]) },
+          s.pinned
+            ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }
+            : { label: "홈 화면에 고정", icon: "Pin", action: () => void pinSessions([s.id], true) },
+        ]);
       }),
     );
     root.querySelector("[data-vault]")!.addEventListener("click", () => actions.vault());

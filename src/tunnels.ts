@@ -8,7 +8,7 @@ import { proxyOf } from "./proxy";
 import { icon } from "./icons";
 import { endpoint, parseTarget, unusableHost, type Session } from "./model";
 import { state } from "./store";
-import { confirmDialog, errorText, esc, modal, promptDialog, toast } from "./ui";
+import { confirmDialog, confirmDiscard, errorText, esc, formValues, modal, promptDialog, toast } from "./ui";
 import { userText } from "./i18n";
 import { forgetHostKey } from "./hostKeys";
 
@@ -260,6 +260,8 @@ export function openTunnelManager() {
       </div>`,
     footer: `<button class="btn" data-close>닫기</button>`,
     onClose: () => clearInterval(timer),
+    // A new tunnel typed in but not added yet.
+    beforeDismiss: () => formValues(form) === formEmpty || confirmDiscard(),
   });
   const listEl = m.root.querySelector<HTMLElement>(".tunnel-list")!;
   const form = m.root.querySelector<HTMLFormElement>(".tunnel-new")!;
@@ -269,6 +271,8 @@ export function openTunnelManager() {
         .map((s) => `<option value="${esc(s.id)}" data-i18n-skip>${esc(s.name)} · ${esc(endpoint(s))}</option>`)
         .join("")
     : `<option value="">저장된 SSH 세션이 없습니다</option>`;
+  /** The new-tunnel form as it starts (and as "추가" leaves it). */
+  const formEmpty = formValues(form);
 
   const refresh = async () => {
     running = await api.tunnelList().catch(() => []);

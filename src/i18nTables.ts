@@ -140,11 +140,32 @@ const prefix = (sep: string, out: string, rest: string) => (out === rest ? undef
 /** "(…)" around a translated phrase, or undefined when it was not known. */
 const wrap = (out: string, inner: string) => (out === inner ? undefined : `(${out})`);
 
+/** `text` split at `sep`, except inside a user's value (userText). */
+function splitOutside(text: string, sep: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "⁨") depth++;
+    else if (text[i] === "⁩") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && text.startsWith(sep, i)) {
+      parts.push(text.slice(start, i));
+      start = i + sep.length;
+      i += sep.length - 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
 /** "연결됨 · 80×24", "이름: 값": several phrases in one text, translated piece by piece. */
 function translateParts(core: string, tr: (s: string) => string): string | undefined {
   for (const sep of [" · ", " — ", "\n"]) {
     if (!core.includes(sep)) continue;
-    const parts = core.split(sep);
+    const parts = splitOutside(core, sep);
+    // Only inside a user's value: not phrases to split (and translating the
+    // same text again would never end).
+    if (parts.length < 2) continue;
     const out = parts.map((p) => tr(p));
     if (out.some((p, i) => p !== parts[i])) return out.join(sep);
   }

@@ -5,12 +5,12 @@ import { proxyFields, proxyOptions, proxyProblem } from "./proxy";
 import { BAUD_RATES, badForwardLine, defaultPort, jumpHostOk, newSession, normalizeFolder, normalizeJumpHost, parseTarget, PROTOCOL_ORDER, PROTOCOLS, unusableHost, serialSettings, type Protocol, type Session } from "./model";
 import { allFolders, state, upsertSession } from "./store";
 import { api } from "./api";
-import { errorText, esc, h, modal, toast } from "./ui";
+import { confirmDiscard, errorText, esc, h, modal, toast } from "./ui";
 import { canBeGateway, confirmGatewayBreak, gatewayField, gatewayUsers } from "./tunnels";
 import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
 import { credentialCheck, openVault, protectKeyFile } from "./vault";
 import { checkReachable } from "./nettools";
-import { userText } from "./i18n";
+import { tr, userText } from "./i18n";
 
 const VNC_QUALITY: [string, string][] = [
   ["fast", "빠르게 (기본: 화질을 낮추고 최대한 압축)"],
@@ -39,7 +39,7 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
           <label class="field"><span>점프 호스트 (선택)</span>
             <input name="opt.jumpHost" value="${esc(o.jumpHost ?? "")}" placeholder="user@bastion:22" spellcheck="false"/></label>
           <label class="field"><span>연결 유지 간격 (초)</span>
-            <input name="opt.keepalive" type="number" min="0" max="3600" value="${esc(o.keepalive ?? 30)}"/></label>
+            <input name="opt.keepalive" type="number" min="0" max="3600" value="${esc(o.keepalive ?? 30)}" placeholder="30" title="비우거나 0이면 기본값 30초를 씁니다"/></label>
         </div>
         <label class="field"><span>포트 포워딩 (한 줄에 하나)</span>
           <textarea name="opt.forwards" rows="3" spellcheck="false" placeholder="L 8080:localhost:80    로컬 8080 → 원격의 localhost:80&#10;R 9000:localhost:3000  원격 9000 → 내 PC의 3000&#10;D 1080                 SOCKS 프록시">${esc(o.forwards ?? "")}</textarea></label>
@@ -227,8 +227,37 @@ export function editSession(
                <button class="btn" data-save>저장</button>
                <button class="btn btn-primary" data-connect>${icon("Play", 14)}저장 후 연결</button>`,
       onClose: () => resolve(result),
+      // Esc or a click outside with unsaved edits: ask before they are lost.
+      beforeDismiss: () => snapshot() === initial || confirmDiscard("이 세션에서 바꾼 내용을 저장하지 않고 닫을까요?"),
     });
     const form = m.root.querySelector<HTMLFormElement>(".editor-form")!;
+
+    /** Saved sessions that already reach this address (same protocol, host,
+     * port and user), named under Host. Only said: copies on purpose (another
+     * folder, other options) stay possible. */
+    function showDuplicate() {
+      const line = form.querySelector<HTMLElement>(".dup-hint");
+      if (!line) return;
+      const value = (n: string) => form.querySelector<HTMLInputElement>(`[name=${n}]`)?.value.trim() ?? "";
+      const host = value("host").toLowerCase();
+      const port = Number(value("port")) || defaultPort(s.protocol, s.options);
+      const user = value("username");
+      const same = host
+        ? state.sessions.filter(
+            (o) =>
+              o.id !== existing?.id &&
+              o.protocol === s.protocol &&
+              o.host.trim().toLowerCase() === host &&
+              (o.port || defaultPort(o.protocol, o.options)) === port &&
+              o.username.trim() === user,
+          )
+        : [];
+      line.hidden = !same.length;
+      const names = same.slice(0, 3).map((o) => userText(o.folder ? `${o.folder}/${o.name}` : o.name)).join(", ");
+      line.innerHTML = same.length
+        ? `${icon("Info", 12)}<span>${esc(`같은 주소의 세션이 이미 있습니다: ${names}${same.length > 3 ? ", …" : ""}`)}</span>`
+        : "";
+    }
 
     const render = () => {
       const info = PROTOCOLS[s.protocol];
@@ -258,7 +287,8 @@ export function editSession(
           <label class="field span-2"><span>세션 이름</span>
             <input name="name" value="${esc(s.name)}" placeholder="예: 운영 웹서버" /></label>
           <label class="field span-2"><span>호스트 <em>*</em></span>
-            <input name="host" value="${esc(s.host)}" placeholder="192.168.0.10 또는 server.example.com" spellcheck="false" required /></label>
+            <input name="host" value="${esc(s.host)}" placeholder="192.168.0.10 또는 server.example.com" spellcheck="false" required />
+            <small class="key-issue dup-hint" hidden></small></label>
           <label class="field"><span>포트</span>
             <input name="port" type="number" min="1" max="65535" value="${esc(s.port ?? info.port)}" /></label>
           ${
@@ -272,7 +302,7 @@ export function editSession(
             <div class="inline">
               <select name="credentialId">
                 <option value="">사용 안 함 (접속할 때 입력)</option>
-                ${creds.map((c) => `<option value="${c.id}" data-i18n-skip title="${c.kind === "key" ? "키" : "비밀번호"}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
+                ${creds.map((c) => `<option value="${c.id}" data-i18n-skip title="${esc(tr(c.kind === "key" ? "키" : "비밀번호"))}${c.username ? ` · ${esc(c.username)}` : ""}" ${c.id === s.credentialId ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
               </select>
               <button type="button" class="btn" data-vault>${icon("KeyRound", 14)}관리</button>
             </div>
@@ -319,6 +349,7 @@ export function editSession(
       };
       credSelect?.addEventListener("change", showCredIssue);
       showCredIssue();
+      showDuplicate();
       // Serial: list the COM ports present now.
       const scan = async () => {
         const found = form.querySelector<HTMLElement>(".com-found");
@@ -331,7 +362,12 @@ export function editSession(
             ? `이 PC의 포트: ${userText(ports.map((p) => p.name + (p.description ? ` (${p.description})` : "")).join(", "))}`
             : "찾은 COM 포트가 없습니다. USB 콘솔 케이블과 드라이버를 확인하세요.";
           const host = form.querySelector<HTMLInputElement>("[name=host]")!;
-          if (!host.value && ports.length === 1) host.value = ports[0].name;
+          if (!host.value && ports.length === 1) {
+            // Filled by the app, not typed: an untouched form stays untouched.
+            const untouched = snapshot() === initial;
+            host.value = ports[0].name;
+            if (untouched) initial = snapshot();
+          }
         } catch (err) {
           found.textContent = errorText(err);
         }
@@ -356,6 +392,12 @@ export function editSession(
 
     /** Set by collect() when the port field holds something that is not a port. */
     let badPort = false;
+    /** What the form holds now (read into `s`), to tell whether anything changed. */
+    const snapshot = () => {
+      collect();
+      return JSON.stringify(s);
+    };
+    let initial = "";
     const collect = () => {
       const data = new FormData(form);
       s.name = String(data.get("name") ?? "").trim();
@@ -524,9 +566,17 @@ export function editSession(
       const user = form.querySelector<HTMLInputElement>("[name=username]");
       if (t.username && user && !user.value.trim()) user.value = t.username;
     });
+    form.addEventListener("input", (e) => {
+      const name = (e.target as HTMLInputElement).name;
+      if (name === "host" || name === "port" || name === "username") showDuplicate();
+    });
+    // After the change handler above has spread a pasted "user@host:port".
+    form.addEventListener("change", () => showDuplicate());
     m.root.querySelector("[data-save]")!.addEventListener("click", () => save(false));
     m.root.querySelector("[data-connect]")!.addEventListener("click", () => save(true));
     render();
+    // The form as first shown, read the way save reads it.
+    initial = snapshot();
     setTimeout(() => form.querySelector<HTMLInputElement>(s.host ? "[name=name]" : "[name=host]")?.focus(), 40);
   });
 }

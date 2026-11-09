@@ -6,7 +6,8 @@ import { api, pickOpenFile, type Credential, type ImportKeyKind } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
-import { confirmDialog, errorText, esc, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { confirmDialog, confirmDiscard, errorText, esc, formValues, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { userText } from "./i18nTables";
 
 /** A strong random password: at least one upper, lower, digit and symbol, the
  * rest mixed, shuffled. Ambiguous characters (O/0, l/1) are left out. */
@@ -91,6 +92,12 @@ export function openVault(): Promise<void> {
     /** Unsaved changes to the selected existing credential (kind toggle).
      * Kept here, never written into state.credentials before a save. */
     let edited: Credential | null = null;
+    /** The detail form's values when its item was opened (or last saved):
+     * typing not saved yet, or a kind toggle, shows as a difference (Esc, a
+     * click outside or another item then asks first). Redrawing the same item
+     * (a kind toggle) keeps it; `shownFor` names the item it belongs to. */
+    let detailShown = "[]";
+    let shownFor = "";
 
     const m = modal({
       title: "자격 증명 보관함",
@@ -107,8 +114,10 @@ export function openVault(): Promise<void> {
         <p class="vault-note">${icon("ShieldCheck", 14)}비밀번호와 키 암호는 Windows 자격 증명 관리자에 암호화되어 저장되며, 설정 파일에는 기록되지 않습니다.</p>`,
       footer: `<button class="btn" data-close>닫기</button>`,
       onClose: () => resolve(),
+      beforeDismiss: () => !dirty() || confirmDiscard(),
     });
     const listEl = m.root.querySelector<HTMLElement>(".vault-items")!;
+    const dirty = () => formValues(detailEl) !== detailShown;
     const detailEl = m.root.querySelector<HTMLElement>(".vault-detail")!;
 
     /** Each key file's kind, by path, read when the vault opens and when a
@@ -146,7 +155,10 @@ export function openVault(): Promise<void> {
             .join("")
         : `<p class="muted small pad">${state.credentials.length ? "일치하는 자격 증명이 없습니다." : "저장된 자격 증명이 없습니다."}</p>`;
       listEl.querySelectorAll<HTMLElement>("[data-id]").forEach((b) =>
-        b.addEventListener("click", () => {
+        b.addEventListener("click", async () => {
+          // The one already open: nothing to switch, the typing stays.
+          if (b.dataset.id === selected && !draft) return;
+          if (dirty() && !(await confirmDiscard("저장하지 않은 내용이 있습니다. 저장하지 않고 다른 항목으로 넘어갈까요?", "저장하지 않고 넘어가기"))) return;
           selected = b.dataset.id!;
           draft = null;
           edited = null;
@@ -156,7 +168,24 @@ export function openVault(): Promise<void> {
       );
     };
 
+    /** Which saved sessions log in with this credential: what a new password
+     * or key changes (the delete confirmation counts them too). */
+    const usedBy = (c: Credential) => {
+      const list = state.sessions.filter((s) => s.credentialId === c.id);
+      if (!list.length) return "";
+      const names = list.slice(0, 5).map((s) => userText(s.name || s.host)).join(", ") + (list.length > 5 ? ", …" : "");
+      return `<p class="muted small cred-used">${icon("Server", 12)} <span>${esc(`이 자격 증명을 쓰는 세션 ${list.length}개: ${names}`)}</span></p>`;
+    };
+
     const renderDetail = () => {
+      // Read once this drawing is done (whichever way it returns), for a newly
+      // opened item only.
+      const key = draft ? `new:${draft.id}` : `id:${selected ?? ""}`;
+      queueMicrotask(() => {
+        if (key === shownFor) return;
+        shownFor = key;
+        detailShown = formValues(detailEl);
+      });
       const c = draft ?? (edited?.id === selected ? edited : null) ?? state.credentials.find((x) => x.id === selected);
       if (!c) {
         detailEl.innerHTML = `<div class="empty-state">${icon("KeyRound", 30)}<p>왼쪽에서 자격 증명을 선택하거나 새로 만드세요.</p></div>`;
@@ -190,6 +219,7 @@ export function openVault(): Promise<void> {
                      <button type="button" class="btn" data-genpass title="강력한 비밀번호를 만들어 넣고 복사합니다">${icon("Sparkles", 14)}생성</button>
                    </div></label>`
           }
+          ${usedBy(c)}
           <div class="row end">
             ${!isNew ? `<button type="button" class="btn btn-danger-ghost" data-del>${icon("Trash2", 14)}삭제</button>` : ""}
             ${!isNew && c.hasSecret ? `<button type="button" class="btn" data-clear>저장된 비밀 값 지우기</button>` : ""}
@@ -275,6 +305,8 @@ export function openVault(): Promise<void> {
           return toast(errorText(err), "error");
         }
         selected = state.credentials[0]?.id ?? null;
+        draft = null;
+        edited = null;
         renderList();
         renderDetail();
       });
@@ -285,6 +317,7 @@ export function openVault(): Promise<void> {
         } catch (err) {
           return toast(errorText(err), "error");
         }
+        shownFor = "";
         renderDetail();
         toast("저장된 비밀 값을 지웠습니다");
       });
@@ -299,6 +332,7 @@ export function openVault(): Promise<void> {
           selected = saved.id;
           draft = null;
           edited = null;
+          shownFor = "";
           renderList();
           renderDetail();
           toast(isNew ? "자격 증명을 추가했습니다" : "저장했습니다", "success");
@@ -348,7 +382,8 @@ export function openVault(): Promise<void> {
       terms = searchTerms(search.value);
       renderList();
     });
-    m.root.querySelector("[data-new]")!.addEventListener("click", () => {
+    m.root.querySelector("[data-new]")!.addEventListener("click", async () => {
+      if (dirty() && !(await confirmDiscard("저장하지 않은 내용이 있습니다. 저장하지 않고 다른 항목으로 넘어갈까요?", "저장하지 않고 넘어가기"))) return;
       search.value = "";
       terms = [];
       draft = { id: crypto.randomUUID(), name: "", username: "", kind: "password", keyPath: null, hasSecret: false };

@@ -23,7 +23,7 @@ import { icon } from "./icons";
 import { endpoint, isSensitiveOption, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
 import { addFolder, reloadCredentials, saveSnippets, state, upsertSessions, type Snippet } from "./store";
 import { addSavedTunnels, parseTunnel, savedTunnels } from "./tunnels";
-import { errorText, esc, modal, timestamp, toast } from "./ui";
+import { errorText, esc, modal, sheetCell, timestamp, toast } from "./ui";
 
 // ---- review & save -----------------------------------------------------------------------
 
@@ -531,9 +531,7 @@ export async function exportCsv() {
   const path = await pickSavePath(`BananaConn-세션-${timestamp()}.csv`, [{ name: "CSV", extensions: ["csv"] }]);
   if (!path) return;
   const field = (v: unknown) => {
-    // A leading = + - @ makes a spreadsheet run the cell as a formula: the
-    // usual "'" guard keeps it text (parseCsv drops it again on import).
-    const s = String(v ?? "").replace(/^(?=[=+\-@])/, "'");
+    const s = sheetCell(String(v ?? ""));
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   // Domain: an RDP session's Windows domain, which parseCsv reads back.

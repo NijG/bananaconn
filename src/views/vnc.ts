@@ -7,6 +7,7 @@ import { readClipboard, writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { contextMenu, errorText, esc, h, promptDialog, toast, setPressed } from "../ui";
+import { notesButton } from "../sessionNotes";
 import { patchSession, state, takeSavedSession } from "../store";
 
 type Quality = "fast" | "balanced" | "sharp";
@@ -23,9 +24,14 @@ import { tr, userText } from "../i18n";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 export class VncView implements View {
+  /** The session's notes button in the bar. */
+  private notes: ReturnType<typeof notesButton>;
   el: HTMLElement;
   state: ViewState = "connecting";
   private rfb: RFB | null = null;
+  /** Connections that have already ended: noVNC logs an error when one is told
+   * to disconnect again. */
+  private ended = new WeakSet<RFB>();
   private proxyId = crypto.randomUUID();
   private screen: HTMLElement;
   private overlay: HTMLElement;
@@ -91,6 +97,9 @@ export class VncView implements View {
       () => [{ label: "AI가 명령을 실행하도록 SSH 연결…", icon: "SquareTerminal", action: () => void import("../ai/sshSetup").then((m) => m.openSshSetup(this.session, this.openSession)) }],
     );
     this.overlay = this.el.querySelector(".view-overlay")!;
+    // The saved session's notes, while it has any (sessionNotes.ts).
+    this.notes = notesButton(session.id, (s) => this.ws.editHandler?.(s));
+    this.el.querySelector(".view-actions")!.prepend(this.notes.el);
     this.el.querySelector(".view-actions")!.addEventListener("click", (e) => {
       const act = (e.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
       if (act === "scale") this.setScale(!this.scale);
@@ -201,7 +210,7 @@ export class VncView implements View {
   }
 
   status(): StatusInfo {
-    return { protocol: "vnc", endpoint: endpoint(this.session), state: this.state, detail: this.desktopName };
+    return { protocol: "vnc", endpoint: endpoint(this.session), state: this.state, detail: this.desktopName && userText(this.desktopName) };
   }
 
   focus() {
@@ -252,6 +261,7 @@ export class VncView implements View {
         this.setState("connected");
       });
       rfb.addEventListener("disconnect", (e: Event) => {
+        this.ended.add(rfb);
         if (!live()) return;
         const clean = (e as CustomEvent<{ clean: boolean }>).detail?.clean;
         if (this.state === "connecting" && this.authFailed)
@@ -320,7 +330,7 @@ export class VncView implements View {
         const res = await promptDialog({ title: "VNC 사용자 이름", label: `${userText(this.session.host)} 의 사용자 이름`, icon: "User", confirm: "다음" });
         if (rfb !== this.rfb) return;
         if (!res) {
-          rfb.disconnect();
+          this.end(rfb);
           return;
         }
         username = res.value.trim();
@@ -344,7 +354,7 @@ export class VncView implements View {
       });
       if (rfb !== this.rfb) return;
       if (!res) {
-        rfb.disconnect();
+        this.end(rfb);
         return;
       }
       password = res.value;
@@ -422,12 +432,17 @@ export class VncView implements View {
     this.connect();
   }
 
-  private teardown() {
+  /** Closes `rfb` unless it has already ended. */
+  private end(rfb: RFB | null) {
     try {
-      this.rfb?.disconnect();
+      if (rfb && !this.ended.has(rfb)) rfb.disconnect();
     } catch {
       /* already closed */
     }
+  }
+
+  private teardown() {
+    this.end(this.rfb);
     this.rfb = null;
     // Clearing the screen detaches the stats box; stop its 1 Hz poll too, or it
     // would keep calling the backend forever against a dead proxy after reconnect.
@@ -441,6 +456,7 @@ export class VncView implements View {
   }
 
   dispose() {
+    this.notes.dispose();
     this.ai.dispose();
     this.disposed = true;
     clearInterval(this.statsTimer);

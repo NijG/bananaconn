@@ -110,8 +110,32 @@ struct Session {
     out: Arc<OutPump>,
     /// A paced multi-line paste in progress (see paste.rs).
     paste: Mutex<Option<Arc<paste::Job>>>,
+    /// The output's last bytes (paste::RECENT), for a new paste to check
+    /// before its first line (paste::Job::prime): a login question on the
+    /// screen, the device's prompt.
+    last_output: Mutex<Screen>,
     /// Time one character takes on the wire (serial; zero otherwise).
     char_time: Duration,
+}
+
+/// The output a new paste checks first (Session::last_output).
+#[derive(Default)]
+struct Screen {
+    /// The last paste::RECENT bytes.
+    bytes: Vec<u8>,
+    /// Output bytes so far, and how many there were when the user last
+    /// pressed Enter (term_write): a login question before that was answered
+    /// (by the user, not a paste), so it stops no paste.
+    total: u64,
+    enter_at: u64,
+}
+
+impl Screen {
+    /// Where in `bytes` the user's last Enter came; 0 when not within them.
+    fn answered(&self) -> usize {
+        let since = usize::try_from(self.total - self.enter_at).unwrap_or(usize::MAX);
+        self.bytes.len().saturating_sub(since)
+    }
 }
 
 /// Run blocking writes on their own thread; the session keeps the sender.
@@ -144,6 +168,7 @@ impl Session {
             started: Instant::now(),
             out,
             paste: Mutex::new(None),
+            last_output: Mutex::new(Screen::default()),
             char_time: Duration::ZERO,
         }
     }
@@ -186,9 +211,20 @@ impl Session {
         if bytes.is_empty() {
             return;
         }
-        // A paced paste waits for exactly this (the echo, the prompt).
-        if let Some(job) = self.paste.lock().unwrap().as_ref() {
-            job.observe(bytes);
+        // A paced paste waits for exactly this (the echo, the prompt). The
+        // last output is kept under the same lock, so a paste starting now
+        // sees these bytes one way or the other (in its job, or primed).
+        {
+            let paste = self.paste.lock().unwrap();
+            if let Some(job) = paste.as_ref() {
+                job.observe(bytes);
+            }
+            let mut screen = self.last_output.lock().unwrap();
+            screen.total += bytes.len() as u64;
+            let keep = &bytes[bytes.len().saturating_sub(paste::RECENT)..];
+            let over = (screen.bytes.len() + keep.len()).saturating_sub(paste::RECENT);
+            screen.bytes.drain(..over);
+            screen.bytes.extend_from_slice(keep);
         }
         // The screen first: a log on a slow share must not delay the echo.
         self.out.push(bytes);
@@ -744,7 +780,10 @@ struct PasteProgress {
     id: String,
     sent: usize,
     total: usize,
-    /// "running", "done", "stopped" or "failed".
+    /// Lines left out on purpose: a password `enable` did not ask for.
+    skipped: usize,
+    /// "running", "done", "stopped", "failed", "login" (stopped at a login
+    /// question) or "noprompt" (stopped: the device's prompt did not come back).
     state: &'static str,
 }
 
@@ -763,6 +802,10 @@ pub fn term_paste(app: AppHandle, state: State<TermState>, id: String, text: Str
         return Ok(());
     }
     let job = Arc::new(paste::Job::new());
+    {
+        let screen = session.last_output.lock().unwrap();
+        job.prime(&screen.bytes, screen.answered());
+    }
     job.add(text.as_bytes());
     *current = Some(job.clone());
     drop(current);
@@ -772,7 +815,7 @@ pub fn term_paste(app: AppHandle, state: State<TermState>, id: String, text: Str
         .spawn(move || {
             let report = |state: &'static str| {
                 let (sent, total) = job.progress();
-                let _ = app.emit("term-paste", PasteProgress { id: id.clone(), sent, total, state });
+                let _ = app.emit("term-paste", PasteProgress { id: id.clone(), sent, total, skipped: job.skipped(), state });
             };
             report("running");
             let end = job.run(mode, rs.char_time, |line| rs.send_input(line), || report("running"));
@@ -787,6 +830,8 @@ pub fn term_paste(app: AppHandle, state: State<TermState>, id: String, text: Str
                 paste::End::Done => "done",
                 paste::End::Stopped => "stopped",
                 paste::End::Failed => "failed",
+                paste::End::Login => "login",
+                paste::End::NoPrompt => "noprompt",
             });
         })
         .map_err(|e| e.to_string())?;
@@ -803,7 +848,9 @@ pub fn term_paste_stop(state: State<TermState>, id: String) {
     }
 }
 
-/// Send a serial Break (e.g. Cisco ROMMON / password recovery).
+/// Send a Break (e.g. Cisco ROMMON / password recovery): a serial Break on a
+/// COM port; on Telnet the protocol's Break command, which a console server
+/// passes to the device's port as one (in order with the typed input).
 #[tauri::command]
 pub async fn term_break(state: State<'_, TermState>, id: String) -> Result<(), String> {
     let session = get(&state, &id)?;
@@ -815,7 +862,8 @@ pub async fn term_break(state: State<'_, TermState>, id: String) -> Result<(), S
             std::thread::sleep(Duration::from_millis(500));
             port.set_break(false).map_err(|e| format!("Break 신호를 끝낼 수 없습니다: {e}"))
         }
-        _ => Err("Break 신호는 시리얼 연결에서만 보낼 수 있습니다".into()),
+        Backend::Telnet { .. } => session.send_raw(&telnet::brk()).map_err(|e| format!("Break 신호를 보낼 수 없습니다: {e}")),
+        Backend::Pty { .. } => Err("Break 신호는 시리얼·텔넷 연결에서만 보낼 수 있습니다".into()),
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1252,9 +1300,14 @@ fn get(state: &TermState, id: &str) -> Result<Arc<Session>, String> {
 
 #[tauri::command]
 pub fn term_write(state: State<TermState>, id: String, data: String) -> Result<(), String> {
-    get(&state, &id)?
-        .send_input(data.as_bytes())
-        .map_err(|e| format!("입력을 보낼 수 없습니다: {e}"))
+    let session = get(&state, &id)?;
+    // An Enter from the user (a paced paste's lines go another way): what
+    // the screen asked before it was answered.
+    if data.contains('\r') {
+        let mut screen = session.last_output.lock().unwrap();
+        screen.enter_at = screen.total;
+    }
+    session.send_input(data.as_bytes()).map_err(|e| format!("입력을 보낼 수 없습니다: {e}"))
 }
 
 /// The Windows display language as one of the app's screen languages

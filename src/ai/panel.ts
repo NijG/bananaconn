@@ -12,7 +12,7 @@ import { findTypedRisk } from "../riskRules";
 import { state, updateSettings } from "../store";
 import { confirmDialog, contextMenu, errorText, esc, h, matchesTerms, promptDialog, searchTerms, toast } from "../ui";
 import { writeClipboard } from "../clipboard";
-import { tr } from "../i18n";
+import { tr, userText } from "../i18n";
 import { judge } from "./policy";
 import { fromCanvas, fromFile, sizeLabel, type Attached } from "./attach";
 import { ask, cliLabel, confirmSend, currentProvider, isLocal, Masker, maskSecrets, proposedCommands, commandLines, prompts, providerLabel, providers, type AiMessage, type AiProvider, type AiUsage, type Asking, type Target } from "./core";
@@ -595,7 +595,7 @@ export class AiPanel {
     row.innerHTML = this.pending
       .map(
         (a, i) =>
-          `<span class="ai-chip" title="${esc(`${a.name} · ${sizeLabel(a.size)}`)}">${a.preview ? `<img class="ai-thumb small" src="${a.preview}" alt="" />` : icon(a.kind === "pdf" ? "FileText" : "File", 13)}<span data-i18n-skip>${esc(a.name)}</span><button type="button" class="tool" data-unattach="${i}" title="빼기">${icon("X", 12)}</button></span>`,
+          `<span class="ai-chip" title="${esc(`${userText(a.name)} · ${sizeLabel(a.size)}`)}">${a.preview ? `<img class="ai-thumb small" src="${a.preview}" alt="" />` : icon(a.kind === "pdf" ? "FileText" : "File", 13)}<span data-i18n-skip>${esc(a.name)}</span><button type="button" class="tool" data-unattach="${i}" title="빼기">${icon("X", 12)}</button></span>`,
       )
       .join("");
   }

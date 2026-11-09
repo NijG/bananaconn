@@ -16,6 +16,7 @@ const WONT: u8 = 252;
 const WILL: u8 = 251;
 const SB: u8 = 250;
 const SE: u8 = 240;
+const BRK: u8 = 243;
 
 const OPT_ECHO: u8 = 1;
 const OPT_SGA: u8 = 3;
@@ -223,6 +224,12 @@ pub fn encode_input(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The Telnet "Break" command (RFC 854, BRK = 243): a console server turns it
+/// into a serial Break on the device's port (ROMMON, password recovery).
+pub fn brk() -> [u8; 2] {
+    [IAC, BRK]
+}
+
 /// Window-size report (NAWS subnegotiation), escaping any 255 bytes.
 pub fn naws(cols: u16, rows: u16) -> Vec<u8> {
     let mut out = vec![IAC, SB, OPT_NAWS];
@@ -249,6 +256,13 @@ mod tests {
         assert!(f.send_size);
         let again = p.feed(&[IAC, DO, OPT_NAWS]);
         assert!(again.replies.is_empty());
+    }
+
+    #[test]
+    fn break_is_the_protocol_command_not_data() {
+        // IAC BRK (RFC 854): sent as it is, never escaped as typed input would be.
+        assert_eq!(brk(), [255, 243]);
+        assert_eq!(encode_input(&[255]), vec![255, 255]);
     }
 
     #[test]
