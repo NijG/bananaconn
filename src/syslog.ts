@@ -7,8 +7,9 @@ import { writeClipboard } from "./clipboard";
 import { tr, userText } from "./i18n";
 import { icon } from "./icons";
 import { clockText } from "./lineTimes";
-import { newSessionHandler, openNetworkTools } from "./nettools";
-import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, modal, osNotify, requestAttention, setPressed, timestamp, toast } from "./ui";
+import { state } from "./store";
+import { newSessionHandler, openNetworkTools, savedSessionItems } from "./nettools";
+import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, formatBytes, markTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, setPressed, timestamp, toast } from "./ui";
 
 /** Messages kept (the oldest go first), and the text they may hold in all. */
 const KEEP = 20000;
@@ -49,9 +50,11 @@ export async function initSyslog() {
       toast(`로그 파일에 쓰지 못해 파일 저장을 멈췄습니다: ${userText(b.fileError)}`, "error", 10000);
       status = { ...status, file: null };
     }
-    alertOf(b.messages, b.droppedBad ?? 0);
-    for (const m of b.messages) {
-      messages.push({ ...m, seq: ++seq, lower: m.text.toLowerCase() });
+    // Each message's lower case made once: the alert words and the filter both use it.
+    const kept: Kept[] = b.messages.map((m) => ({ ...m, seq: ++seq, lower: m.text.toLowerCase() }));
+    alertOf(kept, b.droppedBad ?? 0);
+    for (const m of kept) {
+      messages.push(m);
       chars += m.text.length;
     }
     let cut = 0;
@@ -72,16 +75,24 @@ export function syslogBadge(): string {
 }
 
 /** `alert`: a beep, the taskbar flashing and a notification for an err or
- * worse message, also with the window closed. */
-type Prefs = { port: number; lan: boolean; save: boolean; file: string; alert: boolean };
+ * worse message, also with the window closed; `words`: the alert words as
+ * typed (comma-separated), a message with one is alerted whatever its severity. */
+type Prefs = { port: number; lan: boolean; save: boolean; file: string; alert: boolean; words: string };
 
 function loadPrefs(): Prefs {
-  const d: Prefs = { port: 514, lan: true, save: false, file: "", alert: false };
+  const d: Prefs = { port: 514, lan: true, save: false, file: "", alert: false, words: "" };
   try {
-    return { ...d, ...JSON.parse(localStorage.getItem("bx.syslog") ?? "{}") };
+    const p = { ...d, ...JSON.parse(localStorage.getItem("bx.syslog") ?? "{}") };
+    // An older or edited file: a value of another type is the default.
+    return { ...p, words: typeof p.words === "string" ? p.words : "" };
   } catch {
     return d;
   }
+}
+
+/** The alert words to look for: lower-case, each once, at most 20. */
+function parseWords(typed: string): string[] {
+  return [...new Set(typed.split(/[,\n]/).map((w) => w.trim().toLowerCase()).filter(Boolean))].slice(0, 20);
 }
 
 function savePrefs(p: Prefs) {
@@ -96,19 +107,33 @@ function savePrefs(p: Prefs) {
  * every ALERT_EVERY (a flapping link sends many); those that came meanwhile
  * are told together when that time is up. */
 const ALERT_SEVERITY = 3;
+/** A saving file this large is shown in the warning colour (1 GiB). */
+const BIG_LOG_FILE = 1024 ** 3;
 const ALERT_EVERY = 30_000;
 let alertOn = loadPrefs().alert;
+let alertWords = parseWords(loadPrefs().words);
+/** Whether a message's text (lower-case) has one of the alert words: alerted, and marked in the list. */
+const hasAlertWord = (lower: string) => alertWords.some((w) => lower.includes(w));
 let alertedAt = 0;
-let held: { count: number; last: SyslogMessage | null } = { count: 0, last: null };
+/** The alerts waiting to be told; `from`: their one sender, null when they
+ * came from several (or some in a flood, whose senders are not known). */
+type Held = { count: number; last: SyslogMessage | null; from: string | null };
+const NONE_HELD: Held = { count: 0, last: null, from: null };
+let held: Held = NONE_HELD;
 let heldTimer = 0;
 
 /** `unshown`: err-or-worse messages a flood kept out of the batch (still alerted, counted). */
-function alertOf(batch: SyslogMessage[], unshown: number) {
+function alertOf(batch: Kept[], unshown: number) {
+  const bad = batch.filter((m) => (m.severity !== null && m.severity <= ALERT_SEVERITY) || hasAlertWord(m.lower));
+  const senders = new Set(bad.map((m) => m.from));
+  // The devices' tabs and saved sessions (main's markDevice) are marked
+  // whether or not the alert is on: a quiet sign, not a sound.
+  senders.forEach((ip) => markTabsOf(ip));
   if (!alertOn) return;
-  const bad = batch.filter((m) => m.severity !== null && m.severity <= ALERT_SEVERITY);
   if (!bad.length && !unshown) return;
-  held.count += bad.length + unshown;
-  if (bad.length) held.last = bad[bad.length - 1];
+  const first = held.count === 0;
+  const one = !unshown && senders.size === 1 && (first || held.from === bad[0].from) ? bad[0].from : null;
+  held = { count: held.count + bad.length + unshown, last: bad.length ? bad[bad.length - 1] : held.last, from: one };
   const wait = ALERT_EVERY - (Date.now() - alertedAt);
   if (wait <= 0) raiseAlert();
   else if (!heldTimer) heldTimer = window.setTimeout(raiseAlert, wait);
@@ -116,18 +141,24 @@ function alertOf(batch: SyslogMessage[], unshown: number) {
 
 function raiseAlert() {
   heldTimer = 0;
-  const { count, last } = held;
-  held = { count: 0, last: null };
+  const { count, last, from } = held;
+  held = NONE_HELD;
   if (!alertOn || !count) return;
   alertedAt = Date.now();
   beep();
   requestAttention();
   // The device's words as it sent them (never translated); none when every
   // one of them came in a flood the window could not keep.
-  const what = last ? `${last.from} ${SEVERITY[last.severity ?? 3]}: ${last.text}` : "";
-  if (!document.hasFocus() && canOsNotify()) return osNotify(tr(count > 1 ? `Syslog 경보 ${count}개` : "Syslog 경보"), what, () => openSyslog());
+  // The sender by its saved session's name too, when it has one ("core-sw (10.0.0.2)").
+  const name = last ? sessionNames().get(last.from) : undefined;
+  const sender = last ? (name ? `${name} (${last.from})` : last.from) : "";
+  // A message alerted for a word may have no severity: shown as in the list ("-").
+  const what = last ? `${sender} ${last.severity !== null ? SEVERITY[last.severity] : "-"}: ${last.text}` : "";
+  // All from one device: its messages alone; from several, all of them.
+  const show = () => openSyslog(from ?? undefined);
+  if (!document.hasFocus() && canOsNotify()) return osNotify(tr(count > 1 ? `Syslog 경보 ${count}개` : "Syslog 경보"), what, show);
   const message = !what ? (count > 1 ? `Syslog 경보 ${count}개` : "Syslog 경보") : count > 1 ? `Syslog 경보 ${count}개: ${userText(what)}` : `Syslog 경보: ${userText(what)}`;
-  toast(message, "warn", 10_000, { label: "보기", run: () => openSyslog() });
+  toast(message, "warn", 10_000, { label: "보기", run: show });
 }
 
 function setAlert(on: boolean) {
@@ -137,7 +168,7 @@ function setAlert(on: boolean) {
   else {
     clearTimeout(heldTimer);
     heldTimer = 0;
-    held = { count: 0, last: null };
+    held = NONE_HELD;
   }
 }
 
@@ -145,16 +176,55 @@ function setAlert(on: boolean) {
 const asText = (m: SyslogMessage, withDate: boolean) =>
   [withDate ? new Date(m.at).toLocaleString("sv-SE").replace(",", "") : clockText(m.at), m.from, m.severity !== null ? SEVERITY[m.severity] : "-", m.text].join("\t");
 
-const rowHtml = (x: Kept) =>
-  `<div class="syslog-row sev-${x.severity ?? "x"}" data-seq="${x.seq}"><time>${clockText(x.at)}</time><span class="from" data-i18n-skip>${esc(x.from)}</span><span class="sev">${x.severity !== null ? SEVERITY[x.severity] : "-"}</span><span class="tx" data-i18n-skip>${esc(x.text)}</span></div>`;
+/** Saved sessions' names by their host (lower-case): a sender shown by its address is found by its name too. */
+function sessionNames(): Map<string, string> {
+  const byHost = new Map<string, string[]>();
+  for (const s of state.sessions) {
+    const host = s.host.trim().toLowerCase();
+    if (host) byHost.set(host, [...(byHost.get(host) ?? []), s.name]);
+  }
+  return new Map([...byHost].map(([host, names]) => [host, names.join(", ")]));
+}
+
+/** A row; the sender's session names as its tooltip (user data: never translated). */
+/** A message's row; the filter's words (`terms`) marked in its sender and text. */
+const rowHtml = (x: Kept, names: Map<string, string>, terms: string[]) =>
+  `<div class="syslog-row sev-${x.severity ?? "x"}${hasAlertWord(x.lower) ? " word-hit" : ""}" data-seq="${x.seq}"><time>${clockText(x.at)}</time><span class="from" data-i18n-skip${names.has(x.from) ? ` title="${esc(names.get(x.from)!)}"` : ""}>${markTerms(x.from, terms)}</span><span class="sev">${x.severity !== null ? SEVERITY[x.severity] : "-"}</span><span class="tx" data-i18n-skip>${markTerms(x.text, terms)}</span></div>`;
+
+/** The open tabs connected to an address (main's), each a way to bring it to the front. */
+let tabsOf: (ip: string) => (() => void)[] = () => [];
+export function setSyslogTabs(f: (ip: string) => (() => void)[]) {
+  tabsOf = f;
+}
+/** Marks the open tabs connected to an address that sent an alert-worthy message (main's). */
+let markTabsOf: (ip: string) => void = () => {};
+export function setSyslogTabMarker(f: (ip: string) => void) {
+  markTabsOf = f;
+}
 
 /** The Syslog window while it is open: opened again (an alert's "보기", the
  * status bar), it is the same window, not a second one. */
 let openWindow: HTMLElement | null = null;
+/** The open window's sender filter. */
+let showSender: ((from: string | null) => void) | null = null;
 
-export function openSyslog() {
+/** Whether messages from this address are kept (a terminal's address menu offers them). */
+/** The senders of the kept messages, the latest first, each once. */
+export function syslogSenderList(): string[] {
+  const out = new Set<string>();
+  for (let i = messages.length - 1; i >= 0 && out.size < 300; i--) out.add(messages[i].from);
+  return [...out];
+}
+
+export function syslogSender(host: string): string | undefined {
+  const key = host.trim().toLowerCase();
+  return key ? messages.find((m) => m.from.toLowerCase() === key)?.from : undefined;
+}
+
+/** The Syslog window; `from`: showing only that sender's messages. */
+export function openSyslog(from?: string) {
   if (openWindow?.isConnected) {
-    openWindow.querySelector<HTMLElement>(".syslog-list")?.focus();
+    if (from) showSender?.(from);
     return;
   }
   const p = loadPrefs();
@@ -177,13 +247,15 @@ export function openSyslog() {
         <div class="syslog-tools">
           <label class="pane-filter syslog-filter" title="주소나 내용으로 거르기">${icon("Search", 13)}<input placeholder="필터" spellcheck="false"/></label>
           <button type="button" class="syslog-only" data-only hidden title="모든 장비의 메시지 보기">${icon("X", 12)}<span>보낸 곳</span><code data-i18n-skip></code></button>
+          <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기">${icon("Server", 13)}보낸 곳</button>
           <select name="level" title="심각도">
             <option value="7">모든 심각도</option>
             <option value="4">warning 이상</option>
             <option value="3">err 이상</option>
             <option value="2">crit 이상</option>
           </select>
-          <button type="button" class="btn btn-sm syslog-bell" data-bell title="err 이상 메시지가 오면 소리, 작업 표시줄 깜박임, 알림으로 알립니다 (창을 닫아도)">${icon("Bell", 13)}경보</button>
+          <button type="button" class="btn btn-sm syslog-bell" data-bell title="err 이상 메시지나 경보 낱말이 든 메시지가 오면 소리, 작업 표시줄 깜박임, 알림으로 알립니다 (창을 닫아도)">${icon("Bell", 13)}경보</button>
+          <button type="button" class="btn btn-sm syslog-bell" data-bell-words title="경보 낱말: 이 낱말이 든 메시지도 심각도와 상관없이 알립니다">${icon("Highlighter", 13)}</button>
           <span class="muted small syslog-count" data-count></span>
           <span class="syslog-actions">
             <button type="button" class="btn btn-sm" data-copy>${icon("Copy", 13)}보이는 줄 복사</button>
@@ -195,7 +267,9 @@ export function openSyslog() {
       </div>`,
     footer: `<button class="btn" data-close>닫기</button><button class="btn btn-primary" data-toggle></button>`,
     onClose: () => {
+      clearInterval(sizeTimer);
       openWindow = null;
+      showSender = null;
       off();
       cancelAnimationFrame(frame);
       document.removeEventListener("selectionchange", onSelection);
@@ -228,11 +302,15 @@ export function openSyslog() {
 
   /** Whether the sender, the filter and the severity let a message through. */
   const passes = () => {
-    const terms = filterIn.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const terms = searchTerms(filterIn.value);
     const max = Number(level.value);
     const from = onlyFrom;
+    const names = sessionNames();
+    // A term matches the address, the message, or a saved session's name for that address.
     return (x: Kept) =>
-      (from === null || x.from === from) && (max >= 7 || (x.severity !== null && x.severity <= max)) && terms.every((t) => x.from.includes(t) || x.lower.includes(t));
+      (from === null || x.from === from) &&
+      (max >= 7 || (x.severity !== null && x.severity <= max)) &&
+      terms.every((t) => x.from.includes(t) || x.lower.includes(t) || !!names.get(x.from)?.toLowerCase().includes(t));
   };
   const showOnly = (from: string | null) => {
     onlyFrom = from;
@@ -242,6 +320,32 @@ export function openSyslog() {
     render();
   };
   const visible = () => messages.filter(passes());
+  // The senders of the kept messages, the busiest first, with how many of
+  // theirs are err or worse: which device is the noisy or failing one.
+  m.root.querySelector<HTMLElement>("[data-senders]")!.addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const per = new Map<string, { n: number; bad: number }>();
+    for (const x of messages) {
+      const c = per.get(x.from) ?? { n: 0, bad: 0 };
+      c.n++;
+      if (x.severity !== null && x.severity <= 3) c.bad++;
+      per.set(x.from, c);
+    }
+    if (!per.size) return void toast("아직 받은 메시지가 없습니다.", "info");
+    const names = sessionNames();
+    const top = [...per].sort((a, b) => b[1].n - a[1].n || a[0].localeCompare(b[0])).slice(0, 20);
+    contextMenu(r.left, r.bottom + 4, [
+      ...(onlyFrom !== null ? [{ label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }, "-" as const] : []),
+      ...top.map(([ip, c]) => ({
+        label: names.has(ip) ? `${names.get(ip)} (${ip})` : ip,
+        userLabel: true,
+        icon: c.bad ? "TriangleAlert" : "Server",
+        hint: c.bad ? `${c.n} · err+ ${c.bad}` : `${c.n}`,
+        userHint: true,
+        action: () => showOnly(ip),
+      })),
+    ]);
+  });
 
   let drawnState = "";
   function renderState() {
@@ -254,13 +358,34 @@ export function openSyslog() {
          <div class="ftpd-addrs">${status.addresses
            .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
            .join("")}</div>
-         ${status.file ? `<p class="muted small syslog-saving">${icon("Save", 13)}<span>파일에 저장 중</span> <code data-i18n-skip>${esc(status.file)}</code></p>` : ""}`
+         ${status.file ? `<p class="muted small syslog-saving">${icon("Save", 13)}<span>파일에 저장 중</span> <code data-i18n-skip>${esc(status.file)}</code> <span class="muted" data-file-size data-i18n-skip></span></p>` : ""}`
       : `<div class="ftpd-off"><span class="sb-dot idle"></span><b>중지됨</b><span class="muted">수신을 시작하면 장비가 보내는 로그가 여기에 나타납니다.</span></div>`;
     if (html !== drawnState) {
       drawnState = html;
       stateBox.innerHTML = html;
+      void showFileSize();
     }
   }
+  /** The saving file's size, read again every few seconds while the window is
+   * open: a file a busy network keeps growing is seen growing. */
+  const showFileSize = async () => {
+    const file = status?.file;
+    const el = stateBox.querySelector<HTMLElement>("[data-file-size]");
+    if (!file || !el) return;
+    try {
+      const [, size] = await api.localStat(file);
+      if (status?.file !== file) return;
+      el.textContent = `(${formatBytes(size)})`;
+      // Never split or deleted by the app: past a size worth tidying, said so
+      // (the element skips the screen's translation: the note is translated here).
+      const big = size >= BIG_LOG_FILE;
+      el.classList.toggle("syslog-big", big);
+      el.title = big ? tr("파일이 1GB를 넘었습니다. 오래된 로그를 옮기거나 지우세요") : "";
+    } catch {
+      // Not there yet (nothing written) or unreadable: no size shown.
+    }
+  };
+  const sizeTimer = window.setInterval(() => void showFileSize(), 5000);
 
   /** What the list shows: the filter it was drawn for, the last message
    * in it, and how many of the kept messages pass the filter. */
@@ -273,6 +398,8 @@ export function openSyslog() {
    * for another filter, or a clear), the oldest rows over SHOW taken away;
    * it follows new lines only when it was at its bottom. */
   function renderList() {
+    const names = sessionNames();
+    const terms = searchTerms(filterIn.value);
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
     const key = `${filterIn.value}\u0000${level.value}\u0000${onlyFrom ?? ""}`;
     const lead = messages[0]?.seq ?? seq + 1;
@@ -282,7 +409,7 @@ export function openSyslog() {
       shownCount = shown.length;
       const rows = shown.slice(-SHOW);
       list.innerHTML = rows.length
-        ? rows.map(rowHtml).join("")
+        ? rows.map((x) => rowHtml(x, names, terms)).join("")
         : `<p class="muted ftpd-empty">${messages.length ? "필터에 맞는 메시지가 없습니다." : "아직 받은 메시지가 없습니다."}</p>`;
       drawnFor = key;
     } else {
@@ -296,7 +423,7 @@ export function openSyslog() {
       else shownCount += fresh.length;
       if (fresh.length) {
         list.querySelector(".ftpd-empty")?.remove();
-        list.insertAdjacentHTML("beforeend", fresh.slice(-SHOW).map(rowHtml).join(""));
+        list.insertAdjacentHTML("beforeend", fresh.slice(-SHOW).map((x) => rowHtml(x, names, terms)).join(""));
       }
       // Rows go from the top: those over SHOW, and those of messages no
       // longer kept (copied lines must be the ones shown). Measured once and
@@ -373,6 +500,29 @@ export function openSyslog() {
     setPressed(bell, alertOn);
     toast(alertOn ? "err 이상 메시지가 오면 알립니다 (창을 닫아도)" : "Syslog 경보를 껐습니다", "info", 3000);
   });
+  // Words that alert whatever the severity ("UPDOWN" for a link going down,
+  // which a device sends as an error or only as a notice).
+  const wordsBtn = m.root.querySelector<HTMLButtonElement>("[data-bell-words]")!;
+  setPressed(wordsBtn, alertWords.length > 0);
+  wordsBtn.addEventListener("click", async () => {
+    const r = await promptDialog({
+      title: "Syslog 경보 낱말",
+      icon: "Highlighter",
+      label: "이 낱말이 든 메시지도 심각도와 상관없이 알립니다 (쉼표로 구분, 대소문자 무시)",
+      value: loadPrefs().words,
+      confirm: "저장",
+    });
+    if (!r) return;
+    const typed = r.value.trim();
+    alertWords = parseWords(typed);
+    savePrefs({ ...loadPrefs(), words: typed });
+    setPressed(wordsBtn, alertWords.length > 0);
+    // The rows already shown get their marks for the new words.
+    drawnFor = "";
+    render();
+    if (!alertWords.length) return void toast("경보 낱말을 지웠습니다", "info", 3000);
+    toast(alertOn ? `경보 낱말 ${alertWords.length}개를 저장했습니다` : `경보 낱말 ${alertWords.length}개를 저장했습니다. 경보를 켜야 알립니다`, "success", 4000);
+  });
   // A sender's address: its messages alone, the network tools, a session, a copy.
   list.addEventListener("click", (e) => {
     const from = (e.target as HTMLElement).closest<HTMLElement>(".syslog-row .from");
@@ -386,6 +536,11 @@ export function openSyslog() {
       onlyFrom === ip
         ? { label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }
         : { label: "이 장비의 메시지만 보기", icon: "ListFilter", action: () => showOnly(ip) },
+      // Its console or shell, already open: the window steps aside for it.
+      // Otherwise its saved sessions, to connect (the window closes first; receiving goes on).
+      ...(tabsOf(ip).length
+        ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => (m.close(), tabsOf(ip)[0]?.()) }]
+        : savedSessionItems(ip, () => m.close())),
       { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools(ip) },
       // The window closes as the session connects (receiving goes on), so its tab is not left behind it.
       ...(make ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => make({ protocol: "ssh", host: ip }, () => m.close()) }] : []),
@@ -431,7 +586,7 @@ export function openSyslog() {
       } else {
         const port = Number(portIn.value);
         if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("포트는 1~65535 사이여야 합니다");
-        const prefs: Prefs = { port, lan: lanIn.checked, save: saveIn.checked, file: fileIn.value.trim(), alert: alertOn };
+        const prefs: Prefs = { port, lan: lanIn.checked, save: saveIn.checked, file: fileIn.value.trim(), alert: alertOn, words: loadPrefs().words };
         if (prefs.save && !prefs.file) throw new Error("저장할 파일을 고르세요");
         savePrefs(prefs);
         status = await api.syslogStart(port, prefs.lan, prefs.save ? prefs.file : null);
@@ -446,4 +601,6 @@ export function openSyslog() {
   });
   renderState();
   renderList();
+  showSender = showOnly;
+  if (from) showOnly(from);
 }

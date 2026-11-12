@@ -3,7 +3,7 @@
 // (tunnel.rs) does the forwarding in-process; this module handles the login
 // dialogs (host key, password) and the saved tunnel list.
 
-import { api, on, type ProxyLogEvent, type TunnelInfo } from "./api";
+import { api, on, openExternal, type ProxyLogEvent, type TunnelInfo } from "./api";
 import { proxyOf } from "./proxy";
 import { icon } from "./icons";
 import { endpoint, parseTarget, unusableHost, type Session } from "./model";
@@ -11,6 +11,7 @@ import { state } from "./store";
 import { confirmDialog, confirmDiscard, errorText, esc, formValues, modal, promptDialog, toast } from "./ui";
 import { userText } from "./i18n";
 import { forgetHostKey } from "./hostKeys";
+import { writeClipboard } from "./clipboard";
 
 // ---- connecting through a gateway -----------------------------------------------------
 
@@ -182,6 +183,8 @@ export interface SavedTunnel {
 }
 
 const KEY = "bx.tunnels";
+/** Web ports a tunnel may lead to (a device's management page), by scheme. */
+const WEB_PORTS: Record<number, "http" | "https"> = { 80: "http", 8080: "http", 443: "https", 8443: "https" };
 
 /** A saved tunnel as stored or restored from a backup, or null when any
  * field is not what it must be (ports are whole numbers 1-65535). */
@@ -297,7 +300,7 @@ export function openTunnelManager() {
       const html = `<div class="tunnel-row${r ? " on" : ""}" data-id="${esc(t.id)}">
           <span class="sb-dot ${r ? "connected" : "idle"}"></span>
           <div class="tunnel-main"><b data-i18n-skip>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>
-            <span class="mono small" data-i18n-skip>127.0.0.1:${esc(String(t.localPort))} → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span>
+            <span class="mono small"><button type="button" class="tunnel-local" data-copy-local title="주소 복사"><span data-i18n-skip>127.0.0.1:${esc(String(t.localPort))}</span></button><span data-i18n-skip> → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span></span>
             <span class="muted small">${
               // The session name is the user's: kept out of the "{0} 경유" pattern,
               // whose value the translator would translate too ("삭제" → "Delete").
@@ -305,6 +308,10 @@ export function openTunnelManager() {
             }<span class="tunnel-stats"></span></span></div>
           <button class="btn btn-sm ${r ? "btn-danger" : "btn-primary"}" data-toggle ${busy.has(t.id) || !gw ? "disabled" : ""}>
             ${r ? `${icon("Square", 13)}중지` : `${icon("Play", 13)}시작`}</button>
+          ${
+            // A running tunnel to a web port (a device's management page): opened in the browser.
+            r && WEB_PORTS[t.targetPort] ? `<button class="tool" data-open-web title="브라우저에서 열기">${icon("Globe", 14)}</button>` : ""
+          }
           <button class="tool" data-del title="삭제" ${r || busy.has(t.id) ? "disabled" : ""}>${icon("Trash2", 14)}</button>
         </div>`;
       return { id: t.id, html, stats: r ? ` · 연결 ${r.active}개 / 누적 ${r.total}` : "" };
@@ -333,6 +340,16 @@ export function openTunnelManager() {
     const row = (e.target as HTMLElement).closest<HTMLElement>("[data-id]");
     const t = row && list.find((x) => x.id === row.dataset.id);
     if (!t) return;
+    if ((e.target as HTMLElement).closest("[data-open-web]")) {
+      const scheme = WEB_PORTS[t.targetPort];
+      if (scheme) void openExternal(`${scheme}://127.0.0.1:${t.localPort}/`).catch((err) => toast(errorText(err), "error"));
+      return;
+    }
+    // The local end, to paste into a browser or a database client.
+    if ((e.target as HTMLElement).closest("[data-copy-local]")) {
+      void writeClipboard(`127.0.0.1:${t.localPort}`);
+      return void toast("주소를 복사했습니다", "success", 1600);
+    }
     if ((e.target as HTMLElement).closest("[data-del]")) {
       if (busy.has(t.id) || running.some((r) => r.id === t.id)) return;
       const ok = await confirmDialog({

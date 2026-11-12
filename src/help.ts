@@ -3,7 +3,7 @@
 
 import { language, userText } from "./i18n";
 import { icon } from "./icons";
-import { esc, matchesTerms, modal, searchTerms } from "./ui";
+import { esc, h, matchesTerms, modal, searchTerms } from "./ui";
 
 export interface HelpSection {
   id: string;
@@ -93,7 +93,7 @@ const KO_SECTIONS: HelpSection[] = [
     icon: "SquareTerminal",
     body: `
       <ul>
-        <li><b>복사·붙여넣기</b>: 드래그로 선택하면 바로 복사되고, 오른쪽 클릭으로 붙여넣습니다(설정에서 바꿀 수 있음). ${kbd("Ctrl+C")}는 선택 영역이 있을 때만 복사, 없으면 장비로 전달됩니다. 설정에서 이 동작을 끄면 오른쪽 클릭에 복사·붙여넣기·전체 선택·찾기·화면 지우기 메뉴가 나옵니다.</li>
+        <li><b>복사·붙여넣기</b>: 드래그로 선택하면 바로 복사되고, 오른쪽 클릭으로 붙여넣습니다(설정에서 바꿀 수 있음). ${kbd("Ctrl+C")}는 선택 영역이 있을 때만 복사, 없으면 장비로 전달됩니다. 설정에서 이 동작을 끄면 오른쪽 클릭에 복사·붙여넣기·전체 선택·찾기·화면 지우기 메뉴가 나옵니다. 최근에 복사한 내용 30개는 명령 팔레트의 "클립보드 히스토리"에서 다시 골라 복사할 수 있으며, 위쪽 필터에 낱말을 쓰면 맞는 항목만 남고 Enter로 첫 항목을 복사합니다(비밀번호처럼 보이는 내용은 남기지 않습니다).</li>
         <li><b>출력 속 IP 주소</b>: 터미널 출력(show arp, show ip int brief, ip route, traceroute 등)의 IPv4 주소는 링크처럼 ${kbd("Ctrl")}+클릭(설정에 따라 클릭)하면 메뉴가 열립니다. 그 주소로 새 세션 만들기(편집 창이 채워진 채 열리고 저장해야 접속), 네트워크 도구(ping·포트·DNS), 주소 복사를 고릅니다. 서브넷 마스크(255.x.x.x)와 0.0.0.0은 제외합니다. 메뉴의 서브넷 계산은 그 주소의 네트워크·브로드캐스트·사용 가능한 범위·호스트 수·마스크를 보여 주며, 주소 바로 뒤에 /24나 마스크(255.255.255.0, 0xffffff00, ACL 와일드카드 0.0.0.255)가 있으면 그 접두사로 계산합니다. MAC 주소(aa:bb:cc:dd:ee:ff, aabb.ccdd.eeff 등)도 같은 방법으로 누르면 Linux·Windows·Cisco·Huawei 표기로 복사하거나, "이 MAC을 모든 형식으로 찾기"로 화면에서 어느 표기든 한 번에 찾습니다.</li>
         <li><b>명령 줄로 이동</b>: 프롬프트에서 명령을 입력하면 그 줄을 기억해 두어, 출력이 길어도 ${kbd("Ctrl+Shift+↑")} / ${kbd("Ctrl+Shift+↓")}로 이전·다음 명령을 입력한 줄로 바로 스크롤하고 그 줄을 잠깐 강조합니다. 마지막 명령보다 아래로 가면 출력 끝으로 돌아갑니다. vi·less 같은 전체 화면 프로그램 안에서는 기억하지 않고, 입력한 내용은 저장하지 않습니다. 2초 넘게 걸린 명령은 프롬프트가 다시 나오면 그 명령 줄의 오른쪽 끝에 걸린 시간(⏱ 12.4s)을 표시합니다. ${kbd("Ctrl+Shift+O")}는 마지막 명령(또는 이렇게 이동해 간 명령)의 출력만 골라 복사합니다. 드래그로 긴 출력을 선택할 필요가 없고, 아직 실행 중이면 지금까지의 출력을 복사합니다. 오른쪽 클릭 메뉴의 "이전 실행과 비교"는 같은 명령을 같은 프롬프트에서 앞서 실행했을 때의 출력과 지금 출력을 비교 창에서 줄 단위로 비교합니다(변경 전후의 show 결과 확인 등). 터미널에 남아 있는 출력에서만 찾고, 단축키는 설정에서 정할 수 있습니다.</li>
         <li><b>출력 비교</b>: 비교할 출력을 선택하고 ${kbd("Ctrl+Shift+D")}를 누르면 첫 내용으로 담고, 다른 탭(또는 같은 탭의 다른 부분)에서 선택한 뒤 다시 누르면 두 내용을 줄 단위로 비교합니다. 두 스위치의 설정이나 변경 전후의 show 출력을 맞대 볼 때 씁니다. 추가된 줄은 초록, 삭제된 줄은 빨강으로 표시하고 같은 부분은 접으며, 공백 차이를 무시할 수 있습니다. 명령 팔레트(${kbd("Ctrl+K")})의 "출력 비교"로 빈 창을 열어 직접 붙여 넣어도 됩니다. 비교는 이 창 안에서만 하고 장비에는 아무것도 보내지 않습니다. 양쪽 위의 "파일…"로 저장해 둔 설정 백업 같은 텍스트 파일을 불러와 지금 출력과 비교할 수 있고, "좌우 바꾸기"로 두 쪽을 맞바꿉니다. "결과 복사"는 차이를 +/- 표시가 붙은 텍스트로 복사해 변경 기록에 붙여 넣기 좋습니다.</li>
@@ -259,11 +259,11 @@ const KO_SECTIONS: HelpSection[] = [
       <ul>
         <li><b>SSH 게이트웨이</b>: RDP·VNC·Telnet 세션 편집에서 저장된 SSH 세션을 게이트웨이로 고르면 그 서버를 거쳐 방화벽 안쪽 장비에 접속합니다.</li>
         <li><b>프록시</b>: 세션 편집의 "프록시"에서 PuTTY의 Connection → Proxy처럼 SOCKS 4/4a, SOCKS 5, HTTP CONNECT, Telnet(명령으로 연결), 로컬 명령을 고릅니다. SSH, SFTP, Telnet, FTP/FTPS, RDP, VNC와 그 세션의 리소스 모니터가 모두 프록시를 거칩니다. 프록시 로그인은 자격 증명 보관함에서 고르고, 프록시를 거치지 않을 호스트(*.corp.local, 10.0.0.0/8), DNS 조회 위치, 진단 메시지 표시를 정할 수 있습니다. FTP는 프록시를 거칠 때 수동(PASV) 모드로 연결합니다. PuTTY·KiTTY에서 세션을 가져오면 프록시 설정도 함께 가져옵니다(비밀번호는 제외).</li>
-        <li><b>SSH 터널</b>: 상단 도구 → SSH 터널. 내 PC 포트 → SSH 서버 → 대상 주소 포워딩을 저장해 두고 켜고 끕니다.</li>
-        <li><b>네트워크 도구</b>: ping, TCP 포트 확인(여러 포트·범위), DNS 조회, 서브넷 계산(10.0.0.5/24나 마스크 표기로 네트워크·사용 가능한 범위·호스트 수·와일드카드 마스크). Ping에서 <b>계속 보내기</b>를 켜면 중지할 때까지 1초마다 보내며 응답 여부와 경과 시간, 손실률, 최근 2분의 응답 시간 그래프, 끊김·재개 기록을 보여 주고, 상태가 바뀌면 소리와 알림으로 알려 줍니다(3번 연속 응답이 없으면 끊김으로 봅니다). 장비를 재시작한 뒤 다시 살아나는지 지켜볼 때 씁니다. IP 스캔은 서브넷(최대 /22, 호스트 1022개)의 모든 주소에 ping을 보내 응답하는 장비와 응답 시간을 보여 주고, "응답 없는 주소 복사"로 비어 있을 가능성이 큰 IP를 모을 수 있습니다(방화벽이 ping을 막는 장비도 응답 없음으로 보입니다). 결과의 주소를 누르면 Ping, 포트 확인, 새 세션 만들기, 주소 복사를 고를 수 있고, 이름 열에는 DNS나 hosts 파일에 등록된 장비 이름이 표시됩니다. 다른 도구를 쓰다가 IP 스캔으로 돌아오면 마지막 결과가 그대로 다시 보입니다. 이 PC와 같은 네트워크 구간(라우터를 거치지 않는 곳)의 장비는 MAC 열에 MAC 주소가 표시되며, 누르면 Linux·Windows·Cisco·Huawei 표기 중 하나로 복사할 수 있습니다. 같은 구간에서 ping은 막았지만 ARP에 응답한 장비는 "응답 없음 (ARP로 확인)"으로 표에 나오고, 응답 없는 주소 목록에서 빠집니다.</li>
-        <li><b>경로 추적</b>: 네트워크 도구의 "경로 추적"은 tracert처럼 목적지까지 거치는 라우터를 홉마다 세 번씩 확인해, 응답한 주소·이름(DNS)·응답 시간을 차례로 보여 줍니다. 응답이 없는 홉은 *로 보이고(방화벽이 막는 경우가 많음), 한 홉에 주소가 여럿이면 부하 분산 경로입니다. 옆 칸은 최대 홉 수(기본 30)이며, 목적지가 응답하거나 라우터가 "닿을 수 없음"이라고 답하면 끝납니다. 홉의 주소를 누르면 Ping·포트 확인·새 세션 메뉴가 나옵니다. 관리자 권한 없이 동작하고 IPv4만 지원합니다. 터미널 출력 속 IPv4 주소를 누른 메뉴와 IP 스캔 결과의 주소 메뉴에서도 "경로 추적"으로 바로 시작할 수 있습니다.</li>
+        <li><b>SSH 터널</b>: 상단 도구 → SSH 터널. 내 PC 포트 → SSH 서버 → 대상 주소 포워딩을 저장해 두고 켜고 끕니다. 목록의 "127.0.0.1:포트"를 누르면 그 주소가 복사되어 브라우저나 DB 프로그램에 바로 붙여넣을 수 있습니다. 대상 포트가 80·8080·443·8443인 터널은 실행 중일 때 "브라우저에서 열기" 버튼으로 장비의 웹 관리 화면을 바로 엽니다.</li>
+        <li><b>네트워크 도구</b>: ping, TCP 포트 확인(여러 포트·범위), DNS 조회, 서브넷 계산(10.0.0.5/24나 마스크 표기로 네트워크·사용 가능한 범위·호스트 수·와일드카드 마스크). Ping에서 <b>계속 보내기</b>를 켜면 중지할 때까지 1초마다 보내며 응답 여부와 경과 시간, 손실률, 최근 2분의 응답 시간 그래프, 끊김·재개 기록을 보여 주고, 상태가 바뀌면 소리와 알림으로 알려 줍니다(3번 연속 응답이 없으면 끊김으로 봅니다). 장비를 재시작한 뒤 다시 살아나는지 지켜볼 때 씁니다. IP 스캔은 서브넷(최대 /22, 호스트 1022개)의 모든 주소에 ping을 보내 응답하는 장비와 응답 시간을 보여 주고, "응답 없는 주소 복사"로 비어 있을 가능성이 큰 IP를 모을 수 있습니다(방화벽이 ping을 막는 장비도 응답 없음으로 보입니다). 결과의 주소를 누르면 Ping, 포트 확인, 새 세션 만들기, 주소 복사를 고를 수 있고, 이름 열에는 DNS나 hosts 파일에 등록된 장비 이름이 표시됩니다. 다른 도구를 쓰다가 IP 스캔으로 돌아오면 마지막 결과가 그대로 다시 보입니다. 이 PC와 같은 네트워크 구간(라우터를 거치지 않는 곳)의 장비는 MAC 열에 MAC 주소가 표시되며, 누르면 Linux·Windows·Cisco·Huawei 표기 중 하나로 복사할 수 있습니다. 같은 구간에서 ping은 막았지만 ARP에 응답한 장비는 "응답 없음 (ARP로 확인)"으로 표에 나오고, 응답 없는 주소 목록에서 빠집니다. 이름을 찾지 못한 주소에 같은 주소로 저장된 세션이 있으면 그 세션 이름이 흐리게 표시되고, 주소 메뉴의 "연결"로 그 세션에 바로 접속합니다(Syslog 창의 보낸 주소 메뉴도 같습니다). 같은 범위를 다시 스캔하면 지난 스캔과 비교해 새로 응답한 장비에 "새로" 표시를 붙이고, 이번에 응답하지 않은 주소를 따로 알려 줍니다(비교 기록은 최근 범위 20개까지 앱을 다시 켜도 남으며, 오늘이 아니면 날짜도 함께 보입니다). 호스트 칸에 입력하기 시작하면 저장된 세션의 주소가 세션 이름과 함께 제안됩니다(시리얼 제외). 이번에 응답하지 않은 주소 중 저장된 세션의 장비는 이름과 함께 맨 앞에 보입니다. "계속 보내기"로 지켜보던 장비가 응답하지 않게 되면, 그 장비에 연결된 탭도 다시 볼 때까지 붉게 표시됩니다. "포트 확인" 결과에는 잘 알려진 포트의 IANA 서비스 이름이 "서비스" 열에 나오고, 열린 SSH·Telnet·FTP·FTPS·RDP·VNC 포트 번호를 누르면 "이 포트로 새 세션 만들기…"로 그 프로토콜과 포트가 채워진 새 세션 창을 엽니다. 터미널 출력 속 IP 주소 메뉴와 IP 스캔 결과의 주소 메뉴에서 "연속 ping으로 지켜보기"를 고르면 "계속 보내기"가 켜진 채로 바로 시작합니다(장비를 재시작한 뒤 살아나는지 볼 때). 세션 편집 창의 호스트 칸은 Syslog를 보냈거나 IP 스캔에서 응답한 주소 중 아직 세션이 없는 것을 출처와 함께 제안하므로, 새로 찾은 장비를 주소를 다시 입력하지 않고 등록할 수 있습니다. IP 스캔과 포트 확인 결과 표는 열 제목(주소·이름·MAC·응답, 포트·상태·응답)을 누르면 그 열로 정렬되고 다시 누르면 반대로 정렬됩니다(주소는 숫자 순서, 빈 값은 늘 맨 뒤).</li>
+        <li><b>경로 추적</b>: 네트워크 도구의 "경로 추적"은 tracert처럼 목적지까지 거치는 라우터를 홉마다 세 번씩 확인해, 응답한 주소·이름(DNS)·응답 시간을 차례로 보여 줍니다. 응답이 없는 홉은 *로 보이고(방화벽이 막는 경우가 많음), 한 홉에 주소가 여럿이면 부하 분산 경로입니다. 옆 칸은 최대 홉 수(기본 30)이며, 목적지가 응답하거나 라우터가 "닿을 수 없음"이라고 답하면 끝납니다. 홉의 주소를 누르면 Ping·포트 확인·새 세션 메뉴가 나옵니다. 관리자 권한 없이 동작하고 IPv4만 지원합니다. 터미널 출력 속 IPv4 주소를 누른 메뉴와 IP 스캔 결과의 주소 메뉴에서도 "경로 추적"으로 바로 시작할 수 있습니다. DNS 이름이 없는 홉은 그 주소로 저장된 세션의 이름이 흐리게 대신 보입니다(경로 중간의 라우터·스위치를 알아보기 쉽게).</li>
         <li><b>파일 서버</b>: 상단 파일 서버 버튼으로 이 PC의 폴더를 FTP·TFTP·HTTP로 잠깐 공유합니다(장비 OS 업로드 등).</li>
-        <li><b>Syslog 수신</b>: 상단 파일 서버 버튼 → "Syslog 수신"에서 수신을 시작하면, 이 PC로 로그를 보내도록 설정한 장비(Cisco의 <code>logging host 이 PC 주소</code> 등)의 메시지가 받는 대로 표시됩니다(UDP, 기본 포트 514). 보낸 장비 주소와 심각도(emerg~debug)가 함께 나오고, 필터와 "warning 이상" 같은 심각도 거르기, 보이는 줄 복사, 파일로 저장을 쓸 수 있습니다. 창을 닫아도 수신은 계속되며, 실행 중에는 상태 표시줄에 표시되고 누르면 다시 열립니다. 최근 20,000개까지 보관합니다. 보낸 주소를 누르면 그 장비의 메시지만 보거나(주소가 정확히 같은 것만), 네트워크 도구를 열거나, 그 주소로 새 세션을 만들 수 있습니다. "경보"를 켜 두면 err 이상(err·crit·alert·emerg) 메시지가 올 때 소리와 작업 표시줄 깜박임으로 알리고, 앱이 앞에 있지 않으면 Windows 알림을 띄웁니다. 창을 닫아도 동작하며, 링크가 계속 오르내려도 30초에 한 번만 알리고 그사이에 온 메시지는 개수로 묶어 알립니다. "받는 대로 파일에 저장"을 켜면 창에 다 보이지 않는 메시지까지 모든 메시지를 받는 즉시 고른 파일 끝에 한 줄씩(시각·보낸 주소·심각도·내용, 탭으로 구분) 덧붙입니다. 파일에 쓰지 못하면 저장만 멈추고 알립니다.</li>
+        <li><b>Syslog 수신</b>: 상단 파일 서버 버튼 → "Syslog 수신"에서 수신을 시작하면, 이 PC로 로그를 보내도록 설정한 장비(Cisco의 <code>logging host 이 PC 주소</code> 등)의 메시지가 받는 대로 표시됩니다(UDP, 기본 포트 514). 보낸 장비 주소와 심각도(emerg~debug)가 함께 나오고, 필터와 "warning 이상" 같은 심각도 거르기, 보이는 줄 복사, 파일로 저장을 쓸 수 있습니다. 창을 닫아도 수신은 계속되며, 실행 중에는 상태 표시줄에 표시되고 누르면 다시 열립니다. 최근 20,000개까지 보관합니다. 보낸 주소를 누르면 그 장비의 메시지만 보거나(주소가 정확히 같은 것만), 네트워크 도구를 열거나, 그 주소로 새 세션을 만들 수 있습니다. 그 주소로 연결된 탭이 열려 있으면 "이 장비의 탭으로 이동"으로 바로 넘어갑니다. "경보"를 켜 두면 err 이상(err·crit·alert·emerg) 메시지가 올 때 소리와 작업 표시줄 깜박임으로 알리고, 앱이 앞에 있지 않으면 Windows 알림을 띄웁니다. 창을 닫아도 동작하며, 링크가 계속 오르내려도 30초에 한 번만 알리고 그사이에 온 메시지는 개수로 묶어 알립니다. "받는 대로 파일에 저장"을 켜면 창에 다 보이지 않는 메시지까지 모든 메시지를 받는 즉시 고른 파일 끝에 한 줄씩(시각·보낸 주소·심각도·내용, 탭으로 구분) 덧붙입니다. 파일에 쓰지 못하면 저장만 멈추고 알립니다. 도구 줄의 "보낸 곳" 버튼은 메시지를 보낸 장비를 많이 보낸 순서로 보여 주고 err 이상 메시지 수도 함께 알려 주며, 하나를 고르면 그 장비의 메시지만 봅니다("모든 장비의 메시지 보기"로 되돌림). 필터에 쓴 낱말은 메시지에서 강조됩니다. "경보" 옆 버튼으로 경보 낱말(예: UPDOWN, BGP)을 쉼표로 구분해 정해 두면, 그 낱말이 든 메시지도 심각도와 상관없이 경보를 울리고 목록에서 노란 줄로 표시됩니다(대소문자 무시, 최대 20개). 경보 알림의 "보기"는 경보가 한 장비에서만 왔으면 그 장비의 메시지만 걸러서 엽니다. err 이상 메시지나 경보 낱말이 든 메시지를 보낸 장비에 연결된 탭은, 경보를 꺼 두어도 그 탭을 다시 볼 때까지 붉게 표시됩니다. 메시지를 보낸 장비에 연결된 탭의 오른쪽 클릭 메뉴에서 "이 장비의 Syslog 메시지"로 그 장비의 메시지만 바로 볼 수 있습니다. 탭이 열려 있지 않은 장비는 세션 목록의 그 세션 줄에 붉은 경고 아이콘이 붙으며(연속 ping이 끊긴 장비도 같음), 그 세션에 연결하거나 그 장비의 탭을 앞으로 가져오면 사라집니다. 탭이 없을 때 보이는 홈 화면에는 이런 장비가 "주의가 필요한 장비"로 맨 위에 모이고, 이미 알고 있는 경고는 세션의 오른쪽 클릭 메뉴 "경고 표시 지우기"로 연결하지 않고 지울 수 있습니다. 표시된 장비가 있으면 상태 표시줄에 "주의 N개"가 나타나며, 누르면 장비 목록에서 그 탭으로 가거나 저장된 세션에 연결하거나 Syslog 메시지를 열 수 있고 "경고 표시 모두 지우기"로 한 번에 정리합니다. 경고 표시에는 처음 생긴 시각이 함께 나오고, 접힌 폴더는 안에 표시된 세션이 있으면 폴더 줄에 아이콘이 붙습니다. 명령 팔레트는 표시된 세션을 맨 앞에 보여 주며, "경고 표시된 다음 탭으로" 명령(단축키는 직접 지정)으로 표시된 탭을 차례로 돌 수 있습니다. 파일에 저장하는 동안 창에는 그 파일의 현재 크기가 함께 보이며 몇 초마다 새로 읽습니다(파일은 자동으로 나누거나 지우지 않으므로 크기를 보고 직접 정리하세요). 파일이 1GB를 넘으면 크기가 경고 색으로 바뀝니다.</li>
       </ul>`,
   },
   {
@@ -324,6 +324,84 @@ async function sections(): Promise<HelpSection[]> {
   return load ? (await load()).SECTIONS : KO_SECTIONS;
 }
 
+/** A menu item or button the guide names in quotes, in each language's own
+ * marks ("…", “…”, „…“, «…», 「…」): set apart from the sentence around it. */
+const UI_NAME = /"[^"\n]{1,80}"|“[^”\n]{1,80}”|„[^“\n]{1,80}“|«[^»\n]{1,80}»|「[^」\n]{1,80}」/g;
+
+/** Where one sentence ends and the next begins: after ".", "!" or "?" and a
+ * space when what follows is not a lower-case letter ("e.g. foo" is not an
+ * end), always after a Korean word's period (the next sentence may start with
+ * "err"), or right after "。", "！", "？" (Japanese and Chinese write no space). */
+const SENTENCE_END = /(?<=[가-힣][.!?])\s+(?=\S)|(?<=[.!?])\s+(?=[^\sa-zà-ÿ])|(?<=[。！？])/;
+/** The same, at the end of a text that markup follows (the next sentence starts with it). */
+const ENDS_SENTENCE = /(?:[.!?]\s+|[。！？])$/;
+const KOREAN_END = /[가-힣][.!?]\s+$/;
+/** An item this long reads as a wall of text: its sentences after the first go below it. */
+const LONG_ITEM = 700;
+
+/** A long item as its first sentence (with its subject) and the rest as a
+ * list under it, one sentence each. Markup (keys, codes, names) is never cut. */
+function splitLongItem(li: HTMLLIElement) {
+  if ((li.textContent ?? "").length < LONG_ITEM || li.querySelector("ul, ol")) return;
+  const parts: DocumentFragment[] = [document.createDocumentFragment()];
+  for (const node of [...li.childNodes]) {
+    if (node.nodeType !== Node.TEXT_NODE) {
+      parts[parts.length - 1].append(node);
+      continue;
+    }
+    const pieces = (node as Text).data.split(SENTENCE_END);
+    pieces.forEach((piece, i) => {
+      if (i > 0) parts.push(document.createDocumentFragment());
+      if (piece) parts[parts.length - 1].append(piece);
+    });
+    // A sentence that ends right before markup ("…합니다. "<span>"경보"</span>…"):
+    // the next sentence starts with that element (not when it starts in lower case).
+    const next = node.nextSibling;
+    const nextText = next?.textContent ?? "";
+    const data = (node as Text).data;
+    if (next && nextText && ENDS_SENTENCE.test(data) && (KOREAN_END.test(data) || !/^[a-zà-ÿ]/.test(nextText))) parts.push(document.createDocumentFragment());
+  }
+  const sentences = parts.filter((p) => (p.textContent ?? "").trim());
+  if (sentences.length < 3) {
+    li.replaceChildren(...parts);
+    return;
+  }
+  const sub = document.createElement("ul");
+  sub.className = "help-sub";
+  for (const s of sentences.slice(1)) {
+    const item = document.createElement("li");
+    item.append(s);
+    sub.append(item);
+  }
+  li.replaceChildren(sentences[0], sub);
+}
+
+/** Wraps each quoted UI name in the shown section's text (not in code, keys or links). */
+function markUiNames(root: HTMLElement) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (n.parentElement?.closest("code, kbd, a, .ui-name") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  const nodes: Text[] = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+  for (const node of nodes) {
+    const text = node.data;
+    const hits = [...text.matchAll(UI_NAME)];
+    if (!hits.length) continue;
+    const frag = document.createDocumentFragment();
+    let at = 0;
+    for (const hit of hits) {
+      frag.append(text.slice(at, hit.index));
+      const span = document.createElement("span");
+      span.className = "ui-name";
+      span.textContent = hit[0];
+      frag.append(span);
+      at = hit.index + hit[0].length;
+    }
+    frag.append(text.slice(at));
+    node.replaceWith(frag);
+  }
+}
+
 /** Open the guide, optionally at a section. */
 export async function openHelp(sectionId = "start") {
   // The guide itself is written per language (the rest of the UI is translated as it appears).
@@ -334,7 +412,7 @@ export async function openHelp(sectionId = "start") {
     width: 940,
     body: `<div class="help">
         <nav class="help-nav">
-          <label class="side-search">${icon("Search", 14)}<input placeholder="도움말 검색" spellcheck="false" data-help-search/></label>
+          <label class="side-search">${icon("Search", 14)}<input placeholder="도움말 검색" title="Enter: 다음 위치 · Shift+Enter: 이전 위치" spellcheck="false" data-help-search/></label>
           ${SECTIONS.map((s) => `<button type="button" data-help="${s.id}">${icon(s.icon, 15)}<span>${esc(s.title)}</span></button>`).join("")}
         </nav>
         <article class="help-body"></article>
@@ -346,8 +424,78 @@ export async function openHelp(sectionId = "start") {
     const s = SECTIONS.find((x) => x.id === id) ?? SECTIONS[0];
     body.innerHTML = `<h3>${icon(s.icon, 18)}${esc(s.title)}</h3>${s.body}`;
     body.scrollTop = 0;
+    // An item that starts with its subject ("<b>Name</b>: …") has it marked to stand out.
+    body.querySelectorAll("li").forEach((li) => {
+      const first = [...li.childNodes].find((n) => n.nodeType !== Node.TEXT_NODE || n.textContent?.trim());
+      if (first instanceof HTMLElement && first.tagName === "B") first.classList.add("lead");
+    });
+    markUiNames(body);
+    body.querySelectorAll<HTMLLIElement>(":scope > ul > li, :scope > ol > li").forEach(splitLongItem);
+    // A long section opens with its items' subjects, each a jump to its item.
+    const leads = [...body.querySelectorAll<HTMLElement>("li > b.lead")];
+    if (leads.length >= 4) {
+      const toc = h("nav", { class: "help-toc" });
+      for (const lead of leads) {
+        const go = h("button", { type: "button" }, esc(lead.textContent ?? ""));
+        go.addEventListener("click", () => {
+          const li = lead.closest("li")!;
+          li.scrollIntoView({ block: "start", behavior: "smooth" });
+          li.classList.remove("help-flash");
+          void li.offsetWidth;
+          li.classList.add("help-flash");
+        });
+        toc.append(go);
+      }
+      body.querySelector("h3")!.after(toc);
+    }
     buttons.forEach((b) => b.classList.toggle("on", b.dataset.help === s.id));
     body.querySelectorAll<HTMLElement>("[data-goto]").forEach((a) => a.addEventListener("click", () => show(a.dataset.goto!)));
+    markTerms(searchTerms(norm(search.value)));
+  };
+  /** The search's words marked where they are in the shown section, the first
+   * one scrolled into view: a long section is not read through to find them. */
+  const markTerms = (terms: string[]) => {
+    current = -1;
+    // A key combination is often written key by key (<kbd>Ctrl</kbd>+<kbd>C</kbd>):
+    // its keys are marked each too, after the whole (which wins where it is one
+    // text); a one-letter key alone would mark every such letter.
+    terms = terms.flatMap((t) => (t.includes("+") ? [t, ...t.split("+").filter((k) => k.length > 1)] : [t]));
+    if (!terms.length) return;
+    const re = new RegExp(terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "gi");
+    // Not in the list of subjects at the top: the places are in the items.
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement?.closest(".help-toc") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    const nodes: Text[] = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+    let first: HTMLElement | null = null;
+    for (const node of nodes) {
+      const text = node.data;
+      const hits = [...text.matchAll(re)];
+      if (!hits.length) continue;
+      const frag = document.createDocumentFragment();
+      let at = 0;
+      for (const hit of hits) {
+        frag.append(text.slice(at, hit.index));
+        const mark = document.createElement("mark");
+        mark.className = "help-hit";
+        mark.textContent = hit[0];
+        frag.append(mark);
+        first ??= mark;
+        at = hit.index + hit[0].length;
+      }
+      frag.append(text.slice(at));
+      node.replaceWith(frag);
+    }
+    if (first) focusMark([first], 0);
+  };
+  /** The place of the words Enter is on (stronger than the rest), in view. */
+  let current = -1;
+  const focusMark = (marks: HTMLElement[], i: number) => {
+    body.querySelector("mark.help-hit.current")?.classList.remove("current");
+    marks[i].classList.add("current");
+    marks[i].scrollIntoView({ block: "center" });
+    current = i;
   };
   buttons.forEach((b) => b.addEventListener("click", () => show(b.dataset.help!)));
   const search = m.root.querySelector<HTMLInputElement>("[data-help-search]")!;
@@ -376,9 +524,30 @@ export async function openHelp(sectionId = "start") {
       if (hit && !first) first = b.dataset.help!;
     }
     if (first && q) show(first);
+    // Cleared: the section on screen again, without the marks.
+    else if (!q) show(buttons.find((b) => b.classList.contains("on"))?.dataset.help ?? sectionId);
     else if (q && !first) {
       body.innerHTML = `<p class="muted">"${esc(userText(search.value.trim()))}"와 일치하는 내용이 없습니다.</p>`;
       buttons.forEach((b) => b.classList.remove("on"));
+    }
+  });
+  // Enter: the next place the words are (Shift+Enter the one before), on into
+  // the next section that has them after the last; never while composing (IME).
+  search.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.isComposing || !norm(search.value)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const back = e.shiftKey;
+    const marks = [...body.querySelectorAll<HTMLElement>("mark.help-hit")];
+    const next = current + (back ? -1 : 1);
+    if (next >= 0 && next < marks.length) return focusMark(marks, next);
+    const shown = buttons.filter((b) => !b.hidden);
+    if (!shown.length) return;
+    const at = shown.findIndex((b) => b.classList.contains("on"));
+    show(shown[(at + (back ? -1 : 1) + shown.length) % shown.length].dataset.help!);
+    if (back) {
+      const all = [...body.querySelectorAll<HTMLElement>("mark.help-hit")];
+      if (all.length) focusMark(all, all.length - 1);
     }
   });
   show(sectionId);

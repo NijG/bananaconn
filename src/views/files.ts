@@ -10,7 +10,7 @@ import { defaultPort, endpoint, PROTOCOLS, type Session } from "../model";
 import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
 import { forgetHostKey } from "../hostKeys";
-import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed, type MenuItem } from "../ui";
+import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed, type MenuItem } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
 import { userText } from "../i18n";
@@ -153,6 +153,8 @@ class Pane {
   private pathInput: HTMLInputElement;
   private filterInput: HTMLInputElement;
   private filter = "";
+  /** The filter's words, as the rows were last picked by them (marked in the names). */
+  private filterTerms: string[] = [];
   /** Each load gets a number; only the latest one updates the pane. */
   private loadSeq = 0;
   /** Folder of the newest load request (null once it has finished). */
@@ -333,7 +335,7 @@ class Pane {
   /** Entries after the hidden-file and name filters. */
   private visible(): FileEntry[] {
     // "log 2025" finds "app-2025-10.log", as the session searches match.
-    const terms = searchTerms(this.filter);
+    const terms = (this.filterTerms = searchTerms(this.filter));
     return this.entries.filter((e) => (Pane.showHidden || !e.name.startsWith(".")) && matchesTerms(e.name.toLowerCase(), terms));
   }
 
@@ -415,7 +417,7 @@ class Pane {
   private rowHtml(e: FileEntry): string {
     const ico = e.isDir ? (this.path === "" && this.side === "local" ? "HardDrive" : "Folder") : "File";
     return `<div class="file-row${this.selected.has(e.path) ? " selected" : ""}${e.isDir ? " dir" : ""}" draggable="true" data-path="${esc(e.path)}">
-          <span class="fname">${icon(ico, 15)}<span data-i18n-skip>${esc(e.name)}</span>${e.isLink ? `<em>링크</em>` : ""}</span>
+          <span class="fname">${icon(ico, 15)}<span data-i18n-skip>${markTerms(e.name, this.filterTerms)}</span>${e.isLink ? `<em>링크</em>` : ""}</span>
           <span class="fsize">${e.isDir ? "" : formatBytes(e.size)}</span>
           <span class="fdate">${formatDate(e.modified)}</span>
           ${this.side === "remote" ? `<span class="fperm">${esc(e.perm ?? "")}</span>` : ""}
@@ -454,9 +456,11 @@ class Pane {
     const dirs = this.entries.length - files;
     const sel = this.selection();
     const selSize = sel.filter((e) => !e.isDir).reduce((n, e) => n + e.size, 0);
+    // The folder's files together (its subfolders' contents are not listed, so not counted).
+    const total = files ? this.entries.reduce((n, e) => (e.isDir ? n : n + e.size), 0) : 0;
     this.el.querySelector(".pane-foot")!.textContent = sel.length
       ? `${sel.length}개 선택 · ${formatBytes(selSize)}`
-      : `폴더 ${dirs}개 · 파일 ${files}개${hidden ? ` · ${hidden}개 숨김` : ""}`;
+      : `폴더 ${dirs}개 · 파일 ${files}개${hidden ? ` · ${hidden}개 숨김` : ""}${files ? ` · ${formatBytes(total)}` : ""}`;
   }
 
   selection(): FileEntry[] {

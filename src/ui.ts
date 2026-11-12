@@ -121,6 +121,24 @@ export const searchTerms = (query: string) => query.toLowerCase().split(/\s+/).f
  * "web prod" finds a "prod" session on a "web…" host. No terms: everything. */
 export const matchesTerms = (hay: string, terms: string[]) => terms.every((t) => hay.includes(t));
 
+/** `text` as HTML with every place a search term is found marked
+ * (<mark class="term-hit">), case ignored: which part of a row matched. */
+export function markTerms(text: string, terms: string[]): string {
+  const lower = text.toLowerCase();
+  // A letter whose lower case is longer ("İ") would shift the places: unmarked.
+  if (!terms.length || lower.length !== text.length) return esc(text);
+  const hit = new Array<boolean>(text.length).fill(false);
+  for (const t of terms) for (let i = lower.indexOf(t); i >= 0; i = lower.indexOf(t, i + t.length)) hit.fill(true, i, i + t.length);
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    let j = i;
+    while (j < text.length && hit[j] === hit[i]) j++;
+    out += hit[i] ? `<mark class="term-hit">${esc(text.slice(i, j))}</mark>` : esc(text.slice(i, j));
+    i = j;
+  }
+  return out;
+}
+
 /** Arrow keys between a search box and the list it filters: ↓ from the box
  * goes to the first item, ↑/↓ move between items, ↑ on the first item goes
  * back to the box. Items are re-read on every key (lists are redrawn). */

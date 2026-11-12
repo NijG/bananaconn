@@ -9,7 +9,8 @@ import { confirmDiscard, errorText, esc, h, modal, toast } from "./ui";
 import { canBeGateway, confirmGatewayBreak, gatewayField, gatewayUsers } from "./tunnels";
 import { logFields, runnableLogName, wireLogBrowse } from "./logOptions";
 import { credentialCheck, openVault, protectKeyFile } from "./vault";
-import { checkReachable } from "./nettools";
+import { checkReachable, recentSweepHosts } from "./nettools";
+import { syslogSenderList } from "./syslog";
 import { tr, userText } from "./i18n";
 
 const VNC_QUALITY: [string, string][] = [
@@ -19,6 +20,18 @@ const VNC_QUALITY: [string, string][] = [
 ];
 
 const RESOLUTIONS = ["", "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440"];
+
+/** Addresses this PC has seen that no saved session uses yet, offered in the
+ * host box: devices that sent Syslog messages, then those the last IP scans
+ * found (a new device to set up, its address not typed again). */
+function seenHostsList(): string {
+  const saved = new Set(state.sessions.map((s) => s.host.trim().toLowerCase()));
+  const seen = new Map<string, string>();
+  for (const ip of syslogSenderList()) if (!saved.has(ip.toLowerCase())) seen.set(ip, "Syslog");
+  for (const ip of recentSweepHosts()) if (!saved.has(ip.toLowerCase()) && !seen.has(ip)) seen.set(ip, "IP 스캔");
+  const options = [...seen].slice(0, 300).map(([ip, from]) => `<option value="${esc(ip)}" label="${esc(tr(from))}"></option>`);
+  return `<datalist id="seen-hosts" data-i18n-skip>${options.join("")}</datalist>`;
+}
 
 function optionsFields(p: Protocol, o: Record<string, unknown>): string {
   const check = (name: string, label: string, on: boolean) =>
@@ -287,7 +300,8 @@ export function editSession(
           <label class="field span-2"><span>세션 이름</span>
             <input name="name" value="${esc(s.name)}" placeholder="예: 운영 웹서버" /></label>
           <label class="field span-2"><span>호스트 <em>*</em></span>
-            <input name="host" value="${esc(s.host)}" placeholder="192.168.0.10 또는 server.example.com" spellcheck="false" required />
+            <input name="host" value="${esc(s.host)}" placeholder="192.168.0.10 또는 server.example.com" spellcheck="false" required list="seen-hosts" />
+            ${seenHostsList()}
             <small class="key-issue dup-hint" hidden></small></label>
           <label class="field"><span>포트</span>
             <input name="port" type="number" min="1" max="65535" value="${esc(s.port ?? info.port)}" /></label>

@@ -5,7 +5,7 @@ import { icon } from "./icons";
 import { state, updateSettings, type Settings, type TriggerRule } from "./store";
 import { appLock, openMasterPassword } from "./lock";
 import { LIGHT_THEMES, TERM_THEMES } from "./themes";
-import { confirmDialog, esc, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { confirmDialog, esc, h, listKeys, markTerms, matchesTerms, modal, searchTerms, toast } from "./ui";
 import { clearCommandHistory, commandHistoryCount } from "./cmdLine";
 import { aiSettingsSection, wireAiSettings } from "./ai/settings";
 import { checkForUpdate, refusedNasAccount } from "./updates";
@@ -135,6 +135,20 @@ function paginate(form: HTMLFormElement, start: string | undefined) {
     window.setTimeout(() => el.classList.remove("settings-flash"), 1600);
     (el.matches("button") ? el : el.querySelector<HTMLElement>("input:not([type=hidden]), select, textarea"))?.focus({ preventScroll: true });
   };
+  /** Why a setting was found when its name lacks a word: a short piece of its
+   * explanation around the first such word ("" when the name has them all). */
+  const whyOf = (el: HTMLElement, title: string, terms: string[]) => {
+    const lowTitle = title.toLowerCase();
+    const missing = terms.filter((t) => !lowTitle.includes(t));
+    if (!missing.length) return "";
+    const text = (el.querySelector("small")?.textContent ?? "").replace(/\s+/g, " ").trim();
+    const low = text.toLowerCase();
+    const at = Math.min(...missing.map((t) => low.indexOf(t)).filter((i) => i >= 0));
+    if (!Number.isFinite(at)) return "";
+    const from = Math.max(0, at - 24);
+    const to = Math.min(text.length, at + 56);
+    return `${from > 0 ? "…" : ""}${text.slice(from, to)}${to < text.length ? "…" : ""}`;
+  };
   let found: HTMLElement[] = [];
   search.addEventListener("input", () => {
     const terms = searchTerms(search.value);
@@ -153,7 +167,11 @@ function paginate(form: HTMLFormElement, start: string | undefined) {
           .map((el, i) => {
             const page = el.closest<HTMLElement>(".settings-page")!.dataset.page!;
             const where = nav.querySelector(`[data-page="${page}"] span`)?.textContent ?? "";
-            return `<button type="button" class="settings-hit" role="listitem" data-hit="${i}" data-i18n-skip><small>${esc(where)}</small><span>${esc(titleOf(el))}</span></button>`;
+            const title = titleOf(el);
+            const why = whyOf(el, title, terms);
+            return `<button type="button" class="settings-hit" role="listitem" data-hit="${i}" data-i18n-skip><small>${esc(where)}</small><span>${markTerms(title, terms)}</span>${
+              why ? `<em class="settings-hit-why">${markTerms(why, terms)}</em>` : ""
+            }</button>`;
           })
           .join("")
       : `<p class="muted">일치하는 설정이 없습니다</p>`;

@@ -6,7 +6,8 @@ import { icon } from "./icons";
 import { endpoint, PROTOCOLS, sessionSearchText, type Session } from "./model";
 import { ACTIONS, bindings } from "./keymap";
 import { state } from "./store";
-import { esc, matchesTerms, searchTerms } from "./ui";
+import { deviceAlert, deviceAlertAt } from "./deviceAlerts";
+import { esc, markTerms, matchesTerms, searchTerms } from "./ui";
 import { tr } from "./i18n";
 
 interface Item {
@@ -60,15 +61,19 @@ export function openCommandPalette(opts: {
       run: () => opts.reopen?.(s),
     });
   }
-  // Pinned sessions (the home screen's) come first, then by last use.
-  for (const s of [...state.sessions].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || (b.lastUsed ?? 0) - (a.lastUsed ?? 0))) {
+  // Devices needing attention (deviceAlerts.ts) first, then pinned sessions (the
+  // home screen's), then by last use.
+  // The newest mark first (an unmarked session's time is 0).
+  for (const s of [...state.sessions].sort((a, b) => deviceAlertAt(b.host) - deviceAlertAt(a.host) || Number(!!b.pinned) - Number(!!a.pinned) || (b.lastUsed ?? 0) - (a.lastUsed ?? 0))) {
     const info = PROTOCOLS[s.protocol];
     const ep = endpoint(s);
+    const alert = deviceAlert(s.host);
     // Session names are the user's own data — never run them through translation.
+    // The alert is app text: translated here (the list is skipped on screen).
     items.push({
       label: s.name || s.host,
-      sub: `${info.label} · ${ep}`,
-      icon: info.icon,
+      sub: alert ? `${tr(alert)} · ${info.label} · ${ep}` : `${info.label} · ${ep}`,
+      icon: alert ? "TriangleAlert" : info.icon,
       keys: [],
       hay: sessionSearchText(s),
       run: () => opts.openSession(s),
@@ -103,13 +108,14 @@ export function openCommandPalette(opts: {
 
   const render = () => {
     shown = matches(input.value.trim());
+    const terms = searchTerms(input.value.trim());
     if (sel >= shown.length) sel = Math.max(0, shown.length - 1);
     list.innerHTML = shown.length
       ? shown
           .map(
             (it, i) =>
               `<div class="cmdk-item${i === sel ? " sel" : ""}" data-i="${i}">${icon(it.icon, 15)}
-                <span class="cmdk-text"><b>${esc(it.label)}</b><small>${esc(it.sub)}</small></span>
+                <span class="cmdk-text"><b>${markTerms(it.label, terms)}</b><small>${markTerms(it.sub, terms)}</small></span>
                 ${it.keys.length ? `<span class="cmdk-keys">${it.keys[0].split("+").map((k) => `<kbd>${esc(k)}</kbd>`).join("+")}</span>` : ""}</div>`,
           )
           .join("")

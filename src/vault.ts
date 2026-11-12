@@ -6,7 +6,7 @@ import { api, pickOpenFile, type Credential, type ImportKeyKind } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { detachCredential, reloadCredentials, state } from "./store";
-import { confirmDialog, confirmDiscard, errorText, esc, formValues, h, listKeys, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { confirmDialog, confirmDiscard, errorText, esc, formValues, h, listKeys, markTerms, matchesTerms, modal, searchTerms, toast } from "./ui";
 import { userText } from "./i18nTables";
 
 /** A strong random password: at least one upper, lower, digit and symbol, the
@@ -148,7 +148,7 @@ export function openVault(): Promise<void> {
             .map(
               (c) => `<button class="vault-item${c.id === selected && !draft ? " on" : ""}" data-id="${c.id}">
                 ${icon(c.kind === "key" ? "Key" : "Lock", 15)}
-                <span><b data-i18n-skip>${esc(c.name)}</b><small>${c.kind === "key" ? "SSH 키" : "비밀번호"}${c.username ? `<span data-i18n-skip> · ${esc(c.username)}</span>` : ""}</small></span>
+                <span><b data-i18n-skip>${markTerms(c.name, terms)}</b><small>${c.kind === "key" ? "SSH 키" : "비밀번호"}${c.username ? `<span data-i18n-skip> · ${markTerms(c.username, terms)}</span>` : ""}</small></span>
                 ${issueOf(c) ? `<span class="vault-warn" title="${esc(issueOf(c)!)}">${icon("TriangleAlert", 14)}</span>` : ""}
               </button>`,
             )

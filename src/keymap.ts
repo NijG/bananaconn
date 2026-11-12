@@ -57,6 +57,8 @@ export const ACTIONS: ActionDef[] = [
   // Tabs and panes
   g("tab.next", "다음 탭", ["Ctrl+Tab"]),
   g("tab.prev", "이전 탭", ["Ctrl+Shift+Tab"]),
+  // No key by default (any would take one a terminal program may want); the palette has it.
+  g("tab.nextAlert", "경고 표시된 다음 탭으로", [], { note: "Syslog 경보나 연속 ping 끊김이 있는 장비의 탭" }),
   g("tab.close", "탭 닫기", ["Ctrl+F4", "Ctrl+Shift+W"]),
   g("tab.closeOthers", "다른 탭 모두 닫기"),
   g("tab.duplicate", "같은 세션 하나 더 열기", [], { note: "탭 더블클릭과 같음" }),

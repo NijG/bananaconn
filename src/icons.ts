@@ -98,6 +98,7 @@ import {
   ZoomOut,
   Ban,
   Bell,
+  BellOff,
   Bot,
   Brain,
   ClipboardList,
@@ -120,7 +121,7 @@ type IconNode = Parameters<typeof createElement>[0];
 
 const ICONS: Record<string, IconNode> = {
   Camera, Paperclip, ScanEye, Pin, PinOff, History,
-  Ban, Bell, Bot, Brain, ClipboardList, FileSearch, LoaderCircle, MessageSquarePlus, Power, Send, User, WandSparkles,
+  Ban, Bell, BellOff, Bot, Brain, ClipboardList, FileSearch, LoaderCircle, MessageSquarePlus, Power, Send, User, WandSparkles,
   CircleHelp,
   ClipboardPaste,
   CopyPlus,

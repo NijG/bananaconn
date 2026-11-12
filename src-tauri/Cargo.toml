@@ -1,6 +1,6 @@
 [package]
 name = "bananaconn"
-version = "0.7.54"
+version = "0.7.55"
 description = "Personal all-in-one remote terminal: SSH, Telnet, SFTP, FTP, FTPS, RDP, VNC"
 authors = ["BananaConn contributors"]
 license = "MIT"
@@ -67,6 +67,12 @@ opt-level = 3
 # connection, which the app reports, instead of closing every open session.
 panic = "unwind"
 strip = true
+
+# Dev and test builds: the dependencies without debug info (this crate keeps
+# it, for its own backtraces and debugging). Their debug info was most of the
+# gigabytes each build directory grew to.
+[profile.dev.package."*"]
+debug = false
 
 # suppaftp 6.3.0 with local fixes (see vendor/suppaftp/BANANACONN_PATCH.md):
 # malformed PASV/EPSV/SIZE/MDTM replies returned errors instead of panicking,

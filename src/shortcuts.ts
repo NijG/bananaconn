@@ -16,7 +16,7 @@ import {
   type ActionDef,
 } from "./keymap";
 import { state, subscribe, updateSettings } from "./store";
-import { confirmDialog, esc, matchesTerms, modal, searchTerms, toast } from "./ui";
+import { confirmDialog, esc, markTerms, matchesTerms, modal, searchTerms, toast } from "./ui";
 import { tr, userText } from "./i18n";
 
 const kbd = (chord: string) => chord.split("+").map((k) => `<kbd>${esc(k)}</kbd>`).join("+");
@@ -77,8 +77,16 @@ export function openShortcuts() {
   const row = (a: ActionDef) => {
     const keys = bindings(a.id);
     const changed = !same(keys, a.keys);
+    const terms = searchTerms(filter);
     return `<tr data-id="${esc(a.id)}"${changed ? ' class="changed"' : ""}>
-        <td class="sc-label"><span${a.userLabel ? " data-i18n-skip" : ""}>${esc(a.label)}</span>${a.note ? `<small class="muted">${esc(a.note)}</small>` : ""}</td>
+        <td class="sc-label">${
+          // While searching, the words found are marked: the label and note in
+          // the screen's language already (marks would split them for the
+          // on-screen translation); otherwise as before, translated on screen.
+          terms.length
+            ? `<span data-i18n-skip>${markTerms(onScreen(a), terms)}</span>${a.note ? `<small class="muted" data-i18n-skip>${markTerms(tr(a.note), terms)}</small>` : ""}`
+            : `<span${a.userLabel ? " data-i18n-skip" : ""}>${esc(a.label)}</span>${a.note ? `<small class="muted">${esc(a.note)}</small>` : ""}`
+        }</td>
         <td class="sc-keys"><div class="sc-chips">${keys.map((k) => `<span class="sc-chip">${kbd(k)}<button type="button" class="icon-btn" data-remove="${esc(k)}" title="이 키 빼기">${icon("X", 12)}</button></span>`).join("") || `<span class="muted small">없음</span>`}</div></td>
         <td class="sc-acts">
           <button type="button" class="btn btn-sm" data-add>${capturing === a.id ? "키를 누르세요… (Esc: 취소)" : `${icon("Plus", 13)}키 추가`}</button>

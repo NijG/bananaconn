@@ -4,10 +4,11 @@ import "./styles.css";
 import { api, isTauri, revealInExplorer } from "./api";
 import { fileServerBadges, fileServers, initFileServers, openFileServer } from "./fileServers";
 import { ftpServer, ftpServerBadge, initFtpServer, openFtpServer } from "./ftpServer";
-import { initSyslog, openSyslog, syslog, syslogBadge } from "./syslog";
+import { initSyslog, openSyslog, setSyslogTabMarker, setSyslogTabs, syslog, syslogBadge, syslogSender } from "./syslog";
 import { mountHome } from "./home";
 import { appLock, initLock, lockNow } from "./lock";
-import { openNetworkTools, setNewSessionHandler } from "./nettools";
+import { clearAllDeviceAlerts, clearDeviceAlert, deviceAlertList, markDeviceAlert, onDeviceAlerts } from "./deviceAlerts";
+import { openNetworkTools, setDeviceMarker, setNewSessionHandler, setSessionOpener } from "./nettools";
 import { openCommandPalette } from "./palette";
 import { fileSessionFor } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
@@ -18,7 +19,7 @@ import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
 import { loadAll, savesSettled, state, subscribe, touchSession } from "./store";
 import { isLanguage, LANGUAGES, setLanguage, userText, type Language } from "./i18n";
-import { confirmDialog, contextMenu, errorText, esc, setPressed, toast } from "./ui";
+import { confirmDialog, contextMenu, errorText, esc, type MenuItem, setPressed, toast } from "./ui";
 import { openVault } from "./vault";
 
 import { Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
@@ -132,8 +133,21 @@ async function launchRdp(s: Session) {
   }
 }
 
+/** Something went wrong with a device: its tabs not in front and its saved
+ * sessions in the tree are marked, unless its tab is the one in front.
+ * `knownOnly`: only a device with a saved session or an open tab (Syslog: any
+ * device on the network may send, and forty noisy unknown ones would fill the
+ * status bar; a continuous ping is one the user chose to watch). */
+function markDevice(host: string, note: string, knownOnly = false) {
+  if (ws.markDevice(host, note)) return;
+  const key = host.trim().toLowerCase();
+  const known = state.sessions.some((s) => s.host.trim().toLowerCase() === key) || ws.tabs.some((t) => t.session.host.trim().toLowerCase() === key);
+  if (!knownOnly || known) markDeviceAlert(host, note);
+}
+
 function open(s: Session) {
   if (!s.host) return toast("호스트가 비어 있습니다", "warn");
+  clearDeviceAlert(s.host);
   if (!s.id.startsWith("quick-")) touchSession(s.id);
   const kind = PROTOCOLS[s.protocol].view;
   if (kind === "rdp" && s.options.openMode === "external") return void launchRdp(s);
@@ -161,6 +175,18 @@ const sidebar = new Sidebar($("#sidebar"), { connect: open, edit, openFiles });
 ws.editHandler = (s) => void edit(s);
 ws.newSessionHandler = (defaults) => void edit(null, defaults);
 setNewSessionHandler((defaults, beforeConnect) => void edit(null, defaults, beforeConnect));
+setSessionOpener(open);
+// A syslog sender's open tabs (connected to that address), to go to from its messages.
+setSyslogTabs((ip) => ws.tabs.filter((t) => t.session.host.trim().toLowerCase() === ip.toLowerCase()).map((t) => () => ws.activate(t.id)));
+// A tab's device that sent Syslog messages: they open from the tab's menu too.
+ws.tabMenuExtra = (s) => {
+  const sender = syslogSender(s.host);
+  return sender ? [{ label: "이 장비의 Syslog 메시지", icon: "ScrollText", action: () => openSyslog(sender) }] : [];
+};
+// A sender of an err-or-worse (or alert-word) message: its open tabs marked until shown.
+setSyslogTabMarker((ip) => markDevice(ip, "이 장비에서 Syslog 경보 메시지가 왔습니다", true));
+// A continuous ping gone unanswered: the device's open tabs marked the same way.
+setDeviceMarker((host) => markDevice(host, "연속 ping에 응답하지 않습니다"));
 // A sweep or continuous ping a reloaded page left running ends (nettools.rs net_stop_all).
 void api.netStopAll().catch(() => {});
 // A quick connection's settings in a new session's editor (the open tab stays as it is).
@@ -332,7 +358,10 @@ function renderStatus() {
   setPressed($("#btn-broadcast"), ws.broadcast);
   const tab = ws.activeTab;
   $("#btn-server").classList.toggle("live", !!ftpServer.status || !!fileServers.status("tftp") || !!fileServers.status("http") || !!syslog.status);
-  const right = `${ftpServerBadge()}${fileServerBadges()}${syslogBadge()}${ws.broadcast ? `<span class="sb-warn">${icon("Radio", 13)}동시 입력 켜짐</span>` : ""}
+  // Devices that sent an alert or stopped answering, while their tabs are not in front.
+  const alertCount = deviceAlertList().length;
+  const alerts = alertCount ? `<button class="sb-alerts" data-alerts title="주의가 필요한 장비">${icon("TriangleAlert", 13)}${esc(`주의 ${alertCount}개`)}</button>` : "";
+  const right = `${alerts}${ftpServerBadge()}${fileServerBadges()}${syslogBadge()}${ws.broadcast ? `<span class="sb-warn">${icon("Radio", 13)}동시 입력 켜짐</span>` : ""}
     ${ws.tabs.length ? `<button class="sb-tabs" data-tabs title="${esc(withKey("열린 탭 찾기", "app.commandPalette"))}">탭 ${ws.tabs.length}개</button>` : `<span>탭 0개</span>`}${updateBadge()}`;
   if (!tab) {
     setStatus(bar, `<div class="sb-left"><span class="sb-dot idle"></span><span>준비됨 · 저장된 세션 ${state.sessions.length}개</span></div><div class="sb-right">${right}</div>`);
@@ -371,7 +400,33 @@ $("#statusbar").addEventListener("click", (e) => {
   // The tab count opens the command palette, which lists the open tabs.
   else if (target.closest("[data-tabs]")) GLOBAL_ACTIONS["app.commandPalette"]();
   else if (target.closest("[data-update]")) installUpdate(ws.tabs.filter((t) => t.view.state === "connected").length);
+  else if (target.closest("[data-alerts]")) alertsMenu(target.closest<HTMLElement>("[data-alerts]")!);
 });
+
+/** The marked devices from the status bar (the first twenty): each to its open
+ * tab, else its saved session (connected, as a click on it in the tree), else
+ * its Syslog messages when it sent some, else the network tools (a ping). */
+function alertsMenu(btn: HTMLElement) {
+  const r = btn.getBoundingClientRect();
+  const items: MenuItem[] = deviceAlertList().slice(0, 20).map(([host, note]) => {
+    const tab = ws.tabs.find((t) => t.session.host.trim().toLowerCase() === host);
+    const saved = state.sessions.find((s) => s.host.trim().toLowerCase() === host);
+    const name = tab ? (tab.label ?? tab.session.name) : saved?.name;
+    const sender = syslogSender(host);
+    return {
+      label: name ? `${name} (${host})` : host,
+      userLabel: true,
+      icon: tab ? "SquareTerminal" : saved ? "Play" : sender ? "ScrollText" : "Activity",
+      hint: note,
+      action: () => (tab ? ws.activate(tab.id) : saved ? open(saved) : sender ? openSyslog(sender) : openNetworkTools(host)),
+    };
+  });
+  // Above the button: the menu is kept inside the window (it moves up to fit).
+  contextMenu(r.left, r.top, [...items, "-", { label: "경고 표시 모두 지우기", icon: "BellOff", action: () => clearAllDeviceAlerts() }]);
+}
+onDeviceAlerts(renderStatus);
+// A mark put away anywhere (tree, home, "clear all") goes from the tabs too.
+onDeviceAlerts(() => ws.syncDeviceMarks());
 subscribe("sessions", () => {
   // Close the kept mstsc tunnel of any session that was deleted, so it does not
   // linger open for the rest of the app's life.
@@ -495,6 +550,8 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.checkUpdate": () => void checkForUpdate(true),
   "tab.next": () => ws.cycle(1),
   "tab.prev": () => ws.cycle(-1),
+  // None marked: said so (a key the user gave it is still taken).
+  "tab.nextAlert": () => ws.nextAlertTab() || (toast("경고 표시된 탭이 없습니다", "info", 2000), true),
   "tab.close": () => {
     const t = ws.activeTab;
     if (!t) return false;

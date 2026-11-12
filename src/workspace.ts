@@ -9,9 +9,10 @@ import { icon } from "./icons";
 import { PROTOCOLS, type Protocol, type Session } from "./model";
 import { copyAddresses } from "./clipboard";
 import { keyHint } from "./keymap";
+import { clearDeviceAlert, deviceAlert } from "./deviceAlerts";
 import { userText } from "./i18nTables";
 import { state, updateSettings } from "./store";
-import { confirmDialog, contextMenu, esc, h, promptDialog, toast } from "./ui";
+import { confirmDialog, contextMenu, esc, h, promptDialog, toast, type MenuItem } from "./ui";
 
 export type ViewState = "connecting" | "connected" | "closed" | "error";
 
@@ -107,6 +108,12 @@ export interface Tab {
   /** Left out of broadcast input (tab menu): it neither gets what is typed in
    * the others nor sends what is typed in it. While the tab is open. */
   noBroadcast?: boolean;
+  /** Something went wrong with its device since the tab was last in front (a
+   * Syslog alert, a continuous ping gone unanswered): what, shown in its
+   * tooltip, the tab marked until it is in front. */
+  alertNote?: string;
+  /** When that first happened (the tooltip's "· 14:05", as in the session tree). */
+  alertAt?: number;
 }
 
 export type Layout = "single" | "cols" | "rows" | "grid";
@@ -477,6 +484,7 @@ export class Workspace {
           ? { label: "세션으로 저장…", icon: "Save", action: () => this.saveAsHandler?.(tab.session), disabled: !this.saveAsHandler }
           : { label: "세션 편집…", icon: "Pencil", action: () => saved && this.editHandler?.(saved), disabled: !saved || !this.editHandler },
         { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([tab.session]) },
+        ...(this.tabMenuExtra?.(tab.session) ?? []),
         { label: "탭 이름 바꾸기…", icon: "Pencil", action: () => void this.renameTab(tab) },
         // Broadcast to some of the open terminals: the others are left out.
         ...(tab.view.receiveBroadcast
@@ -525,6 +533,8 @@ export class Workspace {
   editHandler: ((s: Session) => void) | null = null;
   /** Set by the app to save a quick connection's settings as a new session. */
   saveAsHandler: ((s: Session) => void) | null = null;
+  /** Set by the app: more items for a tab's menu about its device (its Syslog messages). */
+  tabMenuExtra: ((s: Session) => MenuItem[]) | null = null;
 
 
   /** Sessions of recently closed tabs, for "reopen closed tab" (Ctrl+Shift+T). */
@@ -599,15 +609,21 @@ export class Workspace {
       const p = PROTOCOLS[t.session.protocol];
       const title = titles.get(t.id)!;
       const shownElsewhere = this.slots.includes(t.id) && t.id !== active;
+      // Seen once in front.
+      if (t.id === active) {
+        t.alertNote = undefined;
+        // Its device looked at: off the session tree's marks too.
+        clearDeviceAlert(t.session.host);
+      }
       // Marked when what is typed in the active tab reaches it (see mirrorTargets).
       const from = this.activeTab?.view;
       // Not a tab left out, and nothing at all while the tab typed in is one.
       const receives =
         this.broadcast && !!t.view.receiveBroadcast && t.view.state === "connected" && !t.noBroadcast && !this.activeTab?.noBroadcast && (!from || samePhase(t.view, from));
-      t.el.className = `tab state-${t.view.state}${t.id === active ? " active" : ""}${shownElsewhere ? " visible" : ""}${receives ? " broadcasting" : ""}${this.broadcast && t.noBroadcast ? " no-broadcast" : ""}`;
+      t.el.className = `tab state-${t.view.state}${t.id === active ? " active" : ""}${shownElsewhere ? " visible" : ""}${receives ? " broadcasting" : ""}${this.broadcast && t.noBroadcast ? " no-broadcast" : ""}${t.alertNote ? " device-alert" : ""}`;
       t.el.style.setProperty("--proto", p.color);
       // The address is the user's: kept as written in the translated tooltip.
-      t.el.title = `${p.label} · ${userText(t.view.status().endpoint)}${t.noBroadcast ? " · 동시 입력에서 뺌" : ""}`;
+      t.el.title = `${p.label} · ${userText(t.view.status().endpoint)}${t.noBroadcast ? " · 동시 입력에서 뺌" : ""}${t.alertNote ? ` · ${t.alertNote} · ${new Date(t.alertAt ?? Date.now()).toTimeString().slice(0, 5)}` : ""}`;
       // The protocol shows as the dot's color and in the tooltip; the label
       // itself cost too much width with many tabs open.
       const html = `<span class="tab-dot"></span>
@@ -635,6 +651,57 @@ export class Workspace {
       this.shownTab = active ?? null;
       this.tabs.find((t) => t.id === active)?.el.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
+  }
+
+  /** A marked tab's device is always in deviceAlerts too (main's markDevice):
+   * when it is no longer there (its mark put away from the tree, the home
+   * screen or the status bar's "clear all"), its tabs' marks go as well. */
+  syncDeviceMarks() {
+    let changed = false;
+    for (const t of this.tabs) {
+      if (t.alertNote && !deviceAlert(t.session.host)) {
+        t.alertNote = undefined;
+        changed = true;
+      }
+    }
+    if (changed) this.renderTabs();
+  }
+
+  /** The next tab after the one in front whose device was marked (markDevice),
+   * brought to the front; false when no tab is marked. */
+  nextAlertTab(): boolean {
+    const at = this.tabs.findIndex((t) => t.id === this.slots[this.focused]);
+    const n = this.tabs.length;
+    for (let i = 1; i <= n; i++) {
+      const t = this.tabs[(at + i + n) % n];
+      if (t.alertNote) {
+        this.activate(t.id);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Something went wrong with the device at this address (`note`: what, an
+   * app phrase): its tabs are marked, unless one of them is in front (the
+   * device is being looked at: none marked, nor in the tree, so a marked tab
+   * always has its device in deviceAlerts). The latest note is the one told.
+   * True when a tab of the device is the one in front. */
+  markDevice(host: string, note: string): boolean {
+    const key = host.trim().toLowerCase();
+    const active = this.slots[this.focused];
+    const mine = this.tabs.filter((t) => t.session.host.trim().toLowerCase() === key);
+    if (mine.some((t) => t.id === active)) return true;
+    let marked = false;
+    for (const t of mine) {
+      if (t.alertNote !== note) {
+        t.alertNote = note;
+        t.alertAt = Date.now();
+        marked = true;
+      }
+    }
+    if (marked) this.renderTabs();
+    return false;
   }
 
   /** A view's badge changed (a timer ticking): that tab's mark only, not the

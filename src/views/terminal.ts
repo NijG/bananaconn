@@ -13,6 +13,7 @@ import { matchLines, type LineMatch, type OutputLine } from "../lineFilter";
 import { clockText, LineTimes } from "../lineTimes";
 import { splitTable, type CellLine } from "../tableCopy";
 import { notesButton } from "../sessionNotes";
+import { openSyslog, syslogSender } from "../syslog";
 import { icon } from "../icons";
 import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Protocol, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
@@ -3727,14 +3728,19 @@ export class TerminalView implements View {
     const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
     const known = port ? byPort[port] : undefined;
     const protocol: Protocol = known ?? (this.session.protocol === "telnet" ? "telnet" : "ssh");
+    const sender = syslogSender(ip);
     contextMenu(x, y, [
       { label: "이 주소로 새 세션 만들기…", icon: "Plus", hint: address, action: () => this.ws.newSessionHandler?.({ protocol, host: ip, ...(known ? { port } : {}) }) },
       { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip)) },
+      // Watching it come back after a restart, at once.
+      { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "ping", null, true, true)) },
       // IPv4 only, as the trace is.
       ...(ip.includes(":") ? [] : [{ label: "경로 추적", icon: "Waypoints", hint: ip, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "trace", null, true)) }]),
       // With the prefix written next to it ("/24", a netmask) when there is one.
       { label: "서브넷 계산", icon: "Network", hint: prefix !== null ? `${ip}/${prefix}` : undefined, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "subnet", prefix)) },
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(address) },
+      // The device's own log messages, when the Syslog receiver has some from it.
+      ...(sender ? [{ label: "이 장비의 Syslog 메시지", icon: "ScrollText", action: () => openSyslog(sender) }] : []),
       // Which device's output holds it (an ARP table, a neighbor list on each).
       ...(this.otherTerminals().length ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", hint: ip, action: () => this.matchList(addressPattern(ip), { regex: true, caseSensitive: false }, true) }] : []),
     ]);

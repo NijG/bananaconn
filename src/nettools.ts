@@ -6,7 +6,8 @@ import { icon } from "./icons";
 import { tr, userText } from "./i18n";
 import { macFormats, parseSubnetInput, subnetInfo } from "./ipLinks";
 import { parseTarget, PROTOCOLS, type Session } from "./model";
-import { beep, canOsNotify, contextMenu, errorText, esc, h, modal, osNotify, requestAttention, sheetCell, toast } from "./ui";
+import { state } from "./store";
+import { beep, canOsNotify, contextMenu, errorText, esc, h, type MenuItem, modal, osNotify, requestAttention, sheetCell, toast } from "./ui";
 
 export type NetTool = "ping" | "trace" | "ports" | "dns" | "subnet" | "sweep";
 
@@ -29,6 +30,52 @@ type NewSessionHandler = (defaults: Partial<Session>, beforeConnect: () => void)
 let newSession: NewSessionHandler | null = null;
 export function setNewSessionHandler(f: NewSessionHandler) {
   newSession = f;
+}
+/** Opens a saved session in a tab (main's): "connect" on an address a sweep found. */
+let openSaved: ((s: Session) => void) | null = null;
+export function setSessionOpener(f: (s: Session) => void) {
+  openSaved = f;
+}
+/** "Connect" items for the saved sessions to an address (the first five), for
+ * an address menu in a dialog: `close` runs first, so the tab (a host key or
+ * password question in it) is not left behind the dialog. One click, one connection. */
+export function savedSessionItems(ip: string, close: () => void): MenuItem[] {
+  const open = openSaved;
+  if (!open) return [];
+  const key = ip.trim().toLowerCase();
+  return state.sessions
+    .filter((s) => s.host.trim().toLowerCase() === key)
+    .slice(0, 5)
+    .map((s) => ({ label: "연결", icon: "Play", hint: s.name, userHint: true, action: () => (close(), open(s)) }));
+}
+/** The first saved session's name for each address (lower-case, as the menus match). */
+function savedNames(): Map<string, string> {
+  const byHost = new Map<string, string>();
+  for (const s of state.sessions) {
+    const host = s.host.trim().toLowerCase();
+    if (host && !byHost.has(host)) byHost.set(host, s.name);
+  }
+  return byHost;
+}
+/** The saved sessions' addresses offered as the host box is typed in (a
+ * serial port is no address), each once, with its session's name beside it. */
+function savedHostOptions(): string {
+  const seen = new Set<string>();
+  const options: string[] = [];
+  for (const s of state.sessions) {
+    const host = s.host.trim();
+    const key = host.toLowerCase();
+    if (!host || s.protocol === "serial" || seen.has(key)) continue;
+    seen.add(key);
+    options.push(`<option value="${esc(host)}" label="${esc(s.name)}"></option>`);
+    if (options.length >= 500) break;
+  }
+  return options.join("");
+}
+/** Marks the open tabs connected to a host whose continuous ping went unanswered (main's). */
+let markDevice: (host: string) => void = () => {};
+export function setDeviceMarker(f: (host: string) => void) {
+  markDevice = f;
 }
 /** The same opener for other windows' address menus (Syslog's senders); null before main sets it. */
 export function newSessionHandler(): NewSessionHandler | null {
@@ -224,6 +271,74 @@ function subnetTable(ip: string, prefix: number): string {
     </tbody></table>${prefix === 31 ? `<p class="muted small">/31은 점대점 링크라 두 주소를 모두 씁니다 (RFC 3021).</p>` : ""}`;
 }
 
+/** IANA service names of well-known TCP ports (the port check is TCP), as the
+ * registry writes them, with the common name after a slash where the registry
+ * name says little ("ms-wbt-server" is RDP). */
+const WELL_KNOWN_PORTS: Record<number, string> = {
+  20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "domain/DNS", 80: "http", 88: "kerberos",
+  110: "pop3", 111: "sunrpc", 119: "nntp", 123: "ntp", 135: "epmap/RPC", 139: "netbios-ssn", 143: "imap", 179: "bgp",
+  389: "ldap", 443: "https", 445: "microsoft-ds/SMB", 465: "submissions", 514: "shell/rsh", 515: "printer/LPD",
+  587: "submission", 636: "ldaps", 830: "netconf-ssh", 873: "rsync", 990: "ftps", 993: "imaps", 995: "pop3s",
+  1433: "ms-sql-s", 1521: "ncube-lm/Oracle", 1723: "pptp", 1883: "mqtt", 2049: "nfs", 3306: "mysql", 3389: "ms-wbt-server/RDP",
+  5432: "postgresql", 5900: "rfb/VNC", 5985: "wsman/WinRM", 5986: "wsmans/WinRM", 6379: "redis", 8080: "http-alt",
+  8443: "pcsync-https", 9100: "pdl-datastream/JetDirect", 27017: "mongodb",
+};
+
+/** The TCP ports whose kind of session the app opens (TFTP is UDP: not found by the port check). */
+const PORT_PROTOCOL: Record<number, Session["protocol"]> = { 21: "ftp", 22: "ssh", 23: "telnet", 990: "ftps", 3389: "rdp", 5900: "vnc" };
+
+/** A result table (a sweep's, a port check's) sorted by the column whose
+ * heading is clicked (again: the other way). Each column's kind is read from
+ * its cells at the click (names come in later): addresses as numbers, round
+ * trips as times (none last), whole numbers (ports) as numbers, the rest as
+ * text (empty last). */
+function sortableTable(table: HTMLTableElement) {
+  table.classList.add("sortable");
+  const heads = [...table.tHead!.rows[0].cells];
+  const ipNum = (ip: string) => ip.split(".").reduce((n, o) => n * 256 + Number(o), 0);
+  heads.forEach((th, col) => {
+    // By keyboard too: Tab to a heading, Enter or Space sorts (as the address links open).
+    th.tabIndex = 0;
+    th.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      th.click();
+    });
+    th.addEventListener("click", () => {
+      const body = table.tBodies[0];
+      const up = th.getAttribute("aria-sort") !== "ascending";
+      heads.forEach((h) => h.removeAttribute("aria-sort"));
+      th.setAttribute("aria-sort", up ? "ascending" : "descending");
+      const text = (row: HTMLTableRowElement) => (row.cells[col]?.textContent ?? "").trim();
+      const all = [...body.rows];
+      const kind = all.some((r) => r.cells[col]?.querySelector("[data-ip]:not([data-port])"))
+        ? "ip"
+        : all.some((r) => /^\d+ ms$/.test(text(r)))
+          ? "ms"
+          : all.every((r) => /^\d*$/.test(text(r)))
+            ? "num"
+            : "text";
+      const key = (row: HTMLTableRowElement): number | string => {
+        const t = text(row);
+        if (kind === "ip") return ipNum(row.cells[col].querySelector<HTMLElement>("[data-ip]:not([data-port])")?.dataset.ip ?? "");
+        if (kind === "ms") return /^\d+ ms$/.test(t) ? Number.parseInt(t, 10) : Infinity;
+        if (kind === "num") return t ? Number(t) : Infinity;
+        return t.toLowerCase();
+      };
+      const rows = [...body.rows].map((r) => ({ r, k: key(r) }));
+      rows.sort((a, b) => {
+        // An empty name or MAC, or no round trip, stays at the end either way.
+        const ea = a.k === "" || a.k === Infinity;
+        const eb = b.k === "" || b.k === Infinity;
+        if (ea !== eb) return ea ? 1 : -1;
+        const c = typeof a.k === "number" && typeof b.k === "number" ? a.k - b.k : String(a.k).localeCompare(String(b.k), undefined, { numeric: true });
+        return up ? c : -c;
+      });
+      body.append(...rows.map((x) => x.r));
+    });
+  });
+}
+
 /** The host addresses of a subnet, as a sweep pings them (the backend's
  * sweep_targets): the network and broadcast addresses left out, except in
  * a /31 (both are hosts) and a /32 (the one address). */
@@ -235,11 +350,65 @@ function hostsOf(ip: string, prefix: number): string[] {
   return out;
 }
 
+/** The addresses each range's last finished sweep found, keyed by its first
+ * and last host: a later sweep of the same range shows what came and what no
+ * longer answers (a device just plugged in, one gone down). Kept across runs
+ * (the last SWEEPS_KEPT ranges) so today's sweep compares with yesterday's. */
+const SWEEPS_KEY = "bx.lastSweeps";
+const SWEEPS_KEPT = 20;
+const lastSweeps = loadSweeps();
+
+function loadSweeps(): Map<string, { at: number; ips: Set<string> }> {
+  const out = new Map<string, { at: number; ips: Set<string> }>();
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(SWEEPS_KEY) ?? "[]");
+    // An entry of another shape (an edited or older store) is left out.
+    if (Array.isArray(raw))
+      for (const e of raw)
+        if (Array.isArray(e) && typeof e[0] === "string" && typeof e[1] === "number" && Array.isArray(e[2]) && e[2].every((ip: unknown) => typeof ip === "string"))
+          out.set(e[0], { at: e[1], ips: new Set(e[2] as string[]) });
+  } catch {
+    // None kept: the first sweep of each range has nothing to compare with.
+  }
+  return out;
+}
+
+/** This range's finished sweep, as the one the next compares with (the oldest ranges dropped). */
+/** The addresses the kept sweeps found, the latest sweep's first, each once. */
+export function recentSweepHosts(): string[] {
+  const out = new Set<string>();
+  for (const s of [...lastSweeps.values()].sort((a, b) => b.at - a.at)) for (const ip of s.ips) out.add(ip);
+  return [...out];
+}
+
+function rememberSweep(key: string, ips: Set<string>) {
+  lastSweeps.delete(key);
+  lastSweeps.set(key, { at: Date.now(), ips });
+  while (lastSweeps.size > SWEEPS_KEPT) lastSweeps.delete(lastSweeps.keys().next().value!);
+  try {
+    localStorage.setItem(SWEEPS_KEY, JSON.stringify([...lastSweeps].map(([k, v]) => [k, v.at, [...v.ips]])));
+  } catch {
+    // Not kept for the next run; this one still compares.
+  }
+}
+
+/** When the last sweep was: its time today, its date and time before. */
+function sweepTime(at: number): string {
+  const d = new Date(at);
+  const time = d.toTimeString().slice(0, 8);
+  if (d.toDateString() === new Date().toDateString()) return time;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${time.slice(0, 5)}`;
+}
+
 /** The network tools dialog, on `initialTool`. The subnet calculator can start
  * with a prefix length (one read next to the address in terminal output). */
-/** `startNow`: start the tool at once on `initialHost` (an address picked in the output). */
-export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping", initialPrefix: number | null = null, startNow = false) {
+/** `startNow`: start the tool at once on `initialHost` (an address picked in the output).
+ * `continuous`: the ping as "Keep sending" (watching a device come back after a restart). */
+export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping", initialPrefix: number | null = null, startNow = false, continuous = false) {
   let tool: NetTool = "ping";
+  /** The host box's suggestions (one list per dialog). */
+  const hostListId = `nettools-hosts-${crypto.randomUUID()}`;
   let busy = false;
   /** The ping running now, so "Stop" and closing the dialog end ping.exe. */
   let pingId: string | null = null;
@@ -279,7 +448,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         </div>
         <form class="form nettools-form" autocomplete="off" novalidate>
           <div class="inline">
-            <input name="host" placeholder="호스트 또는 IP (예: 192.168.0.1)" spellcheck="false" value="${esc(initialHost)}"/>
+            <input name="host" placeholder="호스트 또는 IP (예: 192.168.0.1)" spellcheck="false" value="${esc(initialHost)}" list="${hostListId}"/>
+            <datalist id="${hostListId}" data-i18n-skip>${savedHostOptions()}</datalist>
             <input name="extra" class="nettools-extra" spellcheck="false"/>
             <label class="check nettools-cont" title="중지할 때까지 1초마다 보내고, 끊기거나 다시 응답하면 알립니다"><input type="checkbox" name="cont"/>계속 보내기</label>
             <button type="submit" class="btn btn-primary" data-run>${icon("Play", 14)}실행</button>
@@ -322,7 +492,11 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     toast(`응답 없는 주소 ${free.length}개를 복사했습니다`, "success", 2000);
   });
   copyBtn.addEventListener("click", () => {
+    // As shown (a table as tab-separated rows), without the sweep's "new" marks:
+    // an address cell pasted elsewhere stays just the address.
+    out.classList.add("copying");
     const text = out.innerText.trim();
+    out.classList.remove("copying");
     if (!text) return;
     void writeClipboard(text);
     toast("결과를 복사했습니다", "success", 1500);
@@ -470,18 +644,42 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       free = all.filter((ip) => !present.has(ip));
       const pinged = hits.filter((h) => h.ms != null).length;
       swept = input;
+      // Against the last sweep of this same range (a stopped one never counts).
+      const key = `${all[0]}-${all[all.length - 1]}`;
+      const before = lastSweeps.get(key);
+      rememberSweep(key, present);
+      const added = new Set(before ? hits.filter((h) => !before.ips.has(h.ip)).map((h) => h.ip) : []);
+      const gone = before ? [...before.ips].filter((ip) => !present.has(ip)) : [];
+      // The ones that no longer answer, written out (a few) to look into; "this
+      // time" as a lost ping or a busy device can be the cause, not only removal.
+      // A saved session's device among them is told by its name, and first:
+      // one of the user's own devices gone quiet matters most.
+      const names = savedNames();
+      const goneShown = [...gone.filter((ip) => names.has(ip)), ...gone.filter((ip) => !names.has(ip))]
+        .slice(0, 12)
+        .map((ip) => (names.has(ip) ? `<b>${esc(names.get(ip)!)}</b> ${esc(ip)}` : esc(ip)));
+      const goneList = gone.length ? `: <span class="mono" data-i18n-skip>${goneShown.join(", ")}${gone.length > 12 ? " …" : ""}</span>` : "";
+      const diff = before
+        ? `<p class="muted small sweep-diff"><span>지난 스캔 이후</span> <span data-i18n-skip>(${sweepTime(before.at)})</span> · ${
+            added.size || gone.length
+              ? `<span class="sweep-new">${esc(`새로 응답 ${added.size}개`)}</span> · <span>${esc(`이번에 응답 없음 ${gone.length}개`)}</span>${goneList}`
+              : `<span>바뀐 장비 없음</span>`
+          }</p>`
+        : "";
       // Two phrases, each translated as its own. An address opens what to do
       // with it; its name (DNS, the hosts file) is filled in once looked up.
       // A MAC column only when some host is on this PC's own segment.
       const withMac = hits.some((h) => h.mac);
       out.innerHTML = `<p class="muted small"><span>${esc(`${all.length}개 중 ${pinged}개 응답`)}</span>${
         hits.length > pinged ? ` · <span>${esc(`ping에 응답하지 않고 ARP로만 확인된 장비 ${hits.length - pinged}개`)}</span>` : ""
-      } · <span>방화벽이 ping을 막는 장비는 응답 없음으로 보입니다</span></p>
+      } · <span>방화벽이 ping을 막는 장비는 응답 없음으로 보입니다</span></p>${diff}
         ${
           hits.length
             ? `<table class="nettools-table"><thead><tr><th>주소</th><th>이름</th>${withMac ? `<th title="이 PC의 ARP 표에서 읽습니다. 라우터 너머의 장비는 비어 있습니다">MAC</th>` : ""}<th>응답</th></tr></thead><tbody>${hits
                 .map(
-                  (h) => `<tr><td class="mono"><button type="button" class="sweep-link" data-ip="${esc(h.ip)}" title="Ping, 포트 확인, 새 세션 만들기"><span data-i18n-skip>${esc(h.ip)}</span></button></td>
+                  (h) => `<tr><td class="mono"><button type="button" class="sweep-link" data-ip="${esc(h.ip)}" title="Ping, 포트 확인, 새 세션 만들기"><span data-i18n-skip>${esc(h.ip)}</span></button>${
+                    added.has(h.ip) ? ` <span class="sweep-new-tag" title="지난 스캔에는 없던 장비">새로</span>` : ""
+                  }</td>
                     <td class="sweep-name" data-i18n-skip>…</td>${
                       withMac
                         ? `<td class="mono">${h.mac ? `<button type="button" class="sweep-link" data-mac="${esc(h.mac)}" title="다른 표기로 복사"><span data-i18n-skip>${esc(macFormats(h.mac)[0].text)}</span></button>` : ""}</td>`
@@ -493,6 +691,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         }`;
       freeBtn.hidden = !free.length;
       if (hits.length) void showNames(hits.map((h) => h.ip), [...out.querySelectorAll<HTMLElement>(".sweep-name")]);
+      const table = out.querySelector<HTMLTableElement>("table.nettools-table");
+      if (table) sortableTable(table);
     } catch (err) {
       const msg = errorText(err);
       out.innerHTML = msg === "CANCELLED" ? `<p class="muted">중지했습니다.</p>` : `<p class="danger-text">${esc(msg)}</p>`;
@@ -621,6 +821,9 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
             s.down = s.firstMiss;
             log("응답 없음");
             tell("응답 없음");
+            // Its tabs, by the name or the address it was given as.
+            markDevice(target);
+            if (ip !== target) markDevice(ip);
           }
         }
         render();
@@ -680,10 +883,18 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         body.appendChild(row);
         if (!p.addrs.length) return;
         const cell = row.querySelector<HTMLElement>(".sweep-name")!;
-        api.netNames(p.addrs).then(
-          (names) => (cell.textContent = names.filter((n): n is string => !!n).join(", ")),
-          () => (cell.textContent = ""),
-        );
+        // A hop with no DNS or hosts name: its saved session's name, set apart
+        // (muted), as the sweep's names (a router on the way is often a saved device).
+        const fill = (names: (string | null)[]) => {
+          const saved = savedNames();
+          const shown = p.addrs.map((_, i) => names[i] ?? null);
+          const fromSessions = shown.every((n) => !n) && p.addrs.some((a) => saved.has(a.toLowerCase()));
+          cell.textContent = fromSessions
+            ? p.addrs.flatMap((a) => saved.get(a.toLowerCase()) ?? []).join(", ")
+            : shown.filter((n): n is string => !!n).join(", ");
+          cell.classList.toggle("muted", fromSessions);
+        };
+        api.netNames(p.addrs).then(fill, () => fill([]));
       });
       if (traceId !== id) return void (out.innerHTML = `<p class="muted">중지했습니다.</p>`);
       traceStarted = true;
@@ -720,7 +931,13 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     } catch {
       // Shown as no name.
     }
-    cells.forEach((c, i) => (c.textContent = names[i] ?? ""));
+    // No DNS or hosts name: a saved session's name for the address, set apart (muted).
+    const saved = savedNames();
+    cells.forEach((c, i) => {
+      const session = names[i] ? undefined : saved.get(ips[i]);
+      c.textContent = names[i] ?? session ?? "";
+      c.classList.toggle("muted", !!session);
+    });
   };
   /** Ping or check the ports of an address from the sweep's results. */
   const runOn = (t: "ping" | "trace" | "ports", ip: string) => {
@@ -739,10 +956,22 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     if (mac) return void contextMenu(r.left, r.bottom + 2, macFormats(mac).map((m) => ({ label: m.text, icon: "Copy", hint: m.style, action: () => void writeClipboard(m.text) })));
     const ip = b.dataset.ip;
     if (!ip) return;
+    // An open port found by the port check: a session of its kind, to that port
+    // (in the editor first: nothing connects from here).
+    const port = Number(b.dataset.port);
+    const protocol = PORT_PROTOCOL[port];
+    if (protocol)
+      return void contextMenu(r.left, r.bottom + 2, [
+        { label: "이 포트로 새 세션 만들기…", icon: "Plus", hint: `${PROTOCOLS[protocol].label} :${port}`, action: () => newSession?.({ protocol, host: ip, port }, () => m.close()) },
+        ...savedSessionItems(ip, () => m.close()),
+      ]);
     contextMenu(r.left, r.bottom + 2, [
-      { label: "Ping", icon: "Activity", action: () => runOn("ping", ip) },
+      // Each says which ping it is: the "Keep sending" box set to match.
+      { label: "Ping", icon: "Activity", action: () => ((cont.checked = false), runOn("ping", ip)) },
+      { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => ((cont.checked = true), runOn("ping", ip)) },
       { label: "경로 추적", icon: "Waypoints", action: () => runOn("trace", ip) },
       { label: "포트 확인", icon: "Unplug", action: () => runOn("ports", ip) },
+      ...savedSessionItems(ip, () => m.close()),
       ...(newSession ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => newSession?.({ protocol: "ssh" as const, host: ip }, () => m.close()) }] : []),
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(ip) },
     ]);
@@ -783,12 +1012,26 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         if (!ports) throw new Error("포트 형식: 22, 80, 8000-8010 (1~65535, 한 번에 64개까지)");
         const res = await api.netPorts(target, ports);
         const openCount = res.filter((r) => r.open).length;
-        out.innerHTML = `<p class="muted small">${esc(`${res.length}개 중 ${openCount}개 열림`)}</p><table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th></tr></thead><tbody>${res
+        // The well-known service of a port, in a column of its own (the port
+        // column stays a number when the table is pasted elsewhere); last, so
+        // the state stays the second column its colour is set on.
+        const named = res.some((r) => WELL_KNOWN_PORTS[r.port]);
+        out.innerHTML = `<p class="muted small">${esc(`${res.length}개 중 ${openCount}개 열림`)}</p><table class="nettools-table"><thead><tr><th>포트</th><th>상태</th><th>응답</th>${named ? "<th>서비스</th>" : ""}</tr></thead><tbody>${res
           .map(
-            (r) => `<tr class="${r.open ? "open" : "closed"}"><td class="mono">${r.port}</td>
-              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.open ? "열려 있음" : r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td></tr>`,
+            (r) => `<tr class="${r.open ? "open" : "closed"}"><td class="mono">${
+              // An open port of a kind of session the app has: a new session to it.
+              r.open && PORT_PROTOCOL[r.port] && newSession
+                ? `<button type="button" class="sweep-link" data-ip="${esc(target)}" data-port="${r.port}" title="이 포트로 새 세션 만들기">${r.port}</button>`
+                : r.port
+            }</td>
+              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.open ? "열려 있음" : r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td>${
+                named ? `<td class="muted mono" data-i18n-skip>${WELL_KNOWN_PORTS[r.port] ?? ""}</td>` : ""
+              }</tr>`,
           )
           .join("")}</tbody></table>`;
+        // Many ports (a range): sorted by state or round trip with a click.
+        const portTable = out.querySelector<HTMLTableElement>("table.nettools-table");
+        if (portTable) sortableTable(portTable);
       } else {
         const res = await api.netDns(target);
         out.innerHTML = res.addresses.length
@@ -810,6 +1053,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   });
   // The prefix read next to the address in terminal output, not /24.
   if (initialPrefix !== null) ownPrefix = String(initialPrefix);
+  if (continuous && initialTool === "ping") cont.checked = true;
   setTool(initialTool);
   if (startNow && initialHost.trim()) form.requestSubmit();
 }

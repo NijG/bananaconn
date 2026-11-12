@@ -30,6 +30,10 @@ const utf8 = (s: string) => new TextEncoder().encode(s);
 const mockLines = new Map<string, string>();
 /** Sweeps the preview's "Stop" ended. */
 const sweepsCancelled = new Set<string>();
+/** The preview's open tunnels (no SSH behind them: the manager's rows and buttons). */
+const mockTunnels = new Map<string, { id: string; localPort: number; target: string; gateway: string; active: number; total: number }>();
+/** Sweeps run so far: every other one answers a little differently. */
+let sweepRuns = 0;
 /** The mock syslog receiver: a batch of device messages every second while it runs. */
 let syslogMock: { status: { port: number; lan: boolean; addresses: string[]; file: string | null }; timer: number } | null = null;
 const SYSLOG_SAMPLES: [string, number, string][] = [
@@ -268,6 +272,12 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       ]);
     case "local_home":
       return "C:\\Users\\me";
+    case "local_stat":
+      // [modified, size]: a file that grows as the preview runs (the Syslog file's
+      // size). Its time stays put: the file windows read it to tell an edited
+      // download, and one that always looks newer would ask to upload again.
+      // A path with "big" in it: a file past 1 GB (the Syslog window's warning).
+      return [1_700_000_000_000, (String(a.path).includes("big") ? 1_610_612_736 : 1_200_000) + (Date.now() % 100_000) * 37];
     case "local_list":
       if (!a.path) return fake("", [["C:\\", true, 0], ["E:\\", true, 0]]).map((e) => ({ ...e, path: e.name }));
       return fake(a.path, [
@@ -346,9 +356,11 @@ ${a.host}에 대한 Ping 통계:
         mockEmit("sweep-progress", { id: a.id, done: Math.round((total * i) / 10), total });
       }
       // Eight that answer ping, the fourth of them off this segment (no MAC),
-      // and one that answers ARP only (no round trip).
+      // and one that answers ARP only (no round trip). Every other sweep one
+      // goes away and another comes (the comparison with the last sweep).
       const mac = (n: number) => `00155d${(n % 16777216).toString(16).padStart(6, "0")}`;
-      return [0, 1, 9, 10, 19, 30, 53, 99, 199]
+      const changed = ++sweepRuns % 2 === 0;
+      return [0, 1, 9, 10, 19, 30, changed ? 77 : 53, 99, 199]
         .filter((i) => i < total)
         .map((i, k) => ({ ip: dotted(hosts[i]), ms: k === 5 ? null : (k % 4) + 1, mac: k % 4 === 3 && k !== 5 ? null : mac(hosts[i]) }));
     }
@@ -383,7 +395,8 @@ ${a.host}에 대한 Ping 통계:
     }
     case "net_names":
       await new Promise((r) => setTimeout(r, 600));
-      return a.ips.map((ip: string, i: number) => (i % 3 === 2 ? null : `host-${ip.split(".").pop()}.lan`));
+      // The trace's 10.10.x.x hop has no name (its saved session's name shows instead).
+      return a.ips.map((ip: string, i: number) => (i % 3 === 2 || ip.startsWith("10.10.") ? null : `host-${ip.split(".").pop()}.lan`));
     case "net_dns":
       return { addresses: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"], ms: 12 };
     case "file_server_status":
@@ -491,7 +504,16 @@ ${a.host}에 대한 Ping 통계:
     case "lock_status":
       return { enabled: false, locked: false };
     case "tunnel_list":
-      return [];
+      return [...mockTunnels.values()];
+    case "tunnel_open": {
+      const r = a.req;
+      const info = { id: r.id, localPort: r.localPort, target: `${r.targetHost}:${r.targetPort}`, gateway: r.gatewayHost, active: 0, total: 0 };
+      mockTunnels.set(r.id, info);
+      return info;
+    }
+    case "tunnel_close":
+      mockTunnels.delete(a.id);
+      return;
     case "remote_read_text":
       return {
         text: "# 미리보기 파일\nserver:\n  port: 8080\n  host: 0.0.0.0\nlog_level: info  # ERROR, WARN\n",

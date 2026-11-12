@@ -19,6 +19,8 @@
   --danger-soft: #f871711c;
   --ok: #4ade80;
   --warn: #fbbf24;
+  /* Names of the app's own menus and buttons in running text (the guide). */
+  --info: #8cc4ff;
   --term-bg: #0d1017;
   --radius: 8px;
   --radius-lg: 12px;
@@ -622,6 +624,13 @@ kbd.word {
   flex: none;
   color: var(--muted);
 }
+/* Its device sent a Syslog alert or stopped answering a continuous ping. */
+.row-alert {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--danger);
+}
 .row-go {
   display: grid;
   place-items: center;
@@ -749,6 +758,15 @@ kbd.word {
 }
 .tab.state-error .tab-dot {
   background: var(--danger);
+}
+/* Something went wrong with its device since the tab was last in front (a
+   Syslog alert, a continuous ping unanswered): tinted until it is. */
+.tab.device-alert {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--text);
+}
+.tab.device-alert:hover {
+  background: color-mix(in srgb, var(--danger) 24%, transparent);
 }
 .tab-title {
   flex: 1 1 auto;
@@ -1071,6 +1089,11 @@ kbd.word {
   font-variant-numeric: tabular-nums;
 }
 /* Clipboard history picker: a list of earlier copies, each pickable or removable. */
+/* The history's filter: the window's width. */
+.clip-filter {
+  width: 100%;
+  margin-bottom: 8px;
+}
 .clip-hist {
   display: flex;
   flex-direction: column;
@@ -1938,6 +1961,16 @@ kbd.word {
   font-size: 11.5px;
   color: var(--muted);
 }
+/* A device that sent a Syslog alert or stopped answering a continuous ping. */
+.recent-item.alerted {
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+.ri-alert {
+  display: grid;
+  place-items: center;
+  color: var(--danger);
+}
 .keys {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -2267,10 +2300,14 @@ code.fp {
 }
 .check.block b {
   color: var(--text);
-  font-weight: 550;
+  font-weight: 600;
 }
+/* The explanation under an option's name: apart from the name, still easy to read. */
 .check.block small {
-  color: var(--muted);
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: color-mix(in srgb, var(--text-2) 70%, var(--muted));
 }
 .check-grid {
   display: grid;
@@ -2549,6 +2586,12 @@ code.fp {
 .match-row mark {
   border-radius: 2px;
   background: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: inherit;
+}
+/* The part of a session row or a command that the search matched. */
+mark.term-hit {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
   color: inherit;
 }
 /* "Every terminal tab": each tab's lines under its name, which stays in view. */
@@ -3021,6 +3064,21 @@ code.fp {
 .sb-server:hover {
   text-decoration: underline;
 }
+/* Devices that sent an alert or stopped answering (deviceAlerts.ts): opens their list. */
+.sb-alerts {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  color: var(--danger);
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+.sb-alerts:hover {
+  text-decoration: underline;
+}
 .ftpd {
   display: flex;
   flex-direction: column;
@@ -3143,7 +3201,7 @@ code.fp {
   gap: 8px;
 }
 .syslog-filter {
-  width: 220px;
+  width: 170px;
 }
 .syslog-count {
   flex: 1;
@@ -3224,6 +3282,29 @@ code.fp {
 .syslog-only[hidden] {
   display: none;
 }
+/* The alert words button right after the alert button: one group. */
+/* The saving file grown past 1 GB (syslog.ts BIG_LOG_FILE). */
+.syslog-saving .syslog-big {
+  color: var(--warn);
+  font-weight: 600;
+}
+/* A tunnel's local end: a click copies it (tunnels.ts). */
+.tunnel-local {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: copy;
+  text-decoration: underline dotted color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 3px;
+}
+.tunnel-local:hover {
+  text-decoration-color: currentColor;
+}
+.syslog-bell + .syslog-bell {
+  margin-left: -4px;
+}
 /* Alerts for err-or-worse messages, on. */
 .syslog-bell.on {
   color: var(--accent);
@@ -3236,6 +3317,11 @@ code.fp {
 .syslog-row .tx {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+/* A message with one of the alert words (alerted whatever its severity). */
+.syslog-row.word-hit {
+  box-shadow: inset 3px 0 0 var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
 .syslog-row.sev-0 .sev,
 .syslog-row.sev-1 .sev,
@@ -3451,8 +3537,47 @@ code.fp {
   outline-offset: 1px;
   border-radius: 2px;
 }
+/* A sweep's columns sort on a click on their heading (nettools.ts sortableSweep). */
+.nettools-table.sortable th {
+  cursor: pointer;
+  user-select: none;
+}
+.nettools-table.sortable th:hover {
+  color: var(--text);
+}
+.nettools-table.sortable th:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 2px;
+}
+.nettools-table.sortable th[aria-sort="ascending"]::after {
+  content: " ▲";
+  font-size: 9px;
+  color: var(--accent);
+}
+.nettools-table.sortable th[aria-sort="descending"]::after {
+  content: " ▼";
+  font-size: 9px;
+  color: var(--accent);
+}
 .nettools-table .sweep-name {
   color: var(--text-2);
+}
+/* A sweep against the last one of the same range: what came is marked. */
+.sweep-diff .sweep-new {
+  color: var(--ok);
+}
+.nettools-table .sweep-new-tag {
+  font-family: var(--font);
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 8px;
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+/* Left out of "Copy result" (read while this class is on, then taken off). */
+.copying .sweep-new-tag {
+  display: none;
 }
 .nettools-cont {
   white-space: nowrap;
@@ -3892,16 +4017,93 @@ code.fp {
   align-items: center;
   gap: 8px;
   margin: 0 0 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
   font-size: 17px;
   color: var(--text);
 }
 .help-body h4 {
-  margin: 16px 0 6px;
+  margin: 20px 0 8px;
+  padding-left: 8px;
+  border-left: 3px solid var(--accent);
   color: var(--text);
-  font-size: 13.5px;
+  font-size: 14px;
+  line-height: 1.4;
 }
 .help-body b {
   color: var(--text);
+  font-weight: 600;
+}
+/* The subject a list item starts with ("Network tools: …"), marked in help.ts:
+   the eye finds each item by it. */
+.help-body b.lead {
+  color: var(--accent);
+}
+/* A long section's item subjects at its top: each jumps to its item. */
+.help-toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -2px 0 14px;
+}
+.help-toc button {
+  padding: 2px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+.help-toc button:hover,
+.help-toc button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+/* The item a subject was picked for, shown for a moment. */
+.help-body li.help-flash {
+  animation: help-flash 1.4s ease-out;
+}
+@keyframes help-flash {
+  from {
+    background: var(--accent-soft);
+  }
+  to {
+    background: transparent;
+  }
+}
+/* A menu or button named in quotes ("세션 편집…"): what to look for on screen. */
+.help-body .ui-name {
+  color: var(--info);
+}
+/* Long items kept apart by a line, the bullets quieter than the text. */
+.help-body > ul > li,
+.help-body > ol > li {
+  margin: 0;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+}
+.help-body > ul > li:last-child,
+.help-body > ol > li:last-child {
+  border-bottom: 0;
+}
+.help-body li::marker {
+  color: var(--muted);
+}
+/* A long item's sentences after its first, one per line (help.ts splitLongItem). */
+.help-body .help-sub {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.help-body .help-sub > li {
+  margin: 3px 0;
+  line-height: 1.65;
+}
+.help-body .help-sub > li::marker {
+  content: "– ";
 }
 .help-body p svg,
 .help-body li svg {
@@ -3939,6 +4141,17 @@ code.fp {
   color: var(--accent);
   cursor: pointer;
   text-decoration: underline;
+}
+/* The help search's words where they are in the section (as in "find in all tabs"). */
+.help-body mark.help-hit {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: inherit;
+}
+/* The one Enter moved to. */
+.help-body mark.help-hit.current {
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 .help-table {
   width: 100%;
@@ -4166,6 +4379,13 @@ code.fp {
   color: var(--muted);
   font-size: 11.5px;
 }
+/* Where in its explanation a setting matched, when its name does not say. */
+.settings-hit-why {
+  font-style: normal;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
 .settings-hit:hover,
 .settings-hit:focus-visible {
   background: var(--bg-2);
@@ -4220,7 +4440,23 @@ code.fp {
 }
 .settings-page > h4 {
   margin: 0 0 2px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
   font-size: 13px;
+}
+/* Each option its own card, its name apart from its explanation: a page of
+   them reads as a list of options, not one block of text. */
+.settings-page .check.block {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+.settings-page .check.block:hover {
+  border-color: var(--line-2);
+}
+.settings-page .field > span {
+  color: var(--text);
 }
 /* The risk rules have the page to themselves: no inner scroll box. */
 .settings-page .risk-rules {

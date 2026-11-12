@@ -21,14 +21,16 @@ import { copyAddresses } from "./clipboard";
 const HOME_KEYS = ["app.newSession", "app.quickConnect", "tab.next", "tab.close", "term.find", "app.toggleSidebar"];
 import { contextMenu, esc, relativeTime } from "./ui";
 import { natural } from "./sessionOrder";
+import { clearDeviceAlert, deviceAlert, deviceAlertAt, onDeviceAlerts } from "./deviceAlerts";
 
-/** One session on the home screen; `aside`: text on the right, if any. */
-function sessionButton(s: Session, aside: string): string {
+/** One session on the home screen; `aside`: text on the right, if any;
+ * `alert`: what went wrong with its device (a mark and its tooltip). */
+function sessionButton(s: Session, aside: string, alert?: string): string {
   const info = PROTOCOLS[s.protocol];
-  return `<button class="recent-item" data-id="${s.id}" style="--proto:${info.color}">
+  return `<button class="recent-item${alert ? " alerted" : ""}" data-id="${s.id}" style="--proto:${info.color}"${alert ? ` title="${esc(alert)}"` : ""}>
     <span class="proto-ico">${icon(info.icon, 16)}</span>
     <span class="ri-text" data-i18n-skip><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
-    ${aside ? `<span class="ri-time">${aside}</span>` : ""}</button>`;
+    ${aside ? `<span class="ri-time">${aside}</span>` : ""}${alert ? `<span class="ri-alert">${icon("TriangleAlert", 14)}</span>` : ""}</button>`;
 }
 
 export function mountHome(
@@ -37,6 +39,9 @@ export function mountHome(
 ) {
   const render = () => {
     // Pinned from the session's menu, by name: a fixed place, unlike recent.
+    // Devices that sent a Syslog alert or stopped answering a continuous ping (deviceAlerts.ts): first.
+    const marked = state.sessions.filter((s) => deviceAlert(s.host)).sort((a, b) => deviceAlertAt(b.host) - deviceAlertAt(a.host));
+    const alerted = marked.slice(0, 6);
     const pinned = state.sessions.filter((s) => s.pinned).sort((a, b) => natural.compare(a.name, b.name));
     const recent = [...state.sessions]
       .filter((s) => s.lastUsed)
@@ -63,6 +68,13 @@ export function mountHome(
         </section>
         <div class="home-cols">
           <section>
+            ${
+              alerted.length
+                ? `<h3>주의가 필요한 장비</h3><div class="recent">${alerted.map((s) => sessionButton(s, "", deviceAlert(s.host))).join("")}</div>${
+                    marked.length > alerted.length ? `<p class="muted small">${esc(`외 ${marked.length - alerted.length}개`)}</p>` : ""
+                  }`
+                : ""
+            }
             ${
               pinned.length
                 ? `<h3>고정한 세션</h3><div class="recent">${pinned.map((s) => sessionButton(s, "")).join("")}</div>`
@@ -110,6 +122,7 @@ export function mountHome(
           { label: "연결", icon: "Play", action: () => actions.connect(s) },
           { label: "세션 편집…", icon: "Pencil", action: () => actions.edit(s) },
           { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([s]) },
+          ...(deviceAlert(s.host) ? [{ label: "경고 표시 지우기", icon: "BellOff", action: () => clearDeviceAlert(s.host) }] : []),
           s.pinned
             ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }
             : { label: "홈 화면에 고정", icon: "Pin", action: () => void pinSessions([s.id], true) },
@@ -125,6 +138,7 @@ export function mountHome(
     if (!root.hidden) render();
   };
   subscribe("sessions", renderIfShown);
+  onDeviceAlerts(renderIfShown);
   // The shortcut list follows the user's keys.
   subscribe("settings", renderIfShown);
   // Shown again after the last tab closed: "방금 전" from an hour ago must be

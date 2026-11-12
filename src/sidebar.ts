@@ -41,7 +41,8 @@ import {
   upsertSessions,
 } from "./store";
 import { api } from "./api";
-import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
+import { clearDeviceAlert, deviceAlert, onDeviceAlerts } from "./deviceAlerts";
+import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
 import { userText } from "./i18n";
 
 export interface SidebarActions {
@@ -232,6 +233,8 @@ export class Sidebar {
       else if (ids) void this.dropSessions(ids, at);
     });
     subscribe("sessions", () => this.render());
+    // A device that sent an alert or stopped answering: its rows marked (or no longer).
+    onDeviceAlerts(() => this.render());
     subscribe("folders", () => this.render());
     // The tree depends on only two settings; skip the full walk for unrelated
     // settings writes (AI run mode, "don't ask again", keybindings, …).
@@ -307,6 +310,11 @@ export class Sidebar {
     return root;
   }
 
+  /** Whether a session inside (at any depth) has its device marked (deviceAlerts.ts). */
+  private alerted(node: FolderNode): boolean {
+    return node.sessions.some((s) => deviceAlert(s.host)) || [...node.children.values()].some((c) => this.alerted(c));
+  }
+
   private count(node: FolderNode): number {
     let n = node.sessions.length;
     node.children.forEach((c) => (n += this.count(c)));
@@ -331,7 +339,10 @@ export class Sidebar {
         html.push(`<div class="folder-row" data-folder="${esc(f.path)}" draggable="true" style="--depth:${depth}">
             <span class="chev">${icon(open ? "ChevronDown" : "ChevronRight", 14)}</span>
             ${icon(open ? "FolderOpen" : "Folder", 15, "folder-ico")}
-            <span class="fname" data-i18n-skip>${esc(f.name)}</span><span class="count">${this.count(f)}</span></div>`);
+            <span class="fname" data-i18n-skip>${esc(f.name)}</span>${
+              // A closed folder hides its marked sessions: it shows that one is inside.
+              !open && this.alerted(f) ? `<span class="row-alert" title="주의가 필요한 장비">${icon("TriangleAlert", 12)}</span>` : ""
+            }<span class="count">${this.count(f)}</span></div>`);
         heights.push(FOLDER_H);
         if (open) walk(f, depth + 1);
       }
@@ -342,8 +353,9 @@ export class Sidebar {
         html.push(`<div class="session-row${this.picked.has(s.id) ? " selected" : ""}" data-session="${s.id}" draggable="true"
             style="--depth:${depth};--proto:${p.color}" title="${esc(rowTitle(s))}">
             <span class="proto-ico">${icon(p.icon, 15)}</span>
-            <span class="srow-text"><span class="sname" data-i18n-skip>${esc(s.name)}</span><span class="shost" data-i18n-skip>${esc(endpoint(s))}</span></span>
+            <span class="srow-text"><span class="sname" data-i18n-skip>${markTerms(s.name, this.terms)}</span><span class="shost" data-i18n-skip>${markTerms(endpoint(s), this.terms)}</span></span>
             ${s.pinned ? `<span class="row-pin" title="홈 화면에 고정됨">${icon("Pin", 12)}</span>` : ""}
+            ${deviceAlert(s.host) ? `<span class="row-alert" title="${esc(deviceAlert(s.host)!)}">${icon("TriangleAlert", 12)}</span>` : ""}
             <button class="row-go" data-go title="연결" tabindex="-1">${icon("Play", 13)}</button></div>`);
         heights.push(SESSION_H);
         order.push(s.id);
@@ -650,6 +662,8 @@ export class Sidebar {
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
       ...(s.protocol !== "serial" && s.protocol !== "tftp" ? [{ label: "연결 확인", icon: "Activity", action: () => void checkReachable(s) }] : []),
       ...(String(s.options.wolMac ?? "").trim() ? [{ label: "Wake-on-LAN (전원 켜기)", icon: "Power", action: () => void this.wake(s) }] : []),
+      // A known one (a noisy device): put away without connecting.
+      ...(deviceAlert(s.host) ? [{ label: "경고 표시 지우기", icon: "BellOff", action: () => clearDeviceAlert(s.host) }] : []),
       { label: "주소 복사", icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses([s]) },
       s.pinned
         ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }

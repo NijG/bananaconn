@@ -3,7 +3,7 @@
 import { icon } from "./icons";
 import { saveSnippets, state, type Snippet } from "./store";
 import { groupForKind } from "./snippetLibrary";
-import { confirmDialog, confirmDiscard, contextMenu, enterSubmits, esc, formValues, listKeys, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
+import { confirmDialog, confirmDiscard, contextMenu, enterSubmits, esc, formValues, listKeys, markTerms, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
 import { tr } from "./i18n";
 import { fillSnippetVars, snippetVars } from "./snippetVars";
 
@@ -195,11 +195,12 @@ export function openSnippetManager() {
     const groups = [...new Set(visible.flatMap((s) => (s.group ? [s.group] : [])))];
     const item = (s: Snippet) => `<button class="vault-item${s.id === selected ? " on" : ""}" data-id="${esc(s.id)}">
               ${icon(s.macro ? "Circle" : s.run ? "Play" : "ClipboardType", 15)}
-              <span${
+              <span data-i18n-skip><b>${
                 // The user's own snippets are kept as written; the built-in
-                // library (grouped by OS) is app text and is translated.
-                s.group ? "" : " data-i18n-skip"
-              }><b>${esc(s.name)}</b><small class="mono-ellipsis">${esc(s.macro ? showKeys(s.text) : s.text.split("\n")[0])}</small></span></button>`;
+                // library (grouped by OS) is app text, translated here (not on
+                // screen) so the search's marks do not split it.
+                markTerms(s.group ? tr(s.name) : s.name, terms)
+              }</b><small class="mono-ellipsis">${markTerms(s.macro ? showKeys(s.text) : s.text.split("\n")[0], terms)}</small></span></button>`;
     const own = visible.filter((s) => !s.group);
     listEl.innerHTML = visible.length
       ? [
