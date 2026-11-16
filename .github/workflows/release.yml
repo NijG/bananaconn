@@ -68,6 +68,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Before anything is built: every language's phrases and help agree with
+      # the Korean ones (the backend's messages too), no password or key reaches
+      # a cloud AI or a history, table copy, address links and keyword
+      # highlighting behave, and no hidden character is in the sources. The
+      # same list as "npm run check" locally (package.json), which stops at the
+      # first that fails; the scripts import the app's TypeScript, which Node
+      # 24 above runs directly.
+      - name: Check translations, secret rules, table copy, addresses, highlighting and hidden characters
+        run: npm run check
+
       - name: Build installers
         # beforeBuildCommand builds the RDP helper (rdp-helper/) and the frontend.
         run: npx tauri build

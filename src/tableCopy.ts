@@ -81,7 +81,16 @@ export function splitTable(lines: CellLine[]): string[][] | null {
   let h = 0;
   while (h < rows.length - 1 && titleLike(rows[h]) && rows.slice(h + 1).some((r) => !titleLike(r))) h++;
   if (rows.length - h < 2) return null;
-  const table = rows.slice(h);
+  // Lines below the header that start at the left edge with no column gap
+  // may run across the gaps: a sentence after the table ("Total Mac
+  // Addresses for this criterion: 1"), a name too long for its column on a
+  // line of its own (df's "/dev/mapper/…", its values on the next line).
+  // They place no edge; one that runs across an edge comes as one cell, as
+  // titles do. Rules stay: their gaps are the columns'. An indented line (a
+  // value continued, "show vlan" ports) is a row like any other.
+  const loose = (r: CellLine, i: number) => i > h && titleLike(r) && !blank(r[0]) && !ruleLine(r);
+  const fixed = rows.filter((r, i) => i >= h && !loose(r, i));
+  const table = fixed.length >= 2 ? fixed : rows.slice(h);
   let edges = edgesFor(table);
   // A value that ran past its column (a wide first value pushing the rest
   // right) can make a moved edge split each line differently: a cell then
@@ -89,5 +98,27 @@ export function splitTable(lines: CellLine[]): string[][] | null {
   // only at header words: columns may merge, but no value lands in another's.
   const head = cut(table[0], edges);
   if (table.slice(1).some((r) => cut(r, edges).some((v, j) => overfull(v, head[j] ?? "")))) edges = edgesFor(table, true);
-  return rows.map((r, i) => (i < h ? [r.join("").trim()] : cut(r, edges)));
+  const across = (r: CellLine) => edges.some((x) => x > 0 && !blank(r[x - 1]) && !blank(r[x]));
+  const columns = edges.length;
+  /** A line that runs across the edges: a row packed with single spaces
+   * ("show interfaces status" with a full description) when it has one word
+   * per column, one cell per word; otherwise (a sentence, a long name) one cell. */
+  const acrossCells = (r: CellLine): string[] => {
+    const text = r.join("").trim();
+    const words = text.split(/\s+/);
+    return words.length === columns ? words : [text];
+  };
+  // Rules ("---- ------", "=====") only draw the table: no row of their own in
+  // a spreadsheet (they still helped place the edges above). Only above the
+  // header and right under it: further down, a row of dashes is values ("-"
+  // for none in every column).
+  const drawn = (r: CellLine, i: number) => (i < h || i === h + 1) && ruleLine(r);
+  return rows.flatMap((r, i) => (drawn(r, i) ? [] : [i < h ? [r.join("").trim()] : loose(r, i) && across(r) ? acrossCells(r) : cut(r, edges)]));
 }
+
+/** A line of only dashes, equals signs and the like, with a run of three:
+ * a rule. A value of "-" or "--" in a row of values is not one. */
+const ruleLine = (r: CellLine) => {
+  const text = r.join("");
+  return /^[\s\-=+_]+$/.test(text) && /[-=_]{3}/.test(text);
+};

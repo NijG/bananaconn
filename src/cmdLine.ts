@@ -7,6 +7,7 @@ import { findTypedRisk } from "./riskRules";
 import { groupForKind } from "./snippetLibrary";
 import { snippetVars } from "./snippetVars";
 import { state } from "./store";
+import { holdsMaskable } from "./secrets";
 
 /** A prompt that ends where a command starts: shells ($ # % >) and network
  * gear (router#, FGT #, [~HUAWEI]). "login:" and "Password:" are not. */
@@ -170,7 +171,10 @@ const SECRET = new RegExp(
     String.raw`(^|[#>]\s*)((username\s+\S+|enable)\s+)?password\s+\d?\s*\S`,
     String.raw`(^|[#>]\s*)set\s+\S*(password|passwd|secret|psk)\S*\s+\S`,
     String.raw`\blocal-user\s+\S+\s+password\b`,
-  ].join("|"),
+  ]
+    // Any run bounded: a long pasted line is read in linear time.
+    .map((p) => p.replace(/\.\*/g, ".{0,300}"))
+    .join("|"),
   "i",
 );
 
@@ -180,9 +184,12 @@ export function garbled(line: string): boolean {
   return /\^[?H@[]|[\x00-\x08\x0b-\x1f\x7f]/.test(line);
 }
 
-/** A command line that holds a credential (never stored). */
+/** A command line that holds a credential (never stored): one of the forms
+ * above, or anything the AI's masking would hide (secrets.ts: device shared
+ * keys, SNMP communities, tokens), so what never reaches the AI is never kept
+ * in the history either. */
 export function holdsSecret(command: string): boolean {
-  return SECRET.test(command);
+  return SECRET.test(command) || holdsMaskable(command);
 }
 
 /** A command the history may keep. Risky commands (riskRules.ts) are not, so a

@@ -16,6 +16,16 @@ export const TERM_THEMES: Record<string, TermTheme> = {
       brightBlack: "#5b6478", brightRed: "#fca5a5", brightGreen: "#86efac", brightYellow: "#fde68a", brightBlue: "#93c5fd", brightMagenta: "#d8b4fe", brightCyan: "#67e8f9", brightWhite: "#ffffff",
     },
   },
+  // Warmer and yellower than the default: a ripe banana's cream on dark
+  // brown, the app's yellow for the cursor, selection and yellow text.
+  bananaripe: {
+    label: "Banana Ripe",
+    theme: {
+      background: "#14110a", foreground: "#f1e7c9", cursor: "#f5c518", cursorAccent: "#14110a", selectionBackground: "#f5c51855",
+      black: "#2a2416", red: "#f2766b", green: "#a3d977", yellow: "#f5c518", blue: "#7fb2f0", magenta: "#d49cf0", cyan: "#5fd4c4", white: "#e8dcb8",
+      brightBlack: "#7d7055", brightRed: "#ff9b91", brightGreen: "#c3ec9c", brightYellow: "#ffe066", brightBlue: "#a8cdf7", brightMagenta: "#e6bdf7", brightCyan: "#8fe8dc", brightWhite: "#fffaea",
+    },
+  },
   dracula: {
     label: "Dracula",
     theme: {

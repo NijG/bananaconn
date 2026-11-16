@@ -10,10 +10,10 @@ const SESSION_H = 42;
 const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
-import { endpoint, jumpHostOk, normalizeJumpHost, parseTarget, PROTOCOLS, sessionSearchText, type Protocol, type Session } from "./model";
+import { endpoint, jumpHostOk, normalizeJumpHost, parseTarget, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { canBeGateway, confirmGatewayBreak, gatewayChoices, GATEWAY_PROTOCOLS, gatewayUserList, gatewayUsers } from "./tunnels";
-import { checkReachable, checkReachableMany } from "./nettools";
+import { checkReachable, checkReachableMany, openMultiWatch } from "./nettools";
 import { copyAddresses } from "./clipboard";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
@@ -33,6 +33,7 @@ import {
   removeSession,
   removeSessions,
   renameFolder,
+  renameSessions,
   sessionsLoadProblem,
   startEmptySessionList,
   state,
@@ -42,13 +43,19 @@ import {
 } from "./store";
 import { api } from "./api";
 import { clearDeviceAlert, deviceAlert, onDeviceAlerts } from "./deviceAlerts";
-import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast } from "./ui";
+import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast, type MenuItem } from "./ui";
+import { connectHistory } from "./connectLog";
+import { openConnectHistory } from "./connectHistoryView";
 import { userText } from "./i18n";
+import { subnetMatcher } from "./ipLinks";
+import { clockAt, STATE_RANK, STATE_TEXT, type ViewState } from "./workspace";
 
 export interface SidebarActions {
   connect(s: Session): void;
   edit(s: Session | null, defaults?: Partial<Session>): void;
   openFiles(s: Session): void;
+  /** Bring a tab of this saved session to the front (one open: the dot). */
+  goToTab(sessionId: string): void;
 }
 
 interface FolderNode {
@@ -91,12 +98,17 @@ export class Sidebar {
   private query = "";
   /** `query` split once per search, not once per session it is matched against. */
   private terms: string[] = [];
+  /** The subnet searched for, as a test of a session's address ("10.0.0.0/24"); null otherwise. */
+  private inSubnet: ((host: string) => boolean) | null = null;
   /** The tree markup now on screen. */
   private shown = "";
   /** The focused session (keyboard actions, F2, Ctrl+C). */
   private selected: string | null = null;
   /** All selected sessions (Ctrl+click toggles, Shift+click selects a range). */
   private picked = new Set<string>();
+  /** Saved sessions with a tab open, and the state shown for them (setOpenTabs). */
+  private openTabs = new Map<string, ViewState>();
+  private openKey = "";
   /** Where a Shift+click range starts. */
   private anchor: string | null = null;
   /** Sessions being dragged: the whole selection when the dragged row is part of it. */
@@ -133,7 +145,7 @@ export class Sidebar {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const mod = await import("./importExport").catch((err) => void toast(errorText(err), "error"));
       if (!mod) return;
-      const { exportBackup, exportCsv, importFromBackup, importMenuItems } = mod;
+      const { exportBackup, exportCsv, exportSshConfig, importFromBackup, importMenuItems } = mod;
       contextMenu(r.left, r.bottom + 4, [
         ...importMenuItems(),
         "-",
@@ -141,6 +153,7 @@ export class Sidebar {
         "-",
         { label: "세션 백업 내보내기(JSON)…", icon: "Save", action: () => exportBackup() },
         { label: "세션 목록 내보내기(CSV)…", icon: "Save", action: () => exportCsv() },
+        { label: "SSH 세션을 OpenSSH 설정으로 내보내기…", icon: "Save", hint: "~/.ssh/config", userHint: true, action: () => exportSshConfig() },
       ]);
     });
     // Re-filter once typing pauses, not on every key (thousands of sessions).
@@ -152,6 +165,7 @@ export class Sidebar {
       if (query === this.query) return;
       this.query = query;
       this.terms = searchTerms(query);
+      this.inSubnet = subnetMatcher(query);
       this.render();
     };
     searchBox.addEventListener("input", () => {
@@ -265,15 +279,10 @@ export class Sidebar {
   /** A new session from the address searched for (nothing matched it): the
    * editor opens filled in; nothing connects before the user saves. */
   private newFromSearch(): boolean {
-    const t = this.searchTarget();
-    if (!t) return false;
-    // The protocol a well-known port stands for; otherwise the editor's default.
-    const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
-    // A URL's scheme names it outright ("telnet://10.0.0.5").
-    const scheme = /^([a-z]+):\/\//i.exec(this.searchText())?.[1].toLowerCase();
-    const named = scheme && scheme !== "serial" && scheme in PROTOCOLS ? (scheme as Protocol) : null;
-    const protocol = named ?? ((t.port && byPort[t.port]) || "ssh");
-    this.actions.edit(null, { protocol, host: t.host, username: t.username, ...(t.port ? { port: t.port } : {}) });
+    if (!this.searchTarget()) return false;
+    const defaults = sessionDefaultsFor(this.searchText());
+    if (!defaults) return false;
+    this.actions.edit(null, defaults);
     return true;
   }
 
@@ -283,6 +292,8 @@ export class Sidebar {
 
   private matches(s: Session) {
     if (!this.query) return true;
+    // A subnet searched for ("10.0.0.0/24"): the sessions whose address is in it.
+    if (this.inSubnet?.(s.host)) return true;
     return matchesTerms(sessionSearchText(s), this.terms);
   }
 
@@ -315,10 +326,39 @@ export class Sidebar {
     return node.sessions.some((s) => deviceAlert(s.host)) || [...node.children.values()].some((c) => this.alerted(c));
   }
 
+  /** Of the sessions in a folder (and its subfolders) with a tab open, the
+   * state its dot shows (the most live), or null when none has one. */
+  private openState(node: FolderNode): ViewState | null {
+    let best: ViewState | null = null;
+    const take = (st: ViewState | null | undefined) => {
+      if (st && (!best || STATE_RANK[st] > STATE_RANK[best])) best = st;
+    };
+    node.sessions.forEach((s) => take(this.openTabs.get(s.id)));
+    node.children.forEach((c) => take(this.openState(c)));
+    return best;
+  }
+
   private count(node: FolderNode): number {
     let n = node.sessions.length;
     node.children.forEach((c) => (n += this.count(c)));
     return n;
+  }
+
+  /** The open tabs (by session id and state), told on every workspace change:
+   * a session with one shows a dot, so a device already open is seen before
+   * it is opened twice. Redrawn only when what the dots show changes (a tab
+   * opened or closed, a connection made or lost), not on each change. */
+  setOpenTabs(tabs: { sessionId: string; state: ViewState }[]) {
+    const next = new Map<string, ViewState>();
+    for (const { sessionId, state } of tabs) {
+      const was = next.get(sessionId);
+      if (!was || STATE_RANK[state] > STATE_RANK[was]) next.set(sessionId, state);
+    }
+    const key = [...next].map(([id, st]) => `${id}:${st}`).sort().join(",");
+    if (key === this.openKey) return;
+    this.openKey = key;
+    this.openTabs = next;
+    this.render();
   }
 
   render() {
@@ -336,10 +376,14 @@ export class Sidebar {
       const folders = [...node.children.values()].sort((a, b) => byFolder(a.path, b.path));
       for (const f of folders) {
         const open = this.query ? true : !collapsed.has(f.path);
+        // A closed folder hides its sessions' open-tab dots: one shows on it.
+        const hiddenOpen = open || !this.openTabs.size ? null : this.openState(f);
         html.push(`<div class="folder-row" data-folder="${esc(f.path)}" draggable="true" style="--depth:${depth}">
             <span class="chev">${icon(open ? "ChevronDown" : "ChevronRight", 14)}</span>
             ${icon(open ? "FolderOpen" : "Folder", 15, "folder-ico")}
             <span class="fname" data-i18n-skip>${esc(f.name)}</span>${
+              hiddenOpen ? `<span class="row-open ${hiddenOpen}" title="${esc(`탭이 열려 있음 · ${STATE_TEXT[hiddenOpen]}`)}"></span>` : ""
+            }${
               // A closed folder hides its marked sessions: it shows that one is inside.
               !open && this.alerted(f) ? `<span class="row-alert" title="주의가 필요한 장비">${icon("TriangleAlert", 12)}</span>` : ""
             }<span class="count">${this.count(f)}</span></div>`);
@@ -354,6 +398,7 @@ export class Sidebar {
             style="--depth:${depth};--proto:${p.color}" title="${esc(rowTitle(s))}">
             <span class="proto-ico">${icon(p.icon, 15)}</span>
             <span class="srow-text"><span class="sname" data-i18n-skip>${markTerms(s.name, this.terms)}</span><span class="shost" data-i18n-skip>${markTerms(endpoint(s), this.terms)}</span></span>
+            ${this.openTabs.has(s.id) ? `<span class="row-open ${this.openTabs.get(s.id)}" title="${esc(`탭이 열려 있음 · ${STATE_TEXT[this.openTabs.get(s.id)!]}`)}"></span>` : ""}
             ${s.pinned ? `<span class="row-pin" title="홈 화면에 고정됨">${icon("Pin", 12)}</span>` : ""}
             ${deviceAlert(s.host) ? `<span class="row-alert" title="${esc(deviceAlert(s.host)!)}">${icon("TriangleAlert", 12)}</span>` : ""}
             <button class="row-go" data-go title="연결" tabindex="-1">${icon("Play", 13)}</button></div>`);
@@ -595,7 +640,6 @@ export class Sidebar {
         ]);
       });
     });
-
   }
 
   /** Session rows: one listener per event on the tree (not five per row,
@@ -657,6 +701,8 @@ export class Sidebar {
 
   private sessionMenu(s: Session, x: number, y: number) {
     contextMenu(x, y, [
+      // Already open (the dot): its tab, before another connection to it.
+      ...(this.openTabs.has(s.id) ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => this.actions.goToTab(s.id) }] : []),
       { label: "연결", icon: "Play", hint: keyHint("tree.connect"), action: () => this.actions.connect(s) },
       ...(s.protocol === "ssh" ? [{ label: "SFTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, s) }] : []),
       ...(s.protocol === "telnet" ? [{ label: "FTP 파일 브라우저 열기", icon: "FolderLock", action: () => this.openFileBrowser(s, fileSessionFor(s, "ftp")) }] : []),
@@ -665,6 +711,8 @@ export class Sidebar {
       // A known one (a noisy device): put away without connecting.
       ...(deviceAlert(s.host) ? [{ label: "경고 표시 지우기", icon: "BellOff", action: () => clearDeviceAlert(s.host) }] : []),
       { label: "주소 복사", icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses([s]) },
+      ...(connectHistory(s.id).length ? [{ label: "연결 기록…", icon: "History", action: () => openConnectHistory(s, (x) => this.actions.connect(x)) }] : []),
+      ...this.deviceRenameItems([s]),
       s.pinned
         ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }
         : { label: "홈 화면에 고정", icon: "Pin", action: () => void pinSessions([s.id], true) },
@@ -676,6 +724,49 @@ export class Sidebar {
       "-",
       { label: "삭제", icon: "Trash2", hint: keyHint("tree.delete"), danger: true, action: () => this.deleteSession(s) },
     ]);
+  }
+
+  /** The session's recent connections (connectLog.ts), newest first: when,
+   * for how long, how each ended. Only read here; nothing connects. */
+  /** Sessions named otherwise than the device behind them calls itself (the
+   * host name remembered from their last connection, options.osName): each
+   * takes that name, with one save, when the user picks it; the notice undoes
+   * it. Nothing when none differs. Only what is remembered: nothing connects. */
+  private deviceRenameItems(list: Session[]): MenuItem[] {
+    const names = new Map<string, string>();
+    for (const s of list) {
+      const name = typeof s.options.osName === "string" ? s.options.osName.trim() : "";
+      if (name && name.toLowerCase() !== s.name.trim().toLowerCase()) names.set(s.id, name);
+    }
+    if (!names.size) return [];
+    const old = new Map(list.filter((s) => names.has(s.id)).map((s) => [s.id, s.name]));
+    // True once saved; a refused save says why.
+    const save = (to: Map<string, string>) =>
+      renameSessions(to).then(
+        () => true,
+        (err) => (toast(errorText(err), "error"), false),
+      );
+    // Undone only for the sessions that still have the name given here: one
+    // renamed again since (or deleted) keeps what it has now.
+    const undo = () => {
+      const back = new Map([...old].filter(([id]) => state.sessions.find((s) => s.id === id)?.name === names.get(id)));
+      if (back.size < old.size) toast("그 뒤에 이름이 바뀐 세션은 되돌리지 않았습니다", "info");
+      if (back.size) void save(back);
+    };
+    const one = names.size === 1 && list.length === 1 ? [...names.values()][0] : null;
+    return [
+      {
+        label: one ? `세션 이름을 장비 이름으로 바꾸기 · ${userText(one)}` : `${names.size}개 세션 이름을 장비 이름으로 바꾸기`,
+        icon: "Pencil",
+        action: () =>
+          void save(names).then((saved) => {
+            if (!saved) return;
+            const undoAction = { label: "되돌리기", run: undo };
+            if (one) toast(`세션 이름을 바꿨습니다: ${userText(old.get(list[0].id) ?? "")} → ${userText(one)}`, "success", 8000, undoAction);
+            else toast(`${names.size}개 세션 이름을 장비 이름으로 바꿨습니다`, "success", 8000, undoAction);
+          }),
+      },
+    ];
   }
 
   /** Send a Wake-on-LAN magic packet to the session's saved MAC address. */
@@ -698,10 +789,13 @@ export class Sidebar {
       { label: `${list.length}개 세션 연결`, icon: "Play", hint: keyHint("tree.connect"), action: () => void this.connectAll(list) },
       "-",
       { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
+      // After a maintenance window: which of them are back, as it happens.
+      { label: `${list.length}개 장비를 연속 ping으로 지켜보기`, icon: "Radar", action: () => openMultiWatch(list) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: keyHint("tree.edit"), action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
       // One per line, in the order shown: a list of hosts to paste elsewhere.
       { label: `주소 ${list.length}개 복사`, icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses(list) },
+      ...this.deviceRenameItems(list),
       // Unpin when every one is pinned already; otherwise pin them all.
       list.every((s) => s.pinned)
         ? { label: `${list.length}개 홈 화면 고정 해제`, icon: "PinOff", action: () => void pinSessions(list.map((s) => s.id), false) }
@@ -1170,5 +1264,10 @@ function gatewayDeleteNote(gone: Session[]): string {
  * piece at " · " and line breaks). */
 function rowTitle(s: Session): string {
   const notes = s.notes ? `\n${s.notes.split("\n").map(userText).join("\n")}` : "";
-  return `${PROTOCOLS[s.protocol].label} · ${userText(endpoint(s))}${notes}`;
+  // An absolute time: the tree is not re-rendered as time passes, so "N분 전" would go stale.
+  const used = s.lastUsed ? `\n마지막 연결: ${clockAt(s.lastUsed)}` : "";
+  // What the app recognised there (the search finds it too): the device's own words, kept as written.
+  const words = [s.options.osLabel, s.options.osName].filter((v): v is string => typeof v === "string" && !!v.trim()).map((v) => v.trim());
+  const device = words.length ? `\n장비: ${userText(words.join(" · "))}` : "";
+  return `${PROTOCOLS[s.protocol].label} · ${userText(endpoint(s))}${used}${device}${notes}`;
 }

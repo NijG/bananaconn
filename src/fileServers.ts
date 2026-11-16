@@ -1,7 +1,7 @@
 // Built-in TFTP and HTTP servers (backend: fileservers.rs). Same look as the
 // FTP server dialog: share a folder, see addresses and an activity log.
 
-import { api, on, pickFolder, type FileServerKind, type FileServerStatus } from "./api";
+import { api, on, pickFolder, revealInExplorer, type FileServerKind, type FileServerStatus } from "./api";
 import { writeClipboard } from "./clipboard";
 import { isPublicAddress, logRenderer, type LogEntry } from "./ftpServer";
 import { icon } from "./icons";
@@ -56,7 +56,12 @@ export async function initFileServers() {
   await on<{ server: string; kind: string; user: string; detail: string }>("file-server-event", (e) => {
     const kind = e.server as FileServerKind;
     if (!logs[kind]) return;
-    logs[kind].push({ seq: ++logSeq, at: now(), kind: e.kind, user: e.user, detail: e.detail });
+    // A file a device sent (a configuration backup over TFTP): where it was
+    // saved, under the folder the server shares ("name (123 bytes)").
+    const root = status[kind]?.root;
+    const file = e.kind === "upload" && root ? /^(.+) \(\d+ bytes\)$/.exec(e.detail)?.[1] : undefined;
+    const saved = file ? `${root!.replace(/[\\/]+$/, "")}\\${file.replace(/^[\\/]+/, "").replace(/\//g, "\\")}` : undefined;
+    logs[kind].push({ seq: ++logSeq, at: now(), kind: e.kind, user: e.user, detail: e.detail, ...(saved ? { saved } : {}) });
     if (logs[kind].length > LOG_MAX) logs[kind].splice(0, logs[kind].length - LOG_MAX);
     if (e.kind === "started" || e.kind === "stopped") refreshStatus();
     else notify();
@@ -71,6 +76,31 @@ async function refreshStatus() {
   for (const k of Object.keys(INFO) as FileServerKind[]) delete status[k];
   for (const s of list) status[s.kind] = s;
   notify();
+}
+
+/** For the TFTP server on its own port (69) and this PC's network address:
+ * the Cisco IOS commands a device runs to use it, the address filled in, to
+ * copy (never typed into a terminal from here). Backing a device's
+ * configuration up to this PC needs the server to take uploads. */
+function deviceCommands(s: FileServerStatus): string {
+  if (s.kind !== "tftp" || s.port !== 69) return "";
+  const ip = s.addresses.map((a) => /^tftp:\/\/(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(a)?.[1]).find((a) => a && a !== "127.0.0.1");
+  if (!ip) return "";
+  const rows: [string, string, string][] = [
+    [`copy running-config tftp://${ip}/router-confg`, "장비 설정을 이 PC로 백업", s.readOnly ? "읽기 전용이라 받을 수 없음 · 읽기/쓰기로 다시 시작" : ""],
+    [`copy tftp://${ip}/FILE flash:`, "이 PC의 파일을 장비로 (FILE을 파일 이름으로)", ""],
+  ];
+  // Folded until wanted: the running server's window stays its height. Each
+  // command on one line, what it does in its tooltip; a reason it cannot
+  // work (a read-only server) beside it.
+  return `<details class="tftp-cmds"><summary class="muted small" title="장비에서 쓸 명령 (Cisco IOS, 눌러서 복사)">${icon("SquareTerminal", 13)}<span>장비용 명령</span></summary>${rows
+    .map(
+      ([cmd, what, note]) =>
+        `<button type="button" class="ftpd-addr" data-cmd="${esc(cmd)}" title="${esc(what)}">${icon("Copy", 13)}<code data-i18n-skip>${esc(cmd)}</code>${
+          note ? `<span class="danger-text small">${esc(note)}</span>` : ""
+        }</button>`,
+    )
+    .join("")}</details>`;
 }
 
 export function fileServerBadges(): string {
@@ -139,9 +169,19 @@ export function openFileServer(kind: FileServerKind) {
   // Every log event calls render(): the state box and controls are touched
   // only when what they show changed, and only new log rows are added.
   const renderLog = logRenderer(logBox, KIND_TEXT, `<p class="muted ftpd-empty">아직 기록이 없습니다.</p>`, LOG_MAX);
+  // A received file, shown where it was saved.
+  logBox.addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>("[data-reveal]");
+    if (b?.dataset.reveal) revealInExplorer(b.dataset.reveal).catch((err) => toast(errorText(err), "error"));
+  });
   let drawnControls = "";
   let drawnState = "";
   stateBox.addEventListener("click", async (e) => {
+    const cmd = (e.target as HTMLElement).closest<HTMLElement>("[data-cmd]");
+    if (cmd) {
+      await writeClipboard(cmd.dataset.cmd!);
+      return void toast("명령을 복사했습니다", "success", 1600);
+    }
     const b = (e.target as HTMLElement).closest<HTMLElement>("[data-addr]");
     if (!b) return;
     await writeClipboard(b.dataset.addr!);
@@ -162,8 +202,8 @@ export function openFileServer(kind: FileServerKind) {
            <span class="muted">${esc(s.root)} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.auth ? " · 인증 사용" : ""}</span></div>
          <div class="ftpd-addrs">${s.addresses
            .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
-           .join("")}</div>
-         ${s.addresses.some((a) => isPublicAddress(a.replace(/^\w+:/, "ftp:"))) ? `<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷에서 접속을 시도할 수 있습니다.</p>` : ""}`
+           .join("")}${deviceCommands(s)}</div>
+         ${s.addresses.some((a) => isPublicAddress(a.replace(/^\w+:/, "ftp:"))) ?`<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷에서 접속을 시도할 수 있습니다.</p>` : ""}`
       : `<div class="ftpd-off"><span class="sb-dot idle"></span><b>중지됨</b><span class="muted">폴더를 고르고 서버를 시작하세요.</span></div>`;
     if (html !== drawnState) {
       drawnState = html;

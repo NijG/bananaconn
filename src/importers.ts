@@ -218,7 +218,7 @@ const CRT_PARITY = ["none", "odd", "even", "none", "none"];
  * SSH2), from the file's text. */
 export function secureCrtGlobalKey(ssh2Ini: string): string | undefined {
   const values = new Map<string, string>();
-  for (const line of ssh2Ini.replace(/^﻿/, "").split(/\r?\n/)) {
+  for (const line of ssh2Ini.replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const m = line.match(/^S:"(Identity Filename(?: V2)?)"=(.*)$/);
     if (m) values.set(m[1], m[2].trim());
   }
@@ -366,7 +366,7 @@ export function parseSecureCrtFiles(files: { rel: string; text: string }[], root
     // A list (Z:"Name"=<count in hex>) has its items on the lines after it,
     // each after a space: kept one per line.
     let list: { key: string; left: number; items: string[] } | null = null;
-    for (const line of f.text.replace(/^﻿/, "").split(/\r?\n/)) {
+    for (const line of f.text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
       if (list && list.left > 0 && line.startsWith(" ")) {
         list.items.push(line.slice(1));
         if (--list.left === 0) values.set(list.key, list.items.join("\n"));
@@ -486,7 +486,7 @@ export function parseMRemoteNg(xml: string, rootFolder = "mRemoteNG"): ParsedImp
 function iniSections(text: string, base: RegExp): Map<string, Map<string, string>> {
   const sections = new Map<string, Map<string, string>>();
   let current: Map<string, string> | null = null;
-  for (const raw of text.replace(/^﻿/, "").split(/\r?\n/)) {
+  for (const raw of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const line = raw.trim();
     const sec = line.match(/^\[(.+)\]$/);
     if (sec) {
@@ -753,7 +753,7 @@ export function parseRdpFiles(files: { rel: string; text: string }[]): ParsedImp
     const parts = f.rel.split("/");
     const file = parts.pop() ?? "";
     const v = new Map<string, string>();
-    for (const line of f.text.replace(/^﻿/, "").split(/\r?\n/)) {
+    for (const line of f.text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
       const m = line.match(/^([^:]+):[si]:(.*)$/);
       if (m) v.set(m[1].trim().toLowerCase(), m[2].trim());
     }
@@ -934,7 +934,7 @@ const CSV_PROTOCOLS: Record<string, Protocol> = {
 /** CSV with a header row; columns are found by name (mRemoteNG's CSV export works too). */
 export function parseCsv(text: string): ParsedImport {
   const out = empty();
-  const body = text.replace(/^﻿/, "");
+  const body = text.replace(/^\uFEFF/, "");
   const head = body.split(/\r?\n/).find((l) => l.trim());
   if (!head) return out;
   const sep = [";", "\t", ","].map((s) => [s, head.split(s).length] as const).sort((a, b) => b[1] - a[1])[0][0];

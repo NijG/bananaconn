@@ -2,12 +2,13 @@
 // servers) or send one to it. TFTP has no listing and no login, so the user
 // names the file on the server.
 
-import { api, on, pickOpenFile, pickSavePath } from "../api";
+import { api, on, pickOpenFile, pickSavePath, revealInExplorer } from "../api";
 import { icon } from "../icons";
 import { endpoint, PROTOCOLS, type Session } from "../model";
 import { patchSession } from "../store";
 import { errorText, esc, formatBytes, h, toast } from "../ui";
 import { notesButton } from "../sessionNotes";
+import { userText } from "../i18n";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 
 type Progress = { id: string; done: number; total: number | null };
@@ -20,6 +21,52 @@ const BLOCKS: [number, string][] = [
   [512, "512 (오래된 장비·옵션 미지원)"],
   [8192, "8192 (빠른 사내망)"],
 ];
+
+/** The server file names that went through, by lower-case host, newest
+ * first: offered as the names are typed again (the same running-config,
+ * the same image, on each visit). A name that failed (mistyped) is not kept. */
+const NAMES_KEY = "bx.tftpNames";
+const NAMES_PER_HOST = 12;
+const NAMES_HOSTS = 50;
+
+/** [host, names] pairs, the host used last first (an array: an object's key
+ * order puts number-like names first, whatever was used last). */
+function readNames(): [string, string[]][] {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(NAMES_KEY) ?? "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((e): [string, string[]][] =>
+      Array.isArray(e) && typeof e[0] === "string" && Array.isArray(e[1])
+        ? [[e[0], e[1].filter((n: unknown): n is string => typeof n === "string" && n !== "").slice(0, NAMES_PER_HOST)]]
+        : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
+function namesOf(host: string): string[] {
+  const key = host.trim().toLowerCase();
+  return readNames().find(([h]) => h === key)?.[1] ?? [];
+}
+
+function rememberName(host: string, name: string) {
+  const key = host.trim().toLowerCase();
+  if (!key || !name) return;
+  const all = readNames();
+  const list = [name, ...(all.find(([h]) => h === key)?.[1] ?? []).filter((n) => n !== name)].slice(0, NAMES_PER_HOST);
+  const next = [[key, list] as [string, string[]], ...all.filter(([h]) => h !== key)].slice(0, NAMES_HOSTS);
+  try {
+    localStorage.setItem(NAMES_KEY, JSON.stringify(next));
+  } catch {
+    // Storage full or blocked: the suggestion is a convenience only.
+  }
+}
+
+let listSeq = 0;
+/** The TFTP tabs open now: a name remembered in one is offered at once in
+ * the others to the same server. */
+const openViews = new Set<TftpView>();
 
 export class TftpView implements View {
   /** The session's notes button in the bar. */
@@ -43,6 +90,7 @@ export class TftpView implements View {
     // from an edited backup outside that would fail every transfer.
     const stored = Number(session.options.blockSize);
     const block = Number.isInteger(stored) && stored >= 8 && stored <= 65464 ? stored : 1428;
+    const listId = `tftp-names-${++listSeq}`;
     this.el = h(
       "div",
       { class: "view tftp-view" },
@@ -55,14 +103,15 @@ export class TftpView implements View {
        <div class="tftp-body">
          <section class="tftp-card">
            <h3>${icon("Download", 16)}받기 <small>서버 → 내 PC</small></h3>
-           <label class="field"><span>서버의 파일 이름</span><input name="getName" placeholder="예: running-config, c2960x-universalk9-mz.152-7.E2.bin" spellcheck="false"/></label>
+           <label class="field"><span>서버의 파일 이름</span><input name="getName" list="${listId}" placeholder="예: running-config, c2960x-universalk9-mz.152-7.E2.bin" spellcheck="false"/></label>
+           <datalist id="${listId}" data-names data-i18n-skip></datalist>
            <button class="btn btn-primary" data-get>${icon("Download", 14)}받을 위치 정하고 받기</button>
          </section>
          <section class="tftp-card">
            <h3>${icon("Upload", 16)}보내기 <small>내 PC → 서버</small></h3>
            <div class="field"><span>내 PC의 파일</span>
              <div class="row"><button class="btn" data-pick>${icon("FolderOpen", 14)}파일 선택…</button><span class="tftp-local muted" data-local>선택한 파일 없음</span></div></div>
-           <label class="field"><span>서버에 저장할 이름</span><input name="putName" placeholder="비워 두면 파일 이름 그대로" spellcheck="false"/></label>
+           <label class="field"><span>서버에 저장할 이름</span><input name="putName" list="${listId}" placeholder="비워 두면 파일 이름 그대로" spellcheck="false"/></label>
            <button class="btn btn-primary" data-put>${icon("Upload", 14)}보내기</button>
          </section>
          <section class="tftp-card tftp-wide">
@@ -89,6 +138,20 @@ export class TftpView implements View {
       if (!this.session.id.startsWith("quick-")) patchSession(this.session.id, {}, { blockSize: v }).catch(() => {});
     });
     $<HTMLInputElement>("[name=getName]").addEventListener("keydown", (e) => e.key === "Enter" && this.get());
+    this.fillNames();
+    openViews.add(this);
+    // A received file, shown where it was saved.
+    $("[data-log]").addEventListener("click", (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLElement>("[data-reveal]");
+      if (b?.dataset.reveal) revealInExplorer(b.dataset.reveal).catch((err) => toast(errorText(err), "error"));
+    });
+  }
+
+  /** The names that went through with this server, offered in both name boxes. */
+  private fillNames() {
+    this.el.querySelector("[data-names]")!.innerHTML = namesOf(this.session.host)
+      .map((n) => `<option value="${esc(n)}"></option>`)
+      .join("");
   }
 
   title() {
@@ -138,14 +201,21 @@ export class TftpView implements View {
     const id = crypto.randomUUID();
     this.running = id;
     views.set(id, this);
-    this.showProgress(true, direction === "get" ? `${remote} 받는 중…` : `${remote} 보내는 중…`);
+    // The file names are the user's: kept as written in the translated text
+    // (a server file named "설정" is not "Settings").
+    const remoteText = userText(remote);
+    const localText = userText(local);
+    this.showProgress(true, direction === "get" ? `${remoteText} 받는 중…` : `${remoteText} 보내는 중…`);
     this.ws.changed();
-    const what = direction === "get" ? `받기 ${remote} → ${local}` : `보내기 ${local} → ${remote}`;
+    const what = direction === "get" ? `받기 ${remoteText} → ${localText}` : `보내기 ${localText} → ${remoteText}`;
     try {
       const r = await api.tftpTransfer({ id, host: this.session.host, port: this.session.port, remote, local, direction, blockSize: this.blockSize });
       const secs = Math.max(r.millis, 1) / 1000;
-      this.log(true, `${what} · ${formatBytes(r.bytes)} · ${secs.toFixed(1)}초 · ${formatBytes(r.bytes / secs)}/초 · 블록 ${r.blockSize}`);
-      toast(direction === "get" ? `받았습니다: ${local}` : `보냈습니다: ${remote}`, "success");
+      this.log(true, `${what} · ${formatBytes(r.bytes)} · ${secs.toFixed(1)}초 · ${formatBytes(r.bytes / secs)}/초 · 블록 ${r.blockSize}`, direction === "get" ? local : undefined);
+      rememberName(this.session.host, remote);
+      const host = this.session.host.trim().toLowerCase();
+      openViews.forEach((v) => v.session.host.trim().toLowerCase() === host && v.fillNames());
+      toast(direction === "get" ? `받았습니다: ${localText}` : `보냈습니다: ${remoteText}`, "success");
     } catch (err) {
       const msg = errorText(err);
       this.log(false, `${what} · ${msg === "CANCELLED" ? "취소함" : msg}`);
@@ -173,13 +243,16 @@ export class TftpView implements View {
     this.el.querySelector("[data-progress]")!.textContent = text;
   }
 
-  private log(ok: boolean, text: string) {
-    const li = h("li", { class: ok ? "ok" : "fail" }, `${icon(ok ? "Check" : "TriangleAlert", 13)}<span>${new Date().toLocaleTimeString()}</span> ${esc(text)}`);
+  /** One transfer in the list; `saved`: the file it received, to show in Explorer. */
+  private log(ok: boolean, text: string, saved?: string) {
+    const reveal = saved ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button>` : "";
+    const li = h("li", { class: ok ? "ok" : "fail" }, `${icon(ok ? "Check" : "TriangleAlert", 13)}<span>${new Date().toLocaleTimeString()}</span> ${esc(text)}${reveal}`);
     this.el.querySelector("[data-log]")!.prepend(li);
   }
 
   dispose() {
     this.disposed = true;
+    openViews.delete(this);
     this.notes.dispose();
     if (this.running) api.tftpCancel(this.running).catch(() => {});
   }

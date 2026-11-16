@@ -100,7 +100,10 @@ function translateAttrs(el: Element, inTree = false) {
   for (const name of ATTRS) {
     const value = el.getAttribute(name);
     if (!value || !HANGUL.test(value) || written.get(el) === `${name}=${value}`) continue;
-    const en = tr(value);
+    // A tooltip's lines are separate texts (a session's address, when it was
+    // last used, its notes): read as one, a phrase on one line would not be
+    // found, or its line breaks would be lost. No phrase spans lines in a title.
+    const en = name === "title" && value.includes("\n") ? value.split("\n").map(tr).join("\n") : tr(value);
     if (en === value) continue;
     if (!inTree && el.closest(SKIP)) return;
     const o = originals.get(el);

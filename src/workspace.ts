@@ -7,14 +7,40 @@
 
 import { icon } from "./icons";
 import { PROTOCOLS, type Protocol, type Session } from "./model";
-import { copyAddresses } from "./clipboard";
+import { copyAddresses, writeClipboard } from "./clipboard";
+import { tr } from "./i18n";
 import { keyHint } from "./keymap";
 import { clearDeviceAlert, deviceAlert } from "./deviceAlerts";
+import { connectEnded, connectFailed, connectStarted, type ConnectEnd } from "./connectLog";
 import { userText } from "./i18nTables";
-import { state, updateSettings } from "./store";
-import { confirmDialog, contextMenu, esc, h, promptDialog, toast, type MenuItem } from "./ui";
+import { state, updateSettings, type Snippet } from "./store";
+import { confirmDialog, contextMenu, esc, h, promptDialog, sheetCell, toast, type MenuItem } from "./ui";
 
 export type ViewState = "connecting" | "connected" | "closed" | "error";
+
+/** A time of today as "14:05", of another day as "11-12 14:05", of another
+ * year as "2025-11-12 14:05" (a session last used long ago). */
+export function clockAt(at: number): string {
+  const d = new Date(at);
+  const now = new Date();
+  const hm = d.toTimeString().slice(0, 5);
+  if (d.toDateString() === now.toDateString()) return hm;
+  const md = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
+  return d.getFullYear() === now.getFullYear() ? md : `${d.getFullYear()}-${md}`;
+}
+
+/** A local date and time a spreadsheet reads and sorts: "2026-11-12 14:05". */
+export function sheetTime(at: number): string {
+  const d = new Date(at);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${d.toTimeString().slice(0, 5)}`;
+}
+
+/** Each state in words (the status bar, the session tree's open-tab dot). */
+export const STATE_TEXT: Record<ViewState, string> = { connecting: "연결 중", connected: "연결됨", closed: "종료됨", error: "오류" };
+/** Of one session's open tabs, which tells its state (the tree's dot) and is
+ * gone to (its "go to tab"): a live one first. */
+export const STATE_RANK: Record<ViewState, number> = { connected: 3, connecting: 2, error: 1, closed: 0 };
 
 export interface StatusInfo {
   protocol: Protocol;
@@ -75,6 +101,19 @@ export interface View {
   /** Why closing this tab would lose work (pending uploads, unsaved edits), if so. */
   closeWarning?(): string | null;
   reconnect?(): void;
+  /** Send a snippet or play a macro into it, as its snippet menu does (its
+   * values asked first; nothing sent while it is not connected). */
+  sendSnippet?(s: Snippet): Promise<unknown>;
+  /** How its connection ended, as the view reads it (a terminal knows a
+   * login that never went through from a drop): asked when it stops being
+   * connected or connecting. "closed" for an attempt means the user gave it
+   * up (not a failure); null leaves it to the state it went to. */
+  historyEnd?(): "failed" | "error" | "closed" | null;
+  /** Not a connection of its own (a file editor in a tab): no connection time, no history. */
+  readonly noConnection?: boolean;
+  /** The device's own host name, once recognised (a terminal's monitor), for a
+   * tab with no name of its own: null when the session has one the user gave. */
+  deviceName?(): string | null;
   /** Status bar monitor chip clicked (log in, approve host key, retry). */
   monitorAction?(): void;
   /** The connection it is on now (a new one after a reconnect), for a
@@ -108,6 +147,14 @@ export interface Tab {
   /** Left out of broadcast input (tab menu): it neither gets what is typed in
    * the others nor sends what is typed in it. While the tab is open. */
   noBroadcast?: boolean;
+  /** When its connection was made (noteConnections): only while connected, so
+   * a reconnection (even straight from connected) has its own. Never for TFTP. */
+  connectedAt?: number;
+  /** The state noteConnections last saw, when the current attempt began, and
+   * the open connection-history record (connectLog.ts) it started. */
+  seenState?: ViewState;
+  attemptAt?: number;
+  logAt?: number;
   /** Something went wrong with its device since the tab was last in front (a
    * Syslog alert, a continuous ping gone unanswered): what, shown in its
    * tooltip, the tab marked until it is in front. */
@@ -160,8 +207,55 @@ export class Workspace {
 
   /** Views call this when their state or title changes. */
   changed() {
+    this.noteConnections();
     this.renderTabs();
     this.listeners.forEach((fn) => fn());
+  }
+
+  /** Each tab's connection time, kept from the change that told it was made
+   * (the views tell every state change here). */
+  private noteConnections() {
+    for (const t of this.tabs) {
+      if (t.session.protocol === "tftp" || t.view.noConnection) continue;
+      // Only while connected, from the change that made it: a reconnection
+      // (straight from connected to connecting, as "다시 연결" does) has its own.
+      if (t.view.state !== "connected") t.connectedAt = undefined;
+      else if (t.seenState !== "connected" || t.connectedAt === undefined) t.connectedAt = Date.now();
+      this.noteHistory(t);
+    }
+  }
+
+  /** The tab's state change in its session's connection history: made,
+   * ended (and how), or an attempt that never connected. */
+  private noteHistory(t: Tab) {
+    const was = t.seenState;
+    const now = t.view.state;
+    if (was === now || this.quitting) return;
+    t.seenState = now;
+    const told = now === "connecting" || now === "connected" ? null : (t.view.historyEnd?.() ?? null);
+    // Left connected (closed, an error, or straight to connecting again).
+    if (was === "connected") this.endHistory(t, told ?? (now === "error" ? "error" : "closed"));
+    if (now === "connecting") t.attemptAt = Date.now();
+    else if (now === "connected") t.logAt = connectStarted(t.session.id, t.session.protocol, Date.now());
+    // An attempt that ended unconnected (a view first seen with an error failed
+    // before its tab), unless the user gave it up (as closing its tab does).
+    else if ((was === "connecting" || (was === undefined && now === "error")) && told !== "closed") connectFailed(t.session.id, t.session.protocol, t.attemptAt ?? Date.now());
+  }
+
+  /** The app is closing: nothing more goes into the history (a tab finishing
+   * its connection meanwhile would leave a record nothing ends). */
+  private quitting = false;
+
+  /** The tab's open history record ended, as `how`. */
+  private endHistory(t: Tab, how: ConnectEnd) {
+    if (t.logAt !== undefined) connectEnded(t.session.id, t.logAt, how);
+    t.logAt = undefined;
+  }
+
+  /** The app is going away: the connections still open end with it. */
+  endAllHistory() {
+    this.quitting = true;
+    for (const t of this.tabs) this.endHistory(t, "app");
   }
 
   get activeTab(): Tab | undefined {
@@ -255,6 +349,9 @@ export class Workspace {
     // Remember the session so the tab can be reopened (Ctrl+Shift+T).
     this.closedStack.push(tab.session);
     if (this.closedStack.length > 20) this.closedStack.shift();
+    // Before dispose: a view telling "closed" as it goes would read as the remote end closing.
+    this.endHistory(tab, "tab");
+    tab.seenState = "closed";
     tab.view.dispose();
     tab.view.el.remove();
     tab.el.remove();
@@ -481,9 +578,10 @@ export class Workspace {
         // The saved session behind the tab; a quick connection can become one
         // (one deleted since cannot be edited).
         !saved && tab.session.id.startsWith("quick-")
-          ? { label: "세션으로 저장…", icon: "Save", action: () => this.saveAsHandler?.(tab.session), disabled: !this.saveAsHandler }
+          ? { label: "세션으로 저장…", icon: "Save", action: () => this.saveAsHandler?.({ ...tab.session, name: tab.label || tab.view.deviceName?.() || tab.session.name }), disabled: !this.saveAsHandler }
           : { label: "세션 편집…", icon: "Pencil", action: () => saved && this.editHandler?.(saved), disabled: !saved || !this.editHandler },
         { label: "주소 복사", icon: "ClipboardList", action: () => void copyAddresses([tab.session]) },
+        { label: "열린 탭 목록 복사", icon: "Table", hint: keyHint("tab.copyList"), action: () => void this.copyTabTable() },
         ...(this.tabMenuExtra?.(tab.session) ?? []),
         { label: "탭 이름 바꾸기…", icon: "Pencil", action: () => void this.renameTab(tab) },
         // Broadcast to some of the open terminals: the others are left out.
@@ -500,6 +598,27 @@ export class Workspace {
         { label: "오른쪽 탭 모두 닫기", icon: "X", action: () => this.closeRight(tab.id), disabled: this.tabs.indexOf(tab) === this.tabs.length - 1 },
       ]);
     });
+  }
+
+  /** Every open tab as a table on the clipboard (tab-separated, a header row
+   * in the screen language), for a work log or a handover sheet: its name as
+   * the bar shows it, protocol, address, state, and the device the monitor
+   * recognised (model, software, host name), when it did. Each cell is one
+   * line and guarded against being read as a spreadsheet formula. */
+  async copyTabTable() {
+    if (!this.tabs.length) return;
+    const titles = this.tabTitles();
+    // tr() keeps a user's value as written but leaves its invisible marks; a cell has no tabs or line breaks.
+    const cell = (s: string) => sheetCell(s.replace(/[⁨⁩]/g, "").replace(/[\t\r\n]+/g, " ").trim());
+    const rows = [
+      ["이름", "프로토콜", "주소", "상태", "연결 시각", "장비"].map(tr),
+      ...this.tabs.map((t) => {
+        const st = t.view.status();
+        return [titles.get(t.id) ?? t.view.title(), PROTOCOLS[t.session.protocol].label, st.endpoint, tr(STATE_TEXT[t.view.state]), t.connectedAt ? sheetTime(t.connectedAt) : "", tr(st.device ?? "")];
+      }),
+    ];
+    await writeClipboard(rows.map((r) => r.map(cell).join("\t")).join("\n"));
+    toast(`탭 ${this.tabs.length}개를 표로 복사했습니다`, "success", 2000);
   }
 
   private setNoBroadcast(tab: Tab, out: boolean) {
@@ -595,6 +714,14 @@ export class Workspace {
     return titles;
   }
 
+  /** Of the tabs `match` picks, the one to go to: the most live (STATE_RANK;
+   * a connected one before a closed one), the first in the bar among equals. */
+  liveTab(match: (t: Tab) => boolean): Tab | undefined {
+    let best: Tab | undefined;
+    for (const t of this.tabs) if (match(t) && (!best || STATE_RANK[t.view.state] > STATE_RANK[best.view.state])) best = t;
+    return best;
+  }
+
   /** The name the tab bar shows for a view's tab (the user's label, numbered
    * like the bar), for messages that must say which tab they are about. */
   nameOf(view: View): string {
@@ -623,7 +750,7 @@ export class Workspace {
       t.el.className = `tab state-${t.view.state}${t.id === active ? " active" : ""}${shownElsewhere ? " visible" : ""}${receives ? " broadcasting" : ""}${this.broadcast && t.noBroadcast ? " no-broadcast" : ""}${t.alertNote ? " device-alert" : ""}`;
       t.el.style.setProperty("--proto", p.color);
       // The address is the user's: kept as written in the translated tooltip.
-      t.el.title = `${p.label} · ${userText(t.view.status().endpoint)}${t.noBroadcast ? " · 동시 입력에서 뺌" : ""}${t.alertNote ? ` · ${t.alertNote} · ${new Date(t.alertAt ?? Date.now()).toTimeString().slice(0, 5)}` : ""}`;
+      t.el.title = `${p.label} · ${userText(t.view.status().endpoint)}${t.connectedAt ? ` · ${clockAt(t.connectedAt)}부터 연결됨` : ""}${t.noBroadcast ? " · 동시 입력에서 뺌" : ""}${t.alertNote ? ` · ${t.alertNote} · ${new Date(t.alertAt ?? Date.now()).toTimeString().slice(0, 5)}` : ""}`;
       // The protocol shows as the dot's color and in the tooltip; the label
       // itself cost too much width with many tabs open.
       const html = `<span class="tab-dot"></span>

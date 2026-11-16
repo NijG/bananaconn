@@ -5,6 +5,7 @@
 // noVNC over the loopback bridge in vnc.rs. Credentials live in vault.rs.
 
 mod childjob;
+mod clipboard;
 mod comport;
 mod fileservers;
 mod ftpserver;
@@ -107,6 +108,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            clipboard::clipboard_write_private,
             store::sessions_load,
             store::sessions_reset,
             store::sessions_save,
@@ -194,6 +196,7 @@ pub fn run() {
             updater::update_install,
             updater::update_open_folder,
             remote::local_stat,
+            remote::local_hash,
             rdp::rdp_launch,
             rdp::rdp_open,
             rdp::rdp_cert,

@@ -26,8 +26,12 @@ export function openClipboardHistory() {
     return { terms, items: clipboardHistory().flatMap((t, i) => (matchesTerms(t.toLowerCase(), terms) ? [{ t, i }] : [])) };
   };
 
+  /** The texts as drawn, by the number on their row: a click takes the text
+   * it shows, even if something was copied meanwhile (the history moved on). */
+  let drawn: string[] = [];
   const draw = () => {
     const all = clipboardHistory();
+    drawn = [...all];
     filterBox.hidden = all.length < 2;
     if (!all.length) {
       list.innerHTML = `<p class="muted small">복사한 내용이 아직 없습니다.</p>`;
@@ -54,7 +58,7 @@ export function openClipboardHistory() {
   };
 
   list.addEventListener("click", (e) => {
-    const items = clipboardHistory();
+    const items = drawn;
     const target = e.target as HTMLElement;
     const del = target.closest<HTMLElement>("[data-del]");
     if (del) {

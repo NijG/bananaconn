@@ -14,6 +14,9 @@ export interface LogEntry {
   kind: string;
   user: string;
   detail: string;
+  /** The file on this PC a received upload was saved as, when known: a
+   * "show in Explorer" button on its row. */
+  saved?: string;
 }
 
 /** Event kinds whose detail is only a path, or "a → b" (ftpserver.rs, fileservers.rs). */
@@ -30,7 +33,9 @@ export function logRenderer(box: HTMLElement, kinds: Record<string, [string, str
     // file event, which is a path ("denied" and "error" details are app text).
     const pathOnly = PATH_KINDS.has(e.kind);
     return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
-          ${e.user ? `<span class="who" data-i18n-skip>${esc(e.user)}</span>` : ""}<span class="what"${pathOnly ? " data-i18n-skip" : ""}>${esc(e.detail)}</span></div>`;
+          ${e.user ? `<span class="who" data-i18n-skip>${esc(e.user)}</span>` : ""}<span class="what"${pathOnly ? " data-i18n-skip" : ""}>${esc(e.detail)}</span>${
+            e.saved ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(e.saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button>` : ""
+          }</div>`;
   };
   return (log: LogEntry[]) => {
     if (!log.length) {
@@ -258,8 +263,9 @@ export function openFtpServer() {
     field("password").value = randomPassword();
   });
   m.root.querySelector("[data-copy-pw]")!.addEventListener("click", async () => {
-    await writeClipboard(field("password").value);
-    toast("비밀번호를 복사했습니다", "success", 1600);
+    // Kept out of the clipboard history (localStorage, the history picker), as the vault does.
+    if (await writeClipboard(field("password").value, { secret: true })) toast("비밀번호를 복사했습니다", "success", 1600);
+    else toast("비밀번호를 복사하지 못했습니다", "error");
   });
   m.root.querySelector("[data-clear]")!.addEventListener("click", () => {
     log.length = 0;

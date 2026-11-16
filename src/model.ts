@@ -231,11 +231,34 @@ export function badForwardLine(text: string): string | null {
 /** What a session search looks in, lower-cased (the sidebar and the command
  * palette both use it, so a query finds the same sessions in either). */
 export function sessionSearchText(s: Session): string {
-  return [s.name, s.host, s.username, endpoint(s), s.folder, PROTOCOLS[s.protocol].label, s.notes].join(" ").toLowerCase();
+  return [s.name, s.host, s.username, endpoint(s), s.folder, PROTOCOLS[s.protocol].label, s.notes, ...deviceWords(s)].join(" ").toLowerCase();
+}
+
+/** What the app recognised of the device behind a session when it last
+ * connected (TerminalView.deviceDetected): its kind ("cisco ios"), model or
+ * software ("IOS-XE 17.06.04") and host name, so a search for any finds it. */
+export function deviceWords(s: Session): string[] {
+  const o = s.options;
+  const text = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  return [text(o.osKind).replace(/-/g, " "), text(o.osLabel), text(o.osName)].filter(Boolean);
 }
 
 /** Parse quick-connect input such as "root@10.0.0.5:2222", "[fe80::1]:22",
  * "fe80::1" or "john@corp.com@10.0.0.5" (the user ends at the last "@"). */
+/** A new session's settings for a typed address (the session list's search,
+ * the command palette): the protocol its URL scheme names ("telnet://…"),
+ * else the one a well-known port stands for, else SSH. Null when the text is
+ * no address. */
+export function sessionDefaultsFor(text: string): Partial<Session> | null {
+  const t = parseTarget(text);
+  if (!t) return null;
+  const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
+  const scheme = /^([a-z]+):\/\//i.exec(text.trim())?.[1].toLowerCase();
+  const named = scheme && scheme !== "serial" && scheme in PROTOCOLS ? (scheme as Protocol) : null;
+  const protocol = named ?? ((t.port && byPort[t.port]) || "ssh");
+  return { protocol, host: t.host, username: t.username, ...(t.port ? { port: t.port } : {}) };
+}
+
 export function parseTarget(text: string): { host: string; port: number | null; username: string } | null {
   // A pasted URL form ("ssh://root@host:22", "sftp://host") keeps its scheme;
   // drop it so the user is not parsed as "ssh://root". A bare IPv6 ("fe80::1")
@@ -243,11 +266,22 @@ export function parseTarget(text: string): { host: string; port: number | null; 
   // A URL's path, query or fragment ("ssh://host:22/", "https://host/admin")
   // is not part of the target either.
   const raw = text.trim();
-  const t = /^[a-zA-Z][\w+.-]*:\/\//.test(raw) ? raw.replace(/^[a-zA-Z][\w+.-]*:\/\//, "").replace(/[/?#].*$/, "") : raw;
+  const url = /^[a-zA-Z][\w+.-]*:\/\//.test(raw);
+  let t = url ? raw.replace(/^[a-zA-Z][\w+.-]*:\/\//, "").replace(/[/?#].*$/, "") : raw;
+  // "user:password@" (a URL's userinfo, RFC 3986, and the same typed without
+  // a scheme; up to the last "@", the user name up to its first ":"): the
+  // password is not part of the user name, nor kept anywhere (a session, the
+  // quick connect history); the login asks for it as for any other connection.
+  const at = t.lastIndexOf("@");
+  if (at >= 0 && t.slice(0, at).includes(":")) {
+    const user = t.slice(0, at).split(":")[0];
+    t = user ? `${user}@${t.slice(at + 1)}` : t.slice(at + 1);
+  }
   // A bare IPv6 address: two or more colons, no brackets, so no port.
   const v6 = t.match(/^(?:(\S+)@)?([0-9A-Fa-f.]*:[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%\w+)?)$/);
   if (v6) return { username: v6[1] ?? "", host: v6[2], port: null };
-  const m = t.match(/^(?:(\S+)@)?(\[[^\]]+\]|[^:@\s]+)(?::(\d{1,5}))?$/);
+  // No "/" in a host name: "10.0.0.0/24" is a subnet (a search by network), not a target.
+  const m = t.match(/^(?:(\S+)@)?(\[[^\]]+\]|[^:@\s/]+)(?::(\d{1,5}))?$/);
   if (!m) return null;
   if (m[3] && !(Number(m[3]) >= 1 && Number(m[3]) <= 65535)) return null;
   return {

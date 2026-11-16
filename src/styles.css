@@ -85,7 +85,12 @@ textarea {
   border-radius: 10px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background-color: var(--muted);
+  background-color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+}
+/* Text selected in the app (not the terminal, which draws its own). */
+::selection {
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--text);
 }
 ::-webkit-scrollbar-track,
 ::-webkit-scrollbar-corner {
@@ -146,7 +151,10 @@ kbd.word {
   align-items: center;
   gap: 10px;
   padding: 0 10px;
-  background: var(--bg-1);
+  /* The banana stripe: a yellow line under the title bar, fading out to the right. */
+  background:
+    linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 35%, transparent) 45%, transparent 85%) bottom / 100% 2px no-repeat,
+    var(--bg-1);
   border-bottom: 1px solid var(--line);
 }
 
@@ -492,7 +500,7 @@ kbd.word {
   font-weight: 700;
   letter-spacing: 0.8px;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--accent);
 }
 .side-tools {
   display: flex;
@@ -579,10 +587,11 @@ kbd.word {
   contain-intrinsic-size: auto 42px;
 }
 .session-row:hover {
-  background: var(--bg-2);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-2));
 }
+/* Selected: a yellow tint, with the protocol's own colour still at its edge. */
 .session-row.selected {
-  background: var(--bg-3);
+  background: color-mix(in srgb, var(--accent) 13%, var(--bg-2));
   box-shadow: inset 2px 0 0 var(--proto);
 }
 .session-row .proto-ico,
@@ -623,6 +632,29 @@ kbd.word {
   place-items: center;
   flex: none;
   color: var(--muted);
+}
+/* A tab of this session is open: its state, as the status bar's dot. */
+.row-open {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+/* The same dot beside an address in the IP scan results (a table cell, not a flex row). */
+.nettools-table .row-open {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 2px;
+}
+.row-open.connected {
+  background: var(--ok);
+}
+.row-open.connecting {
+  background: var(--warn);
+}
+.row-open.error {
+  background: var(--danger);
 }
 /* Its device sent a Syslog alert or stopped answering a continuous ping. */
 .row-alert {
@@ -1716,6 +1748,12 @@ kbd.word {
 .tftp-log li.fail svg {
   color: #f87171;
 }
+/* "Show in Explorer" on a received file: at the line's end, never squeezed. */
+.tftp-log li .btn {
+  flex: none;
+  margin-left: auto;
+  word-break: normal;
+}
 /* RDP "키 확인": what each key press became. */
 /* Clipboard sharing status in the RDP toolbar, and its log. */
 /* Icon plus a state dot; the state in words is the tooltip (and for screen readers). */
@@ -1849,7 +1887,7 @@ kbd.word {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.8px;
-  color: var(--muted);
+  color: var(--accent);
 }
 /* "최근 연결" under the pinned list: the gap the home sections keep. */
 #home .recent + h3 {
@@ -1944,8 +1982,8 @@ kbd.word {
   cursor: pointer;
 }
 .recent-item:hover {
-  background: var(--bg-1);
-  border-color: var(--line);
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-1));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
 }
 .ri-text {
   flex: 1;
@@ -1965,6 +2003,15 @@ kbd.word {
 .recent-item.alerted {
   border-color: color-mix(in srgb, var(--danger) 35%, transparent);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+/* Its last connection attempt never connected (connectLog.ts). */
+.ri-fail {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .ri-alert {
   display: grid;
@@ -1997,7 +2044,7 @@ kbd.word {
   padding: 0 12px;
   font-size: 11.5px;
   background: var(--bg-1);
-  border-top: 1px solid var(--line);
+  border-top: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
   color: var(--text-2);
   white-space: nowrap;
   overflow: hidden;
@@ -2086,6 +2133,8 @@ kbd.word {
   flex-direction: column;
   background: var(--bg-1);
   border: 1px solid var(--line-2);
+  /* Every dialog wears the yellow stripe on top. */
+  border-top: 2px solid var(--accent);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
   transform: translateY(8px) scale(0.98);
@@ -2577,6 +2626,13 @@ code.fp {
   text-align: right;
   color: var(--muted);
 }
+/* When the line arrived ("14:03:22", with its date when not today). */
+.match-row .tm {
+  flex: none;
+  min-width: 8ch;
+  color: var(--muted);
+  white-space: nowrap;
+}
 .match-row .tx {
   min-width: 0;
   overflow: hidden;
@@ -2812,7 +2868,10 @@ mark.term-hit {
   flex: 1;
 }
 .ctx-item:hover:not([disabled]) {
-  background: var(--bg-4);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-3));
+}
+.ctx-item:hover:not([disabled], .danger) .ico {
+  color: var(--accent);
 }
 .ctx-item[disabled] {
   opacity: 0.4;
@@ -2834,6 +2893,26 @@ mark.term-hit {
 /* The label span grows (.ctx-item span); the icon's place keeps its width. */
 .ctx-item .ico-pad {
   flex: none;
+}
+/* A heading over the items after it: plain text, not a greyed-out action. */
+.ctx-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 0 10px;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: default;
+  user-select: none;
+}
+.ctx-head span {
+  flex: 1;
+  /* A long heading (a port's description, up to 240 characters) wraps
+     instead of widening the menu across the screen. */
+  max-width: 420px;
+  padding: 4px 0;
+  overflow-wrap: anywhere;
 }
 .ctx-sep {
   height: 1px;
@@ -3131,6 +3210,29 @@ mark.term-hit {
 .ftpd-addr code {
   font-size: 12.5px;
 }
+/* The TFTP server's commands for a device (fileServers.ts deviceCommands): one per line. */
+/* Folded, beside the addresses (no height of its own); opened, a row of its own. */
+.tftp-cmds {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  align-self: center;
+  gap: 6px;
+}
+.tftp-cmds[open] {
+  flex-basis: 100%;
+}
+.tftp-cmds summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tftp-cmds .ftpd-addr {
+  flex-wrap: wrap;
+  text-align: left;
+}
 .ftpd-form {
   gap: 12px;
 }
@@ -3214,10 +3316,48 @@ mark.term-hit {
   display: inline-flex;
   gap: 6px;
 }
+/* The last hour, a bar a minute (syslog.ts drawRate). */
+.syslog-rate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.syslog-rate[hidden] {
+  display: none;
+}
+.syslog-rate span {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.syslog-rate svg {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border-bottom: 1px solid var(--line);
+}
+.syslog-rate rect {
+  fill: color-mix(in srgb, var(--accent) 75%, transparent);
+}
+.syslog-rate rect.bad {
+  fill: color-mix(in srgb, var(--danger) 80%, transparent);
+}
+.syslog-rate rect {
+  cursor: pointer;
+}
+.syslog-rate rect:hover {
+  fill: var(--accent);
+}
+.syslog-rate rect.bad:hover {
+  fill: var(--danger);
+}
+/* The message a bar was clicked for, shown for a moment. */
+.syslog-row.flash {
+  animation: help-flash 1.4s ease-out;
+}
 .syslog-list {
   /* Shorter on a low screen, so the whole window fits without scrolling
      (receiving, with its addresses shown and the count on two lines). */
-  height: clamp(200px, calc(100vh - 520px), 340px);
+  height: clamp(200px, calc(100vh - 560px), 340px);
   overflow: auto;
   /* The code keeps a scrolled-up view on its lines as rows go from the top
      (syslog.ts); the browser's own anchoring would move it twice. */
@@ -3351,7 +3491,9 @@ mark.term-hit {
   font-weight: 600;
 }
 .ftpd-log {
-  height: 150px;
+  /* Shorter on a low screen, so a running server's window (its addresses and
+     notes shown) fits without scrolling at 800px; 150px from about 860px. */
+  height: clamp(80px, calc(100vh - 714px), 150px);
   overflow: auto;
   font-size: 12.5px;
 }
@@ -3619,6 +3761,67 @@ mark.term-hit {
   max-height: 150px;
   overflow: auto;
   font-size: 12.5px;
+}
+/* A folder's size (files.ts folderSize): each part's share as a bar. */
+.fs-list {
+  max-height: 46vh;
+  overflow: auto;
+}
+.fs-list td {
+  font-variant-numeric: tabular-nums;
+}
+.fs-list .fs-row {
+  cursor: pointer;
+}
+.fs-list .fs-row:hover td {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.fs-list .fs-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fs-list .fs-name .ico {
+  color: var(--accent);
+}
+.fs-list .fs-bar {
+  width: 30%;
+}
+.fs-list .fs-bar i {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--accent);
+}
+/* Several devices watched at once (openMultiWatch). */
+.mw-scroll {
+  max-height: 44vh;
+  overflow: auto;
+}
+.mw-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.mw-add {
+  align-items: center;
+}
+.mw-add input {
+  flex: 1;
+  max-width: 280px;
+  height: 30px;
+}
+.mw-table td {
+  font-variant-numeric: tabular-nums;
+}
+.mw-table tr.down td {
+  background: var(--danger-soft);
+}
+.mw-table .ok-text {
+  color: var(--ok);
+}
+.mw-table .danger-text {
+  color: var(--danger);
 }
 .watch-log time {
   color: var(--muted);
@@ -5233,4 +5436,111 @@ body.ai-resizing .xterm {
   text-align: center;
   color: var(--muted);
   font-size: 13px;
+}
+
+/* "Caps Lock is on" under a password box (promptDialog). */
+.caps-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn);
+}
+.caps-hint[hidden] {
+  display: none;
+}
+/* On the lock screen's centred card, centred as its other lines are. */
+.lock-card .caps-hint {
+  justify-content: center;
+}
+/* A session's connection history: times line up, a live one is green. */
+.history-table td {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.history-table .ok-text {
+  color: var(--ok);
+}
+/* The history of every session can run long: it scrolls under its header. */
+.history-wrap {
+  max-height: min(56vh, 460px);
+  overflow: auto;
+}
+.history-wrap thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-1);
+}
+.history-table .history-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Every session's history: a search and "today only" over the table. */
+.history-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.history-tools .list-search {
+  flex: 1;
+  max-width: 260px;
+}
+/* A local file's digests (fileHash.ts): name, value, copy. */
+.hash-row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.hash-row code {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.hash-compare {
+  margin-top: 12px;
+}
+.hash-compare input {
+  font-family: var(--mono);
+}
+[data-verdict].ok-text {
+  color: var(--ok);
+}
+.history-wrap[title] tbody tr {
+  cursor: pointer;
+}
+.history-wrap[title] tbody tr:hover td {
+  background: var(--accent-soft);
+}
+/* "최근 연결" with the way to every session's connection history beside it. */
+#home h3.home-h3-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.home-h3-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.home-h3-link:hover,
+.home-h3-link:focus-visible {
+  color: var(--accent);
 }

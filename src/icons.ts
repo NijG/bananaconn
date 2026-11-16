@@ -115,12 +115,13 @@ import {
   Pin,
   PinOff,
   History,
+  Palette,
 } from "lucide";
 
 type IconNode = Parameters<typeof createElement>[0];
 
 const ICONS: Record<string, IconNode> = {
-  Camera, Paperclip, ScanEye, Pin, PinOff, History,
+  Camera, Paperclip, ScanEye, Pin, PinOff, History, Palette,
   Ban, Bell, BellOff, Bot, Brain, ClipboardList, FileSearch, LoaderCircle, MessageSquarePlus, Power, Send, User, WandSparkles,
   CircleHelp,
   ClipboardPaste,

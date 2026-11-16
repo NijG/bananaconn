@@ -2,13 +2,14 @@
   "name": "bananaconn",
   "private": true,
   "license": "MIT",
-  "version": "0.7.55",
+  "version": "0.7.56",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:rdp": "node scripts/build-rdp.mjs",
     "preview": "vite preview",
+    "check": "node scripts/i18n-check.mjs && node scripts/secrets-check.mjs && node scripts/table-check.mjs && node scripts/address-check.mjs && node scripts/rust-i18n-check.mjs && node scripts/hidden-chars-check.mjs && node scripts/highlight-check.mjs && node scripts/help-check.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

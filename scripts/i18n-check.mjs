@@ -92,6 +92,41 @@ for (const file of fs.readdirSync(dictDir).filter((f) => f.endsWith(".json"))) {
     const userValue = tr(`${userText(name)} 을(를) 저장했습니다`);
     if (!userValue.includes(userText(name))) report(lang, `a userText value was translated: ${userValue}`);
     if (plainValue.includes(name)) report(lang, `a plain phrase value was not translated: ${plainValue}`);
+    // Phrases joined by " · " (a tooltip, a status line) come out as each
+    // translated alone: no phrase's value may take in the ones around it
+    // ("Telnet · ⁨10.0.0.2⁩ · 23:15부터 연결됨" read as "{0}부터 연결됨" gave
+    // "Connected since Telnet · …"). Pairs of the phrases, their values
+    // filled (a number, a user's value), in a fixed pseudo-random order.
+    {
+      const phrases = [...tried]
+        .filter((k) => !k.includes(" · ") && !k.includes("\n") && k.length < 70)
+        .map((k, i) => k.replace(/\{(\d+)\}/g, (_m, n) => ((Number(n) + i) % 2 ? "12" : userText("web01"))));
+      let seed = 11;
+      const pick = () => phrases[(seed = (seed * 1103515245 + 12345) % 2147483648) % phrases.length];
+      const wrong = [];
+      for (let i = 0; i < 4000; i++) {
+        const parts = i % 4 === 3 ? ["Telnet", userText("10.0.0.2"), pick()] : [pick(), pick()];
+        const whole = tr(parts.join(" · "));
+        const apart = parts.map(tr).join(" · ");
+        if (whole !== apart) wrong.push(`"${parts.join(" · ").slice(0, 60)}" comes out as "${whole.slice(0, 60)}", not "${apart.slice(0, 60)}"`);
+      }
+      for (const w of wrong.slice(0, 3)) report(lang, w);
+      if (wrong.length > 3) report(lang, `${wrong.length - 3} more phrases joined by " · " come out wrong`);
+      // Texts the app makes, translated in full (a user's value aside): a
+      // message holding " · " in parentheses shown inside another (devmon.rs's
+      // timeout in a toast), and a tail added with its " · " (the editor's
+      // status line, a transfer's result).
+      for (const text of [
+        "설정을 읽지 못했습니다: 장비가 응답하지 않습니다 (show running-config · 마지막 화면: Router#)",
+        "리소스 표시 오류: 장비가 응답하지 않습니다 (로그인 후 · 마지막 화면: 없음) · 클릭해 다시 시도",
+        `SSH · ${userText("10.0.0.2")} · 23:15부터 연결됨 · 장비가 응답하지 않습니다 (로그인 후 · 마지막 화면: 없음) · 23:20`,
+        "120줄 · UTF-8 (BOM) · 저장 안 됨",
+        "완료 · 파일 3개 · 안전하지 않은 이름·링크 1개 건너뜀",
+      ]) {
+        const got = tr(text);
+        if (/[가-힣]/.test(got.replace(/⁨[^⁨⁩]*⁩/g, ""))) report(lang, `"${text.slice(0, 50)}" comes out as "${got.slice(0, 70)}"`);
+      }
+    }
     // English counts: a singular after 1 (not 11), never inside a user's value.
     if (lang === "en") {
       for (const [ko, want] of [

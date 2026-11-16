@@ -333,6 +333,8 @@ export const api = {
   termOpen: async (req: TermOpen, onOutput: (bytes: Uint8Array) => void, onExit: (code: number) => void) => {
     if (!isTauri) {
       on<[string, Uint8Array]>("term-output", ([id, bytes]) => id === req.id && onOutput(bytes));
+      // The preview's ended connections (mock.ts __bxMockExit).
+      on<[string, number]>("term-exit", ([id, code]) => id === req.id && onExit(code));
       return call<void>("term_open", { req });
     }
     const { Channel } = await import("@tauri-apps/api/core");
@@ -422,6 +424,8 @@ export const api = {
     call<[number, number]>("remote_write_text", { id, path, text, bom, stamp, force }),
   /** [modified ms, size] */
   localStat: (path: string) => call<[number, number]>("local_stat", { path }),
+  /** A local file's SHA-256 and SHA-512, lower-case hex. */
+  localHash: (path: string) => call<[string, string]>("local_hash", { path }),
 
   rdpLaunch: (req: Record<string, unknown>) => call<void>("rdp_launch", { req }),
   rdpCert: (id: string, accept: boolean) => call<void>("rdp_cert", { id, accept }),
@@ -502,6 +506,8 @@ export const api = {
 
   vaultList: () => call<Credential[]>("vault_list"),
   vaultSave: (cred: Credential, secret: string | null) => call<Credential>("vault_save", { cred, secret }),
+  /** A secret on the clipboard, left out of the Windows clipboard history and cloud clipboard. */
+  clipboardWritePrivate: (text: string) => call<void>("clipboard_write_private", { text }),
   vaultDelete: (id: string) => call<void>("vault_delete", { id }),
   vaultGenerateKey: (path: string, keyType: string, passphrase: string, comment: string) =>
     call<string>("vault_generate_key", { path, keyType, passphrase, comment }),

@@ -1,7 +1,7 @@
 // Clipboard access. Inside Tauri the clipboard-manager plugin is used so
 // reads never depend on WebView clipboard-permission prompts.
 
-import { isTauri } from "./api";
+import { api, isTauri } from "./api";
 import { holdsSecret } from "./cmdLine";
 import { endpoint, type Session } from "./model";
 import { toast } from "./ui";
@@ -74,19 +74,24 @@ export function removeClipboardHistory(text: string) {
 }
 
 /** `secret`: do not keep this in the clipboard history (a generated password
- * must not be left in localStorage or shown in the history picker). */
-export async function writeClipboard(text: string, opts?: { secret?: boolean }) {
+ * must not be left in localStorage or shown in the history picker), nor let
+ * Windows keep it (its clipboard history, the cloud clipboard). False when it
+ * could not be copied: a secret is then not copied the plain way instead. */
+export async function writeClipboard(text: string, opts?: { secret?: boolean }): Promise<boolean> {
   if (opts?.secret) removeClipboardHistory(text);
   else record(text);
   try {
-    if (isTauri) {
+    if (isTauri && opts?.secret) await api.clipboardWritePrivate(text);
+    else if (isTauri) {
       const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
       await writeText(text);
     } else {
       await navigator.clipboard.writeText(text);
     }
+    return true;
   } catch {
-    /* clipboard unavailable: ignore */
+    // Clipboard unavailable: most callers ignore it; a secret's caller says so.
+    return false;
   }
 }
 

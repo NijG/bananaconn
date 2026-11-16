@@ -22,15 +22,18 @@ const HOME_KEYS = ["app.newSession", "app.quickConnect", "tab.next", "tab.close"
 import { contextMenu, esc, relativeTime } from "./ui";
 import { natural } from "./sessionOrder";
 import { clearDeviceAlert, deviceAlert, deviceAlertAt, onDeviceAlerts } from "./deviceAlerts";
+import { lastConnect } from "./connectLog";
+import { openConnectHistory } from "./connectHistoryView";
 
 /** One session on the home screen; `aside`: text on the right, if any;
  * `alert`: what went wrong with its device (a mark and its tooltip). */
-function sessionButton(s: Session, aside: string, alert?: string): string {
+/** `failed`: its last connection attempt never connected (connectLog.ts). */
+function sessionButton(s: Session, aside: string, alert?: string, failed = false): string {
   const info = PROTOCOLS[s.protocol];
   return `<button class="recent-item${alert ? " alerted" : ""}" data-id="${s.id}" style="--proto:${info.color}"${alert ? ` title="${esc(alert)}"` : ""}>
     <span class="proto-ico">${icon(info.icon, 16)}</span>
     <span class="ri-text" data-i18n-skip><b>${esc(s.name)}</b><small>${esc(endpoint(s))}</small></span>
-    ${aside ? `<span class="ri-time">${aside}</span>` : ""}${alert ? `<span class="ri-alert">${icon("TriangleAlert", 14)}</span>` : ""}</button>`;
+    ${failed ? `<span class="ri-fail" title="마지막 연결 시도에서 연결하지 못했습니다">연결하지 못함</span>` : ""}${aside ? `<span class="ri-time">${aside}</span>` : ""}${alert ? `<span class="ri-alert">${icon("TriangleAlert", 14)}</span>` : ""}</button>`;
 }
 
 export function mountHome(
@@ -80,10 +83,15 @@ export function mountHome(
                 ? `<h3>고정한 세션</h3><div class="recent">${pinned.map((s) => sessionButton(s, "")).join("")}</div>`
                 : ""
             }
-            <h3>최근 연결</h3>
+            <h3 class="home-h3-row"><span>최근 연결</span>${
+              // Every session's connections, newest first (the palette's "전체 연결 기록"): found from here too.
+              // Cheap (the cached newest record of each saved session), and none for
+              // a history that is all deleted sessions' (the dialog would be empty).
+              state.sessions.some((s) => lastConnect(s.id)) ? `<button type="button" class="home-h3-link" data-history>${icon("History", 13)}<span>전체 연결 기록</span></button>` : ""
+            }</h3>
             ${
               recent.length
-                ? `<div class="recent">${recent.map((s) => sessionButton(s, relativeTime(s.lastUsed))).join("")}</div>`
+                ? `<div class="recent">${recent.map((s) => sessionButton(s, relativeTime(s.lastUsed), undefined, lastConnect(s.id)?.how === "failed")).join("")}</div>`
                 : `<p class="muted">아직 연결한 세션이 없습니다. 위에서 프로토콜을 골라 시작하세요.</p>`
             }
           </section>
@@ -129,6 +137,7 @@ export function mountHome(
         ]);
       }),
     );
+    root.querySelector("[data-history]")?.addEventListener("click", () => openConnectHistory(undefined, (s) => actions.connect(s)));
     root.querySelector("[data-vault]")!.addEventListener("click", () => actions.vault());
     root.querySelector("[data-shortcuts]")!.addEventListener("click", () => void import("./shortcuts").then((m) => m.openShortcuts()));
   };

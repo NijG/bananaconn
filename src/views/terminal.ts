@@ -8,11 +8,36 @@ import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } f
 import type { PasteEvent } from "../api";
 import { proxyOf } from "../proxy";
 import { readClipboard, writeClipboard } from "../clipboard";
-import { addressPattern, findIps, findMacs, macFormats, macSearchPattern } from "../ipLinks";
+import {
+  type UptimeMatch,
+  addressKind,
+  addressPattern,
+  arpPair,
+  bandwidthAbove,
+  findInterfaces,
+  findIps,
+  interfaceDescription,
+  interfaceNeighbor,
+  interfaceStateChange,
+  interfaceVlan,
+  findMacs,
+  findMasks,
+  findRates,
+  findUptimes,
+  maskForms,
+  readableRate,
+  interfaceNames,
+  interfaceSearchPattern,
+  macFormats,
+  macKind,
+  macSearchPattern,
+  mayHoldInterface,
+} from "../ipLinks";
 import { matchLines, type LineMatch, type OutputLine } from "../lineFilter";
 import { clockText, LineTimes } from "../lineTimes";
 import { splitTable, type CellLine } from "../tableCopy";
 import { notesButton } from "../sessionNotes";
+import { savedSessionItems } from "../nettools";
 import { openSyslog, syslogSender } from "../syslog";
 import { icon } from "../icons";
 import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Protocol, type Session } from "../model";
@@ -43,8 +68,6 @@ const MARKED_KEYS: EditKey[] = ["Delete", "Home", "End", "Backspace"];
 
 import { beep, canOsNotify, confirmDialog, contextMenu, ensureNotifyPermission, errorText, esc, h, isScreenLocked, modal, osNotify, promptDialog, requestAttention, sheetCell, timestamp, toast, setPressed, type MenuItem } from "../ui";
 import type { BroadcastInput, EditKey, InputKind, MonitorInfo, StatusInfo, Tab, View, ViewState, Workspace } from "../workspace";
-
-
 
 /** An output line that asks for a login or a secret ("Password:", "Username:",
  * "Enter passphrase", "암호:", a one-time code): trigger rules never auto-answer
@@ -143,6 +166,12 @@ const SETTLES = /^(?:(?:do\s+)?reload\s+cancel|commit(?![^\r\n]*\bconfirmed\b)(?
 /** The configuration backup last saved or compared per device (backupKey),
  * offered first the next time. This PC's browser storage only; at most 200. */
 const LAST_BACKUP = "bx.lastConfigBackup";
+/** Output lines read, the newest first, for the IP of a MAC (and the MAC of
+ * an IP) in an address menu: in each terminal tab (an ARP table printed
+ * lately is among them), and in all. Measured in the preview: 60,000 lines
+ * read (three full tabs, nothing found) open the menu in about 90 ms. */
+const PAIR_SCAN_TAB = 20_000;
+const PAIR_SCAN = 100_000;
 
 function lastBackup(key: string): string | undefined {
   try {
@@ -296,7 +325,6 @@ let routed = false;
 function ensureRouting() {
   if (routed) return;
   routed = true;
-
 
   on<MonitorEvent>("monitor-stats", (e) => {
     const m = monitorsById.get(e.id);
@@ -515,6 +543,8 @@ export class TerminalView implements View {
   private loginAsked = false;
   private loggedIn = false;
   private loggedInAt = 0;
+  /** How the last connection ended (exited), for its history: null until it does. */
+  private endedAs: "failed" | "error" | "closed" | null = null;
   private keyWarned = false;
   private endBytes = new Uint8Array(0);
   /** "Notify when the task finishes" is on for this tab, with its silence timer
@@ -713,7 +743,9 @@ export class TerminalView implements View {
     this.term.registerLinkProvider({
       provideLinks: (y, callback) => {
         const line = this.term.buffer.active.getLine(y - 1);
-        if (!line || !/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}/.test(line.translateToString(true))) return callback(undefined);
+        // A cheap test first: an address, a MAC or an interface name ("Gi1/0/1", "Po1").
+        const lineText = line?.translateToString(true) ?? "";
+        if (!line || !(/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average/.test(lineText) || mayHoldInterface(lineText))) return callback(undefined);
         // The text with the screen cell of each character: a wide character
         // (Hangul) takes two cells, so string positions are not columns.
         let text = "";
@@ -744,6 +776,10 @@ export class TerminalView implements View {
         const links = [
           ...findIps(text).map((m) => link(m.index, m.length, (e) => this.addressMenu(m.ip, m.port, m.prefix, e.clientX, e.clientY))),
           ...findMacs(text).map((m) => link(m.index, m.length, (e) => this.macMenu(m.hex, e.clientX, e.clientY))),
+          ...findInterfaces(text).map((m) => link(m.index, m.length, (e) => this.interfaceMenu(m.type, m.number, e.clientX, e.clientY))),
+          ...findMasks(text).map((m) => link(m.index, m.length, (e) => this.maskMenu(m.prefix, e.clientX, e.clientY))),
+          ...findRates(text).map((m) => link(m.index, m.length, (e) => this.rateMenu(m.bitsPerSecond, y - 1, e.clientX, e.clientY))),
+          ...findUptimes(text).map((m) => link(m.index, m.length, (e) => this.uptimeMenu(m, y - 1, e.clientX, e.clientY))),
         ];
         callback(links.length ? links : undefined);
       },
@@ -885,8 +921,21 @@ export class TerminalView implements View {
     this.connect();
   }
 
+  /** A quick connection, named only by its address (or COM port) as main.ts
+   * names one, is called by the device's host name once the monitor reads it
+   * ("SW-CORE-01", not "10.0.0.5"); a name the user gave is kept. */
   title() {
-    return this.session.name || endpoint(this.session);
+    return this.deviceName() || this.session.name || endpoint(this.session);
+  }
+
+  private autoNamed(): boolean {
+    const s = this.session;
+    return s.id.startsWith("quick-") && (!s.name || s.name === endpoint(s) || s.name === s.host);
+  }
+
+  /** The device's host name, for a tab with no name of its own (autoNamed); null otherwise. */
+  deviceName(): string | null {
+    return (this.autoNamed() && this.device?.name.trim()) || null;
   }
 
   status(): StatusInfo {
@@ -938,7 +987,9 @@ export class TerminalView implements View {
     // Remember the OS the first time so later connections skip re-detecting it:
     // the monitor reuses it, and snippets, history recall and key mode apply at
     // once without waiting. Cleared if the monitor later finds it no longer fits.
-    if (!this.session.id.startsWith("quick-") && this.session.options.osKind !== d.kind) {
+    // The label and host name follow the device too (an upgrade, a rename): found by them in the session search.
+    const o = this.session.options;
+    if (!this.session.id.startsWith("quick-") && (o.osKind !== d.kind || (o.osLabel ?? "") !== (d.label ?? "") || (o.osName ?? "") !== (d.name ?? ""))) {
       this.session.options.osKind = d.kind;
       this.session.options.osLabel = d.label ?? "";
       this.session.options.osName = d.name ?? "";
@@ -967,6 +1018,8 @@ export class TerminalView implements View {
       this.renderKeyMode();
       toast(`${deviceTitle(d)} 장비로 인식해 키 입력을 장비 방식(Delete=Ctrl-D, Home=Ctrl-A, End=Ctrl-E)으로 바꿨습니다`, "info", 4000);
     }
+    // An unnamed tab is now called by the device's host name (title).
+    if (this.autoNamed()) this.ws.changed();
   }
 
   /** `cd` to `path` in this shell, from the SFTP pane opened beside it:
@@ -1013,14 +1066,49 @@ export class TerminalView implements View {
       },
     }));
     contextMenu(r.left, r.bottom + 4, [
-      { label: `${deviceTitle(d)}${d.name ? ` · ${userText(d.name)}` : ""}`, icon: "Server", disabled: true },
+      { label: `${deviceTitle(d)}${d.name ? ` · ${userText(d.name)}` : ""}`, icon: "Server", heading: true },
       "-",
       ...(d.backup ? [{ label: "설정 백업 (running-config를 파일로 저장)…", icon: "Save", action: () => this.backupConfig() }] : []),
       ...(d.backup ? [{ label: "설정을 백업 파일과 비교…", icon: "Columns2", action: () => void this.compareConfig() }] : []),
       ...(d.backup ? [{ label: "설정을 AI로 점검…", icon: "Sparkles", action: () => void this.aiConfigReview() }] : []),
       { label: "상위 프로세스·리소스", icon: "Activity", action: () => showTopProcesses(sh.id, this.ws.nameOf(this)) },
+      ...(this.renameItem(d.name.trim()) ?? []),
       ...(commands.length ? ["-" as const, ...commands] : []),
     ]);
+  }
+
+  /** A saved session named otherwise (often its address) can take the name
+   * the device gives itself, when the user picks it; undone from its notice. */
+  private renameItem(name: string): MenuItem[] | null {
+    const id = this.session.id;
+    const saved = state.sessions.find((s) => s.id === id);
+    if (!name || !saved || saved.name.trim().toLowerCase() === name.toLowerCase()) return null;
+    const old = saved.name;
+    const rename = (to: string) =>
+      patchSession(id, { name: to }).then(() => {
+        // The tab keeps its own copy when it was opened from one.
+        this.session.name = to;
+        this.ws.changed();
+      });
+    return [
+      {
+        label: `세션 이름을 장비 이름으로 바꾸기 · ${userText(name)}`,
+        icon: "Pencil",
+        action: () =>
+          void rename(name).then(
+            () =>
+              toast(`세션 이름을 바꿨습니다: ${userText(old)} → ${userText(name)}`, "success", 8000, {
+                label: "되돌리기",
+                // Only while it still has the name given here: one the user typed since stays.
+                run: () => {
+                  if (state.sessions.find((s) => s.id === id)?.name !== name) return void toast("그 뒤에 이름이 바뀌어 되돌리지 않았습니다", "info");
+                  void rename(old).catch((err) => toast(errorText(err), "error"));
+                },
+              }),
+            (err) => toast(errorText(err), "error"),
+          ),
+      },
+    ];
   }
 
   // ---- AI (ai/panel.ts) ----
@@ -1049,12 +1137,11 @@ export class TerminalView implements View {
       },
       insert: (command) => {
         if (this.state !== "connected") return toast("연결된 다음 넣을 수 있습니다", "warn");
-        // Replace what is typed on the line (Ctrl-U), never press Enter.
-        const typed = this.assist.typedText();
-        const data = (typed ? "\x15" : "") + command.replace(/[\r\n]+/g, " ");
-        this.interruptRepeat();
-        this.assist.note(data);
-        this.sendInput(data);
+        // Judged when the button is pressed: a line that is a login, password
+        // or host-key question by then (a console that timed out, a sudo or
+        // enable asking) must not get a command typed into it.
+        if (!this.atCommandLine()) return toast("명령 줄에서만 보낼 수 있습니다", "warn");
+        this.putOnInputLine(command);
       },
       focus: () => this.term.focus(),
       run: (command, reason) => this.runForAi(command, reason),
@@ -1388,7 +1475,11 @@ export class TerminalView implements View {
     if (!m) return;
     if (m.kind === "stats" && sh) return showTopProcesses(sh.id, this.ws.nameOf(this));
     if (m.kind === "login" && sh) {
-      if (m.needUser || (!this.session.username && !sh.user && this.session.protocol === "telnet")) {
+      // A user name typed here (the session has none) is asked again after a
+      // failed login, filled in: it may be the wrong one, not only the password.
+      // (A key passphrase refused is not about the name.)
+      const typedFailed = !this.session.username && !!sh.user && m.message === "비밀번호가 올바르지 않습니다";
+      if (m.needUser || typedFailed || (!this.session.username && !sh.user && this.session.protocol === "telnet")) {
         const u = await promptDialog({ title: "리소스 모니터링 로그인", label: "사용자 이름", icon: "Activity", confirm: "다음", value: sh.user });
         if (!u?.value.trim()) return;
         sh.user = u.value.trim();
@@ -2314,15 +2405,38 @@ export class TerminalView implements View {
     return true;
   }
 
+  /** Values this output offers for a snippet's {{?name}}, by what the name
+   * asks for: the interfaces it shows for an interface or a port ("인터페이스",
+   * "port"), the IPv4 addresses for an address or a target ("대상", "IP",
+   * "host"); the newest first, each once. Nothing for any other name. */
+  private valuesFor(name: string, text: string): string[] {
+    // Whole words in English: no "ip" in "zip", no "port" in "report". A
+    // MAC address is no IP address. "포트"/"port" alone may be a TCP port
+    // ("telnet {{?host}} {{?port}}"): a switch port only in a snippet about
+    // interfaces.
+    const aboutInterfaces = /\b(?:int(?:erface)?|switchport|shut(?:down)?)\b/i.test(text.replace(/\{\{\?[^}]*\}\}/g, " "));
+    const wantsPort = /인터페이스|\b(?:interface|intf|if)\b/i.test(name) || (/포트|\bport\b/i.test(name) && aboutInterfaces);
+    const wantsAddress = !/mac/i.test(name) && /대상|주소|호스트|\b(?:ip|host|address|target|peer|neighbor)\b/i.test(name);
+    if (!wantsPort && !wantsAddress) return [];
+    const out = new Set<string>();
+    const lines = [...this.outputLines()];
+    for (let i = lines.length - 1; i >= 0 && out.size < 50; i--) {
+      const text = lines[i].text;
+      if (wantsPort) for (const m of findInterfaces(text)) out.add(interfaceNames(m.type, m.number).short);
+      if (wantsAddress) for (const m of findIps(text)) if (!m.ip.includes(":")) out.add(m.ip);
+    }
+    return [...out];
+  }
+
   /** Send a saved command; it follows broadcast like typed input does. */
-  private async sendSnippet(s: Snippet) {
+  async sendSnippet(s: Snippet) {
     if (this.state !== "connected") return toast("연결된 다음 보낼 수 있습니다", "warn");
     // Its {{?name}} values first, if it has any: then sent only to the
     // connections it was asked on (see sendScope), and the line it joins.
     const scope = this.inputScope();
     let text = s.text;
     if (asksValues(s)) {
-      const filled = await askSnippetValues(s);
+      const filled = await askSnippetValues(s, (name, text) => this.valuesFor(name, text));
       this.term.focus();
       if (filled === null) return;
       if (!this.stillSame(scope)) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
@@ -2812,6 +2926,7 @@ export class TerminalView implements View {
     this.loginAsked = false;
     this.loggedIn = false;
     this.loggedInAt = 0;
+    this.endedAs = null;
     this.keyWarned = false;
     this.endBytes = new Uint8Array(0);
     // Reuse the OS detected on an earlier connection (no re-sniff, no re-detect).
@@ -3389,7 +3504,6 @@ export class TerminalView implements View {
     row?.insertBefore(edit, row.lastElementChild);
   }
 
-
   private decoder = new TextDecoder();
   /** Trigger patterns compiled once and cached by source, so a busy stream does
    *  not rebuild the same regex for every output line. null = malformed pattern. */
@@ -3540,15 +3654,332 @@ export class TerminalView implements View {
   /** A MAC address clicked in the output: copy it in another vendor's notation,
    * or find it on screen in any of them. */
   private macMenu(hex: string, x: number, y: number) {
+    // Its IPv4 address, as an ARP table in this tab or another one gives it
+    // (a router's, beside a switch's MAC table): each opens that address's menu.
+    const ips = this.ipsOfMac(hex);
+    // What the address itself says it is (an HSRP group, STP, multicast), when anything.
+    const kind = macKind(hex);
     contextMenu(x, y, [
+      ...(kind ? [{ label: kind, icon: "Info", heading: true }, "-" as const] : []),
       ...macFormats(hex).map((f) => ({ label: f.text, icon: "Copy", hint: f.style, action: () => void writeClipboard(f.text) })),
       "-" as const,
+      ...ips.map((m) => ({ label: m.value, userLabel: true, icon: "Network", hint: m.tab, userHint: true, action: () => this.addressMenu(m.value, null, null, x, y) })),
+      ...(ips.length ? ["-" as const] : []),
       { label: "이 MAC을 모든 형식으로 찾기", icon: "Search", action: () => this.findInTerminal(macSearchPattern(hex), true) },
       // Which switch's output holds it (a MAC table, an ARP table on each).
       ...(this.otherTerminals().length
         ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", action: () => this.matchList(macSearchPattern(hex), { regex: true, caseSensitive: false }, true) }]
         : []),
     ]);
+  }
+
+  /** Put a command on the input line, replacing what is typed there (Ctrl-U);
+   * Enter is never pressed: the user reads it and runs it. */
+  private putOnInputLine(command: string) {
+    const typed = this.assist.typedText();
+    const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : "\x15";
+    const data = clear + command.replace(/[\r\n]+/g, " ");
+    this.interruptRepeat();
+    this.assist.note(data);
+    this.sendInput(data);
+  }
+
+  /** The cursor is at a shell or device prompt after the login: not at a
+   * login, password or host-key question, nor in a pager or a full-screen
+   * program, where typed text would answer something else. */
+  private atCommandLine(): boolean {
+    if (this.disposed || this.state !== "connected" || !this.loggedIn || this.pasteActive) return false;
+    // The same judgement typed keys and broadcasts get: a login, password,
+    // host-key or confirm question, or a console about to start a login, is
+    // not a command line (a device that timed out back to "Username:" while
+    // the connection stayed up included).
+    if (this.inputKind() !== "shell") return false;
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return false;
+    const before = (buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd();
+    if (!before || PAGER_PROMPT.test(before) || CREDENTIAL_PROMPT.test(before) || LOGIN_END.test(before) || USER_ANSWERED_ANGLE.test(before)) return false;
+    // And a prompt it knows, or one by its shape ("R1#", "user@h:~$"), with
+    // anything typed after it.
+    const known = this.assist.knownPrompt().trimEnd();
+    return (!!known && before.startsWith(known)) || PROMPT_END.test(before);
+  }
+
+  /** A data rate clicked in the output ("123456000 bits/sec"): read in
+   * Mbit/s or Gbit/s, to copy either way. */
+  private rateMenu(bitsPerSecond: number, row: number, x: number, y: number) {
+    const readable = readableRate(bitsPerSecond);
+    const raw = String(bitsPerSecond);
+    // In "show interfaces", the share of the interface's bandwidth (its BW
+    // line in the same block above). Not for the BW line itself.
+    const buf = this.term.buffer.active;
+    const here = buf.getLine(row)?.translateToString(true) ?? "";
+    const bw = /\bBW \d/.test(here) ? null : bandwidthAbove((i) => buf.getLine(i)?.translateToString(true), row);
+    const share = bw ? (bitsPerSecond / bw) * 100 : null;
+    contextMenu(x, y, [
+      ...(bw && share !== null
+        ? [{ label: share > 0 && share < 0.01 ? `대역폭 ${readableRate(bw)}의 0.01% 미만` : `대역폭 ${readableRate(bw)}의 ${Number(share.toFixed(2))}%`, icon: "Activity", heading: true }, "-" as const]
+        : []),
+      { label: readable, userLabel: true, icon: "Copy", action: () => void writeClipboard(readable) },
+      { label: raw, userLabel: true, icon: "Copy", hint: "bit/s", userHint: true, action: () => void writeClipboard(raw) },
+    ]);
+  }
+
+  /** A device's uptime clicked in the output ("uptime is 3 weeks, 2 days,
+   * …", "up 12 days, 3:04"): when it booted, counted back from when that
+   * line arrived, not from now (the output may be hours old). To the
+   * minute, the precision the devices give. */
+  private uptimeMenu(found: UptimeMatch, row: number, x: number, y: number) {
+    // The link sees one screen row; a long line wrapped onto the next
+    // ("… 3 days, 4 ho" | "urs, 12 minutes") is read whole, or its first
+    // part alone would give a boot time hours off.
+    const buf = this.term.buffer.active;
+    let first = row;
+    while (first > 0 && buf.getLine(first)?.isWrapped) first--;
+    let whole = "";
+    let offset = -1;
+    for (let r = first; ; r++) {
+      const l = buf.getLine(r);
+      if (!l || (r > first && !l.isWrapped)) break;
+      if (r === row) offset = whole.length + found.index;
+      whole += l.translateToString(r === row ? false : !buf.getLine(r + 1)?.isWrapped);
+    }
+    const m = findUptimes(whole).find((u) => offset >= u.index && offset < u.index + u.length) ?? found;
+    const { seconds, approximate } = m;
+    const text = m === found ? (buf.getLine(row)?.translateToString(false) ?? "").slice(found.index, found.index + found.length) : whole.slice(m.index, m.index + m.length);
+    const at = this.lineTime(row);
+    const boot = at === null ? null : clockText(at - seconds * 1000).slice(0, -3);
+    contextMenu(x, y, [
+      {
+        label: boot === null ? "받은 시각을 몰라 부팅 시각을 셀 수 없습니다" : approximate ? `${boot} 무렵 부팅` : `${boot}에 부팅`,
+        icon: "Clock",
+        heading: true,
+      },
+      "-" as const,
+      ...(boot === null ? [] : [{ label: boot, userLabel: true, icon: "Copy", hint: "부팅 시각", action: () => void writeClipboard(boot) }]),
+      { label: text, userLabel: true, icon: "Copy", hint: "가동 시간", action: () => void writeClipboard(text) },
+    ]);
+  }
+
+  /** A netmask or ACL/OSPF wildcard clicked in the output: the same prefix
+   * written the other ways, to copy ("0.0.0.255" in an ACL is /24, and
+   * 255.255.255.0 as a wildcard is 0.0.0.255). */
+  private maskMenu(prefix: number, x: number, y: number) {
+    const f = maskForms(prefix);
+    contextMenu(x, y, [
+      { label: f.slash, userLabel: true, icon: "Copy", hint: "접두사", action: () => void writeClipboard(f.slash) },
+      { label: f.netmask, userLabel: true, icon: "Copy", hint: "서브넷 마스크", action: () => void writeClipboard(f.netmask) },
+      { label: f.wildcard, userLabel: true, icon: "Copy", hint: "와일드카드 마스크", action: () => void writeClipboard(f.wildcard) },
+    ]);
+  }
+
+  /** A Cisco interface clicked in the output ("Gi1/0/1", CDP's "Gig 1/0/1",
+   * "GigabitEthernet1/0/1" in the configuration): copy it by its full or short
+   * name, or find it however it is written, here or in every terminal tab. */
+  private interfaceMenu(type: number, number: string, x: number, y: number) {
+    const names = interfaceNames(type, number);
+    const pattern = interfaceSearchPattern(type, number);
+    // What is on that port, as this switch's MAC table shows it; each opens
+    // that MAC's menu, which finds its IP in an ARP table (a router's tab).
+    const macs = this.macsOnInterface(pattern);
+    // What the port is for, as this tab's output describes it (its
+    // configuration, "show interfaces", "show interfaces description").
+    const whole = new RegExp(`^(?:${pattern})$`, "i");
+    const lines = [...this.outputLines()];
+    const texts = lines.map((l) => l.text);
+    const description = interfaceDescription(texts, whole);
+    // The device at its other end, as CDP or LLDP told it here; its tab
+    // when one is open (a session named as CDP names it, "SW2" for
+    // "SW2.corp.local", or with that address).
+    const neighbor = interfaceNeighbor(texts, whole);
+    // The VLAN it is in, as "show vlan brief" here lists it.
+    const vlan = interfaceVlan(texts, whole);
+    const neighborTab = neighbor
+      ? this.ws.liveTab((t) => {
+          if (t.view === this) return false;
+          // NX-OS adds the serial number: "SW2(FOC1234X0AB)".
+          const d = neighbor.device.replace(/\([^()]*\)$/, "").toLowerCase();
+          const name = t.session.name.trim().toLowerCase();
+          const host = t.session.host.trim().toLowerCase();
+          return (!!name && (d === name || d.startsWith(`${name}.`))) || (!!host && (d === host || d.startsWith(`${host}.`)));
+        })
+      : undefined;
+    // Its last link or line-protocol change in this tab's output (a console
+    // message, "show logging"), with when that line arrived: told as when it
+    // was received, which for an old log line is not when it happened (the
+    // message's own time is on the line, which the item goes to).
+    let change: { line: OutputLine; state: "up" | "down" | "admin-down"; protocol: boolean } | null = null;
+    for (let i = lines.length - 1; i >= 0 && !change; i--) {
+      const c = interfaceStateChange(lines[i].text);
+      if (c && whole.test(c.iface)) change = { line: lines[i], state: c.state, protocol: c.protocol };
+    }
+    // What the last change was, and when its line came (null: not known).
+    const changeWhat =
+      change && (change.protocol ? (change.state === "up" ? "프로토콜 올라옴" : "프로토콜 내려감") : change.state === "up" ? "링크 올라옴" : change.state === "down" ? "링크 내려감" : "관리자가 끔");
+    const changeAt = change && this.lineTime(change.line.row);
+    const changeItems = (() => {
+      if (!change || !changeWhat) return [];
+      const { line, state } = change;
+      const what = changeWhat;
+      const at = changeAt;
+      return [
+        {
+          label: "마지막 상태 변화 메시지로 이동",
+          icon: state === "up" ? "Cable" : "Unplug",
+          hint: at === null ? what : `${what} · ${clockText(at)}에 받음`,
+          action: () => {
+            const row = this.locateLine(line.row, line.text);
+            if (row < 0) return void toast("그 줄은 스크롤 기록에서 이미 사라졌습니다", "info");
+            this.revealLine(row);
+          },
+        },
+        "-" as const,
+      ];
+    })();
+    // All that is known of the port in one text, for a ticket or a chat:
+    // its name, then what this output says of it. Words in the screen's
+    // language; the device's own values (a description, a name) as written.
+    const facts = [
+      ...(description ? [`${tr("설명")}: ${description}`] : []),
+      ...(vlan ? [vlan.trunk ? tr("트렁크 포트") : `VLAN ${vlan.id}${vlan.name ? ` (${vlan.name})` : ""}`] : []),
+      ...(vlan?.state ? [`${tr("상태")}: ${vlan.state}`] : []),
+      ...(neighbor ? [`${tr("이웃 장비")}: ${neighbor.device} (${neighbor.port})`] : []),
+      ...(changeWhat ? [`${tr("마지막 상태 변화")}: ${tr(changeWhat)}${changeAt === null ? "" : ` (${tr(`${clockText(changeAt)}에 받음`)})`}`] : []),
+    ];
+    const copyFacts = facts.length
+      ? [
+          {
+            label: "포트 정보 복사",
+            icon: "ClipboardList",
+            action: () => {
+              void writeClipboard([names.full, ...facts].join("\n"));
+              toast("포트 정보를 복사했습니다", "success", 1500);
+            },
+          },
+        ]
+      : [];
+    // Its configuration and state, put on the input line to run (forms both
+    // IOS and NX-OS take), only at a command line after the login.
+    const commands = this.atCommandLine() ? [`show running-config interface ${names.full}`, `show interface ${names.full}`] : [];
+    const rid = this.runtimeId;
+    const putCommand = (cmd: string) => {
+      if (this.runtimeId !== rid || !this.atCommandLine()) return void toast("명령 줄에서만 보낼 수 있습니다", "warn");
+      this.putOnInputLine(cmd);
+    };
+    contextMenu(x, y, [
+      ...(description ? [{ label: description, userLabel: true, icon: "StickyNote", heading: true }, "-" as const] : []),
+      // The device's own words (a VLAN number and name): not translated.
+      // With the port's state as show interfaces status gives it
+      // ("connected", "err-disabled"), the device's own word.
+      ...(vlan?.trunk
+        ? [{ label: `트렁크 포트${vlan.state ? ` · ${vlan.state}` : ""}`, icon: "Columns2", heading: true }, "-" as const]
+        : vlan
+          ? [{ label: `VLAN ${vlan.id}${vlan.name ? ` · ${vlan.name}` : ""}${vlan.state ? ` · ${vlan.state}` : ""}`, userLabel: true, icon: "Columns2", heading: true }, "-" as const]
+          : []),
+      ...(neighbor
+        ? [
+            { label: `이웃 장비: ${userText(neighbor.device)} (${userText(neighbor.port)})`, icon: "Network", heading: true },
+            ...(neighborTab ? [{ label: "이웃 장비의 탭으로 이동", icon: "SquareTerminal", action: () => this.ws.activate(neighborTab.id) }] : []),
+            "-" as const,
+          ]
+        : []),
+      ...changeItems,
+      { label: names.full, userLabel: true, icon: "Copy", hint: "전체 이름", action: () => void writeClipboard(names.full) },
+      ...(names.short !== names.full ? [{ label: names.short, userLabel: true, icon: "Copy", hint: "줄인 이름", action: () => void writeClipboard(names.short) }] : []),
+      ...copyFacts,
+      "-" as const,
+      { label: "이 인터페이스를 모든 형식으로 찾기", icon: "Search", action: () => this.findInTerminal(pattern, true) },
+      // Its lines alone: its status, its CDP neighbour, its configuration.
+      { label: "이 인터페이스가 나온 줄 모아 보기", icon: "ListFilter", action: () => this.matchList(pattern, { regex: true, caseSensitive: false }, false) },
+      ...(this.otherTerminals().length
+        ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", action: () => this.matchList(pattern, { regex: true, caseSensitive: false }, true) }]
+        : []),
+      ...(commands.length ? ["-" as const] : []),
+      ...commands.map((cmd) => ({ label: cmd, userLabel: true, icon: "CornerDownLeft", hint: "입력 줄에 넣기", action: () => putCommand(cmd) })),
+      ...(macs.length ? ["-" as const, { label: "이 포트의 MAC 주소", icon: "Cable", heading: true }] : []),
+      ...macs.map((m) => ({ label: macFormats(m.value)[2].text, userLabel: true, icon: "Cable", action: () => this.macMenu(m.value, x, y) })),
+    ]);
+  }
+
+  /** The MAC addresses on an interface's lines of this terminal's output
+   * ("show mac address-table": "10  0011.2233.4455  DYNAMIC  Gi1/0/1"), a
+   * line with one MAC only; at most eight. This terminal alone: "Gi1/0/1"
+   * on another switch is another port. */
+  private macsOnInterface(pattern: string): { value: string; tab: string }[] {
+    const port = new RegExp(pattern, "i");
+    return this.pairedInOutput(
+      8,
+      (text) => {
+        if (!port.test(text)) return null;
+        const macs = findMacs(text);
+        return macs.length === 1 ? macs[0].hex : null;
+      },
+      true,
+    );
+  }
+
+  /** The IPv4 addresses that ARP table lines (arpPair) give this MAC, in
+   * this terminal and then the others, each once with the tab it was seen
+   * in; at most five. */
+  private ipsOfMac(hex: string): { value: string; tab: string }[] {
+    // A cheap test first: most lines hold no MAC, or another one.
+    const mac = new RegExp(`(?<![0-9a-f])${macSearchPattern(hex)}(?![0-9a-f])`, "i");
+    return this.pairedInOutput(5, (text) => {
+      if (!mac.test(text)) return null;
+      const pair = arpPair(text);
+      return pair?.hex === hex ? pair.ip : null;
+    });
+  }
+
+  /** ipsOfMac the other way: the MACs that ARP table lines give this IPv4
+   * address; at most three. */
+  private macsOfIp(ip: string): { value: string; tab: string }[] {
+    if (ip.includes(":")) return [];
+    const addr = new RegExp(addressPattern(ip));
+    return this.pairedInOutput(3, (text) => {
+      if (!addr.test(text)) return null;
+      const pair = arpPair(text);
+      return pair?.ip === ip ? pair.hex : null;
+    });
+  }
+
+  /** What `pick` reads from the output's lines (an address paired with
+   * another on an ARP table's line), each once with the tab it was seen in:
+   * this terminal first, then the others, each from its newest line back
+   * (the table printed last is the one that holds now). At most `max`, from
+   * at most PAIR_SCAN_TAB lines of each and PAIR_SCAN in all: a menu opens
+   * at once even with many tabs of the longest scrollback. */
+  private pairedInOutput(max: number, pick: (text: string) => string | null, hereOnly = false): { value: string; tab: string }[] {
+    const found = new Map<string, string>();
+    let left = PAIR_SCAN;
+    for (const view of hereOnly ? [this] : [this, ...this.otherTerminals()]) {
+      let tabLeft = PAIR_SCAN_TAB;
+      for (const text of view.recentLines()) {
+        if (--left < 0 || --tabLeft < 0) break;
+        const value = pick(text);
+        if (value === null || found.has(value)) continue;
+        // As the tab bar names it: two tabs of one session told apart.
+        found.set(value, this.ws.nameOf(view));
+        if (found.size >= max) break;
+      }
+      if (left < 0 || found.size >= max) break;
+    }
+    return [...found].map(([value, tab]) => ({ value, tab }));
+  }
+
+  /** The output's logical lines (a wrapped line joined into one), the newest first. */
+  private *recentLines(): Generator<string> {
+    const buf = this.term.buffer.active;
+    const parts: string[] = [];
+    for (let y = buf.length - 1; y >= 0; y--) {
+      const line = buf.getLine(y);
+      if (!line) continue;
+      parts.push(rowText(buf, y).text);
+      if (line.isWrapped) continue;
+      yield parts.reverse().join("");
+      parts.length = 0;
+    }
+    // A line whose start has left the scrollback.
+    if (parts.length) yield parts.reverse().join("");
   }
 
   /** The output as logical lines (a wrapped line joined into one) and the
@@ -3655,8 +4086,17 @@ export class TerminalView implements View {
       }
       return out + esc(m.text.slice(at));
     };
+    // When each line arrived (a console message or a log line carries no
+    // time of its own): a column only when some line's time is known, blank
+    // for a line whose time is not (never another line's).
+    const now = Date.now();
+    const times = groups.map((g) => g.res.matches.map((x) => g.view.lineTime(x.row)));
+    const timed = times.some((t) => t.some((v) => v !== null));
+    const timeCell = (t: number | null) => (timed ? `<span class="tm">${t === null ? "" : clockText(t, now)}</span>` : "");
     const rows = (g: (typeof groups)[number], gi: number) =>
-      g.res.matches.map((x, i) => `<button type="button" class="match-row" data-g="${gi}" data-i="${i}" data-i18n-skip><span class="ln">${x.row + 1}</span><span class="tx">${marked(x) || " "}</span></button>`).join("");
+      g.res.matches
+        .map((x, i) => `<button type="button" class="match-row" data-g="${gi}" data-i="${i}" data-i18n-skip><span class="ln">${x.row + 1}</span>${timeCell(times[gi][i])}<span class="tx">${marked(x) || " "}</span></button>`)
+        .join("");
     // The tab names are the user's own (never translated); the counts are not.
     const list = groups
       .map((g, gi) => (everywhere ? `<div class="match-tab"><b data-i18n-skip>${esc(g.name)}</b><span class="muted">${g.res.matches.length}개 줄</span></div>` : "") + rows(g, gi))
@@ -3668,7 +4108,7 @@ export class TerminalView implements View {
       width: 860,
       body: `<p class="muted small"><span>${total}개 줄</span>${everywhere ? ` · <span>${groups.length}개 탭</span>` : ""}${more ? ` · <span>처음 ${LIMIT}줄만 보여 줍니다</span>` : ""}</p>
         <div class="match-list mono">${list}</div>`,
-      footer: `<button class="btn" data-close>닫기</button>${others ? `<button class="btn" data-everywhere>${icon("Search", 14)}모든 터미널 탭에서</button>` : ""}<button class="btn" data-copy>${icon("Copy", 14)}모두 복사</button>`,
+      footer: `<button class="btn" data-close>닫기</button>${others ? `<button class="btn" data-everywhere>${icon("Search", 14)}모든 터미널 탭에서</button>` : ""}${timed ? `<button class="btn" data-copy-times>${icon("Clock", 14)}시각과 함께 복사</button>` : ""}<button class="btn" data-copy>${icon("Copy", 14)}모두 복사</button>`,
       onClose: () => groups.forEach((g) => g.res.dispose()),
     });
     m.root.querySelector(".match-list")!.addEventListener("click", (e) => {
@@ -3692,11 +4132,19 @@ export class TerminalView implements View {
       m.close();
       this.matchList(query, opts, true);
     });
-    m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
-      const lines = (g: (typeof groups)[number]) => g.res.matches.map((x) => x.text.trimEnd()).join("\n");
-      void writeClipboard(everywhere ? groups.map((g) => `[${g.name}]\n${lines(g)}`).join("\n\n") : lines(groups[0]));
+    // Each line as it reads, or with the time it arrived in front (a record
+    // of when a link went down, for a report); a line whose time is not
+    // known gets blanks as wide, so the lines stay aligned.
+    const copy = (withTimes: boolean) => {
+      const shown = times.map((ts) => ts.map((t) => (t === null ? "" : clockText(t, now))));
+      const width = Math.max(0, ...shown.flat().map((s) => s.length));
+      const lines = (g: (typeof groups)[number], gi: number) =>
+        g.res.matches.map((x, i) => (withTimes ? `${shown[gi][i].padEnd(width)}  ` : "") + x.text.trimEnd()).join("\n");
+      void writeClipboard(everywhere ? groups.map((g, gi) => `[${g.name}]\n${lines(g, gi)}`).join("\n\n") : lines(groups[0], 0));
       toast(`${total}줄을 복사했습니다`, "success", 2000);
-    });
+    };
+    m.root.querySelector("[data-copy]")!.addEventListener("click", () => copy(false));
+    m.root.querySelector("[data-copy-times]")?.addEventListener("click", () => copy(true));
   }
 
   /** Case and regex as the user had them before findInTerminal set its own. */
@@ -3719,8 +4167,9 @@ export class TerminalView implements View {
     input.dispatchEvent(new Event("input"));
   }
 
-  /** What to do with an address clicked in the output. Nothing connects from
-   * here: a new session opens in the editor first. */
+  /** What to do with an address clicked in the output. A new session opens in
+   * the editor first; only a saved session's own "Connect" item connects, once
+   * per click (as in the network tools and the Syslog window). */
   private addressMenu(ip: string, port: number | null, prefix: number | null, x: number, y: number) {
     const address = port ? `${ip}:${port}` : ip;
     // A port names the protocol when it is a well-known one ("10.0.0.5:3389");
@@ -3729,7 +4178,22 @@ export class TerminalView implements View {
     const known = port ? byPort[port] : undefined;
     const protocol: Protocol = known ?? (this.session.protocol === "telnet" ? "telnet" : "ssh");
     const sender = syslogSender(ip);
+    // That device's tab, already open (a neighbour in an ARP table): gone to.
+    // Otherwise its saved sessions, to connect; none for this tab's own device.
+    const key = ip.toLowerCase();
+    const theirs = this.ws.liveTab((t) => t.view !== this && t.session.host.trim().toLowerCase() === key);
+    const own = this.session.host.trim().toLowerCase() === key;
+    // Its MAC, as an ARP table in a tab gives it: each opens that MAC's menu
+    // (which switch port: "모든 터미널 탭에서 찾기" there).
+    const macs = this.macsOfIp(ip);
     contextMenu(x, y, [
+      // What kind of address it is (private, CGNAT, loopback…), as the subnet calculator says.
+      ...(ip.includes(":") ? [] : [{ label: addressKind(ip), icon: "Info", heading: true }, "-" as const]),
+      ...(theirs
+        ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => this.ws.activate(theirs.id) }]
+        : own
+          ? []
+          : savedSessionItems(ip, () => {})),
       { label: "이 주소로 새 세션 만들기…", icon: "Plus", hint: address, action: () => this.ws.newSessionHandler?.({ protocol, host: ip, ...(known ? { port } : {}) }) },
       { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip)) },
       // Watching it come back after a restart, at once.
@@ -3738,11 +4202,19 @@ export class TerminalView implements View {
       ...(ip.includes(":") ? [] : [{ label: "경로 추적", icon: "Waypoints", hint: ip, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "trace", null, true)) }]),
       // With the prefix written next to it ("/24", a netmask) when there is one.
       { label: "서브넷 계산", icon: "Network", hint: prefix !== null ? `${ip}/${prefix}` : undefined, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "subnet", prefix)) },
+      // The other devices on its subnet (an interface's address in "show ip
+      // interface"): the IP scan filled in, started by its Run button. Only a
+      // prefix the scan takes (/22 at most); none written is the scan's /24.
+      ...(!ip.includes(":") && (prefix === null || (prefix >= 22 && prefix <= 32))
+        ? [{ label: "이 서브넷 스캔…", icon: "Radar", hint: `${ip}/${prefix ?? 24}`, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "sweep", prefix)) }]
+        : []),
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(address) },
       // The device's own log messages, when the Syslog receiver has some from it.
       ...(sender ? [{ label: "이 장비의 Syslog 메시지", icon: "ScrollText", action: () => openSyslog(sender) }] : []),
       // Which device's output holds it (an ARP table, a neighbor list on each).
       ...(this.otherTerminals().length ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", hint: ip, action: () => this.matchList(addressPattern(ip), { regex: true, caseSensitive: false }, true) }] : []),
+      ...(macs.length ? ["-" as const] : []),
+      ...macs.map((m) => ({ label: macFormats(m.value)[0].text, userLabel: true, icon: "Cable", hint: m.tab, userHint: true, action: () => this.macMenu(m.value, x, y) })),
     ]);
   }
 
@@ -3967,11 +4439,37 @@ export class TerminalView implements View {
     else if (!this.ackTimer) this.ackTimer = window.setTimeout(send, 50);
   }
 
+  /** How a connection that ended with `code` went, from what exited() reads
+   * below: given up on purpose ("다시 연결", closing), a login that never went
+   * through (only ssh.exe's own messages, a failed or unfinished login: the
+   * attempt failed though output came), a drop, or an ordinary end. */
+  private endedHow(code: number): "failed" | "error" | "closed" {
+    if (this.closing) return "closed";
+    const p = this.session.protocol;
+    if (p === "ssh" || p === "telnet") {
+      const lines = plainLines(new TextDecoder().decode(this.endBytes));
+      const refused = loginFailure(lines);
+      // A login refused, or (ssh) nothing but ssh.exe's own messages before it ended.
+      if (!this.loggedIn && (refused || (p === "ssh" && code && !loginThrough(lines)))) return "failed";
+      if (refused && code) return "failed";
+      // As exited() decides a Telnet end: not through unless the device's own prompt was last.
+      if (p === "telnet" && code && (!this.loggedIn || !loginThrough(lines))) return "failed";
+    }
+    if (!code) return "closed";
+    if (p === "ssh") return code === 255 ? "error" : "closed";
+    return "error";
+  }
+
+  historyEnd(): "failed" | "error" | "closed" | null {
+    return this.endedAs;
+  }
+
   exited(id: string, code: number) {
     if (id === this.runtimeId) this.stopPaste(true);
     if (id !== this.runtimeId) return;
     this.stopMonitor();
     clearTimeout(this.loginTimer);
+    this.endedAs = this.endedHow(code);
     this.setState("closed");
     this.writeNote(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
     // A serial line ends with an error only when the port went away.

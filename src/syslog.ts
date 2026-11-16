@@ -6,9 +6,10 @@ import { api, on, pickSavePath, type SyslogMessage, type SyslogStatus } from "./
 import { writeClipboard } from "./clipboard";
 import { tr, userText } from "./i18n";
 import { icon } from "./icons";
+import { linkDowns } from "./ipLinks";
 import { clockText } from "./lineTimes";
 import { state } from "./store";
-import { newSessionHandler, openNetworkTools, savedSessionItems } from "./nettools";
+import { deviceItems, newSessionHandler, openNetworkTools } from "./nettools";
 import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, formatBytes, markTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, setPressed, timestamp, toast } from "./ui";
 
 /** Messages kept (the oldest go first), and the text they may hold in all. */
@@ -191,11 +192,6 @@ function sessionNames(): Map<string, string> {
 const rowHtml = (x: Kept, names: Map<string, string>, terms: string[]) =>
   `<div class="syslog-row sev-${x.severity ?? "x"}${hasAlertWord(x.lower) ? " word-hit" : ""}" data-seq="${x.seq}"><time>${clockText(x.at)}</time><span class="from" data-i18n-skip${names.has(x.from) ? ` title="${esc(names.get(x.from)!)}"` : ""}>${markTerms(x.from, terms)}</span><span class="sev">${x.severity !== null ? SEVERITY[x.severity] : "-"}</span><span class="tx" data-i18n-skip>${markTerms(x.text, terms)}</span></div>`;
 
-/** The open tabs connected to an address (main's), each a way to bring it to the front. */
-let tabsOf: (ip: string) => (() => void)[] = () => [];
-export function setSyslogTabs(f: (ip: string) => (() => void)[]) {
-  tabsOf = f;
-}
 /** Marks the open tabs connected to an address that sent an alert-worthy message (main's). */
 let markTabsOf: (ip: string) => void = () => {};
 export function setSyslogTabMarker(f: (ip: string) => void) {
@@ -247,7 +243,7 @@ export function openSyslog(from?: string) {
         <div class="syslog-tools">
           <label class="pane-filter syslog-filter" title="주소나 내용으로 거르기">${icon("Search", 13)}<input placeholder="필터" spellcheck="false"/></label>
           <button type="button" class="syslog-only" data-only hidden title="모든 장비의 메시지 보기">${icon("X", 12)}<span>보낸 곳</span><code data-i18n-skip></code></button>
-          <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기">${icon("Server", 13)}보낸 곳</button>
+          <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기 · 링크가 자주 끊긴 포트도 함께 보기">${icon("Server", 13)}보낸 곳</button>
           <select name="level" title="심각도">
             <option value="7">모든 심각도</option>
             <option value="4">warning 이상</option>
@@ -263,11 +259,14 @@ export function openSyslog(from?: string) {
             <button type="button" class="btn btn-sm" data-clear>${icon("Eraser", 13)}지우기</button>
           </span>
         </div>
+        <div class="syslog-rate" data-rate hidden><span class="muted small" data-rate-label></span><svg viewBox="0 0 60 24" preserveAspectRatio="none" aria-hidden="true"></svg></div>
         <div class="syslog-list mono" role="log"></div>
       </div>`,
     footer: `<button class="btn" data-close>닫기</button><button class="btn btn-primary" data-toggle></button>`,
     onClose: () => {
       clearInterval(sizeTimer);
+      clearInterval(rateTimer);
+      clearTimeout(rateLater);
       openWindow = null;
       showSender = null;
       off();
@@ -296,6 +295,72 @@ export function openSyslog(from?: string) {
   const onlyChip = m.root.querySelector<HTMLButtonElement>("[data-only]")!;
   let busy = false;
   let frame = 0;
+
+  /** The last hour's messages a minute at a time, as bars (all received,
+   * whatever the filter): a storm of messages, or when a device went quiet,
+   * seen at a glance; a minute with an err-or-worse message in red. Drawn at
+   * most once a second however fast they come, and moved on as minutes pass. */
+  const rateBox = m.root.querySelector<HTMLElement>("[data-rate]")!;
+  const rateSvg = rateBox.querySelector("svg")!;
+  const rateLabel = rateBox.querySelector<HTMLElement>("[data-rate-label]")!;
+  let rateAt = 0;
+  let rateLater = 0;
+  const drawRate = (force = false) => {
+    const now = Date.now();
+    if (!force && now - rateAt < 1000) {
+      // Drawn once the second is up, so the last messages are not left out.
+      if (!rateLater) rateLater = window.setTimeout(() => ((rateLater = 0), drawRate(true)), 1000 - (now - rateAt));
+      return;
+    }
+    clearTimeout(rateLater);
+    rateLater = 0;
+    rateAt = now;
+    const MIN = 60_000;
+    // The current minute is the last bar.
+    const end = Math.floor(now / MIN) * MIN + MIN;
+    const counts = new Array<number>(60).fill(0);
+    const bad = new Array<boolean>(60).fill(false);
+    // Kept in the order they came: from the newest back, until an hour ago.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const x = messages[i];
+      const k = 59 - Math.floor((end - 1 - x.at) / MIN);
+      if (k < 0) break;
+      if (k > 59) continue;
+      counts[k]++;
+      if (x.severity !== null && x.severity <= 3) bad[k] = true;
+    }
+    const top = Math.max(...counts);
+    rateBox.hidden = top === 0;
+    if (!top) return;
+    rateLabel.textContent = `최근 60분 분당 메시지 (최대 ${top}개)`;
+    rateSvg.innerHTML = counts
+      .map((c, k) => {
+        if (!c) return "";
+        const hgt = Math.max(1.5, (22 * c) / top);
+        const at = new Date(end - (60 - k) * MIN);
+        const hm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+        return `<rect class="${bad[k] ? "bad" : ""}" data-from="${at.getTime()}" x="${k + 0.1}" y="${24 - hgt}" width="0.8" height="${hgt}"><title>${hm} · ${c}</title></rect>`;
+      })
+      .join("");
+  };
+  const rateTimer = window.setInterval(() => drawRate(true), 15_000);
+  // A bar clicked: the list goes to that minute's first message it shows
+  // (the filter or the list's length may leave it out: then said so).
+  rateSvg.addEventListener("click", (e) => {
+    const from = Number((e.target as Element).closest("rect")?.getAttribute("data-from"));
+    if (!from) return;
+    // The rows shown, by their message's number: looked up once, not per message.
+    const shown = new Map<number, HTMLElement>();
+    for (const el of list.querySelectorAll<HTMLElement>(".syslog-row")) shown.set(Number(el.dataset.seq), el);
+    const first = messages.find((x) => x.at >= from && x.at < from + 60_000 && shown.has(x.seq));
+    const row = first && shown.get(first.seq);
+    if (!row) return void toast("그 분의 메시지가 목록에 없습니다 (필터나 표시 개수 때문)", "info", 2500);
+    row.scrollIntoView({ block: "center" });
+    row.classList.remove("flash");
+    void row.offsetWidth;
+    row.classList.add("flash");
+    row.addEventListener("animationend", () => row.classList.remove("flash"), { once: true });
+  });
   /** Only the messages of this sender, its address exactly (the filter box
    * matches parts: "10.0.0.2" there lets "10.0.0.20" through too). */
   let onlyFrom: string | null = null;
@@ -320,8 +385,30 @@ export function openSyslog(from?: string) {
     render();
   };
   const visible = () => messages.filter(passes());
+  // Ports whose link went down, the most often first (ipLinks.linkDowns), as
+  // menu items that show that port's lines.
+  const portItems = (names: Map<string, string>) => {
+    return linkDowns(messages)
+      .slice(0, 10)
+      .map((c) => ({
+        // The port and its device, as written (never translated).
+        label: `${c.iface} · ${names.get(c.from) ?? c.from}`,
+        userLabel: true,
+        icon: c.last === "up" ? "Activity" : c.last === "admin-down" ? "Ban" : "TriangleAlert",
+        // Cisco's own words: how many times down, and its state now.
+        hint: `down ${c.downs} · ${c.last === "admin-down" ? "administratively down" : c.last}`,
+        userHint: true,
+        action: () => {
+          // That device alone, and that port's lines: "Gi1/0/1," so that
+          // Gi1/0/10's are not let through.
+          filterIn.value = `${c.iface},`;
+          showOnly(c.from);
+        },
+      }));
+  };
   // The senders of the kept messages, the busiest first, with how many of
-  // theirs are err or worse: which device is the noisy or failing one.
+  // theirs are err or worse: which device is the noisy or failing one; then
+  // their ports whose link went down.
   m.root.querySelector<HTMLElement>("[data-senders]")!.addEventListener("click", (e) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const per = new Map<string, { n: number; bad: number }>();
@@ -334,6 +421,7 @@ export function openSyslog(from?: string) {
     if (!per.size) return void toast("아직 받은 메시지가 없습니다.", "info");
     const names = sessionNames();
     const top = [...per].sort((a, b) => b[1].n - a[1].n || a[0].localeCompare(b[0])).slice(0, 20);
+    const ports = portItems(names);
     contextMenu(r.left, r.bottom + 4, [
       ...(onlyFrom !== null ? [{ label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }, "-" as const] : []),
       ...top.map(([ip, c]) => ({
@@ -344,6 +432,7 @@ export function openSyslog(from?: string) {
         userHint: true,
         action: () => showOnly(ip),
       })),
+      ...(ports.length ? ["-" as const, { label: "포트 상태 변화", icon: "Activity", heading: true }, ...ports] : []),
     ]);
   });
 
@@ -352,7 +441,13 @@ export function openSyslog(from?: string) {
     form.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = !!status || busy));
     toggle.disabled = busy;
     toggle.className = `btn ${status ? "btn-danger" : "btn-primary"}`;
-    toggle.innerHTML = status ? `${icon("Square", 14)}수신 중지` : `${icon("Play", 14)}수신 시작`;
+    // Redrawn once per batch of messages: its icon and label replaced only
+    // when they change, so a press is not lost to a redraw under the mouse.
+    const label = status ? "stop" : "start";
+    if (toggle.dataset.drawn !== label) {
+      toggle.dataset.drawn = label;
+      toggle.innerHTML = status ? `${icon("Square", 14)}수신 중지` : `${icon("Play", 14)}수신 시작`;
+    }
     const html = status
       ? `<div class="ftpd-on"><span class="sb-dot connected"></span><b>수신 중</b><span class="muted">UDP ${status.port}</span></div>
          <div class="ftpd-addrs">${status.addresses
@@ -478,6 +573,7 @@ export function openSyslog(from?: string) {
     frame = requestAnimationFrame(() => {
       frame = 0;
       renderState();
+      drawRate();
       if (selecting()) waiting = true;
       else renderList();
     });
@@ -538,9 +634,7 @@ export function openSyslog(from?: string) {
         : { label: "이 장비의 메시지만 보기", icon: "ListFilter", action: () => showOnly(ip) },
       // Its console or shell, already open: the window steps aside for it.
       // Otherwise its saved sessions, to connect (the window closes first; receiving goes on).
-      ...(tabsOf(ip).length
-        ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => (m.close(), tabsOf(ip)[0]?.()) }]
-        : savedSessionItems(ip, () => m.close())),
+      ...deviceItems(ip, () => m.close()),
       { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools(ip) },
       // The window closes as the session connects (receiving goes on), so its tab is not left behind it.
       ...(make ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => make({ protocol: "ssh", host: ip }, () => m.close()) }] : []),

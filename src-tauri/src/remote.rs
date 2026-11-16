@@ -2439,9 +2439,98 @@ fn local_stat_blocking(path: &str) -> Result<(u64, u64), String> {
     Ok((modified, meta.len()))
 }
 
+/// SHA-256 and SHA-512 of a local file (lower-case hex), read a piece at a
+/// time in one pass: to check an image against the value its vendor publishes
+/// before it is uploaded to a device.
 #[tauri::command]
-pub async fn local_op(op: String, path: String, target: Option<String>) -> Result<(), String> {
-    off_ui(move || local_op_blocking(&op, &path, target)).await
+pub async fn local_hash(path: String) -> Result<(String, String), String> {
+    off_ui(move || local_hash_blocking(&path)).await
+}
+
+fn local_hash_blocking(p: &str) -> Result<(String, String), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(p).map_err(|e| format!("{p} 를 읽을 수 없습니다: {e}"))?;
+    let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut sha512 = ring::digest::Context::new(&ring::digest::SHA512);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("{p} 를 읽을 수 없습니다: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        sha256.update(&buf[..n]);
+        sha512.update(&buf[..n]);
+    }
+    let hex = |d: ring::digest::Digest| d.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok((hex(sha256.finish()), hex(sha512.finish())))
+}
+
+#[tauri::command]
+pub async fn local_op(window: tauri::WebviewWindow, op: String, path: String, target: Option<String>) -> Result<(), String> {
+    // The window owns the shell's question before a permanent delete (no
+    // Recycle Bin there): as a number, a window handle is not Send.
+    let owner = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    off_ui(move || local_op_blocking(&op, &path, target, owner)).await
+}
+
+/// Delete a file or folder (with its contents) into the Recycle Bin, as
+/// Explorer does, so a mistake can be undone. Where there is no Recycle Bin
+/// (a network share, some removable drives) or the item is too large for it,
+/// the shell asks before deleting it for good (FOF_WANTNUKEWARNING), owned by
+/// the app's window; declining leaves it in place.
+fn recycle(path: &Path, owner: isize) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW};
+    use std::path::{Component, Prefix};
+    // A relative path would be taken from the process's current folder.
+    if !path.is_absolute() {
+        return Err("작업에 실패했습니다: 전체 경로가 아닙니다".into());
+    }
+    // The shell reads "*" and "?" as wildcards and follows "..": a path is
+    // only ever one listed item, named as it is (a "." inside still names the
+    // same item; Path's components skip it). (A listed name never
+    // holds them: Windows does not allow "*" or "?" in a name.)
+    let plain = path.components().all(|c| match c {
+        Component::Prefix(p) => !matches!(p.kind(), Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_)),
+        Component::RootDir => true,
+        Component::Normal(n) => !n.to_string_lossy().contains(['*', '?']),
+        Component::CurDir | Component::ParentDir => false,
+    });
+    // The shell takes no "\\?\" path and nothing of MAX_PATH (260) or more:
+    // said plainly, never deleted for good some other way instead.
+    let long = path.as_os_str().encode_wide().count() >= 260;
+    if long || path.as_os_str().to_string_lossy().starts_with(r"\\?\") {
+        return Err("경로가 너무 길어 휴지통으로 보낼 수 없습니다 (260자 이상). 탐색기에서 지우거나 이름을 줄이세요".into());
+    }
+    if !plain {
+        return Err("작업에 실패했습니다: 이 경로는 지울 수 없습니다".into());
+    }
+    // The list of paths ends with two NULs: this one path, then an empty one.
+    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: owner as _,
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        pTo: std::ptr::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING) as u16,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+    // SAFETY: `from` is a double-NUL-terminated UTF-16 list that outlives the
+    // call; no target, name mappings or title are used.
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if op.fAnyOperationsAborted != 0 {
+        return Err("삭제하지 않았습니다 (영구 삭제를 취소함)".into());
+    }
+    if code != 0 {
+        return Err(format!("작업에 실패했습니다: 코드 {code:#x}"));
+    }
+    // The shell reports some refusals as success: it is gone or it is not.
+    if path.symlink_metadata().is_ok() {
+        return Err("작업에 실패했습니다: 삭제되지 않았습니다".into());
+    }
+    Ok(())
 }
 
 /// Rename that fails if the target exists (std::fs::rename silently replaces
@@ -2455,7 +2544,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
-fn local_op_blocking(op: &str, path: &str, target: Option<String>) -> Result<(), String> {
+fn local_op_blocking(op: &str, path: &str, target: Option<String>, owner: isize) -> Result<(), String> {
     // A drive or share root has no parent: never delete or rename one.
     if matches!(op, "rename" | "delete") && Path::new(path).parent().is_none() {
         return Err("드라이브 전체는 지우거나 이름을 바꿀 수 없습니다".into());
@@ -2475,13 +2564,7 @@ fn local_op_blocking(op: &str, path: &str, target: Option<String>) -> Result<(),
                 }
             });
         }
-        "delete" => {
-            if Path::new(path).is_dir() {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            }
-        }
+        "delete" => return recycle(Path::new(path), owner),
         _ => return Err("알 수 없는 작업입니다".into()),
     };
     res.map_err(|e| format!("작업에 실패했습니다: {e}"))
@@ -2624,6 +2707,36 @@ pub fn test_connect_ftp(host: &str, port: u16, security: &str) -> Result<(Vec<Fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local delete goes to the Recycle Bin (and leaves nothing behind); a
+    /// relative path is refused. Ignored by default: it puts a small file in
+    /// the Recycle Bin of whoever runs it (`cargo test recycle -- --ignored`).
+    #[test]
+    #[ignore]
+    fn local_delete_goes_to_the_recycle_bin() {
+        let dir = std::env::temp_dir().join(format!("bananaconn-recycle-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner").join("a.txt"), b"x").unwrap();
+        recycle(&dir, 0).unwrap();
+        assert!(!dir.exists());
+        assert!(recycle(Path::new("relative-name.txt"), 0).is_err());
+    }
+
+    /// Paths the shell would read as more than the one item are refused before
+    /// anything is deleted: wildcards, "..","\\?\" and MAX_PATH or
+    /// more. Under a folder that does not exist, so a gap here deletes nothing.
+    #[test]
+    fn recycle_refuses_paths_the_shell_would_widen() {
+        let none = std::env::temp_dir().join(format!("bananaconn-no-such-folder-{}", std::process::id()));
+        assert!(!none.exists());
+        for p in [none.join("*"), none.join("a?.txt"), none.join("sub").join("..")] {
+            assert!(recycle(&p, 0).unwrap_err().contains("지울 수 없습니다"), "{}", p.display());
+        }
+        let verbatim = PathBuf::from(format!(r"\\?\{}", none.join("x").display()));
+        assert!(recycle(&verbatim, 0).unwrap_err().contains("너무 길어"));
+        let long = none.join("a".repeat(250));
+        assert!(recycle(&long, 0).unwrap_err().contains("너무 길어"));
+    }
 
     /// A fake FTP server answering from a script; `pasv` is its PASV reply.
     fn hostile_ftp(greeting: &'static str, pasv: &'static str) -> u16 {
@@ -2879,5 +2992,17 @@ mod tests {
         assert!(same_fingerprint(&fp.replace(':', "").to_uppercase(), &fp));
         assert!(!same_fingerprint("", &fp));
         assert!(!same_fingerprint(&cert_fingerprint(b"other"), &fp));
+    }
+
+    #[test]
+    fn local_hash_of_known_text() {
+        let p = std::env::temp_dir().join(format!("bananaconn-hash-{}.txt", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        let (s256, s512) = local_hash_blocking(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(s256, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(s512, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+        let missing = std::env::temp_dir().join("bananaconn-hash-no-such-file.bin");
+        assert!(local_hash_blocking(missing.to_str().unwrap()).is_err());
     }
 }

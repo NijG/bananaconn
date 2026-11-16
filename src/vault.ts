@@ -283,8 +283,12 @@ export function openVault(): Promise<void> {
         // Keep the reveal toggle's icon in step with the now-visible field.
         const reveal = form.querySelector("[data-reveal]");
         if (reveal) reveal.innerHTML = icon("EyeOff", 14);
-        writeClipboard(pw, { secret: true }); // keep the generated password out of clipboard history
-        toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000);
+        // Kept out of the clipboard history (the app's and Windows').
+        void writeClipboard(pw, { secret: true }).then((copied) =>
+          copied
+            ? toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000)
+            : toast("강력한 비밀번호를 만들었지만 클립보드에 복사하지 못했습니다", "warn", 5000),
+        );
       });
       form.querySelector("[data-del]")?.addEventListener("click", async () => {
         const used = state.sessions.filter((s) => s.credentialId === c.id).length;

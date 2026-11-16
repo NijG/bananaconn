@@ -20,7 +20,7 @@ import {
 } from "./importers";
 import type { MenuItem } from "./ui";
 import { icon } from "./icons";
-import { endpoint, isSensitiveOption, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
+import { endpoint, isSensitiveOption, normalizeJumpHost, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
 import { addFolder, reloadCredentials, saveSnippets, state, upsertSessions, type Snippet } from "./store";
 import { addSavedTunnels, parseTunnel, savedTunnels } from "./tunnels";
 import { errorText, esc, modal, sheetCell, timestamp, toast } from "./ui";
@@ -524,6 +524,73 @@ export async function exportBackup() {
   }
 }
 
+/** The saved SSH sessions as an OpenSSH client config, in the keywords
+ * parseSshConfig reads back (Host, HostName, User, Port, ProxyJump), so ssh.exe
+ * and other tools reach the same devices by name. The Host name is the
+ * session's name made one word (spaces to "-", ssh's pattern characters left
+ * out), numbered when two come out the same; the session's own name and folder
+ * go in a comment above it. No secrets and no key paths: a key or password
+ * stays with the app's vault. */
+export function sshConfigText(sessions: Session[]): string {
+  const used = new Set<string>();
+  // ssh splits on blanks and reads "*?!,%" in Host patterns; quotes, too.
+  // Control characters (a line break in an imported host or user name) would
+  // start a line of their own in the file: blanks instead, before anything else.
+  const plain = (v: string) => v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const word = (v: string) => plain(v).replace(/\s+/g, "-").replace(/[*?!,%"'#=]/g, "");
+  const arg = (v: string) => {
+    const p = plain(v);
+    return /[\s"]/.test(p) ? `"${p.replace(/"/g, "")}"` : p;
+  };
+  const blocks = sessions
+    .filter((s) => sshConfigKeeps(s) && plain(s.host))
+    .map((s) => {
+      const base = word(s.name) || word(s.host);
+      let alias = base;
+      for (let n = 2; used.has(alias.toLowerCase()); n++) alias = `${base}-${n}`;
+      used.add(alias.toLowerCase());
+      // One line each: a name or folder with a line break would end the comment.
+      const label = plain([s.folder, s.name].filter(Boolean).join("/"));
+      // A jump list is one word to ssh ("a@b:22,c"): no blanks inside.
+      const jump = normalizeJumpHost(plain(String(s.options.jumpHost ?? ""))).replace(/\s+/g, "");
+      return [
+        `# ${label || plain(s.host)}`,
+        `Host ${alias}`,
+        // "%" starts a token there ("%h"); a literal one (an IPv6 zone, "fe80::1%12")
+        // is "%%", which parseSshConfig reads back as "%".
+        `    HostName ${arg(s.host).replace(/%/g, "%%")}`,
+        ...(plain(s.username) ? [`    User ${arg(s.username)}`] : []),
+        ...(s.port && s.port !== 22 ? [`    Port ${s.port}`] : []),
+        ...(jump ? [`    ProxyJump ${jump}`] : []),
+      ].join("\n");
+    });
+  return blocks.length ? `# Exported from BananaConn ${new Date().toISOString()}\n\n${blocks.join("\n\n")}\n` : "";
+}
+
+/** SSH sessions the export writes. Not one through an SSH gateway (another
+ * saved session the app tunnels through): written without it, ssh would go
+ * straight to the address, perhaps another machine's on a private network. */
+function sshConfigKeeps(s: Session): boolean {
+  return s.protocol === "ssh" && !String(s.options.gateway ?? "");
+}
+
+/** Save the SSH sessions as an OpenSSH config file (sshConfigText). */
+export async function exportSshConfig() {
+  const text = sshConfigText(state.sessions);
+  const viaGateway = state.sessions.filter((s) => s.protocol === "ssh" && !sshConfigKeeps(s)).length;
+  const left = viaGateway ? ` · SSH 게이트웨이를 거치는 세션 ${viaGateway}개는 뺐습니다` : "";
+  if (!text) return toast(`내보낼 SSH 세션이 없습니다${left}`, "warn", 6000);
+  // No extension: ssh reads a file named "config".
+  const path = await pickSavePath("config");
+  if (!path) return;
+  try {
+    await api.saveTextFile(path, text);
+    toast(`SSH 세션 ${(text.match(/^Host /gm) ?? []).length}개를 OpenSSH 설정 파일로 내보냈습니다${left}`, "success", left ? 7000 : 3800);
+  } catch (err) {
+    toast(errorText(err), "error");
+  }
+}
+
 /** Export the session list as CSV (the columns parseCsv reads back), for editing
  * in a spreadsheet or sharing. No secrets — passwords live only in the vault. */
 export async function exportCsv() {
@@ -540,7 +607,7 @@ export async function exportCsv() {
     [s.name, s.protocol, s.host, s.port ?? "", s.username, s.folder, s.protocol === "rdp" ? (s.options.domain ?? "") : ""].map(field).join(","),
   );
   // A UTF-8 BOM so Excel reads Korean names correctly; parseCsv strips it on import.
-  const csv = `﻿${[header.join(","), ...rows].join("\r\n")}\r\n`;
+  const csv = `\uFEFF${[header.join(","), ...rows].join("\r\n")}\r\n`;
   try {
     await api.saveTextFile(path, csv);
     toast(`세션 ${state.sessions.length}개를 내보냈습니다`, "success");

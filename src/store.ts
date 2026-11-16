@@ -445,6 +445,15 @@ export async function patchSession(id: string, patch: Partial<Omit<Session, "id"
   await persistSessions();
 }
 
+/** Several sessions renamed (id → new name) with one save. */
+export async function renameSessions(names: Map<string, string>) {
+  for (const s of state.sessions) {
+    const name = names.get(s.id);
+    if (name !== undefined) s.name = name;
+  }
+  await persistSessions();
+}
+
 /** Pin sessions to the home screen, or unpin them, with one save. */
 export async function pinSessions(ids: Iterable<string>, pinned: boolean) {
   const set = new Set(ids);

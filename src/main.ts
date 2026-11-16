@@ -4,25 +4,26 @@ import "./styles.css";
 import { api, isTauri, revealInExplorer } from "./api";
 import { fileServerBadges, fileServers, initFileServers, openFileServer } from "./fileServers";
 import { ftpServer, ftpServerBadge, initFtpServer, openFtpServer } from "./ftpServer";
-import { initSyslog, openSyslog, setSyslogTabMarker, setSyslogTabs, syslog, syslogBadge, syslogSender } from "./syslog";
+import { initSyslog, openSyslog, setSyslogTabMarker, syslog, syslogBadge, syslogSender } from "./syslog";
 import { mountHome } from "./home";
 import { appLock, initLock, lockNow } from "./lock";
 import { clearAllDeviceAlerts, clearDeviceAlert, deviceAlertList, markDeviceAlert, onDeviceAlerts } from "./deviceAlerts";
-import { openNetworkTools, setDeviceMarker, setNewSessionHandler, setSessionOpener } from "./nettools";
+import { openNetworkTools, setDeviceMarker, setDeviceTabFinder, setNewSessionHandler, setSessionOpener } from "./nettools";
 import { openCommandPalette } from "./palette";
 import { fileSessionFor } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
 import { icon } from "./icons";
+import { parseSubnetInput } from "./ipLinks";
 import { endpoint, newSession, parseTarget, PROTOCOLS, type Protocol, type Session } from "./model";
 import { editSession } from "./sessionEditor";
 import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
 import { loadAll, savesSettled, state, subscribe, touchSession } from "./store";
 import { isLanguage, LANGUAGES, setLanguage, userText, type Language } from "./i18n";
-import { confirmDialog, contextMenu, errorText, esc, type MenuItem, setPressed, toast } from "./ui";
+import { confirmDialog, contextMenu, elapsedText, errorText, esc, installCapsLockHint, type MenuItem, setPressed, toast } from "./ui";
 import { openVault } from "./vault";
 
-import { Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
+import { clockAt, STATE_TEXT, Workspace, type Layout, type MonitorInfo, type View } from "./workspace";
 import { checkForUpdate, installUpdate, loadVersion, onUpdateChange, startAutoUpdate, updateBadge } from "./updates";
 import { ACTIONS, actionFor, withKey } from "./keymap";
 // Loaded on first use: noVNC probes the video decoder when imported, and
@@ -171,13 +172,29 @@ async function edit(existing: Session | null, defaults: Partial<Session> = {}, b
 }
 
 // ---- sidebar & home ----------------------------------------------------------------
-const sidebar = new Sidebar($("#sidebar"), { connect: open, edit, openFiles });
+const sidebar = new Sidebar($("#sidebar"), {
+  connect: open,
+  edit,
+  openFiles,
+  // The most live of its tabs (the one its dot tells of).
+  goToTab: (id) => {
+    const best = ws.liveTab((t) => t.session.id === id);
+    if (best) ws.activate(best.id);
+  },
+});
 ws.editHandler = (s) => void edit(s);
 ws.newSessionHandler = (defaults) => void edit(null, defaults);
 setNewSessionHandler((defaults, beforeConnect) => void edit(null, defaults, beforeConnect));
 setSessionOpener(open);
-// A syslog sender's open tabs (connected to that address), to go to from its messages.
-setSyslogTabs((ip) => ws.tabs.filter((t) => t.session.host.trim().toLowerCase() === ip.toLowerCase()).map((t) => () => ws.activate(t.id)));
+// Any password box (logins, the master password, the vault): Caps Lock on is said under it.
+installCapsLockHint();
+// An address's open tab (the most live of them), to go to from the address
+// menus of the Syslog window and the network tools.
+setDeviceTabFinder((ip) => {
+  const key = ip.trim().toLowerCase();
+  const tab = ws.liveTab((t) => t.session.host.trim().toLowerCase() === key);
+  return tab ? { state: tab.view.state, go: () => ws.activate(tab.id) } : null;
+});
 // A tab's device that sent Syslog messages: they open from the tab's menu too.
 ws.tabMenuExtra = (s) => {
   const sender = syslogSender(s.host);
@@ -189,6 +206,11 @@ setSyslogTabMarker((ip) => markDevice(ip, "이 장비에서 Syslog 경보 메시
 setDeviceMarker((host) => markDevice(host, "연속 ping에 응답하지 않습니다"));
 // A sweep or continuous ping a reloaded page left running ends (nettools.rs net_stop_all).
 void api.netStopAll().catch(() => {});
+// And the taskbar button's transfer progress it left showing (views/files.ts updateTaskbar).
+if (isTauri)
+  void import("@tauri-apps/api/window")
+    .then(({ getCurrentWindow, ProgressBarStatus }) => getCurrentWindow().setProgressBar({ status: ProgressBarStatus.None }))
+    .catch(() => {});
 // A quick connection's settings in a new session's editor (the open tab stays as it is).
 ws.saveAsHandler = (s) =>
   void edit(null, {
@@ -249,17 +271,51 @@ const quickList = document.createElement("datalist");
 quickList.id = "quick-history";
 document.body.appendChild(quickList);
 quickTarget.setAttribute("list", "quick-history");
+/** A quick connection as it is remembered: a URL's password ("ssh://root:pw@host")
+ * left out, as parseTarget leaves it out of the connection. The rest as typed. */
+function withoutPassword(text: string): string {
+  // Up to the last "@" all the way, with or without a scheme: a password
+  // holding "/", "?" or "#" (which a URL does not allow unencoded, so the
+  // connection reads it otherwise) is left out of the history all the same.
+  const m = /^([a-zA-Z][\w+.-]*:\/\/)?([\s\S]*)$/.exec(text)!;
+  const rest = m[2];
+  const at = rest.lastIndexOf("@");
+  if (at < 0 || !rest.slice(0, at).includes(":")) return text;
+  const user = rest.slice(0, at).split(":")[0];
+  return `${m[1] ?? ""}${user ? `${user}@` : ""}${rest.slice(at + 1)}`;
+}
+/** The quick connections typed before, by protocol. One remembered with a
+ * password by an earlier version is put back without it, and saved so. */
 const quickHistory = (): Record<string, string[]> => {
+  let all: Record<string, string[]>;
   try {
-    return JSON.parse(localStorage.getItem("bx.quickHistory") ?? "{}");
+    all = JSON.parse(localStorage.getItem("bx.quickHistory") ?? "{}");
   } catch {
     return {};
   }
+  if (!all || typeof all !== "object" || Array.isArray(all)) return {};
+  let cleaned = false;
+  for (const [proto, list] of Object.entries(all)) {
+    if (!Array.isArray(list)) continue;
+    const kept = [...new Set(list.filter((t): t is string => typeof t === "string").map(withoutPassword))];
+    if (kept.length !== list.length || kept.some((t, i) => t !== list[i])) {
+      all[proto] = kept;
+      cleaned = true;
+    }
+  }
+  if (cleaned)
+    try {
+      localStorage.setItem("bx.quickHistory", JSON.stringify(all));
+    } catch {
+      // Stored as it was; read clean all the same.
+    }
+  return all;
 };
 function renderQuickHistory() {
   quickList.innerHTML = (quickHistory()[quickProto.value] ?? []).map((t) => `<option value="${esc(t)}">`).join("");
 }
-function rememberQuick(proto: string, target: string) {
+function rememberQuick(proto: string, typed: string) {
+  const target = withoutPassword(typed);
   const all = quickHistory();
   all[proto] = [target, ...(all[proto] ?? []).filter((t) => t !== target)].slice(0, 12);
   localStorage.setItem("bx.quickHistory", JSON.stringify(all));
@@ -296,7 +352,18 @@ $("#quick").addEventListener("submit", (e) => {
   const protocol = quickProto.value as Protocol;
   if (protocol === "serial") return void openQuickSerial(quickTarget.value);
   const target = parseTarget(quickTarget.value);
-  if (!target) return toast("형식: user@host:port (예: root@192.168.0.10:22)", "warn");
+  if (!target) {
+    // A subnet typed here ("10.0.0.0/24", "10.0.0.0 255.255.255.0"): the IP
+    // scan with it filled in (run with its own button), or the subnet
+    // calculator for one wider than the scan takes (/22).
+    const sub = parseSubnetInput(quickTarget.value);
+    if (sub?.prefix != null) {
+      openNetworkTools(sub.ip, sub.prefix >= 22 ? "sweep" : "subnet", sub.prefix);
+      quickTarget.value = "";
+      return;
+    }
+    return toast("형식: user@host:port (예: root@192.168.0.10:22)", "warn");
+  }
   const s: Session = {
     ...newSession(protocol),
     id: `quick-${crypto.randomUUID()}`,
@@ -351,7 +418,6 @@ $("#btn-tools").addEventListener("click", (e) => {
 $("#btn-settings").addEventListener("click", () => openSettings());
 
 // ---- status bar ----------------------------------------------------------------------
-const STATE_TEXT = { connecting: "연결 중", connected: "연결됨", closed: "종료됨", error: "오류" };
 function renderStatus() {
   const bar = $("#statusbar");
   document.querySelectorAll<HTMLElement>("[data-layout]").forEach((b) => setPressed(b, b.dataset.layout === ws.layout));
@@ -373,12 +439,24 @@ function renderStatus() {
       <span class="sb-dot ${st.state}"></span>
       <b style="color:${p.color}">${p.label}</b><span data-i18n-skip>${esc(st.endpoint)}</span>
       <span class="muted">${STATE_TEXT[st.state]}</span>
+      ${
+        // How long it has been connected (a device's idle timeout, a work window), to the minute.
+        st.state === "connected" && tab.connectedAt
+          ? `<span class="muted sb-since" title="${esc(`${clockAt(tab.connectedAt)}부터 연결됨`)}">${elapsedText(Date.now() - tab.connectedAt)}</span>`
+          : ""
+      }
       ${st.detail ? `<span class="muted">${esc(st.detail)}</span>` : ""}
       ${st.logPath ? `<button class="sb-log" title="${esc(userText(st.logPath))}">${icon("ScrollText", 13)}로그 기록 중</button>` : ""}
       ${st.device ? `<span class="sb-device" title="자동으로 인식한 장비">${icon("Server", 13)}<span data-i18n-skip>${esc(st.device)}</span></span>` : ""}
       ${monitorChip(st.monitor)}
     </div><div class="sb-right">${right}</div>`);
 }
+
+// The age moves on while nothing else changes: looked at twice a minute
+// (setStatus leaves the bar alone when the minute has not turned).
+setInterval(() => {
+  if (ws.activeTab?.connectedAt) renderStatus();
+}, 30000);
 
 /** Replace the status bar only when its content changed: it is asked to
  * redraw on every monitor sample, and replacing the buttons under the mouse
@@ -409,9 +487,10 @@ $("#statusbar").addEventListener("click", (e) => {
 function alertsMenu(btn: HTMLElement) {
   const r = btn.getBoundingClientRect();
   const items: MenuItem[] = deviceAlertList().slice(0, 20).map(([host, note]) => {
-    const tab = ws.tabs.find((t) => t.session.host.trim().toLowerCase() === host);
+    // The most live of its tabs (a connected one before a closed one), named as the tab bar names it.
+    const tab = ws.liveTab((t) => t.session.host.trim().toLowerCase() === host);
     const saved = state.sessions.find((s) => s.host.trim().toLowerCase() === host);
-    const name = tab ? (tab.label ?? tab.session.name) : saved?.name;
+    const name = tab ? ws.nameOf(tab.view) : saved?.name;
     const sender = syslogSender(host);
     return {
       label: name ? `${name} (${host})` : host,
@@ -436,6 +515,8 @@ subscribe("sessions", () => {
       externalLinks.delete(id);
     }
   if (!ws.activeTab) renderStatus();
+  // A tab opened from a session shows its name: one renamed (the tree's menu) shows at once.
+  if (ws.tabs.length) ws.changed();
 });
 onUpdateChange(renderStatus);
 loadVersion();
@@ -501,6 +582,8 @@ function monitorChip(m: MonitorInfo | null | undefined): string {
     : `<span class="sb-monitor muted">${icon("Activity", 13)}${esc(text[m.kind])}</span>`;
 }
 ws.onChange(renderStatus);
+// The session tree's open-tab dots.
+ws.onChange(() => sidebar.setOpenTabs(ws.tabs.map((t) => ({ sessionId: t.session.id, state: t.view.state }))));
 ftpServer.onChange(renderStatus);
 fileServers.onChange(renderStatus);
 syslog.onChange(renderStatus);
@@ -534,6 +617,22 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
       showTab: (id) => ws.activate(id),
       closed: ws.recentlyClosed(),
       reopen: (s) => ws.reopenClosed(s),
+      newSession: (defaults) => void edit(null, defaults),
+      netTools: (host) => openNetworkTools(host),
+      subnetTools: (ip, prefix, tool) => openNetworkTools(ip, tool, prefix),
+      snippets: (() => {
+        const tab = ws.activeTab;
+        const view = tab?.view;
+        if (!tab || !view?.sendSnippet) return undefined;
+        return {
+          tab: ws.tabTitles().get(tab.id) ?? view.title(),
+          send: (s) => {
+            // Its keys go where the terminal's focus is; the palette had it.
+            view.focus?.();
+            void view.sendSnippet!(s);
+          },
+        };
+      })(),
     }),
   "app.quickConnect": () => quickTarget.focus(),
   "app.toggleSidebar": () => toggleSidebar(),
@@ -546,6 +645,7 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.netTools": () => openNetworkTools(),
   "app.subnet": () => openNetworkTools("", "subnet"),
   "app.compare": () => void import("./diffView").then((m) => m.openDiffFromMenu()),
+  "app.connectHistory": () => void import("./connectHistoryView").then((m) => m.openConnectHistory(undefined, open)),
   "app.lock": () => (appLock.enabled ? void lockNow() : false),
   "app.checkUpdate": () => void checkForUpdate(true),
   "tab.next": () => ws.cycle(1),
@@ -568,6 +668,8 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
     ws.duplicateHandler?.(t.session);
   },
   "tab.reopenClosed": () => ws.reopenLastClosed(),
+  // The tab menu's table of the open tabs; with none open the key is not taken.
+  "tab.copyList": () => (ws.tabs.length ? void ws.copyTabTable() : false),
   "tab.reconnect": () => {
     const v = ws.activeTab?.view;
     if (!v?.reconnect) return false;
@@ -634,6 +736,8 @@ if (isTauri) {
 }
 
 // ---- quitting with live connections ----------------------------------------------------
+// A page going away any other way (a reload) ends the connection history too.
+window.addEventListener("pagehide", () => ws.endAllHistory());
 if (isTauri) {
   import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
     const win = getCurrentWindow();
@@ -647,7 +751,7 @@ if (isTauri) {
         const w = t.view.closeWarning?.();
         return w ? [`<li><b data-i18n-skip>${esc(ws.nameOf(t.view))}</b>: <span>${esc(w)}</span></li>`] : [];
       });
-      if (!work.length && (!live.length || !state.settings.confirmClose)) return;
+      if (!work.length && (!live.length || !state.settings.confirmClose)) return void ws.endAllHistory();
       event.preventDefault();
       const ok = await confirmDialog({
         title: "BananaConn 종료",
@@ -663,6 +767,8 @@ if (isTauri) {
         danger: true,
       });
       if (ok) {
+        // Before dispose: the connections end because the app closes, not the remote end.
+        ws.endAllHistory();
         for (const t of [...ws.tabs]) t.view.dispose();
         await win.destroy();
       }

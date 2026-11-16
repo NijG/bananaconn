@@ -138,6 +138,8 @@ const theme = CodeView.theme(
 export class EditorView implements View {
   el: HTMLElement;
   state: ViewState = "connecting";
+  /** A file of another tab's connection, not a connection of its own. */
+  readonly noConnection = true;
   private code: CodeView | null = null;
   private bom = false;
   private stamp: [number, number] | null = null;
@@ -413,7 +415,7 @@ export class EditorView implements View {
     const path = await pickSavePath(this.name);
     if (!path) return;
     try {
-      const bom = this.bom ? "﻿" : "";
+      const bom = this.bom ? "\uFEFF" : "";
       await api.saveTextFile(path, bom + this.text());
       toast(`내 PC에 저장했습니다: ${userText(path)}`, "success");
     } catch (err) {

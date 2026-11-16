@@ -24,6 +24,25 @@ function fake(dir: string, names: [string, boolean, number][]): FileEntry[] {
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
 
+/** The preview terminal opened last, and a way to show device output in it
+ * from the browser console while checking a feature (`__bxMockOut("…")`):
+ * the preview shell only echoes what is typed, so a "show interfaces" block,
+ * a login question or a log line cannot be produced otherwise. Preview only:
+ * this module is never loaded in the app. */
+let lastTermId: string | null = null;
+(globalThis as { __bxMockOut?: (text: string) => boolean }).__bxMockOut = (text: string) => {
+  if (!lastTermId) return false;
+  mockEmit("term-output", [lastTermId, utf8(text)]);
+  return true;
+};
+/** The last opened preview terminal's connection ends with `code` (as ssh.exe's
+ * 255 for a lost connection): `__bxMockExit(255)`. Preview only. */
+(globalThis as { __bxMockExit?: (code: number) => boolean }).__bxMockExit = (code: number) => {
+  if (!lastTermId) return false;
+  mockEmit("term-exit", [lastTermId, code]);
+  return true;
+};
+
 // The preview's pretend shell edits its line the way a real one does:
 // Backspace (DEL or ^H) erases a character, Ctrl-U the line, Enter starts a
 // new prompt; cursor and function keys are ignored.
@@ -34,6 +53,8 @@ const sweepsCancelled = new Set<string>();
 const mockTunnels = new Map<string, { id: string; localPort: number; target: string; gateway: string; active: number; total: number }>();
 /** Sweeps run so far: every other one answers a little differently. */
 let sweepRuns = 0;
+/** The mock TFTP/HTTP servers running, by kind (what file_server_status reports). */
+const fileServersMock = new Map<string, unknown>();
 /** The mock syslog receiver: a batch of device messages every second while it runs. */
 let syslogMock: { status: { port: number; lan: boolean; addresses: string[]; file: string | null }; timer: number } | null = null;
 const SYSLOG_SAMPLES: [string, number, string][] = [
@@ -217,6 +238,7 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       return;
     case "term_open": {
       const { id, host, username, protocol } = a.req;
+      lastTermId = id;
       setTimeout(() => {
         const lines = [
           `\x1b[90m${protocol.toUpperCase()} ${username || "user"}@${host} (미리보기 모드)\x1b[0m\r\n`,
@@ -261,7 +283,16 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
         sessionStorage.setItem("bx.mock.trusted", "1");
         throw "HOSTKEY_UNKNOWN::SHA256:d7Te2DHmvBNSWJNBWik2KbDTjmWtYHe2bvXTMM9lVg4";
       }
+      // FTP logins to try the login dialogs: none given asks for one, and a
+      // user name in capitals (typed with Caps Lock on) is refused.
+      if ((a.req.protocol === "ftp" || a.req.protocol === "ftps") && !a.req.username && !a.req.password) throw "NEED_PASSWORD";
+      if ((a.req.protocol === "ftp" || a.req.protocol === "ftps") && a.req.username && a.req.username !== a.req.username.toLowerCase())
+        throw "로그인에 실패했습니다 (미리보기: 대문자 사용자 이름)";
       return { home: "/home/" + (a.req.username || "user"), banner: null };
+    // Preview of a delete or chmod the server refuses: README.md (the rest succeed).
+    case "remote_op":
+      if ((a.op === "delete" || a.op === "chmod") && /readme/i.test(String(a.path))) throw "Permission denied (미리보기: README 거부)";
+      return;
     case "remote_list":
       return fake(a.path, [
         ["logs", true, 0],
@@ -272,6 +303,10 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       ]);
     case "local_home":
       return "C:\\Users\\me";
+    case "local_hash":
+      // The digests of "abc" (a preview has no files to read); a path with "slow" takes 2 s.
+      await new Promise((r) => setTimeout(r, String(a.path).includes("slow") ? 2000 : 300));
+      return ["ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"];
     case "local_stat":
       // [modified, size]: a file that grows as the preview runs (the Syslog file's
       // size). Its time stays put: the file windows read it to tell an edited
@@ -290,7 +325,9 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
     case "transfer": {
       const total = 50_000_000;
       for (let done = 0; done <= total; done += 5_000_000) {
-        await new Promise((r) => setTimeout(r, 120));
+        // Uploading backup.zip stalls halfway for a while (the "진행 없음" display).
+        const stall = done === 25_000_000 && String(a.req.localPath).includes("backup.zip");
+        await new Promise((r) => setTimeout(r, stall ? 6_500 : 120));
         mockEmit("transfer-progress", { transferId: a.req.transferId, file: a.req.remotePath, done, total, filesDone: 0 });
       }
       return { filesDone: 1, skipped: 0 };
@@ -400,7 +437,11 @@ ${a.host}에 대한 Ping 통계:
     case "net_dns":
       return { addresses: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"], ms: 12 };
     case "file_server_status":
-      return [];
+      return [...fileServersMock.values()];
+    case "file_server_stop":
+      fileServersMock.delete(a.kind);
+      setTimeout(() => mockEmit("file-server-event", { server: a.kind, kind: "stopped", user: "", detail: "" }), 50);
+      return;
     case "syslog_status":
       return syslogMock?.status ?? null;
     case "syslog_stop":
@@ -426,7 +467,9 @@ ${a.host}에 대한 Ping 통계:
       const c = a.config;
       if (!c.root) throw "공유할 폴더가 없습니다. 폴더를 다시 선택하세요.";
       setTimeout(() => mockEmit("file-server-event", { server: c.kind, kind: "started", user: "", detail: `${c.kind}://127.0.0.1:${c.port}` }), 50);
-      return { kind: c.kind, root: c.root, port: c.port, lan: c.lan, readOnly: c.kind === "http" || c.readOnly, auth: !!c.username, addresses: [`${c.kind}://127.0.0.1:${c.port}`] };
+      const started = { kind: c.kind, root: c.root, port: c.port, lan: c.lan, readOnly: c.kind === "http" || c.readOnly, auth: !!c.username, addresses: [...(c.lan ? [`${c.kind}://192.168.0.10:${c.port}`] : []), `${c.kind}://127.0.0.1:${c.port}`] };
+      fileServersMock.set(c.kind, started);
+      return started;
     }
     case "serial_ports":
       return [{ name: "COM3", description: "USB Serial Port · Prolific" }];

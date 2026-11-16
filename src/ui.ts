@@ -59,6 +59,12 @@ export function timestamp(): string {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
+/** How long, in whole minutes: "12분", "3시간 5분". */
+export function elapsedText(ms: number): string {
+  const m = Math.max(0, Math.floor(ms / 60000));
+  return m < 60 ? `${m}분` : `${Math.floor(m / 60)}시간 ${m % 60}분`;
+}
+
 export function relativeTime(ms: number | null): string {
   if (!ms) return "사용 기록 없음";
   const s = (Date.now() - ms) / 1000;
@@ -477,6 +483,39 @@ export function choiceDialog(opts: {
   });
 }
 
+/** "Caps Lock is on" under any password box being typed in (a login, the
+ * master password, the vault, an API key): a password typed so fails as a
+ * wrong one, and a user name typed so goes in in capitals. Installed once for
+ * the whole page (main.ts); the hint goes right after the box's field. */
+export function installCapsLockHint() {
+  let hint: HTMLElement | null = null;
+  const place = (box: HTMLInputElement) => {
+    hint ??= h("p", { class: "caps-hint" }, `${icon("TriangleAlert", 13)}Caps Lock이 켜져 있습니다`);
+    const after = box.closest<HTMLElement>("label.field, .field") ?? box;
+    if (after.nextElementSibling !== hint) after.after(hint);
+    hint.hidden = false;
+  };
+  const isPassword = (t: EventTarget | null): t is HTMLInputElement => t instanceof HTMLInputElement && t.type === "password";
+  // Caps Lock as the last key or click anywhere told it (a focus change does
+  // not): a password box opened with it already on is told at once.
+  let capsOn = false;
+  const check = (e: KeyboardEvent) => {
+    capsOn = e.getModifierState("CapsLock");
+    // Typing anywhere else puts it away too (a focus change may go unseen).
+    if (isPassword(e.target) && capsOn) place(e.target);
+    else if (hint) hint.hidden = true;
+  };
+  document.addEventListener("keydown", check, true);
+  document.addEventListener("keyup", check, true);
+  document.addEventListener("mousedown", (e) => (capsOn = e.getModifierState("CapsLock")), true);
+  document.addEventListener("focusin", (e) => {
+    if (isPassword(e.target) && capsOn) place(e.target);
+  }, true);
+  document.addEventListener("focusout", (e) => {
+    if (hint && isPassword(e.target)) hint.hidden = true;
+  }, true);
+}
+
 export function promptDialog(opts: {
   title: string;
   label: string;
@@ -579,6 +618,10 @@ export interface MenuItem {
   userLabel?: boolean;
   /** The hint is such text too (a command): never translated. */
   userHint?: boolean;
+  /** Not an action but a heading over the items after it (a group's name, what
+   * an address is): shown plainly, not as a greyed-out item, and skipped by
+   * the arrow keys. */
+  heading?: boolean;
 }
 
 /** The open context menu's close: there is one at a time. */
@@ -596,6 +639,12 @@ export function contextMenu(x: number, y: number, items: (MenuItem | "-")[]) {
   for (const item of items) {
     if (item === "-") {
       menu.appendChild(h("div", { class: "ctx-sep" }));
+      continue;
+    }
+    if (item.heading) {
+      menu.appendChild(
+        h("div", { class: "ctx-head", role: "presentation" }, `${item.icon ? icon(item.icon, 13) : ""}<span${item.userLabel ? " data-i18n-skip" : ""}>${esc(item.label)}</span>`),
+      );
       continue;
     }
     const btn = h(

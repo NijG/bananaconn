@@ -3,12 +3,14 @@
 // the action list and sessions; the caller runs the chosen action or session.
 
 import { icon } from "./icons";
-import { endpoint, PROTOCOLS, sessionSearchText, type Session } from "./model";
-import { ACTIONS, bindings } from "./keymap";
-import { state } from "./store";
+import { endpoint, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
+import { ACTIONS, bindings, SNIPPET_PREFIX } from "./keymap";
+import { state, updateSettings, type Snippet } from "./store";
+import { TERM_THEMES } from "./themes";
 import { deviceAlert, deviceAlertAt } from "./deviceAlerts";
 import { esc, markTerms, matchesTerms, searchTerms } from "./ui";
 import { tr } from "./i18n";
+import { parseSubnetInput, subnetMatcher } from "./ipLinks";
 
 interface Item {
   label: string;
@@ -17,6 +19,10 @@ interface Item {
   keys: string[];
   hay: string;
   run: () => void;
+  /** A session's or tab's address: found by a subnet typed too ("10.0.0.0/24"). */
+  host?: string;
+  /** Listed only for a search, not before anything is typed. */
+  searchedOnly?: boolean;
 }
 
 /** Open the palette. Only one at a time. */
@@ -29,6 +35,16 @@ export function openCommandPalette(opts: {
   /** Sessions of recently closed tabs, newest first, to open again. */
   closed?: Session[];
   reopen?: (s: Session) => void;
+  /** An address typed into the palette: a new session for it (the editor
+   * opens filled in; nothing connects before it is saved), its network tools. */
+  newSession?: (defaults: Partial<Session>) => void;
+  netTools?: (host: string) => void;
+  /** A subnet typed into the palette ("10.0.0.0/24"): the network tools'
+   * IP scan or subnet calculator with it filled in (a scan runs with its own button). */
+  subnetTools?: (ip: string, prefix: number, tool: "sweep" | "subnet") => void;
+  /** The tab in front takes snippets (a terminal): searched snippets and
+   * macros are sent to it, `tab` named on each. */
+  snippets?: { tab: string; send: (s: Snippet) => void };
 }): void {
   if (document.querySelector(".cmdk-backdrop")) return;
 
@@ -47,6 +63,7 @@ export function openCommandPalette(opts: {
       // "탭" / "tab" (the word in the screen language) lists the open tabs.
       hay: `${t.title} ${t.endpoint} ${sessionSearchText(t.session)} 열린 탭 ${tr("열린 탭")}`.toLowerCase(),
       run: () => opts.showTab?.(t.id),
+      host: t.session.host,
     });
   }
   for (const s of opts.closed ?? []) {
@@ -59,6 +76,7 @@ export function openCommandPalette(opts: {
       keys: [],
       hay: `${sessionSearchText(s)} 닫은 탭 ${tr("닫은 탭")}`.toLowerCase(),
       run: () => opts.reopen?.(s),
+      host: s.host,
     });
   }
   // Devices needing attention (deviceAlerts.ts) first, then pinned sessions (the
@@ -77,6 +95,7 @@ export function openCommandPalette(opts: {
       keys: [],
       hay: sessionSearchText(s),
       run: () => opts.openSession(s),
+      host: s.host,
     });
   }
   for (const a of ACTIONS) {
@@ -85,6 +104,42 @@ export function openCommandPalette(opts: {
     const label = tr(a.label);
     const sub = a.note ? tr(a.note) : tr("명령");
     items.push({ label, sub, icon: "Zap", keys: bindings(a.id), hay: `${label} ${a.label} ${a.note ?? ""}`.toLowerCase(), run: () => opts.runAction(a.id) });
+  }
+  // Snippets and macros for the terminal in front, found by name or group
+  // ("스니펫", "snippet" lists them all); only when searched for. Their
+  // commands are not searched: an address typed would match half of them.
+  if (opts.snippets) {
+    const { tab, send } = opts.snippets;
+    for (const s of state.snippets) {
+      // The built-in library's names are translated; the user's own are not (as in the snippet menu).
+      const name = s.group ? tr(s.name) : s.name;
+      const kind = tr(s.macro ? "매크로 재생" : "스니펫 보내기");
+      items.push({
+        label: name,
+        sub: [kind, s.group ? tr(s.group) : "", tab].filter(Boolean).join(" · "),
+        icon: s.macro ? "Circle" : s.run ? "Play" : "ClipboardType",
+        keys: bindings(SNIPPET_PREFIX + s.id),
+        hay: `${name} ${s.name} ${s.group ?? ""} ${s.group ? tr(s.group) : ""} 스니펫 매크로 snippet macro ${kind}`.toLowerCase(),
+        run: () => send(s),
+        searchedOnly: true,
+      });
+    }
+  }
+  // The terminal color themes, each applied at once ("테마", "theme",
+  // "banana"…), the one in use marked; only when searched for, so the list
+  // shown before typing stays the sessions and commands.
+  const themeWord = tr("터미널 테마");
+  for (const [key, t] of Object.entries(TERM_THEMES)) {
+    const current = state.settings.terminalTheme === key;
+    items.push({
+      label: `${themeWord}: ${tr(t.label)}`,
+      sub: current ? tr("지금 쓰는 테마") : tr("명령"),
+      icon: current ? "Check" : "Palette",
+      keys: [],
+      hay: `${themeWord} 터미널 테마 terminal theme ${t.label} ${tr(t.label)} ${key}`.toLowerCase(),
+      run: () => updateSettings({ terminalTheme: key }),
+      searchedOnly: true,
+    });
   }
 
   const root = document.createElement("div");
@@ -100,10 +155,38 @@ export function openCommandPalette(opts: {
   let shown: Item[] = [];
   let sel = 0;
 
+  /** What can be done with the query when it is an address ("10.0.0.9",
+   * "root@sw1:22"), after what it matched: one not saved yet starts a session. */
+  const forAddress = (q: string): Item[] => {
+    const defaults = /[.@:]/.test(q) ? sessionDefaultsFor(q) : null;
+    if (!defaults?.host) return [];
+    const shown = endpoint({ protocol: defaults.protocol ?? "ssh", host: defaults.host, port: defaults.port ?? null, username: defaults.username ?? "" });
+    const host = defaults.host;
+    return [
+      ...(opts.newSession ? [{ label: tr("이 주소로 새 세션 만들기…"), sub: shown, icon: "Plus", keys: [], hay: "", run: () => opts.newSession!(defaults) }] : []),
+      ...(opts.netTools ? [{ label: tr("네트워크 도구"), sub: host, icon: "Activity", keys: [], hay: "", run: () => opts.netTools!(host) }] : []),
+    ];
+  };
+
+  /** What can be done with the query when it is a subnet: scan it (what the
+   * scan takes, /22 to /32) or work it out. */
+  const forSubnet = (q: string): Item[] => {
+    const s = parseSubnetInput(q);
+    if (!s || s.prefix === null || !opts.subnetTools) return [];
+    const { ip, prefix } = s;
+    const sub = `${ip}/${prefix}`;
+    return [
+      ...(prefix >= 22 ? [{ label: tr("이 서브넷 스캔…"), sub, icon: "Radar", keys: [], hay: "", run: () => opts.subnetTools!(ip, prefix, "sweep") }] : []),
+      { label: tr("서브넷 계산"), sub, icon: "Network", keys: [], hay: "", run: () => opts.subnetTools!(ip, prefix, "subnet") },
+    ];
+  };
+
   const matches = (q: string): Item[] => {
-    if (!q) return items.slice(0, 50);
+    if (!q) return items.filter((it) => !it.searchedOnly).slice(0, 50);
     const terms = searchTerms(q);
-    return items.filter((it) => matchesTerms(it.hay, terms)).slice(0, 50);
+    // A subnet ("10.0.0.0/24") also finds what is in it, as the session list's search does.
+    const inSubnet = subnetMatcher(q);
+    return [...items.filter((it) => matchesTerms(it.hay, terms) || (inSubnet !== null && it.host !== undefined && inSubnet(it.host))).slice(0, 50), ...forAddress(q), ...forSubnet(q)];
   };
 
   const render = () => {

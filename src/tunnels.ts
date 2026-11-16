@@ -32,6 +32,14 @@ export const GATEWAY_PROTOCOLS: ReadonlySet<string> = new Set(["telnet", "rdp", 
  * that itself goes through no jump host or gateway (openSshTunnel's rule). */
 export const canBeGateway = (s: Session) => s.protocol === "ssh" && !String(s.options.jumpHost ?? "").trim() && !s.options.gateway;
 
+/** The user name a gateway logs in with, as tunnel.rs picks it: its own,
+ * else its credential's; shown in its prompts (kept as written), "사용자"
+ * (app text) when neither has one. */
+function gatewayUserText(gw: Session): string {
+  const user = gw.username || state.credentials.find((c) => c.id === gw.credentialId)?.username || "";
+  return user ? userText(user) : "사용자";
+}
+
 /** Saved SSH sessions that can be a gateway, by name; `current` stays listed. */
 export function gatewayChoices(current?: unknown): Session[] {
   return state.sessions
@@ -145,7 +153,7 @@ export async function openSshTunnel(
       if (msg === "NEED_PASSPHRASE" || msg === "BAD_PASSPHRASE") {
         const res = await promptDialog({
           title: msg === "BAD_PASSPHRASE" ? "키 암호가 맞지 않습니다" : "게이트웨이 키 암호",
-          label: `${gw.username ? userText(gw.username) : "사용자"}@${userText(gw.host)} 의 개인 키 암호`,
+          label: `${gatewayUserText(gw)}@${userText(gw.host)} 의 개인 키 암호`,
           type: "password",
           icon: "KeyRound",
           confirm: "연결",
@@ -157,7 +165,7 @@ export async function openSshTunnel(
       if (msg === "NEED_PASSWORD" || /인증에 실패/.test(msg)) {
         const res = await promptDialog({
           title: msg === "NEED_PASSWORD" ? "게이트웨이 비밀번호" : "게이트웨이 비밀번호가 올바르지 않습니다",
-          label: `${gw.username ? userText(gw.username) : "사용자"}@${userText(gw.host)} 의 비밀번호`,
+          label: `${gatewayUserText(gw)}@${userText(gw.host)} 의 비밀번호`,
           type: "password",
           icon: "KeyRound",
           confirm: "연결",

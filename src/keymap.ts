@@ -52,6 +52,7 @@ export const ACTIONS: ActionDef[] = [
   g("app.netTools", "네트워크 도구"),
   g("app.subnet", "서브넷 계산", [], { note: "IP와 접두사로 네트워크·호스트 범위 계산" }),
   g("app.compare", "출력 비교", [], { note: "두 내용을 줄 단위로 비교" }),
+  g("app.connectHistory", "전체 연결 기록", [], { note: "모든 세션의 연결·끊김·실패를 최신순으로" }),
   g("app.lock", "앱 잠그기", [], { note: "마스터 비밀번호를 설정했을 때" }),
   g("app.checkUpdate", "업데이트 확인"),
   // Tabs and panes
@@ -64,6 +65,7 @@ export const ACTIONS: ActionDef[] = [
   g("tab.duplicate", "같은 세션 하나 더 열기", [], { note: "탭 더블클릭과 같음" }),
   g("tab.reopenClosed", "닫은 탭 다시 열기", ["Ctrl+Shift+T"]),
   g("tab.reconnect", "다시 연결"),
+  g("tab.copyList", "열린 탭 목록 복사", [], { note: "이름·주소·상태·연결 시각·장비를 표로" }),
   ...Array.from({ length: 9 }, (_, i) => g(`tab.go${i + 1}`, `${i + 1}번째 탭으로`)),
   g("pane.next", "다음 칸으로 이동", [], { note: "화면을 나눴을 때" }),
   g("layout.single", "화면: 한 칸"),

@@ -4,10 +4,11 @@ import { api, on } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { tr, userText } from "./i18n";
-import { macFormats, parseSubnetInput, subnetInfo } from "./ipLinks";
+import { addressKind, macFormats, parseSubnetInput, subnetInfo } from "./ipLinks";
 import { parseTarget, PROTOCOLS, type Session } from "./model";
+import { STATE_TEXT, type ViewState } from "./workspace";
 import { state } from "./store";
-import { beep, canOsNotify, contextMenu, errorText, esc, h, type MenuItem, modal, osNotify, requestAttention, sheetCell, toast } from "./ui";
+import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, h, type MenuItem, modal, osNotify, requestAttention, sheetCell, toast } from "./ui";
 
 export type NetTool = "ping" | "trace" | "ports" | "dns" | "subnet" | "sweep";
 
@@ -47,6 +48,25 @@ export function savedSessionItems(ip: string, close: () => void): MenuItem[] {
     .filter((s) => s.host.trim().toLowerCase() === key)
     .slice(0, 5)
     .map((s) => ({ label: "연결", icon: "Play", hint: s.name, userHint: true, action: () => (close(), open(s)) }));
+}
+/** The open tab connected to an address (main's: the most live of them):
+ * its state and a way to bring it to the front, or null when none is open. */
+type DeviceTab = { state: ViewState; go: () => void };
+let tabOf: (ip: string) => DeviceTab | null = () => null;
+export function setDeviceTabFinder(f: (ip: string) => DeviceTab | null) {
+  tabOf = f;
+}
+/** What a dialog's address menu offers for the device itself: its open tab
+ * to go to, else its saved sessions to connect (savedSessionItems). `close`
+ * runs first, so the tab is not left behind the dialog. */
+export function deviceItems(ip: string, close: () => void): MenuItem[] {
+  const tab = tabOf(ip);
+  return tab ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => (close(), tab.go()) }] : savedSessionItems(ip, close);
+}
+/** The session tree's open-tab dot for an address, as markup ("" when no tab is open). */
+function openTabDot(ip: string): string {
+  const tab = tabOf(ip);
+  return tab ? ` <span class="row-open ${tab.state}" title="${esc(`탭이 열려 있음 · ${STATE_TEXT[tab.state]}`)}"></span>` : "";
 }
 /** The first saved session's name for each address (lower-case, as the menus match). */
 function savedNames(): Map<string, string> {
@@ -237,22 +257,6 @@ export function parsePorts(text: string): number[] | null {
   }
   // The limit is for the whole list ("1-60, 100-160" is 121 ports).
   return out.size && out.size <= 64 ? [...out] : null;
-}
-
-/** What kind of IPv4 address it is (the special-purpose blocks a network
- * engineer meets; anything else is public). */
-function addressKind(ip: string): string {
-  const [a, b, c] = ip.split(".").map(Number);
-  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return "사설 (RFC 1918)";
-  if (a === 100 && b >= 64 && b <= 127) return "공유 주소 (CGNAT, RFC 6598)";
-  if (a === 127) return "루프백";
-  if (a === 169 && b === 254) return "링크 로컬 (APIPA)";
-  if (a >= 224 && a <= 239) return "멀티캐스트";
-  // "This network", reserved 240/4 and broadcast, IETF protocol assignments,
-  // the documentation ranges and the benchmarking block.
-  if (a === 0 || a >= 240 || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113) || (a === 198 && (b === 18 || b === 19)))
-    return "특수 용도 (예약)";
-  return "공인";
 }
 
 /** The subnet calculator's result for an address and prefix length. */
@@ -457,7 +461,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         </form>
         <div class="nettools-out" role="log"><p class="muted">결과가 여기에 표시됩니다.</p></div>
       </div>`,
-    footer: `<button class="btn" data-close>닫기</button><button class="btn" data-copy-free hidden>${icon("Copy", 14)}응답 없는 주소 복사</button><button class="btn" data-copy-result hidden>${icon("Copy", 14)}결과 복사</button>`,
+    footer: `<button class="btn" data-close>닫기</button><button class="btn" data-watch-hits hidden>${icon("Radar", 14)}응답한 주소 지켜보기</button><button class="btn" data-copy-free hidden>${icon("Copy", 14)}응답 없는 주소 복사</button><button class="btn" data-copy-result hidden>${icon("Copy", 14)}결과 복사</button>`,
     onClose: () => {
       void stopPing();
       void stopSweep();
@@ -486,6 +490,16 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
    * on coming back to the sweep. */
   let swept: { host: string; prefix: string } | null = null;
   let kept: Node[] | null = null;
+  // The addresses the last sweep had answer its ping (one seen by ARP alone
+  // would never answer the watch's ping either), to watch through a
+  // maintenance window: by a saved session's name when there is one.
+  const watchBtn = m.root.querySelector<HTMLButtonElement>("[data-watch-hits]")!;
+  let answered: string[] = [];
+  watchBtn.addEventListener("click", () => {
+    if (!answered.length) return;
+    const names = savedNames();
+    openMultiWatch(answered.map((ip) => ({ name: names.get(ip) || ip, host: ip })));
+  });
   freeBtn.addEventListener("click", () => {
     if (!free.length) return;
     void writeClipboard(free.join("\n"));
@@ -505,7 +519,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   const placeholder = () => {
     out.innerHTML = `<p class="muted">결과가 여기에 표시됩니다.</p>`;
     copyBtn.hidden = true;
-    freeBtn.hidden = true;
+    freeBtn.hidden = watchBtn.hidden = true;
   };
   /** A prefix typed with the address ("/24", a mask) is the one used: shown
    * in the prefix box, which then takes no input of its own. */
@@ -554,7 +568,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     extra.hidden = t === "dns";
     extra.disabled = false;
     contBox.hidden = t !== "ping";
-    if (t !== "sweep") freeBtn.hidden = true;
+    if (t !== "sweep") freeBtn.hidden = watchBtn.hidden = true;
     host.placeholder = t === "subnet" ? "IP 주소 (예: 10.0.0.5/24)" : t === "sweep" ? "네트워크 (예: 192.168.0.0/24)" : "호스트 또는 IP (예: 192.168.0.1)";
     const withPrefix = (x: NetTool) => x === "subnet" || x === "sweep";
     if (withPrefix(was) && !withPrefix(t)) {
@@ -582,6 +596,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         out.replaceChildren(...kept);
         copyBtn.hidden = !out.querySelector("table.nettools-table");
         freeBtn.hidden = !free.length;
+        watchBtn.hidden = !answered.length;
       } else if (was !== "sweep") placeholder();
       kept = null;
       mirrorPrefix();
@@ -615,18 +630,19 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     // return to this tool shows what is there now, not an older sweep).
     swept = null;
     free = [];
+    answered = [];
     const parsed = mirrorPrefix();
     const typed = /^\d{1,2}$/.test(extra.value.trim()) ? Number(extra.value) : NaN;
     const prefix = parsed?.prefix ?? typed;
     if (!parsed || !(prefix >= 22 && prefix <= 32)) {
       out.innerHTML = `<p class="danger-text">네트워크 주소와 접두사 길이를 입력하세요. 한 번에 /22(호스트 1022개)까지 검사할 수 있습니다 (예: 192.168.0.0/24)</p>`;
-      copyBtn.hidden = freeBtn.hidden = true;
+      copyBtn.hidden = freeBtn.hidden = watchBtn.hidden = true;
       return;
     }
     const all = hostsOf(parsed.ip, prefix);
     const input = { host: host.value, prefix: extra.value };
     busy = true;
-    copyBtn.hidden = freeBtn.hidden = true;
+    copyBtn.hidden = freeBtn.hidden = watchBtn.hidden = true;
     const label = run.innerHTML;
     run.innerHTML = `${icon("Square", 14)}중지`;
     const id = (sweepId = crypto.randomUUID());
@@ -642,6 +658,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       // never among the free addresses.
       const present = new Set(hits.map((h) => h.ip));
       free = all.filter((ip) => !present.has(ip));
+      answered = hits.filter((h) => h.ms != null).map((h) => h.ip);
       const pinged = hits.filter((h) => h.ms != null).length;
       swept = input;
       // Against the last sweep of this same range (a stopped one never counts).
@@ -677,7 +694,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
           hits.length
             ? `<table class="nettools-table"><thead><tr><th>주소</th><th>이름</th>${withMac ? `<th title="이 PC의 ARP 표에서 읽습니다. 라우터 너머의 장비는 비어 있습니다">MAC</th>` : ""}<th>응답</th></tr></thead><tbody>${hits
                 .map(
-                  (h) => `<tr><td class="mono"><button type="button" class="sweep-link" data-ip="${esc(h.ip)}" title="Ping, 포트 확인, 새 세션 만들기"><span data-i18n-skip>${esc(h.ip)}</span></button>${
+                  (h) => `<tr><td class="mono"><button type="button" class="sweep-link" data-ip="${esc(h.ip)}" title="Ping, 포트 확인, 새 세션 만들기"><span data-i18n-skip>${esc(h.ip)}</span></button>${openTabDot(h.ip)}${
                     added.has(h.ip) ? ` <span class="sweep-new-tag" title="지난 스캔에는 없던 장비">새로</span>` : ""
                   }</td>
                     <td class="sweep-name" data-i18n-skip>…</td>${
@@ -690,6 +707,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
             : ""
         }`;
       freeBtn.hidden = !free.length;
+      watchBtn.hidden = !answered.length;
       if (hits.length) void showNames(hits.map((h) => h.ip), [...out.querySelectorAll<HTMLElement>(".sweep-name")]);
       const table = out.querySelector<HTMLTableElement>("table.nettools-table");
       if (table) sortableTable(table);
@@ -722,6 +740,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     let later = 0;
     const id = crypto.randomUUID();
     watchId = id;
+    // Its notices need the permission, asked from a user action: this one.
+    ensureNotifyPermission();
     try {
       // The echo is IPv4: a name is looked up first, its first IPv4 address used.
       const ip = isIPv4(target) ? target : (await api.netDns(target)).addresses.find(isIPv4);
@@ -731,7 +751,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       const shown = ip === target ? ip : `${target} (${ip})`;
       const LOST_AFTER = 3;
       const WIDTH = 120;
-      const s = { sent: 0, got: 0, min: Infinity, max: 0, sum: 0, misses: 0, firstMiss: 0, answers: 0, down: null as number | null, told: 0, since: Date.now(), samples: [] as (number | null)[] };
+      const s = { sent: 0, got: 0, min: Infinity, max: 0, sum: 0, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null as number | null, outages: 0, downTotal: 0, told: 0, since: Date.now(), samples: [] as (number | null)[] };
       out.innerHTML = `<div class="watch">
           <p class="watch-head"><b class="watch-state" data-w-state></b> <span class="muted" data-i18n-skip>${esc(shown)}</span></p>
           <p class="muted small" data-w-stats></p>
@@ -787,7 +807,10 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         stateEl.classList.toggle("down", s.down !== null);
         const loss = s.sent ? Math.round((100 * (s.sent - s.got)) / s.sent) : 0;
         const rtt = s.got ? `${s.min}/${Math.round(s.sum / s.got)}/${s.max}` : "-";
-        statsEl.textContent = [`보냄 ${s.sent}`, `받음 ${s.got}`, `손실 ${loss}%`, `최소/평균/최대 ${rtt} ms`, `경과 ${clock(now - s.since)}`].map((p) => tr(p)).join(" · ");
+        // How often it went down and for how long in all, the outage going
+        // on now included (a reload's one, or a link flapping all night).
+        const outages = s.outages ? [`끊김 ${s.outages}번`, `끊긴 시간 합계 ${clock(s.downTotal + (s.down !== null ? now - s.down : 0))}`] : [];
+        statsEl.textContent = [`보냄 ${s.sent}`, `받음 ${s.got}`, `손실 ${loss}%`, `최소/평균/최대 ${rtt} ms`, ...outages, `경과 ${clock(now - s.since)}`].map((p) => tr(p)).join(" · ");
         const top = Math.max(10, ...s.samples.map((v) => v ?? 0));
         const offset = WIDTH - s.samples.length;
         chart.innerHTML = s.samples
@@ -807,10 +830,14 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
           s.max = Math.max(s.max, p.ms);
           s.sum += p.ms;
           s.misses = 0;
-          // Back once two answers come in a row, not on one stray reply.
-          if (s.down !== null && ++s.answers >= 2) {
-            log(`응답 재개 (끊긴 시간 ${clock(Date.now() - s.down)})`);
+          // Back once two answers come in a row, not on one stray reply;
+          // down until the first of them came, not the second.
+          if (s.down !== null && ++s.answers === 1) s.firstBack = Date.now();
+          if (s.down !== null && s.answers >= 2) {
+            const lasted = s.firstBack - s.down;
+            log(`응답 재개 (끊긴 시간 ${clock(lasted)})`);
             tell("응답 재개");
+            s.downTotal += lasted;
             s.down = null;
           }
         } else {
@@ -819,6 +846,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
           if (++s.misses === 1) s.firstMiss = Date.now() - 1000;
           if (s.misses === LOST_AFTER && s.down === null) {
             s.down = s.firstMiss;
+            s.outages++;
             log("응답 없음");
             tell("응답 없음");
             // Its tabs, by the name or the address it was given as.
@@ -963,7 +991,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     if (protocol)
       return void contextMenu(r.left, r.bottom + 2, [
         { label: "이 포트로 새 세션 만들기…", icon: "Plus", hint: `${PROTOCOLS[protocol].label} :${port}`, action: () => newSession?.({ protocol, host: ip, port }, () => m.close()) },
-        ...savedSessionItems(ip, () => m.close()),
+        ...deviceItems(ip, () => m.close()),
       ]);
     contextMenu(r.left, r.bottom + 2, [
       // Each says which ping it is: the "Keep sending" box set to match.
@@ -971,7 +999,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => ((cont.checked = true), runOn("ping", ip)) },
       { label: "경로 추적", icon: "Waypoints", action: () => runOn("trace", ip) },
       { label: "포트 확인", icon: "Unplug", action: () => runOn("ports", ip) },
-      ...savedSessionItems(ip, () => m.close()),
+      ...deviceItems(ip, () => m.close()),
       ...(newSession ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => newSession?.({ protocol: "ssh" as const, host: ip }, () => m.close()) }] : []),
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(ip) },
     ]);
@@ -1056,4 +1084,306 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   if (continuous && initialTool === "ping") cont.checked = true;
   setTool(initialTool);
   if (startNow && initialHost.trim()) form.requestSubmit();
+}
+
+/** Several devices watched at once with a continuous ping each (the session
+ * list's multi-selection): after a maintenance window, which of ten
+ * switches are back. A row per device (whether it answers now and since
+ * when, the loss, how often it went down), the changes in a list below; a
+ * change is told with a sound and, when the app is not in front, a Windows
+ * notification (at most every half minute). Down is three echoes in a row
+ * unanswered, back two answers in a row, as in the single continuous ping.
+ * Each ping stops when the dialog closes. */
+export function openMultiWatch(sessions: { name: string; host: string; protocol?: Session["protocol"] }[]) {
+  const MAX = 32;
+  const LOST_AFTER = 3;
+  // Each address once, in the order given; a serial port has none.
+  const seen = new Set<string>();
+  const all: { name: string; host: string }[] = [];
+  for (const s of sessions) {
+    const host = s.host.trim();
+    const key = host.toLowerCase();
+    if (!host || s.protocol === "serial" || seen.has(key)) continue;
+    seen.add(key);
+    all.push({ name: s.name || host, host });
+  }
+  if (!all.length) return void toast("지켜볼 주소가 없습니다", "info");
+  // Its notices need the permission, asked from a user action: this one.
+  ensureNotifyPermission();
+  const targets = all.slice(0, MAX);
+  type Row = {
+    name: string;
+    host: string;
+    id: string;
+    ip: string | null;
+    started: boolean;
+    problem: string;
+    /** Its ping ended by itself (a day is its limit). */
+    ended: boolean;
+    sent: number;
+    got: number;
+    last: number | null;
+    misses: number;
+    firstMiss: number;
+    answers: number;
+    firstBack: number;
+    down: number | null;
+    outages: number;
+    changed: number;
+    el: HTMLTableRowElement;
+  };
+  const rows: Row[] = targets.map((t) => ({ ...t, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, el: document.createElement("tr") }));
+  let closed = false;
+  /** The replies are listened to: a row added from now on starts at once. */
+  let listening = false;
+  let unlisten = () => {};
+  const m = modal({
+    title: "여러 장비 지켜보기",
+    icon: "Activity",
+    width: 820,
+    body: `<p class="muted small" data-mw-summary></p>
+      ${all.length > MAX ? `<p class="muted small">${esc(`처음 ${MAX}개만 지켜봅니다`)}</p>` : ""}
+      <div class="mw-scroll"><table class="nettools-table mw-table"><thead><tr><th>이름</th><th>주소</th><th>상태</th><th>손실</th><th>끊김</th><th>마지막 변화</th></tr></thead><tbody></tbody></table></div>
+      <div class="mw-add"><input data-add class="list-search" spellcheck="false" autocomplete="off" placeholder="주소 추가 (예: 10.0.0.5)" list="mw-hosts"/><datalist id="mw-hosts">${savedHostOptions()}</datalist><button type="button" class="btn btn-sm" data-add-go>${icon("Plus", 13)}추가</button></div>
+      <ul class="watch-log" data-mw-log></ul>`,
+    footer: `<button class="btn" data-copy>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
+    onClose: () => {
+      closed = true;
+      clearTimeout(later);
+      unlisten();
+      for (const r of rows) if (r.started) void api.netWatchStop(r.id).catch(() => {});
+    },
+  });
+  const body = m.root.querySelector("tbody")!;
+  const summary = m.root.querySelector<HTMLElement>("[data-mw-summary]")!;
+  const logEl = m.root.querySelector<HTMLElement>("[data-mw-log]")!;
+  const time = (ms = Date.now()) => {
+    const d = new Date(ms);
+    return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
+  };
+  const log = (text: string) => {
+    logEl.prepend(h("li", {}, `<time>${time()}</time> <span>${esc(text)}</span>`));
+    while (logEl.children.length > 300) logEl.lastElementChild!.remove();
+  };
+  // Told at most every half minute (a rack coming back is one notice, not ten).
+  // A change within the half minute is not dropped: told once it is up, as
+  // things stand then (which devices are down), unless that was told last.
+  let toldAt = 0;
+  let toldKey = "";
+  let later = 0;
+  const standing = () => {
+    const down = rows.filter((r) => r.down !== null && !r.ended);
+    return down.length
+      ? { title: "응답 없음", who: down.map((r) => r.name).join(", ") }
+      : // Every one not down counts as answering: a single echo missed is
+        // not news (down takes three in a row).
+        { title: "응답 재개", who: tr(`응답 ${rows.filter((r) => r.sent > 0 && !r.problem && !r.ended).length}대`) };
+  };
+  const announce = (title: string, who: string) => {
+    toldAt = Date.now();
+    toldKey = `${title}\u0000${who}`;
+    beep();
+    requestAttention();
+    if (!document.hasFocus() && canOsNotify()) osNotify(tr(title), who);
+  };
+  const tell = (title: string, who: string) => {
+    const wait = 30_000 - (Date.now() - toldAt);
+    if (wait <= 0) return announce(title, who);
+    if (!later)
+      later = window.setTimeout(() => {
+        later = 0;
+        if (closed) return;
+        const now = standing();
+        if (`${now.title}\u0000${now.who}` !== toldKey) announce(now.title, now.who);
+      }, wait);
+  };
+  const draw = (r: Row) => {
+    const now = Date.now();
+    const status = r.problem
+      ? `<span class="danger-text">${esc(r.problem)}</span>`
+      : r.ended
+        ? `<span class="muted">${esc(tr("모니터링 중지"))}</span>`
+      : r.down !== null
+        ? `<span class="danger-text">${esc(tr(`응답 없음 · ${clock(now - r.down)}`))}</span>`
+        : !r.sent
+          ? `<span class="muted">${esc(tr("보내는 중..."))}</span>`
+          : r.last === null
+            ? `<span class="muted">${esc(tr(`응답을 기다리는 중 (${r.misses}번 놓침)`))}</span>`
+            : `<span class="ok-text">${esc(tr(`응답 중 · ${r.last} ms`))}</span>`;
+    const loss = r.sent ? `${Math.round((100 * (r.sent - r.got)) / r.sent)}%` : "-";
+    r.el.classList.toggle("down", (r.down !== null && !r.ended) || !!r.problem);
+    // The cells are made once and only their contents change: a row
+    // rebuilt every second would lose a click whose press and release
+    // fell on either side of the redraw.
+    if (!r.el.cells.length)
+      r.el.innerHTML = `<td><button type="button" class="sweep-link" data-row="${r.id}" title="이 장비의 탭으로 이동, 연결, 주소 복사"><span data-i18n-skip>${esc(r.name)}</span></button><span data-dot></span></td><td data-i18n-skip></td><td></td><td></td><td></td><td></td>`;
+    const [, addr, st, lossCell, downs, changed] = r.el.cells;
+    const set = (el: HTMLElement, html: string) => {
+      if (el.innerHTML !== html) el.innerHTML = html;
+    };
+    set(r.el.querySelector<HTMLElement>("[data-dot]")!, openTabDot(r.host));
+    set(addr, esc(r.ip && r.ip !== r.host ? `${r.host} (${r.ip})` : r.host));
+    set(st, status);
+    set(lossCell, loss);
+    set(downs, String(r.outages || "-"));
+    set(changed, r.changed ? time(r.changed) : "-");
+  };
+  const drawSummary = () => {
+    // A row whose ping ended counts as neither.
+    const down = rows.filter((r) => r.down !== null && !r.ended).length;
+    const up = rows.filter((r) => r.down === null && r.last !== null && !r.problem && !r.ended).length;
+    const failed = rows.filter((r) => !!r.problem).length;
+    summary.innerHTML = [`<span>${esc(`응답 ${up}대`)}</span>`, `<span>${esc(`응답 없음 ${down}대`)}</span>`, ...(failed ? [`<span>${esc(`시작 못 함 ${failed}대`)}</span>`] : [])].join(" · ");
+    reorder();
+  };
+  // The ones not answering on top (then those that could not start), each
+  // group in the order given: of 32, the few down are seen without scrolling.
+  // Rows move only when the order changes (a state change), not each second.
+  let drawnOrder = "";
+  const reorder = () => {
+    const rank = (r: Row) => (r.down !== null && !r.ended ? 0 : r.problem ? 1 : 2);
+    const order = rows.map((r, i) => [r, i] as const).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]);
+    const key = order.map(([, i]) => i).join(",");
+    if (key === drawnOrder) return;
+    drawnOrder = key;
+    // A row moved out and back loses the keyboard focus inside it: given back.
+    const focused = document.activeElement as HTMLElement | null;
+    for (const [r] of order) body.appendChild(r.el);
+    if (focused && focused !== document.activeElement && body.contains(focused)) focused.focus();
+  };
+  for (const r of rows) {
+    body.appendChild(r.el);
+    draw(r);
+  }
+  drawSummary();
+  // The "응답 없음 · 1:23" clocks move on between replies too.
+  const tick = window.setInterval(() => {
+    if (closed) return clearInterval(tick);
+    for (const r of rows) if (r.down !== null && !r.ended) draw(r);
+  }, 1000);
+  // A device back: its tab to go to, or its saved session to connect (one
+  // click, one connection; this window closes first, so the tab is not
+  // left behind it), or its address.
+  body.addEventListener("click", (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>("[data-row]");
+    // By its id, not its place: rows come and go (added, taken out).
+    const r = b && rows.find((x) => x.id === b.dataset.row);
+    if (!b || !r) return;
+    const at = b.getBoundingClientRect();
+    contextMenu(at.left, at.bottom + 2, [
+      ...deviceItems(r.host, () => m.close()),
+      { label: "주소 복사", icon: "ClipboardList", hint: r.host, userHint: true, action: () => void writeClipboard(r.host) },
+      "-",
+      // No longer of interest (back and fine, or added by mistake): its pings stop, its row goes.
+      { label: "지켜보기에서 빼기", icon: "X", action: () => remove(r) },
+    ]);
+  });
+  const remove = (r: Row) => {
+    const i = rows.indexOf(r);
+    if (i < 0) return;
+    rows.splice(i, 1);
+    if (r.started) void api.netWatchStop(r.id).catch(() => {});
+    r.el.remove();
+    log(`${userText(r.name)}: 지켜보기에서 뺌`);
+    drawSummary();
+  };
+  m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
+    const head = ["이름", "주소", "상태", "손실", "끊김", "마지막 변화"].map((t) => tr(t)).join("\t");
+    const lines = rows.map((r) => [...r.el.querySelectorAll("td")].map((td) => td.textContent?.trim() ?? "").join("\t"));
+    void writeClipboard([head, ...lines].join("\n"));
+    toast("결과를 복사했습니다", "success", 1500);
+  });
+  void (async () => {
+    unlisten = await on<{ id: string; seq: number; ms: number | null }>("watch-reply", (p) => {
+      const r = rows.find((x) => x.id === p.id);
+      if (!r || closed) return;
+      r.sent++;
+      r.last = p.ms;
+      if (p.ms !== null) {
+        r.got++;
+        r.misses = 0;
+        if (r.down !== null && ++r.answers === 1) r.firstBack = Date.now();
+        if (r.down !== null && r.answers >= 2) {
+          log(`${userText(r.name)}: 응답 재개 (끊긴 시간 ${clock(r.firstBack - r.down)})`);
+          r.down = null;
+          r.changed = Date.now();
+          tell("응답 재개", r.name);
+        }
+      } else {
+        r.answers = 0;
+        if (++r.misses === 1) r.firstMiss = Date.now() - 1000;
+        if (r.misses === LOST_AFTER && r.down === null) {
+          r.down = r.firstMiss;
+          r.outages++;
+          r.changed = Date.now();
+          log(`${userText(r.name)}: 응답 없음`);
+          tell("응답 없음", r.name);
+          markDevice(r.host);
+          if (r.ip && r.ip !== r.host) markDevice(r.ip);
+        }
+      }
+      draw(r);
+      drawSummary();
+    });
+    if (closed) return unlisten();
+    log(`모니터링 시작: ${rows.length}대`);
+    listening = true;
+    for (const r of rows) start(r);
+  })();
+  /** One device: its address (a name looked up, its first IPv4 address), then its pings. */
+  function start(r: Row) {
+      void (async () => {
+        try {
+          const ip = isIPv4(r.host) ? r.host : (await api.netDns(r.host)).addresses.find(isIPv4);
+          if (!ip) throw new Error(`${userText(r.host)}의 IPv4 주소를 찾을 수 없습니다`);
+          // Closed, or taken out while its name was looked up: nothing started.
+          if (closed || !rows.includes(r)) return;
+          r.ip = ip;
+          r.started = true;
+          draw(r);
+          await api.netWatch(r.id, ip, 1000);
+          // Ended by itself (its day is up, or the echoes could not go on):
+          // said so, not left looking alive. (Taken out: stopped on purpose.)
+          if (closed || !rows.includes(r)) return;
+          r.ended = true;
+          log(`${userText(r.name)}: 모니터링 중지`);
+          draw(r);
+          drawSummary();
+        } catch (err) {
+          if (closed) return;
+          r.problem = errorText(err);
+          draw(r);
+          drawSummary();
+        } finally {
+          // Nothing left running to stop when the window closes (a stop
+          // for an ended ping would leave its flag behind in the backend).
+          r.started = false;
+        }
+      })();
+  }
+  // An address added while it runs (a device the selection left out): a
+  // row of its own, its pings started, up to MAX in all, each address once.
+  const addIn = m.root.querySelector<HTMLInputElement>("[data-add]")!;
+  const add = () => {
+    const host = addIn.value.trim();
+    if (!host) return;
+    if (rows.some((r) => r.host.toLowerCase() === host.toLowerCase())) return void toast("이미 지켜보는 주소입니다", "info");
+    if (rows.length >= MAX) return void toast(`처음 ${MAX}개만 지켜봅니다`, "info");
+    const names = savedNames();
+    const r: Row = { name: names.get(host.toLowerCase()) || host, host, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, el: document.createElement("tr") };
+    rows.push(r);
+    body.appendChild(r.el);
+    draw(r);
+    drawSummary();
+    addIn.value = "";
+    log(`${userText(r.name)}: 지켜보기에 추가`);
+    if (listening) start(r);
+  };
+  addIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      add();
+    }
+  });
+  m.root.querySelector("[data-add-go]")!.addEventListener("click", add);
 }

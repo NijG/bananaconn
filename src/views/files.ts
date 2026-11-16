@@ -10,10 +10,10 @@ import { defaultPort, endpoint, PROTOCOLS, type Session } from "../model";
 import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
 import { forgetHostKey } from "../hostKeys";
-import { choiceDialog, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast, setPressed, type MenuItem } from "../ui";
+import { canOsNotify, choiceDialog, ensureNotifyPermission, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, toast, setPressed, type MenuItem } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
-import { userText } from "../i18n";
+import { tr, userText } from "../i18n";
 import { hasPendingDiff, openDiff, pendingTitle, takeForDiff, type DiffSide } from "../diffView";
 
 /** The file last taken for a comparison (Pane.fileKey), to tell it from another of the same name. */
@@ -39,7 +39,61 @@ interface Job {
   error?: string;
   /** Interrupted by a reconnect: run again on the new connection. */
   requeue?: boolean;
+  /** The speed while running (bytes per second, a moving average over
+   * half-second steps; 0 until the first step) and the step's start. */
+  rate?: number;
+  rateAt?: number;
+  rateDone?: number;
+  /** When its last progress came (or it started). */
+  seenAt?: number;
+  /** When its (last) run started and when it finished: the time it took. */
+  startedAt?: number;
+  finishedAt?: number;
   el: HTMLElement;
+}
+
+/** No progress for this long: the speed and time left give way to how long it has been still. */
+const STALL_MS = 5000;
+const stalledFor = (j: Job) => (j.seenAt === undefined ? 0 : Date.now() - j.seenAt);
+
+/** The time left at `rate` bytes per second: "0:42", "1:05:00". */
+function timeLeft(bytes: number, rate: number): string {
+  const s = Math.max(0, Math.ceil(bytes / rate));
+  const mmss = `${Math.floor((s % 3600) / 60)}:${String(s % 60).padStart(2, "0")}`;
+  return s >= 3600 ? `${Math.floor(s / 3600)}:${mmss.padStart(5, "0")}` : mmss;
+}
+
+/** What a finished transfer took: " · 0:42 · 38.2 MB/s" (the time, and the
+ * average speed over it), or "" for one done within a second or of no size. */
+function doneTook(j: Job): string {
+  if (j.startedAt === undefined || j.finishedAt === undefined) return "";
+  const ms = j.finishedAt - j.startedAt;
+  const bytes = j.total || j.done;
+  if (ms < 1000 || !bytes) return "";
+  // The time it took to the nearest second (timeLeft rounds up, as a time to wait should).
+  return ` · ${timeLeft(Math.round(ms / 1000), 1)} · ${formatBytes(Math.round((bytes / ms) * 1000))}/s`;
+}
+
+/** A progress report for a running job: its speed brought up to date. */
+function measure(j: Job, done: number) {
+  const now = Date.now();
+  const stalled = stalledFor(j) >= STALL_MS;
+  j.seenAt = now;
+  // Started (again: a reconnect runs it from the start), or moving again
+  // after standing still: measured afresh, or the still time would hold the
+  // speed down long after it is going at full speed again.
+  if (j.rateAt === undefined || j.rateDone === undefined || done < j.rateDone || stalled) {
+    j.rate = 0;
+    j.rateAt = now;
+    j.rateDone = done;
+    return;
+  }
+  const dt = now - j.rateAt;
+  if (dt < 500) return;
+  const step = ((done - j.rateDone) / dt) * 1000;
+  j.rate = j.rate ? j.rate * 0.7 + step * 0.3 : step;
+  j.rateAt = now;
+  j.rateDone = done;
 }
 
 /** Same rule as the backend's local_component: one safe Windows path component. */
@@ -124,13 +178,46 @@ const VIRTUAL_MIN = 300;
 const ROW_H = 28;
 const MARGIN = 45;
 const jobs = new Map<string, { job: Job; view: FilesView }>();
+/** The app's taskbar button shows the transfers of every file tab as one bar
+ * (seen with the window minimized): their bytes so far out of their sizes;
+ * moving without a size; paused (yellow) while all of them stand still; gone
+ * when none runs. Worked out a moment after a change and sent only when it
+ * differs, at most four times a second. */
+// None at first: main clears a bar a reloaded page left behind as it starts.
+let taskbarSent = "none";
+let taskbarTimer = 0;
+function updateTaskbar() {
+  if (taskbarTimer) return;
+  taskbarTimer = window.setTimeout(() => {
+    taskbarTimer = 0;
+    const running = [...jobs.values()].map((e) => e.job).filter((j) => j.status === "running");
+    const sized = running.filter((j) => j.total > 0);
+    const total = sized.reduce((n, j) => n + j.total, 0);
+    const done = sized.reduce((n, j) => n + Math.min(j.done, j.total), 0);
+    const still = running.length > 0 && running.every((j) => stalledFor(j) >= STALL_MS);
+    const status = !running.length ? "none" : still ? "paused" : sized.length === running.length ? "normal" : "indeterminate";
+    const progress = total ? Math.floor((done / total) * 100) : 0;
+    const key = `${status}:${status === "none" ? 0 : progress}`;
+    if (key === taskbarSent) return;
+    taskbarSent = key;
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow, ProgressBarStatus }) => {
+        const s = { none: ProgressBarStatus.None, normal: ProgressBarStatus.Normal, paused: ProgressBarStatus.Paused, indeterminate: ProgressBarStatus.Indeterminate }[status];
+        return getCurrentWindow().setProgressBar(status === "none" ? { status: s } : { status: s, progress });
+      })
+      .catch(() => {});
+  }, 250);
+}
 let progressRouted = false;
 function routeProgress() {
   if (progressRouted) return;
   progressRouted = true;
   on<TransferProgress>("transfer-progress", (p) => {
     const entry = jobs.get(p.transferId);
-    if (!entry) return;
+    // Only a running job: a report the cancelled run of a requeued one sent
+    // late would put its old progress back on it.
+    if (!entry || entry.job.status !== "running") return;
+    measure(entry.job, p.done);
     Object.assign(entry.job, { done: p.done, total: p.total, filesDone: p.filesDone });
     entry.view.renderJob(entry.job);
   });
@@ -381,7 +468,9 @@ class Pane {
       if (k === "name") return natural.compare(a.name, b.name) * this.sortDir;
       const av = a[k] ?? 0;
       const bv = b[k] ?? 0;
-      return (av < bv ? -1 : av > bv ? 1 : 0) * this.sortDir;
+      // Equal sizes or times (every folder by size, files copied together)
+      // in name order, not the order the server listed them in.
+      return (av < bv ? -1 : av > bv ? 1 : 0) * this.sortDir || natural.compare(a.name, b.name);
     });
   }
 
@@ -696,7 +785,12 @@ class Pane {
       "-",
       { label: "이름 바꾸기", icon: "Pencil", hint: keyHint("files.rename"), disabled: sel.length !== 1, action: () => this.rename(sel[0]) },
       { label: "경로 복사", icon: "Copy", disabled: !sel.length, action: () => writeClipboard(sel.map((s) => s.path).join("\n")) },
+      // The folder clicked, else the one shown: which subfolder takes the space.
+      // Not on the list of drives (no folder open): that would be every disk.
+      { label: "폴더 크기 계산", icon: "HardDrive", disabled: !target?.isDir && !this.path, action: () => this.folderSize(target?.isDir ? target : { name: this.path.split(/[\\/]/).filter(Boolean).pop() || this.path, path: this.path, isDir: true, isLink: false, size: 0, modified: null, perm: null }) },
       this.compareItem(sel),
+      // An image checked against its vendor's published value before it goes up.
+      ...(!remote && target && !target.isDir ? [{ label: "해시 확인 (SHA-256·SHA-512)…", icon: "ShieldCheck", action: () => void import("../fileHash").then((h) => h.openFileHash(target)) }] : []),
       ...(term?.cdTo && cdTarget
         ? [{ label: "터미널에서 이 폴더로 이동 (cd)", icon: "SquareTerminal", hint: cdTarget.split("/").filter(Boolean).pop() || "/", userHint: true, action: () => term.cdTo?.(cdTarget) }]
         : []),
@@ -707,6 +801,127 @@ class Pane {
       "-",
       { label: "삭제", icon: "Trash2", hint: keyHint("files.delete"), danger: true, disabled: !sel.length, action: () => this.remove(sel) },
     ]);
+  }
+
+  /** A folder's total size, read folder by folder (one listing at a time, so
+   * the connection is not flooded), with what is inside it by size: which
+   * subfolder takes the space. Links are not followed (a link back up would
+   * count forever) and count as nothing. Ends at Stop, on closing, or past
+   * LIMIT entries (then said to be at least that). */
+  private folderSize(target: FileEntry) {
+    const LIMIT = 200_000;
+    let stopped = false;
+    const m = modal({
+      title: "폴더 크기",
+      icon: "HardDrive",
+      width: 560,
+      body: `<p class="muted small mono" data-i18n-skip>${esc(target.path)}</p>
+        <p data-fs-state><span class="spinner sm"></span> <span>계산 중...</span></p>
+        <div class="fs-list" data-fs-list></div>`,
+      footer: `<button class="btn" data-stop>${icon("Square", 14)}중지</button><button class="btn btn-primary" data-close>닫기</button>`,
+      onClose: () => (stopped = true),
+    });
+    const stateEl = m.root.querySelector<HTMLElement>("[data-fs-state]")!;
+    const listEl = m.root.querySelector<HTMLElement>("[data-fs-list]")!;
+    const stopBtn = m.root.querySelector<HTMLButtonElement>("[data-stop]")!;
+    stopBtn.addEventListener("click", () => (stopped = true));
+    // A row: the pane goes to that folder (the window closes, the count with
+    // it). On the press, not the click: the rows are redrawn as the count
+    // goes on, and a click across a redraw would be lost.
+    listEl.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      const path = (e.target as HTMLElement).closest<HTMLElement>("[data-path]")?.dataset.path;
+      if (!path) return;
+      e.preventDefault();
+      m.close();
+      this.load(path);
+    });
+    const list = (path: string) => (this.side === "local" ? api.localList(path) : api.remoteList(this.owner.remoteId, path));
+    // What is directly inside, each with its own total: a subfolder by its
+    // name, the files lying in the folder itself together ("").
+    const buckets = new Map<string, { bytes: number; files: number; path: string }>();
+    let bytes = 0;
+    let files = 0;
+    let dirs = 0;
+    let failed = 0;
+    let entries = 0;
+    const counts = () => [tr(`파일 ${files}개`), tr(`폴더 ${dirs}개`), formatBytes(bytes)].join(" · ");
+    let shownAt = 0;
+    const show = (done: boolean) => {
+      const extra = [
+        ...(failed ? [tr(`목록을 읽지 못한 폴더 ${failed}개`)] : []),
+        ...(entries >= LIMIT ? [tr(`항목 ${LIMIT}개에서 멈췄습니다 (실제는 더 큼)`)] : []),
+      ];
+      stateEl.innerHTML = done
+        ? `<b>${esc(tr(`합계 ${formatBytes(bytes)}`))}</b> <span class="muted">${esc([counts(), ...extra].join(" · "))}</span>`
+        : `<span class="spinner sm"></span> <span>${esc(counts())}</span>`;
+      const rows = [...buckets].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 15);
+      listEl.innerHTML = rows.length
+        ? `<table class="nettools-table"><thead><tr><th>${esc(tr("이름"))}</th><th>${esc(tr("크기"))}</th><th></th></tr></thead><tbody>${rows
+            .map(
+              ([name, b]) => `<tr class="fs-row" data-path="${esc(b.path)}" title="${esc(tr("이 폴더로 이동"))}"><td class="fs-name"${name ? " data-i18n-skip" : ""}>${name ? `${icon("Folder", 13)}<span>${esc(name)}</span>` : esc(tr("이 폴더의 파일"))}</td><td>${formatBytes(b.bytes)}</td><td class="fs-bar"><i style="width:${bytes ? Math.round((100 * b.bytes) / bytes) : 0}%"></i></td></tr>`,
+            )
+            .join("")}</tbody></table>`
+        : "";
+    };
+    void (async () => {
+      const queue: { path: string; bucket: string }[] = [];
+      try {
+        for (const e of await list(target.path)) {
+          entries++;
+          if (e.isLink) continue;
+          if (e.isDir) {
+            dirs++;
+            buckets.set(e.name, buckets.get(e.name) ?? { bytes: 0, files: 0, path: e.path });
+            queue.push({ path: e.path, bucket: e.name });
+          } else {
+            files++;
+            bytes += e.size;
+            const b = buckets.get("") ?? { bytes: 0, files: 0, path: target.path };
+            b.bytes += e.size;
+            b.files++;
+            buckets.set("", b);
+          }
+        }
+      } catch (err) {
+        stateEl.innerHTML = `<span class="danger-text">${esc(errorText(err))}</span>`;
+        stopBtn.hidden = true;
+        return;
+      }
+      while (queue.length && !stopped && entries < LIMIT) {
+        const { path, bucket } = queue.shift()!;
+        let got: FileEntry[];
+        try {
+          got = await list(path);
+        } catch {
+          // No permission to read it (a system folder): counted as not read.
+          failed++;
+          continue;
+        }
+        const b = buckets.get(bucket)!;
+        for (const e of got) {
+          entries++;
+          if (e.isLink) continue;
+          if (e.isDir) {
+            dirs++;
+            queue.push({ path: e.path, bucket });
+          } else {
+            files++;
+            bytes += e.size;
+            b.bytes += e.size;
+            b.files++;
+          }
+        }
+        if (Date.now() - shownAt > 200) {
+          shownAt = Date.now();
+          show(false);
+        }
+      }
+      if (!m.root.isConnected) return;
+      stopBtn.hidden = true;
+      show(true);
+      if (stopped) stateEl.insertAdjacentHTML("beforeend", ` <span class="muted">· ${esc(tr("중지했습니다"))}</span>`);
+    })();
   }
 
   /** Compare files as text (a configuration backup with the one on the
@@ -890,16 +1105,25 @@ class Pane {
       }
       m.close();
       let changed = 0;
+      let failed = false;
       for (const e of entries) {
         try {
           await this.op("chmod", e.path, mode);
           changed++;
         } catch (err) {
-          toast(errorText(err), "error");
+          // As a failed delete says it: which one, and of several, how far it
+          // got (the one that failed is among those left). No "changed" toast
+          // then: it would read as if all were.
+          failed = true;
+          toast(
+            `${userText(e.name)} 권한 변경 실패: ${errorText(err)}${entries.length > 1 ? ` · ${changed}개 바꿈, ${entries.length - changed}개 남김` : ""}`,
+            "error",
+            8000,
+          );
           break;
         }
       }
-      if (changed) toast(`권한을 ${mode}(으)로 바꿨습니다`, "success", 2500);
+      if (!failed) toast(`권한을 ${mode}(으)로 바꿨습니다`, "success", 2500);
       await this.refresh();
     };
     form.addEventListener("submit", (e) => {
@@ -912,24 +1136,34 @@ class Pane {
   private async remove(entries: FileEntry[]) {
     if (this.inDriveList()) return toast("드라이브 전체는 삭제할 수 없습니다", "warn");
     const dirs = entries.filter((e) => e.isDir).length;
+    const what = entries.length === 1 ? `<b data-i18n-skip>${esc(entries[0].name)}</b>` : `${entries.length}개 항목`;
     const ok = await confirmDialog({
       title: "삭제",
-      message: `${entries.length === 1 ? `<b data-i18n-skip>${esc(entries[0].name)}</b>` : `${entries.length}개 항목`}을(를) 영구히 삭제합니다.${
-        dirs ? "<br>폴더는 안의 내용까지 모두 삭제됩니다." : ""
-      }<br>${
-        // Whole sentences, not "{0}에서 …" with the place filled in: a
-        // translated place cannot take the case or article the sentence needs.
-        this.side === "remote" ? "서버에서 삭제하며 되돌릴 수 없습니다." : "내 PC에서 삭제하며 되돌릴 수 없습니다."
-      }`,
+      // On the server: gone for good. On this PC: into the Recycle Bin
+      // (remote.rs recycle), where the shell asks first if there is none.
+      message:
+        this.side === "remote"
+          ? `${what}을(를) 영구히 삭제합니다.${dirs ? "<br>폴더는 안의 내용까지 모두 삭제됩니다." : ""}<br>서버에서 삭제하며 되돌릴 수 없습니다.`
+          : `${what}을(를) 휴지통으로 보냅니다.${dirs ? "<br>폴더는 안의 내용까지 함께 휴지통으로 갑니다." : ""}<br>휴지통이 없는 곳(네트워크 드라이브 등)이면 Windows가 영구 삭제할지 먼저 묻습니다.`,
       confirm: "삭제",
       danger: true,
     });
     if (!ok) return;
+    let done = 0;
     for (const e of entries) {
       try {
         await this.op("delete", e.path, undefined, e.isDir);
+        done++;
       } catch (err) {
-        toast(errorText(err), "error");
+        // Which one failed, and of several, how far it got: the rest are
+        // left alone (nothing more is deleted after a failure); the one that
+        // failed is among those left.
+        const left = entries.length - done;
+        toast(
+          `${userText(e.name)} 삭제 실패: ${errorText(err)}${entries.length > 1 ? ` · ${done}개 삭제함, ${left}개 남김` : ""}`,
+          "error",
+          8000,
+        );
         break;
       }
     }
@@ -939,6 +1173,38 @@ class Pane {
 
 /** Same limit as the backend's built-in editor. */
 const EDITOR_MAX = 5 * 1024 * 1024;
+
+/** User names typed at a login prompt that then worked, by protocol and
+ * lower-case host, the one used last first: filled in the next time that
+ * server asks for one (a Telnet session's FTP has no saved user name). Never
+ * a password. At most TYPED_USERS_MAX servers. */
+const TYPED_USERS = "bx.typedUsers";
+const TYPED_USERS_MAX = 50;
+/** One server: protocol, lower-case host and port (two servers on one host are two). */
+const typedUserKey = (protocol: string, host: string, port: number | null) => `${protocol}:${host.trim().toLowerCase()}:${port ?? ""}`;
+function readTypedUsers(): [string, string][] {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(TYPED_USERS) ?? "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.flatMap((e: unknown): [string, string][] => (Array.isArray(e) && typeof e[0] === "string" && typeof e[1] === "string" ? [[e[0], e[1]]] : []));
+  } catch {
+    return [];
+  }
+}
+function typedUserFor(s: Pick<Session, "protocol" | "host" | "port">): string {
+  const key = typedUserKey(s.protocol, s.host, s.port);
+  return readTypedUsers().find(([k]) => k === key)?.[1] ?? "";
+}
+function rememberTypedUser(s: Pick<Session, "protocol" | "host" | "port">, user: string) {
+  const key = typedUserKey(s.protocol, s.host, s.port);
+  const latest: [string, string] = [key, user];
+  const next = [latest, ...readTypedUsers().filter(([k]) => k !== key)].slice(0, TYPED_USERS_MAX);
+  try {
+    localStorage.setItem(TYPED_USERS, JSON.stringify(next));
+  } catch {
+    // Storage full or blocked: the name is only a convenience.
+  }
+}
 
 export class FilesView implements View, EditorHost {
   el: HTMLElement;
@@ -968,6 +1234,14 @@ export class FilesView implements View, EditorHost {
   private readonly viewKey = crypto.randomUUID().slice(0, 8);
   /** A password typed at the prompt, saved to the vault once it worked. */
   private pendingCredential: string | null = null;
+  /** The user name typed in the login dialog (the session had none): while it
+   * is still the session's, a failed login asks for it again as well as the
+   * password, and one that works is remembered for this server. A name the
+   * session got otherwise later (a saved one) is not taken for it. */
+  private typedUser: string | null = null;
+  private get usingTypedUser(): boolean {
+    return this.typedUser !== null && this.typedUser === this.session.username;
+  }
   /** A key passphrase typed at the prompt, saved to the session's key
    * credential once it opened the key and the login went through. */
   private pendingPassphrase: string | null = null;
@@ -1346,6 +1620,9 @@ export class FilesView implements View, EditorHost {
       this.overlay.hidden = true;
       this.setState("connected");
       if (res.banner) toast(res.banner, "info");
+      // A user name typed for it that worked: offered the next time this
+      // server asks (a Telnet session's FTP, which has no saved user name).
+      if (this.usingTypedUser && this.session.username) rememberTypedUser(this.session, this.session.username);
       // The typed password worked: only now is it worth keeping.
       if (this.pendingCredential !== null) {
         const pw = this.pendingCredential;
@@ -1452,11 +1729,14 @@ export class FilesView implements View, EditorHost {
       const ftp = this.session.protocol === "ftp" || this.session.protocol === "ftps";
       const saveRow = `<label class="check"><input type="checkbox" name="save" /> 자격 증명 보관함에 저장하고 이 세션에 연결</label>`;
       let password: string;
-      if (!this.session.username) {
+      // A user name typed here before (none was saved) is asked again with the
+      // password when that login fails: it may be the wrong one ("SU" typed
+      // with Caps Lock on), not only the password.
+      if (!this.session.username || (retry && this.usingTypedUser)) {
         const res = await promptDialog({
           title: retry ? "로그인 정보가 올바르지 않습니다" : "로그인 정보 입력",
           label: `사용자 이름${ftp ? " (비우면 anonymous)" : ""}`,
-          value: "",
+          value: this.usingTypedUser ? this.session.username : typedUserFor(this.session),
           icon: "KeyRound",
           confirm: "연결",
           extra: `<label class="field"><span>${esc(userText(this.session.host))} 의 비밀번호</span>
@@ -1471,6 +1751,7 @@ export class FilesView implements View, EditorHost {
         });
         if (!res) return this.fail("로그인 정보 입력을 취소했습니다.");
         this.session.username = res.value.trim();
+        this.typedUser = this.session.username;
         password = res.form.querySelector<HTMLInputElement>("input[name=pw]")!.value;
         const save = res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked;
         this.pendingCredential = save ? password : null;
@@ -1488,6 +1769,8 @@ export class FilesView implements View, EditorHost {
         const save = res.form.querySelector<HTMLInputElement>("input[name=save]")!.checked;
         this.pendingCredential = save ? password : null;
       }
+      // The tab closed while the prompt was open: no login for a tab that is gone.
+      if (this.disposed) return;
       return this.connect({ ...extra, password });
     }
     this.fail(msg);
@@ -1651,16 +1934,37 @@ export class FilesView implements View, EditorHost {
     }
     this.el.querySelector(".transfers")!.classList.remove("collapsed");
     this.updateCount();
+    // The "finished" notice (see pump) needs the permission, asked from a
+    // user action: this one (asked once; nothing when already decided).
+    ensureNotifyPermission();
     this.pump();
   }
+
+  /** The transfers since the queue was last empty (see pump). */
+  private batch: { began: number; ok: number; failed: number } | null = null;
 
   private async pump() {
     if (this.running) return;
     this.running = true;
+    // A transfer that stops moving sends no progress: looked at every second
+    // so its last speed is not shown as if it were still going.
+    const stallTimer = window.setInterval(() => {
+      for (const j of this.queue) if (j.status === "running" && stalledFor(j) >= STALL_MS) this.renderJob(j);
+    }, 1000);
+    // This batch of transfers: when it began and how they ended, to tell when
+    // it is over (below). Kept across a dropped connection (the loop ends;
+    // connect() runs it again): the batch goes on.
+    const batch = (this.batch ??= { began: Date.now(), ok: 0, failed: 0 });
     let job: Job | undefined;
     // Pauses while disconnected; connect() calls pump() again.
     while (!this.disposed && this.state === "connected" && (job = this.queue.find((j) => j.status === "queued"))) {
       job.status = "running";
+      job.rate = 0;
+      job.rateAt = job.rateDone = undefined;
+      // Not "still" before its first progress: a large folder being listed
+      // first has not stalled.
+      job.seenAt = undefined;
+      job.startedAt = Date.now();
       this.renderJob(job);
       this.ws.changed();
       try {
@@ -1677,6 +1981,7 @@ export class FilesView implements View, EditorHost {
         job.filesDone = result.filesDone;
         job.skipped = result.skipped;
         job.status = "done";
+        job.finishedAt = Date.now();
         job.done = Math.max(job.done, job.total);
       } catch (err) {
         const msg = errorText(err);
@@ -1692,6 +1997,8 @@ export class FilesView implements View, EditorHost {
         continue;
       }
       job.requeue = false;
+      if (job.status === "done") batch.ok++;
+      else if (job.status === "error") batch.failed++;
       this.active--;
       jobs.delete(job.id);
       if (this.disposed) break;
@@ -1701,8 +2008,27 @@ export class FilesView implements View, EditorHost {
       this.trimFinished();
       this.updateCount();
     }
+    clearInterval(stallTimer);
     this.running = false;
     this.ws.changed();
+    // All of it over (not paused by a lost connection) after a while, with the
+    // app behind other windows: told, as a long ping or a timer is. Cancelled
+    // ones were the user's own doing and are not counted.
+    const drained = !this.disposed && !this.queue.some((j) => j.status === "queued" || j.status === "running");
+    if (!drained) return;
+    // Over: the next transfer starts a new batch.
+    this.batch = null;
+    const { began, ok, failed } = batch;
+    if ((ok || failed) && Date.now() - began >= 10_000 && !document.hasFocus()) {
+      requestAttention();
+      if (canOsNotify()) {
+        const counts = [tr(`${ok}개 완료`), ...(failed ? [tr(`${failed}개 실패`)] : [])].join(" · ");
+        // A click brings this tab back, if it is still open.
+        osNotify(tr(failed ? "파일 전송이 끝났습니다 (실패 있음)" : "파일 전송이 끝났습니다"), `${this.ws.nameOf(this)} · ${counts}`, () => {
+          if (!this.disposed) this.ws.focusView(this);
+        });
+      }
+    }
   }
 
   /** Keep only the most recent finished rows, so a long session of many small
@@ -1741,8 +2067,15 @@ export class FilesView implements View, EditorHost {
     const pct = j.total ? Math.min(100, Math.round((j.done / j.total) * 100)) : j.status === "done" ? 100 : 0;
     const statusText: Record<Job["status"], string> = {
       queued: "대기 중",
-      running: j.total ? `${pct}% · ${formatBytes(j.done)} / ${formatBytes(j.total)}` : `${formatBytes(j.done)} 전송`,
-      done: (j.isDir ? `완료 · 파일 ${j.filesDone}개` : "완료") + (j.skipped ? ` · 안전하지 않은 이름·링크 ${j.skipped}개 건너뜀` : ""),
+      running: [
+        j.total ? `${pct}% · ${formatBytes(j.done)} / ${formatBytes(j.total)}` : `${formatBytes(j.done)} 전송`,
+        // Still for a while: for how long (a speed from before would be a lie).
+        // Else, once there is a speed: it, and the time left when the size is known.
+        ...(stalledFor(j) >= STALL_MS
+          ? [`진행 없음 ${timeLeft(stalledFor(j) / 1000, 1)}`]
+          : [...(j.rate ? [`${formatBytes(Math.round(j.rate))}/s`] : []), ...(j.rate && j.total > j.done ? [`남은 시간 ${timeLeft(j.total - j.done, j.rate)}`] : [])]),
+      ].join(" · "),
+      done: (j.isDir ? `완료 · 파일 ${j.filesDone}개` : "완료") + doneTook(j) + (j.skipped ? ` · 안전하지 않은 이름·링크 ${j.skipped}개 건너뜀` : ""),
       error: j.error ?? "실패",
       cancelled: "취소됨",
     };
@@ -1758,6 +2091,7 @@ export class FilesView implements View, EditorHost {
     }
     j.el.querySelector<HTMLElement>(".job-bar i")!.style.width = `${pct}%`;
     j.el.querySelector(".job-status")!.textContent = statusText[j.status];
+    updateTaskbar();
   }
 
   private cancelJob(id: string) {
@@ -1803,6 +2137,8 @@ export class FilesView implements View, EditorHost {
       if (j.status === "queued") j.status = "cancelled";
       jobs.delete(j.id);
     }
+    // The taskbar bar no longer counts this tab's transfers.
+    updateTaskbar();
     api.remoteDisconnect(this.remoteId).catch(() => {});
   }
 }

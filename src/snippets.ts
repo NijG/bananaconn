@@ -34,9 +34,13 @@ export function asksValues(s: Snippet): boolean {
 /** Ask for the values of `s`'s {{?name}}s and give its text with them filled
  * in; null when cancelled. Each value starts as the one typed last time, else
  * the default written in the snippet. One without a default must be given. */
-export function askSnippetValues(s: Snippet): Promise<string | null> {
+/** `suggest`: values to offer for a {{?name}} as it is typed (the caller's:
+ * a terminal offers the interfaces or the addresses its output shows). */
+export function askSnippetValues(s: Snippet, suggest?: (name: string, text: string) => string[]): Promise<string | null> {
   const vars = snippetVars(s.text);
   const key = (name: string) => `${s.id}\n${name}`;
+  const lists = vars.map((v) => (suggest?.(v.name, s.text) ?? []).slice(0, 50));
+  const listId = (i: number) => `snippet-var-list-${i}`;
   return new Promise((resolve) => {
     let result: string | null = null;
     const m = modal({
@@ -48,7 +52,9 @@ export function askSnippetValues(s: Snippet): Promise<string | null> {
           ${vars
             .map(
               (v, i) => `<label class="field"><span data-i18n-skip>${esc(v.name)}</span>
-                <input name="v${i}" value="${esc(lastValues.get(key(v.name)) ?? v.value)}" spellcheck="false" autocomplete="off"/></label>`,
+                <input name="v${i}" value="${esc(lastValues.get(key(v.name)) ?? v.value)}" spellcheck="false" autocomplete="off"${lists[i].length ? ` list="${listId(i)}"` : ""}/>${
+                  lists[i].length ? `<datalist id="${listId(i)}">${lists[i].map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>` : ""
+                }</label>`,
             )
             .join("")}
           <div class="field"><span>보낼 내용</span><pre class="mono snippet-preview" data-i18n-skip></pre></div>
@@ -120,7 +126,7 @@ export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kin
     const items: (MenuItem | "-")[] = state.snippets.filter((s) => !s.group).map(entry);
     if (group) {
       if (items.length) items.push("-");
-      items.push({ label: group, icon: "Server", disabled: true });
+      items.push({ label: group, icon: "Server", heading: true });
       items.push(...state.snippets.filter((s) => s.group === group).map(entry));
     }
     const others = groups.filter((g) => g !== group);

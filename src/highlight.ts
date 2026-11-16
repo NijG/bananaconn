@@ -8,23 +8,29 @@
 // own output (any SGR style in effect) and of full-screen programs (alternate
 // screen).
 
-// One pass over the text: the group that matched picks the colour.
+// One pass over the text: the group that matched picks the colour. Network
+// gear's own states too: a port shut by errdisable ("err-disabled") in red, a
+// flapping link or MAC in yellow ("down" and "up" are left alone: too common
+// in prose to colour).
 const RULE =
-  /\b(?:(errors?|fail(?:ed|ure|s)?|fatal|critical|panic|denied|refused|exception|unreachable|timed out|timeout|offline|disconnected|rejected|aborted|invalid|unavailable|unhealthy)|(warn(?:ing|ings)?|deprecated|retry(?:ing)?)|(ok|success(?:ful(?:ly)?)?|succeeded|passed|enabled|active|running|online|connected|healthy))\b/gi;
+  /\b(?:(err-?disabled?|errors?|fail(?:ed|ure|s)?|fatal|critical|panic|denied|refused|exception|unreachable|timed out|timeout|offline|disconnected|rejected|aborted|invalid|unavailable|unhealthy|(?:packet )?loss)|(warn(?:ing|ings)?|deprecated|retry(?:ing)?|flap(?:ping|s)?)|(ok|success(?:ful(?:ly)?)?|succeeded|passed|enabled|active|running|online|connected|healthy))\b/gi;
 const bytesOf = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 const COLORS = ["\x1b[1;31m", "\x1b[1;33m", "\x1b[1;32m"].map(bytesOf);
 const RESET = bytesOf("\x1b[22;39m");
 
-const enum Esc {
-  Text,
-  Esc,
-  Csi,
+/** Where the parser is in the byte stream. Plain constants rather than a
+ * const enum, so Node can run this file as it is (scripts/highlight-check.mjs). */
+const Esc = {
+  Text: 0,
+  Esc: 1,
+  Csi: 2,
   /** OSC, DCS, APC, PM or SOS payload: passed through until BEL or ST. */
-  Str,
-  StrEsc,
+  Str: 3,
+  StrEsc: 4,
   /** ESC followed by an intermediate byte (charset selection etc.): one more byte. */
-  Single,
-}
+  Single: 5,
+} as const;
+type Esc = (typeof Esc)[keyof typeof Esc];
 
 /** The SGR state a program has set: any of it means "the program colours this". */
 class Sgr {
@@ -62,7 +68,7 @@ class Sgr {
 }
 
 export class KeywordHighlighter {
-  private esc = Esc.Text;
+  private esc: Esc = Esc.Text;
   private csi = "";
   private sgr = new Sgr();
   /** A full-screen program (vim, htop, less) is on the alternate screen. */
@@ -152,6 +158,18 @@ function latin1(data: Uint8Array, start: number, end: number): string {
 /** The text run as pieces with its keywords coloured (views into `data`
  * plus colour codes: the run itself is not copied), or null when there is
  * nothing to colour. */
+/** The word at [from, to) counts zero of itself: "0 errors", "0 input
+ * errors" (one word between), "errors 0", "errors: 0", and a ping's
+ * "0% packet loss" or "(0.0% loss)". */
+function zeroCount(text: string, from: number, to: number): boolean {
+  const before = text.slice(Math.max(0, from - 24), from);
+  const after = text.slice(to, to + 8);
+  return /(?:^|[^\w.])0(?:\.0+)?%? (?:[A-Za-z-]+ )?$/.test(before) || /^:? ?0(?:\.0+)?%?(?![\w.])/.test(after);
+}
+
+/** A column's title, not a state: "Loss%" over mtr's columns. */
+const columnTitle = (text: string, to: number) => text[to] === "%";
+
 function colorize(data: Uint8Array, start: number, end: number): Uint8Array[] | null {
   const text = latin1(data, start, end);
   RULE.lastIndex = 0;
@@ -162,6 +180,12 @@ function colorize(data: Uint8Array, start: number, end: number): Uint8Array[] | 
   while (m) {
     const from = m.index;
     const to = from + m[0].length;
+    // A count of none is no trouble: "0 input errors, 0 CRC" (IOS show
+    // interfaces), "RX errors 0 dropped 0" (Linux), "failed: 0".
+    if ((m[1] || m[2]) && (zeroCount(text, from, to) || columnTitle(text, to))) {
+      m = RULE.exec(text);
+      continue;
+    }
     if (from > at) pieces.push(data.subarray(start + at, start + from));
     pieces.push(m[1] ? COLORS[0] : m[2] ? COLORS[1] : COLORS[2], data.subarray(start + from, start + to), RESET);
     at = to;
