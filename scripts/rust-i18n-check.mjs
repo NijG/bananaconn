@@ -44,7 +44,8 @@ const dir = path.join(root, "src-tauri", "src");
 const missing = [];
 const seen = new Set();
 for (const f of fs.readdirSync(dir).filter((n) => n.endsWith(".rs") && !n.endsWith("tests.rs"))) {
-  let src = fs.readFileSync(path.join(dir, f), "utf8");
+  // A Windows checkout (CI) has CRLF line ends; the test marker below is LF.
+  let src = fs.readFileSync(path.join(dir, f), "utf8").replace(/\r\n/g, "\n");
   const testAt = src.indexOf("#[cfg(test)]\nmod tests");
   if (testAt >= 0) src = src.slice(0, testAt);
   src = src.replace(/\/\/[^\n]*/g, "");
