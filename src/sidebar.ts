@@ -13,7 +13,7 @@ const TREE_MARGIN = 40;
 import { endpoint, jumpHostOk, normalizeJumpHost, parseTarget, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { canBeGateway, confirmGatewayBreak, gatewayChoices, GATEWAY_PROTOCOLS, gatewayUserList, gatewayUsers } from "./tunnels";
-import { checkReachable, checkReachableMany, openMultiWatch } from "./nettools";
+import { checkReachable, checkReachableMany, openMultiWatch, watchTargets } from "./nettools";
 import { copyAddresses } from "./clipboard";
 import { folderCompare, sessionCompare, type SessionSort } from "./sessionOrder";
 import {
@@ -44,8 +44,8 @@ import {
 import { api } from "./api";
 import { clearDeviceAlert, deviceAlert, onDeviceAlerts } from "./deviceAlerts";
 import { confirmDialog, confirmDiscard, contextMenu, errorText, esc, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast, type MenuItem } from "./ui";
-import { connectHistory } from "./connectLog";
-import { openConnectHistory } from "./connectHistoryView";
+import { lastConnect } from "./connectLog";
+import { endedWord, openConnectHistory } from "./connectHistoryView";
 import { userText } from "./i18n";
 import { subnetMatcher } from "./ipLinks";
 import { clockAt, STATE_RANK, STATE_TEXT, type ViewState } from "./workspace";
@@ -620,6 +620,7 @@ export class Sidebar {
         e.preventDefault();
         const n = this.picked.size;
         const inside = this.folderSessions(path);
+        const watchable = watchTargets(inside).length;
         contextMenu(e.clientX, e.clientY, [
           ...(n ? [{ label: `선택한 세션 ${n}개를 여기로 이동`, icon: "FolderSync", action: () => this.moveTo([...this.picked], path) }, "-" as const] : []),
           { label: "이 폴더에 새 세션", icon: "Plus", action: () => this.actions.edit(null, { folder: path }) },
@@ -630,6 +631,11 @@ export class Sidebar {
             disabled: !inside.length,
             action: () => void checkReachableMany(inside, (s) => this.actions.connect(s)),
           },
+          // A floor's or a site's switches after maintenance, as the multi-selection offers it.
+          // Counted as the window takes them (no serial ports, each address once).
+          { label: `이 폴더의 장비 ${watchable}개를 연속 ping으로 지켜보기`, icon: "Radar", disabled: !watchable, action: () => openMultiWatch(inside) },
+          // One per line, as the multi-selection copies them: a host list to paste elsewhere.
+          { label: `이 폴더의 주소 ${inside.length}개 복사`, icon: "ClipboardList", disabled: !inside.length, action: () => void copyAddresses(inside) },
           { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: keyHint("tree.paste"), disabled: !this.clip, action: () => this.pasteSession(path) },
           { label: "하위 폴더 만들기", icon: "FolderPlus", action: () => this.newFolder(path) },
           { label: "이 폴더 안을 이름순으로 정렬", icon: "ArrowUpDown", action: () => this.sortOnce(path, "name") },
@@ -711,7 +717,8 @@ export class Sidebar {
       // A known one (a noisy device): put away without connecting.
       ...(deviceAlert(s.host) ? [{ label: "경고 표시 지우기", icon: "BellOff", action: () => clearDeviceAlert(s.host) }] : []),
       { label: "주소 복사", icon: "ClipboardList", hint: keyHint("tree.copyAddress"), action: () => void copyAddresses([s]) },
-      ...(connectHistory(s.id).length ? [{ label: "연결 기록…", icon: "History", action: () => openConnectHistory(s, (x) => this.actions.connect(x)) }] : []),
+      // Whether there is any record (lastConnect reads the cache; connectHistory would copy the whole log).
+      ...(lastConnect(s.id) ? [{ label: "연결 기록…", icon: "History", action: () => openConnectHistory(s, (x) => this.actions.connect(x)) }] : []),
       ...this.deviceRenameItems([s]),
       s.pinned
         ? { label: "홈 화면 고정 해제", icon: "PinOff", action: () => void pinSessions([s.id], false) }
@@ -1265,7 +1272,13 @@ function gatewayDeleteNote(gone: Session[]): string {
 function rowTitle(s: Session): string {
   const notes = s.notes ? `\n${s.notes.split("\n").map(userText).join("\n")}` : "";
   // An absolute time: the tree is not re-rendered as time passes, so "N분 전" would go stale.
-  const used = s.lastUsed ? `\n마지막 연결: ${clockAt(s.lastUsed)}` : "";
+  // With how that connection ended (the history's words), when the history has
+  // it: a record about as recent as the last use (none for one still open).
+  const last = lastConnect(s.id);
+  const record = last && (!s.lastUsed || last.at >= s.lastUsed - 60_000) ? last : undefined;
+  const at = record?.at ?? s.lastUsed;
+  const how = record ? endedWord(record) : null;
+  const used = at ? `\n마지막 연결: ${clockAt(at)}${how ? ` · ${how}` : ""}` : "";
   // What the app recognised there (the search finds it too): the device's own words, kept as written.
   const words = [s.options.osLabel, s.options.osName].filter((v): v is string => typeof v === "string" && !!v.trim()).map((v) => v.trim());
   const device = words.length ? `\n장비: ${userText(words.join(" · "))}` : "";

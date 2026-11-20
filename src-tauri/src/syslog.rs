@@ -125,12 +125,14 @@ fn file_writer(file: std::fs::File) -> std::io::Result<(FileOut, std::thread::Jo
 const SEVERITY: [&str; 8] = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
 
 /// A message as one line of the file: local time, sender, severity, the
-/// message (its own line breaks made blanks), tab-separated.
+/// message (its own tabs and line breaks made blanks, so it stays one line
+/// of four columns), tab-separated. The window's copy and save (syslog.ts
+/// asText) follow the same rule.
 fn file_line(m: &SyslogMessage) -> String {
     use chrono::TimeZone;
     let at = chrono::Local.timestamp_millis_opt(m.at as i64).single().map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
     let sev = m.severity.map_or("-", |s| SEVERITY[s as usize]);
-    format!("{at}\t{}\t{sev}\t{}\r\n", m.from, m.text.replace(['\r', '\n'], " "))
+    format!("{at}\t{}\t{sev}\t{}\r\n", m.from, m.text.replace(['\r', '\n', '\t'], " "))
 }
 
 struct Running {
@@ -406,6 +408,17 @@ mod tests {
         let m = message(b"<34>1 2026-11-08T10:00:00Z host app - - - hello", from, 0);
         assert_eq!((m.facility, m.severity), (Some(4), Some(2)));
         assert_eq!(m.text, "1 2026-11-08T10:00:00Z host app - - - hello");
+    }
+
+    #[test]
+    fn a_file_line_is_one_line_of_four_columns() {
+        let from: std::net::SocketAddr = "10.0.0.2:514".parse().unwrap();
+        // A sender's own tab and line breaks in the middle of its text.
+        let m = message(b"<189>a\tb\r\nc\nd", from, 0);
+        let line = file_line(&m);
+        assert!(line.ends_with("\r\n") && line.matches("\r\n").count() == 1, "{line:?}");
+        let cols: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!((cols.len(), cols[1], cols[2], cols[3]), (4, "10.0.0.2", "notice", "a b  c d"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 import { Terminal, type IBuffer, type IMarker } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { FullScreenSearch } from "../fullScreenSearch";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { api, on, openExternal, pickOpenFile, pickSavePath, revealInExplorer } from "../api";
 import type { PasteEvent } from "../api";
@@ -24,6 +25,8 @@ import {
   findMasks,
   findRates,
   findUptimes,
+  findLogMnemonics,
+  MAY_HOLD_MNEMONIC,
   maskForms,
   readableRate,
   interfaceNames,
@@ -38,7 +41,7 @@ import { clockText, LineTimes } from "../lineTimes";
 import { splitTable, type CellLine } from "../tableCopy";
 import { notesButton } from "../sessionNotes";
 import { savedSessionItems } from "../nettools";
-import { openSyslog, syslogSender } from "../syslog";
+import { openSyslog, SEVERITY, syslogSender } from "../syslog";
 import { icon } from "../icons";
 import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Protocol, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
@@ -481,12 +484,38 @@ const TOOLBAR_KEYS: Record<string, string> = {
   "term.break": "break",
 };
 
+/** The host part of a prompt ("router" of "router(config)#", "web" of
+ * "user@web:~$" and of "[root@web ~]#"): two prompts of one device in another
+ * mode, folder or user (su -, sudo -i) share it; another host's does not. */
+function promptHost(prompt: string): string {
+  const head = promptHead(prompt);
+  return head.slice(head.lastIndexOf("@") + 1);
+}
+
+/** The prompt's head with its user ("admin@web" of "admin@web:~$", "router" of
+ * "router(config)#"): what sending a command again goes by (a repeat, the
+ * pager-off button). Stricter than promptHost: many devices share a default
+ * host name (raspberrypi, OpenWrt, ubuntu), so after "ssh other@ubuntu" only
+ * a different user may tell them apart; telling the done notice a little
+ * late is harmless, sending a command to another device is not. */
+function promptHead(prompt: string): string {
+  return /^[^\s(#>$%\]:]*/.exec(prompt)![0];
+}
+
+/** How long a command ran, as its line's mark shows it: "12.4s", "3m 05s", "1h 02m". */
+function durationText(ms: number): string {
+  const s = ms / 1000;
+  return s < 60 ? `${s.toFixed(1)}s` : s < 3600 ? `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
 export class TerminalView implements View {
   el: HTMLElement;
   state: ViewState = "connecting";
   private term: Terminal;
   private fit = new FitAddon();
   private search = new SearchAddon();
+  /** Matches of a search typed in vi, less or more, marked on the screen. */
+  private fullSearch!: FullScreenSearch;
   private runtimeId = "";
   private logPath: string | null = null;
   private host: HTMLElement;
@@ -743,9 +772,11 @@ export class TerminalView implements View {
     this.term.registerLinkProvider({
       provideLinks: (y, callback) => {
         const line = this.term.buffer.active.getLine(y - 1);
-        // A cheap test first: an address, a MAC or an interface name ("Gi1/0/1", "Po1").
+        // A cheap test first: an address, a MAC, an interface name ("Gi1/0/1", "Po1")
+        // or a log message name ("%SYS-5-CONFIG_I", often on a line with nothing else).
         const lineText = line?.translateToString(true) ?? "";
-        if (!line || !(/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average/.test(lineText) || mayHoldInterface(lineText))) return callback(undefined);
+        if (!line || !(/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average/.test(lineText) || mayHoldInterface(lineText) || MAY_HOLD_MNEMONIC.test(lineText)))
+          return callback(undefined);
         // The text with the screen cell of each character: a wide character
         // (Hangul) takes two cells, so string positions are not columns.
         let text = "";
@@ -780,11 +811,13 @@ export class TerminalView implements View {
           ...findMasks(text).map((m) => link(m.index, m.length, (e) => this.maskMenu(m.prefix, e.clientX, e.clientY))),
           ...findRates(text).map((m) => link(m.index, m.length, (e) => this.rateMenu(m.bitsPerSecond, y - 1, e.clientX, e.clientY))),
           ...findUptimes(text).map((m) => link(m.index, m.length, (e) => this.uptimeMenu(m, y - 1, e.clientX, e.clientY))),
+          ...findLogMnemonics(text).map((m) => link(m.index, m.length, (e) => this.logMnemonicMenu(m.text, m.severity, e.clientX, e.clientY))),
         ];
         callback(links.length ? links : undefined);
       },
     });
     this.term.open(this.host);
+    this.fullSearch = new FullScreenSearch(this.term, () => this.atShellLine());
     this.applyThemeBackground();
     this.wireBlink();
     this.assist = new CmdAssist(
@@ -810,6 +843,8 @@ export class TerminalView implements View {
 
     this.term.onData((data) => {
       if (this.state !== "connected" && this.state !== "connecting") return;
+      // Enter typed: a search line at the bottom (vi's "/text") marks its matches.
+      if (!this.pasting && data.includes("\r")) this.fullSearch.enterTyped();
       // Broadcast only what the user typed; xterm's automatic replies (device
       // reports, focus and mouse events) belong to this terminal alone, and
       // pastes are mirrored as text below.
@@ -885,6 +920,7 @@ export class TerminalView implements View {
       const row = this.rowAt(e.clientY);
       const came = row === null ? null : this.lineTime(row);
       const when = came === null ? "" : clockText(came);
+      const span = this.selectionSpan();
       contextMenu(e.clientX, e.clientY, [
         { label: "복사", icon: "Copy", hint: keyHint("term.copy"), disabled: !this.term.hasSelection(), action: run(() => writeClipboard(this.term.getSelection())) },
         { label: "붙여넣기", icon: "ClipboardPaste", hint: keyHint("term.paste"), action: run(() => this.paste()) },
@@ -892,21 +928,36 @@ export class TerminalView implements View {
         { label: "선택 영역 비교", icon: "Columns2", hint: keyHint("term.compare"), disabled: !this.term.hasSelection(), action: () => this.compareSelection() },
         { label: "표로 복사 (엑셀용)", icon: "Table", hint: keyHint("term.copyTable"), disabled: !this.term.hasSelection(), action: run(() => this.copyTable()) },
         { label: "명령 출력 복사", icon: "ClipboardList", hint: keyHint("term.copyOutput"), action: run(() => this.copyCommandOutput()) },
+        { label: "명령 출력을 파일로 저장…", icon: "Save", hint: keyHint("term.saveOutput"), action: () => void this.saveCommandOutput() },
         { label: "이전 실행과 비교", icon: "History", hint: keyHint("term.compareRuns"), action: () => this.compareRuns() },
         "-",
         { label: "터미널에서 찾기", icon: "Search", hint: keyHint("term.find"), action: () => this.toggleFind(true) },
         { label: "화면 지우기", icon: "Eraser", hint: keyHint("term.clear"), action: run(() => this.clearScreen()) },
         this.repeatMenuItem(),
         this.timerMenuItem(),
+        ...(when || span ? ["-" as const] : []),
         ...(when
           ? [
-              "-" as const,
               {
                 label: "이 줄을 받은 시각",
                 icon: "Clock",
                 hint: when,
                 action: run(() => {
                   void writeClipboard(when);
+                  toast("시각을 복사했습니다", "success", 1500);
+                }),
+              },
+            ]
+          : []),
+        // Between the selection's first and last line: a click copies it.
+        ...(span
+          ? [
+              {
+                label: "선택한 줄 사이 시간",
+                icon: "Timer",
+                hint: span,
+                action: run(() => {
+                  void writeClipboard(span);
                   toast("시각을 복사했습니다", "success", 1500);
                 }),
               },
@@ -2230,6 +2281,7 @@ export class TerminalView implements View {
     if (prompt) this.markPrompts.set(marker, prompt);
     clearTimeout(this.commandEndTimer);
     this.runningCommand = prompt ? { marker, prompt, start: Date.now() } : null;
+    this.pagerSeen = false;
   }
 
   /** Dispose the command marks `which` picks (their ⏱ labels go with them). */
@@ -2269,23 +2321,79 @@ export class TerminalView implements View {
     if (row <= run.marker.line) return;
     // Up to the cursor's column (cells, so a wide character counts as two).
     const before = (buf.getLine(row)?.translateToString(true, 0, buf.cursorX) ?? "").trimEnd();
+    // The device's pager stopped the output ("--More--"): offered off once the
+    // prompt is back (keys typed now would go to the pager).
+    if (PAGER_PROMPT.test(before)) this.pagerSeen = true;
     if (!before || !PROMPT_END.test(before)) return;
     // The same prompt, or the same host's in another mode or folder ("router#"
     // → "router(config)#", "user@web:~$" → "user@web:/tmp$"); not another
     // host's ("router2#", the prompt of a server reached by ssh).
-    const host = (p: string) => /^[^\s(#>$%\]:]*/.exec(p)![0];
-    if (before !== run.prompt && !(host(run.prompt) && host(before) === host(run.prompt))) return;
+    if (before !== run.prompt && !(promptHost(run.prompt) && promptHost(before) === promptHost(run.prompt))) return;
     this.runningCommand = null;
+    if (this.pagerSeen) {
+      this.pagerSeen = false;
+      this.offerPagerOff(before);
+    }
     const ms = this.lastOutputAt - run.start;
     if (ms >= 2000) this.showDuration(run.marker, ms);
+    this.commandDone(run, ms);
+  }
+
+  /** The running command's output met the device's pager ("--More--"). */
+  private pagerSeen = false;
+  /** Turning the pager off was offered in this connection (once is enough). */
+  private pagerOffered = false;
+
+  /** A command's output stopped at the device's pager and its prompt is back:
+   * once per connection, the device's own session-only command that turns
+   * paging off (devmon.rs Kind::pager_off, as the monitor uses it) is offered.
+   * Sent only on a click, and only to an empty prompt of this tab that is
+   * still the same device's (`prompt`: the one the output came back to; after
+   * ssh or telnet to another device the command would mean nothing there). */
+  private offerPagerOff(prompt: string) {
+    const command = this.device?.pagerOff;
+    if (!command || this.pagerOffered || !this.loggedIn) return;
+    this.pagerOffered = true;
+    toast(`이 장비가 긴 출력을 페이지로 나눕니다 (--More--). 이 연결에서만 끄는 명령: ${userText(command)}`, "info", 12000, {
+      label: "페이지 나눔 끄기",
+      run: () => {
+        // As cdTo, and not in the middle of a paced paste.
+        if (this.disposed || this.state !== "connected" || !this.loggedIn || this.pasteActive || this.inputKind() !== "shell") return void toast("명령 줄에서만 보낼 수 있습니다", "warn");
+        const now = this.idlePrompt();
+        if (now === null) return void toast("명령 프롬프트에서 아무것도 입력하지 않았을 때 보낼 수 있습니다", "warn", 5000);
+        // The same device's prompt, by its head (user included); a prompt with
+        // no head ("$ ", "# ") cannot tell devices apart: not sent.
+        if (!promptHead(prompt) || promptHead(now.trimEnd()) !== promptHead(prompt)) return void toast("다른 장비의 프롬프트라 보내지 않았습니다", "warn", 5000);
+        this.interruptRepeat();
+        this.sendInput(`${command}\r`);
+        this.ws.focusView(this);
+      },
+    });
+  }
+
+  /** "작업 완료" on, the prompt back: told now (not after the silence of
+   * armNotify), with the command and how long it took, unless this tab is
+   * being watched. The silence timer's notice is then not needed. */
+  private commandDone(run: { marker: IMarker; prompt: string }, ms: number) {
+    if (!this.notifyDone || this.disposed) return;
+    clearTimeout(this.notifyTimer);
+    this.notifySaw = false;
+    // A repeat sends its command again and again: told once, when it stops (stopRepeat).
+    if (this.repeat || (this.isOnScreen() && document.hasFocus())) return;
+    // The line as typed (wrapped rows joined); a line that does not start with
+    // the prompt was no command (an answer to a question, keys typed into
+    // output): no command named then, rather than a piece of output.
+    const line = this.commandBook().text(run.marker.line);
+    const typed = line.startsWith(run.prompt) ? line.slice(run.prompt.length).trim() : "";
+    const command = typed.length > 80 ? `${typed.slice(0, 79)}…` : typed;
+    const body = [this.ws.nameOf(this), command && `${command} (${durationText(ms)})`].filter(Boolean).join("\n");
+    osNotify(tr("작업 완료"), body, () => this.ws.focusView(this));
   }
 
   /** "⏱ 12.4s" at the right end of a command's line, where it does not cover
    * the command itself. */
   private showDuration(marker: IMarker, ms: number) {
-    const s = ms / 1000;
-    const label =
-      s < 60 ? `⏱ ${s.toFixed(1)}s` : s < 3600 ? `⏱ ${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s` : `⏱ ${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+    const label = `⏱ ${durationText(ms)}`;
     const width = label.length + 1;
     // Columns the line uses: up to its last non-blank cell (a wide character
     // takes two, so the text's length would undercount).
@@ -2771,8 +2879,7 @@ export class TerminalView implements View {
       if (prompt !== null && (!r.marker || r.marker.isDisposed || row > r.marker.line)) {
         // The same prompt, or the same device's ("router#" → "router(config)#");
         // another host's (the run logged out or jumped) ends the repeat.
-        const host = (p: string) => /^[^\s(#>$%\]:]*/.exec(p)![0];
-        if (prompt !== r.prompt && !(host(r.prompt) && host(prompt) === host(r.prompt))) return this.stopRepeat("프롬프트가 바뀌어 반복 실행을 멈췄습니다", "warn");
+        if (prompt !== r.prompt && !(promptHead(r.prompt) && promptHead(prompt) === promptHead(r.prompt))) return this.stopRepeat("프롬프트가 바뀌어 반복 실행을 멈췄습니다", "warn");
         if (Date.now() >= r.dueAt) return this.repeatRun(r);
       }
     }
@@ -2807,6 +2914,8 @@ export class TerminalView implements View {
     r.marker?.dispose();
     this.renderRepeat();
     if (message) toast(message, kind, 5000);
+    // "작업 완료" on: the repeat as a whole is the task (its runs were not told one by one).
+    if (this.notifyDone && !this.disposed && !(this.isOnScreen() && document.hasFocus())) osNotify(tr("작업 완료"), `${this.ws.nameOf(this)}\n${r.command}`, () => this.ws.focusView(this));
   }
 
   /** Input from the user or for them (keys, paste, snippet, AI) takes the line: the repeat stops. */
@@ -2911,6 +3020,8 @@ export class TerminalView implements View {
     clearTimeout(this.tailTimer);
     this.lastLine = "";
     this.runningCommand = null;
+    // A new session on the device: its pager is on again.
+    this.pagerSeen = this.pagerOffered = false;
     clearTimeout(this.commandEndTimer);
     // A new TextDecoder so a partial multibyte character left over from a dropped
     // connection does not corrupt the first trigger line of this one.
@@ -3530,12 +3641,17 @@ export class TerminalView implements View {
   private armNotify() {
     this.notifySaw = true;
     clearTimeout(this.notifyTimer);
+    // A command whose prompt is known is told when the prompt comes back
+    // (commandDone): a pause in its output (a TFTP copy between files) is
+    // not its end. The silence still tells after a while, should the prompt
+    // never be recognised (another host's, reached from this one).
+    const quiet = this.runningCommand && !this.runningCommand.marker.isDisposed ? 30_000 : 4000;
     this.notifyTimer = window.setTimeout(() => {
-      if (!this.notifyDone || !this.notifySaw || this.disposed) return;
+      if (!this.notifyDone || !this.notifySaw || this.disposed || this.repeat) return;
       this.notifySaw = false;
       if (this.isOnScreen() && document.hasFocus()) return; // you are watching it
       osNotify(tr("작업 완료"), this.ws.nameOf(this), () => this.ws.focusView(this));
-    }, 4000);
+    }, quiet);
   }
 
   /** This tab is shown in a visible slot right now. */
@@ -3769,6 +3885,19 @@ export class TerminalView implements View {
       { label: f.slash, userLabel: true, icon: "Copy", hint: "접두사", action: () => void writeClipboard(f.slash) },
       { label: f.netmask, userLabel: true, icon: "Copy", hint: "서브넷 마스크", action: () => void writeClipboard(f.netmask) },
       { label: f.wildcard, userLabel: true, icon: "Copy", hint: "와일드카드 마스크", action: () => void writeClipboard(f.wildcard) },
+    ]);
+  }
+
+  /** A Cisco log message name clicked in the output ("%LINK-3-UPDOWN"): its
+   * severity in words, a copy, and every line with it (in this tab or in
+   * every terminal tab): how often a port flapped, when the config changed. */
+  private logMnemonicMenu(name: string, severity: number, x: number, y: number) {
+    const exact = { regex: false, caseSensitive: true };
+    contextMenu(x, y, [
+      { label: name, userLabel: true, icon: "Copy", hint: `심각도 ${severity} · ${SEVERITY[severity]}`, action: () => void writeClipboard(name) },
+      "-",
+      { label: "이 메시지가 나온 줄 모아 보기", icon: "ListFilter", action: () => this.matchList(name, exact, false) },
+      ...(this.otherTerminals().length ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", action: () => this.matchList(name, exact, true) }] : []),
     ]);
   }
 
@@ -4257,16 +4386,56 @@ export class TerminalView implements View {
   /** term.copyOutput: the output of the command meant now (currentCommand).
    * A command still running gives what it printed so far. */
   private copyCommandOutput() {
+    const out = this.commandOutputNow();
+    if (!out) return;
+    const { lines, running } = out;
+    void writeClipboard(lines.join("\n"));
+    toast(running ? `명령 출력 ${lines.length}줄을 복사했습니다 (실행 중: 지금까지의 출력)` : `명령 출력 ${lines.length}줄을 복사했습니다`, "success", 3000);
+  }
+
+  /** The command meant now (currentCommand), its line flashed: the command as
+   * typed after its prompt and its output, trailing blanks trimmed. Nothing
+   * (a toast says why) when there is no such command or no output. */
+  private commandOutputNow(): { command: string; lines: string[]; running: boolean } | undefined {
     const buf = this.term.buffer.active;
     if (buf.type !== "normal") return void toast("화면 전체를 쓰는 프로그램 안에서는 쓸 수 없습니다", "info");
     const book = this.commandBook();
     if (!book.marks.length) return void toast("복사할 명령이 없습니다. 프롬프트에서 입력한 명령이 기록된 다음 쓸 수 있습니다", "info", 5000);
     const i = this.currentCommand(book);
+    const mark = book.marks[i];
     const { lines, running } = this.outputOf(book, i);
-    this.flashLine(book.marks[i].line);
+    this.flashLine(mark.line);
     if (!lines.length) return void toast("그 명령은 출력이 없습니다", "info");
-    void writeClipboard(lines.map((l) => l.trimEnd()).join("\n"));
-    toast(running ? `명령 출력 ${lines.length}줄을 복사했습니다 (실행 중: 지금까지의 출력)` : `명령 출력 ${lines.length}줄을 복사했습니다`, "success", 3000);
+    // Named only when the line starts with its prompt (as commandDone reads it).
+    const line = book.text(mark.line);
+    const prompt = this.markPrompts.get(mark) ?? "";
+    const command = line.startsWith(prompt) ? line.slice(prompt.length).trim() : "";
+    return { command, lines: lines.map((l) => l.trimEnd()), running };
+  }
+
+  /** term menu: the output of the command meant now saved as a text file
+   * ("show tech-support" is too long for the clipboard to be handy), named
+   * by the tab, the command and the time. */
+  private async saveCommandOutput() {
+    const out = this.commandOutputNow();
+    if (!out) return;
+    const { command, lines, running } = out;
+    // Name parts with blanks as "_", kept short; characters Windows refuses
+    // are replaced where every suggested save name is (pickSavePath).
+    const part = (s: string) =>
+      s
+        .replace(/\s+/g, "_")
+        .slice(0, 60)
+        .replace(/^_+|_+$/g, "");
+    const name = [part(this.title()), part(command), timestamp()].filter(Boolean).join("_");
+    const path = await pickSavePath(`${name}.txt`, [{ name: "텍스트", extensions: ["txt", "log"] }]);
+    if (!path) return;
+    try {
+      await api.saveTextFile(path, `${lines.join("\r\n")}\r\n`);
+      toast(running ? `명령 출력 ${lines.length}줄을 저장했습니다 (실행 중: 지금까지의 출력)` : `명령 출력 ${lines.length}줄을 저장했습니다`, "success", 3000);
+    } catch (err) {
+      toast(errorText(err), "error");
+    }
   }
 
   /** term.compareRuns: the output of the command meant now (currentCommand)
@@ -4358,13 +4527,25 @@ export class TerminalView implements View {
     return { lines, running };
   }
 
-  /** term.copyTable: the selected lines, whole (from the selection's first
-   * row to its last, wrapped rows joined), as a tab-separated table a
-   * spreadsheet pastes one value per cell; columns as tableCopy.ts reads them
-   * from the header, by screen cell so wide characters keep them aligned. */
-  private copyTable() {
+  /** The cursor's row is the shell's command line: it starts with the prompt
+   * this tab learnt (by its head, "admin@web" of "admin@web:/tmp$", so another
+   * folder still counts), or, no prompt learnt, an idle prompt waits on the
+   * bottom row. A vi's file rows ("# comment") are neither. */
+  private atShellLine(): boolean {
+    const buf = this.term.buffer.active;
+    if (buf.type !== "normal") return false;
+    const row = (buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true) ?? "").trimStart();
+    const learnt = this.assist?.knownPrompt().trim() ?? "";
+    const head = learnt ? promptHead(learnt) : "";
+    if (head) return promptHead(row) === head;
+    return buf.cursorY === this.term.rows - 1 && this.idlePrompt() !== null;
+  }
+
+  /** The selection's lines, whole: its first and last buffer row, wrapped
+   * rows taken in; none without a selection. */
+  private selectedRows(): { first: number; last: number } | null {
     const pos = this.term.hasSelection() ? this.term.getSelectionPosition() : undefined;
-    if (!pos) return void toast("표로 복사할 줄을 머리글 줄부터 먼저 선택하세요", "info", 4000);
+    if (!pos) return null;
     const buf = this.term.buffer.active;
     // Buffer rows, from 0 (xterm's docs say 1, its selection service gives 0).
     // A selection ending at the very start of a row does not take that row.
@@ -4372,6 +4553,40 @@ export class TerminalView implements View {
     let last = pos.end.x === 0 && pos.end.y > first ? pos.end.y - 1 : pos.end.y;
     while (first > 0 && buf.getLine(first)?.isWrapped) first--;
     while (buf.getLine(last + 1)?.isWrapped) last++;
+    return { first, last };
+  }
+
+  /** The time between the selection's first and last line, by when each
+   * arrived (a reload's outage, a routing change settling): "12:01:03 →
+   * 12:03:40 · 2m 37s"; none for one line or a line with no time. */
+  private selectionSpan(): string | null {
+    const rows = this.selectedRows();
+    if (!rows) return null;
+    // A drag often ends (or starts) on a blank row, which has no time: the
+    // nearest line with text at each end counts.
+    const buf = this.term.buffer.active;
+    const blank = (y: number) => !buf.getLine(y)?.translateToString(true).trim();
+    let { first, last } = rows;
+    while (first < last && blank(first)) first++;
+    while (last > first && blank(last)) last--;
+    // One line (wrapped over several rows or not) spans no time.
+    while (last > first && buf.getLine(last)?.isWrapped) last--;
+    if (first === last) return null;
+    const from = this.lineTime(first);
+    const to = this.lineTime(last);
+    if (from === null || to === null || to <= from) return null;
+    return `${clockText(from)} → ${clockText(to)} · ${durationText(to - from)}`;
+  }
+
+  /** term.copyTable: the selected lines, whole (from the selection's first
+   * row to its last, wrapped rows joined), as a tab-separated table a
+   * spreadsheet pastes one value per cell; columns as tableCopy.ts reads them
+   * from the header, by screen cell so wide characters keep them aligned. */
+  private copyTable() {
+    const picked = this.selectedRows();
+    if (!picked) return void toast("표로 복사할 줄을 머리글 줄부터 먼저 선택하세요", "info", 4000);
+    const { first, last } = picked;
+    const buf = this.term.buffer.active;
     const nul = buf.getNullCell();
     const lines: CellLine[] = [];
     for (let y = first; y <= last; y++) {
@@ -5093,6 +5308,11 @@ export class TerminalView implements View {
         e.preventDefault();
         this.compareRuns();
         return false;
+      case "term.saveOutput":
+        if (this.term.buffer.active.type !== "normal") break;
+        e.preventDefault();
+        void this.saveCommandOutput();
+        return false;
       case "term.prevCommand":
       case "term.nextCommand":
         // In vi, tmux, mc … the key is the program's (no command marks there).
@@ -5144,6 +5364,7 @@ export class TerminalView implements View {
   dispose() {
     this.disposed = true;
     this.closing = true;
+    this.fullSearch?.dispose();
     this.notes.dispose();
     this.stopTimer();
     this.stopAutoReconnect();

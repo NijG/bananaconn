@@ -173,6 +173,9 @@ export function openFileServer(kind: FileServerKind) {
   logBox.addEventListener("click", (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>("[data-reveal]");
     if (b?.dataset.reveal) revealInExplorer(b.dataset.reveal).catch((err) => toast(errorText(err), "error"));
+    // Or its SHA-256/SHA-512: a device's backup or image checked where it arrived.
+    const hash = (e.target as HTMLElement).closest<HTMLElement>("[data-hash]")?.dataset.hash;
+    if (hash) void import("./fileHash").then((f) => f.openSavedFileHash(hash));
   });
   let drawnControls = "";
   let drawnState = "";

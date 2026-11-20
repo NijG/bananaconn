@@ -531,10 +531,22 @@ function safeSaveName(name: string): string {
 }
 
 export async function pickSavePath(defaultPath: string, filters?: { name: string; extensions: string[] }[]) {
-  const safe = safeSaveName(defaultPath);
-  if (!isTauri) return `C:\\preview\\${safe}`;
+  return saveDialog("", safeSaveName(defaultPath), filters);
+}
+
+/** A save dialog that starts at `path`, a full path the user chose or typed
+ * before (a folder and a file name): the folder is kept as it is, only the
+ * name is made valid. pickSavePath is for bare names, whose "/" or "\" is
+ * part of the name (a session called "SW/1"). */
+export async function pickSavePathAt(path: string, filters?: { name: string; extensions: string[] }[]) {
+  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return saveDialog(path.slice(0, cut + 1), safeSaveName(path.slice(cut + 1)), filters);
+}
+
+async function saveDialog(folder: string, name: string, filters?: { name: string; extensions: string[] }[]) {
+  if (!isTauri) return `${folder || "C:\\preview\\"}${name}`;
   const { save } = await import("@tauri-apps/plugin-dialog");
-  return save({ defaultPath: safe, filters });
+  return save({ defaultPath: folder + name, filters });
 }
 
 export async function pickOpenFile(title: string, defaultPath?: string) {

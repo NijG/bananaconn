@@ -1842,6 +1842,39 @@ export class FilesView implements View, EditorHost {
   // ---- transfers --------------------------------------------------------------
 
   /** Queue the given entries from one side to the other side's current folder. */
+  /** Of `candidates` (files whose listed size and time match the file of the
+   * same name at the destination), those that still match when read again
+   * now: the local file's stat, and the remote folder listed afresh. Times in
+   * whole seconds on both sides (as the listings give them); a time of 0 is
+   * unknown, never a match. Anything that cannot be read is not the same. */
+  private async sameNow(candidates: FileEntry[], to: Side, destDir: string): Promise<Set<FileEntry>> {
+    const same = new Set<FileEntry>();
+    if (!candidates.length) return same;
+    // Each remote folder listed once; its entries found by name (exact: remote names are case-sensitive).
+    const remoteDirs = new Map<string, Promise<Map<string, FileEntry>>>();
+    const remoteEntry = (path: string) => {
+      const cut = path.lastIndexOf("/");
+      const dir = path.slice(0, cut) || "/";
+      if (!remoteDirs.has(dir)) remoteDirs.set(dir, api.remoteList(this.remoteId, dir).then((l) => new Map(l.map((e) => [e.name, e]))));
+      return remoteDirs.get(dir)!.then((m) => m.get(path.slice(cut + 1)));
+    };
+    await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          // Upload: c is the local file; download: c is the remote one.
+          const localPath = to === "remote" ? c.path : this.pane("local").join(destDir, c.name);
+          const remotePath = to === "remote" ? this.pane("remote").join(destDir, c.name) : c.path;
+          const [[ms, size], r] = await Promise.all([api.localStat(localPath), remoteEntry(remotePath)]);
+          const secs = Math.floor(ms / 1000);
+          if (r && !r.isDir && secs > 0 && r.modified === secs && r.size === size) same.add(c);
+        } catch {
+          // Not readable now: sent as chosen.
+        }
+      }),
+    );
+    return same;
+  }
+
   async send(from: Side, entries: FileEntry[]) {
     if (this.state !== "connected") return toast("서버에 연결된 다음 전송할 수 있습니다", "warn");
     const to = from === "local" ? "remote" : "local";
@@ -1891,8 +1924,29 @@ export class FilesView implements View, EditorHost {
         .map((j) => key(j.dest)),
     );
     const clashes = entries.filter((e) => existing.has(key(e.name)) || queuedHere.has(key(dest.join(destDir, e.name))));
+    // The same file already there: same size and modification second. SFTP
+    // only: its transfers keep the time both ways (remote.rs keep_modified),
+    // and its times are exact seconds, while an FTP listing can give minutes
+    // or just a date. A name only queued here is no known file yet.
+    // The panes' listings only pick the candidates: a file edited since it was
+    // listed (same size, a save in Notepad) must not pass for the same, so
+    // both sides are read again now (sameNow).
+    const there = new Map(destEntries.map((d) => [key(d.name), d]));
+    const candidates =
+      this.session.protocol !== "sftp"
+        ? []
+        : clashes.filter((c) => {
+            const d = there.get(key(c.name));
+            // A name also queued here will be replaced by that job: not known yet.
+            return !c.isDir && !!d && !d.isDir && !queuedHere.has(key(dest.join(destDir, c.name))) && c.size === d.size && !!c.modified && c.modified === d.modified;
+          });
+    const same = await this.sameNow(candidates, to, destDir);
+    if (this.disposed) return;
     if (clashes.length) {
-      const list = clashes.slice(0, 6).map((c) => `<li><span data-i18n-skip>${esc(c.name)}</span>${c.isDir ? " (폴더 — 안의 같은 파일을 덮어씀)" : ""}</li>`).join("");
+      const list = clashes
+        .slice(0, 6)
+        .map((c) => `<li><span data-i18n-skip>${esc(c.name)}</span>${c.isDir ? " (폴더 — 안의 같은 파일을 덮어씀)" : same.has(c) ? " (같은 파일)" : ""}</li>`)
+        .join("");
       const choice = await choiceDialog({
         title: "같은 이름이 이미 있습니다",
         icon: "TriangleAlert",
@@ -1900,6 +1954,15 @@ export class FilesView implements View, EditorHost {
           <ul class="clash-list">${list}${clashes.length > 6 ? `<li>외 ${clashes.length - 6}개</li>` : ""}</ul>`,
         choices: [
           ...(clashes.length < entries.length ? [{ value: "skip", label: "겹치는 항목 건너뛰기" }] : []),
+          // Only files are compared: a clashing folder still has everything in it overwritten, which the label says.
+          ...(same.size
+            ? [
+                {
+                  value: "changed",
+                  label: clashes.some((c) => c.isDir) ? `바뀐 것만 덮어쓰기 (같은 파일 ${same.size}개 건너뜀 · 폴더 안은 모두 덮어씀)` : `바뀐 것만 덮어쓰기 (같은 파일 ${same.size}개 건너뜀)`,
+                },
+              ]
+            : []),
           { value: "overwrite", label: "덮어쓰기", kind: "danger" as const },
         ],
       });
@@ -1907,6 +1970,9 @@ export class FilesView implements View, EditorHost {
       if (choice === "skip") {
         const drop = new Set(clashes);
         entries = entries.filter((e) => !drop.has(e));
+      } else if (choice === "changed") {
+        entries = entries.filter((e) => !same.has(e));
+        if (!entries.length) return void toast("모두 같은 파일이라 보낼 것이 없습니다", "info");
       }
     }
     // Closed or disconnected while the dialog was up.

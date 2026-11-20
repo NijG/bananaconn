@@ -34,7 +34,9 @@ export function logRenderer(box: HTMLElement, kinds: Record<string, [string, str
     const pathOnly = PATH_KINDS.has(e.kind);
     return `<div class="ftpd-row k-${esc(e.kind)}"><time>${esc(e.at)}</time>${icon(ic, 13)}<b>${esc(label)}</b>
           ${e.user ? `<span class="who" data-i18n-skip>${esc(e.user)}</span>` : ""}<span class="what"${pathOnly ? " data-i18n-skip" : ""}>${esc(e.detail)}</span>${
-            e.saved ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(e.saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button>` : ""
+            e.saved
+              ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(e.saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button><button type="button" class="btn btn-ghost btn-sm" data-hash="${esc(e.saved)}">${icon("ShieldCheck", 13)}해시 확인</button>`
+              : ""
           }</div>`;
   };
   return (log: LogEntry[]) => {

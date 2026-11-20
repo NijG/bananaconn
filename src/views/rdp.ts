@@ -102,7 +102,8 @@ export class RdpView implements View {
         key: `rdp:${endpoint(session)}`,
         system: "a Windows computer seen through Remote Desktop (RDP); the engineer can attach screenshots of its screen",
         names: () => [session.host, session.name, session.username],
-        canvas: () => (this.desktop.w ? this.canvas : null),
+        // Only while connected (a dropped session's canvas keeps its last frame).
+        canvas: () => (this.state === "connected" && this.desktop.w ? this.canvas : null),
         focus: () => this.canvas.focus(),
       }),
       () => {},
@@ -702,13 +703,16 @@ export class RdpView implements View {
 
   /** Steps of this connection's clipboard channel, for the diagnostic log. */
   private clipLog: { at: number; state: string; detail: string }[] = [];
-  private clipState: "starting" | "ready" | "noResponse" | "error" | "unavailable" = "starting";
+  private clipState: "starting" | "ready" | "busy" | "noResponse" | "error" | "unavailable" = "starting";
   private clipTimer = 0;
+  /** "Not passed on" was told in this connection (once is enough). */
+  private clipBusyTold = false;
 
   private resetClipboard() {
     clearTimeout(this.clipTimer);
     this.clipLog = [];
     this.clipState = "starting";
+    this.clipBusyTold = false;
     this.renderClipboard();
   }
 
@@ -718,6 +722,16 @@ export class RdpView implements View {
     if (state === "ready") this.clipState = "ready";
     else if (state === "rejected") this.clipState = "error";
     else if (state === "unavailable") this.clipState = "unavailable";
+    // The helper gave up passing a copy on (another program held this PC's
+    // clipboard open through all its tries): the copy did not arrive, though
+    // the channel works. Told once; a later transfer that went through clears it.
+    else if ((state === "remoteLost" || state === "busy") && this.clipState === "ready") {
+      this.clipState = "busy";
+      if (!this.clipBusyTold) {
+        this.clipBusyTold = true;
+        toast("다른 프로그램이 이 PC의 클립보드를 쓰고 있어 복사한 내용이 전달되지 않았습니다. 다시 복사해 보세요.", "warn", 7000);
+      }
+    } else if ((state === "pasteData" || state === "localPasteData") && this.clipState === "busy") this.clipState = "ready";
     this.renderClipboard();
   }
 
@@ -742,6 +756,7 @@ export class RdpView implements View {
     const text = {
       starting: "클립보드: 준비 중",
       ready: "클립보드: 연결됨",
+      busy: "클립보드: 전달 실패",
       noResponse: "클립보드: 응답 없음",
       error: "클립보드: 오류",
       unavailable: "클립보드: 사용 불가",
@@ -749,7 +764,7 @@ export class RdpView implements View {
     // An icon and a coloured dot in the toolbar; the words in the tooltip.
     label.textContent = text;
     button.title = tr(`${text} · 누르면 진단 기록`);
-    button.classList.toggle("warn", this.clipState === "noResponse" || this.clipState === "error" || this.clipState === "unavailable");
+    button.classList.toggle("warn", this.clipState === "busy" || this.clipState === "noResponse" || this.clipState === "error" || this.clipState === "unavailable");
     button.classList.toggle("ok", this.clipState === "ready");
   }
 
@@ -759,7 +774,9 @@ export class RdpView implements View {
     const hint =
       this.clipState === "ready"
         ? "클립보드가 연결되어 있습니다. 붙여넣기가 안 되면 원격에서 붙여넣을 때 기록에 pasteRequest가 생기는지 확인하세요."
-        : "원격 PC의 클립보드 프로그램(rdpclip.exe)이 응답하지 않거나, 원격 PC가 클립보드 공유를 막고 있습니다. 원격에서 작업 관리자로 rdpclip.exe를 끝낸 다음 Win+R에 rdpclip을 입력해 다시 실행하면 대부분 해결됩니다. mstsc로 열어도 안 되면 원격 PC의 정책(클립보드 리디렉션)을 확인하세요.";
+        : this.clipState === "busy"
+          ? "클립보드는 연결되어 있지만, 다른 프로그램이 이 PC의 클립보드를 오래 잡고 있어 복사한 내용이 전달되지 않았습니다. 다시 복사하면 대부분 됩니다. 자주 그러면 클립보드 기록(Win+V)이나 클립보드 관리 프로그램, 이 PC에 원격으로 접속해 있다면 그 원격 데스크톱의 클립보드 공유가 원인일 수 있습니다."
+          : "원격 PC의 클립보드 프로그램(rdpclip.exe)이 응답하지 않거나, 원격 PC가 클립보드 공유를 막고 있습니다. 원격에서 작업 관리자로 rdpclip.exe를 끝낸 다음 Win+R에 rdpclip을 입력해 다시 실행하면 대부분 해결됩니다. mstsc로 열어도 안 되면 원격 PC의 정책(클립보드 리디렉션)을 확인하세요.";
     const m = modal({
       title: "클립보드 공유 상태",
       icon: "ClipboardPaste",

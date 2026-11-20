@@ -1716,7 +1716,8 @@ fn claim(seen: &mut HashSet<String>, target: &Path) -> bool {
 }
 
 async fn sftp_download(sftp: &SftpSession, remote: &str, local: &Path, is_dir: bool, rep: &mut Reporter) -> Result<(), String> {
-    let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+    // Each file with the server's modification time (seconds), kept on the copy.
+    let mut jobs: Vec<(String, PathBuf, Option<u64>)> = Vec::new();
     if is_dir {
         let mut seen = HashSet::new();
         let mut stack = vec![(remote.to_string(), local.to_path_buf())];
@@ -1741,21 +1742,23 @@ async fn sftp_download(sftp: &SftpSession, remote: &str, local: &Path, is_dir: b
                     stack.push((e.path, target));
                 } else {
                     rep.total += e.size;
-                    jobs.push((e.path, target));
+                    jobs.push((e.path, target, e.modified));
                 }
             }
         }
     } else {
-        rep.total = sftp.metadata(remote.to_string()).await.map(|m| m.len()).unwrap_or(0);
-        jobs.push((remote.to_string(), local.to_path_buf()));
+        let meta = sftp.metadata(remote.to_string()).await.ok();
+        rep.total = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        jobs.push((remote.to_string(), local.to_path_buf(), meta.and_then(|m| m.mtime).map(u64::from)));
     }
-    sftp_parallel(jobs, rep, |(rpath, lpath): (String, PathBuf), mut lane| async move {
+    sftp_parallel(jobs, rep, |(rpath, lpath, modified): (String, PathBuf, Option<u64>), mut lane| async move {
         let mut buf = vec![0u8; CHUNK];
         lane.start_file(rpath.clone());
         let part = partial_path(&lpath);
         let res = sftp_fetch(sftp, &rpath, &part, &mut buf, &mut lane).await;
         let res = finish_partial(res, &part, &lpath);
         if res.is_ok() {
+            keep_modified(&lpath, modified);
             lane.file_finished();
         }
         (res, lane)
@@ -1781,6 +1784,45 @@ async fn sftp_fetch(sftp: &SftpSession, rpath: &str, part: &Path, buf: &mut [u8]
         dst.sync_all().await.map_err(|e| format!("쓰기 오류: {e}"))?;
     }
     Ok(())
+}
+
+/// A downloaded file keeps the server's modification time (as Explorer's copy
+/// keeps a file's), so logs and configs sort and compare by when they were
+/// written, not when they were fetched. Best effort: a file that cannot be
+/// opened for writing (read-only) keeps the download time; the download
+/// itself has succeeded either way. SFTP only, both ways (keep_remote_modified):
+/// its times are exact seconds, while an FTP listing can give minutes or just
+/// a date.
+fn keep_modified(path: &Path, secs: Option<u64>) {
+    let Some(secs) = secs.filter(|&s| s > 0) else { return };
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(at);
+    }
+}
+
+/// A local file's modification time in whole seconds (none for 0 or past 2106).
+fn local_secs(path: &Path) -> Option<u32> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u32::try_from(d.as_secs()).ok())
+        .filter(|&s| s > 0)
+}
+
+/// An uploaded file keeps the local file's modification time on the server
+/// (keep_modified's other way): only the times are set (ACMODTIME; access
+/// time as the modification time, as Windows often does not keep access
+/// times), never the permissions or the owner. Best effort: a server that
+/// refuses (a file owned by someone else) keeps the upload time.
+/// `before`/`after`: the local file's time read before and after sending; a
+/// file rewritten meanwhile keeps the upload time (the server has bytes of
+/// neither version for sure, and the same time would later pass for the same file).
+async fn keep_remote_modified(sftp: &SftpSession, before: Option<u32>, after: Option<u32>, rpath: &str) {
+    let Some(secs) = before.filter(|&b| Some(b) == after) else { return };
+    let attrs = russh_sftp::protocol::FileAttributes { atime: Some(secs), mtime: Some(secs), ..Default::default() };
+    let _ = sftp.set_metadata(rpath.to_string(), attrs).await;
 }
 
 /// Large downloads are flushed to disk before they replace the old file; for
@@ -1836,8 +1878,11 @@ async fn sftp_upload(sftp: &SftpSession, local: &Path, remote: &str, is_dir: boo
     sftp_parallel(jobs, rep, |(lpath, rpath): (PathBuf, String), mut lane| async move {
         let mut buf = vec![0u8; CHUNK];
         lane.start_file(lpath.to_string_lossy().into_owned());
+        // The time of the bytes about to be sent (read before them, not after).
+        let before = local_secs(&lpath);
         let res = sftp_put(sftp, Source::File(&lpath), &rpath, &mut buf, &mut lane).await;
         if res.is_ok() {
+            keep_remote_modified(sftp, before, local_secs(&lpath), &rpath).await;
             lane.file_finished();
         }
         (res, lane)
@@ -2992,6 +3037,21 @@ mod tests {
         assert!(same_fingerprint(&fp.replace(':', "").to_uppercase(), &fp));
         assert!(!same_fingerprint("", &fp));
         assert!(!same_fingerprint(&cert_fingerprint(b"other"), &fp));
+    }
+
+    #[test]
+    fn a_download_keeps_the_server_time() {
+        let path = std::env::temp_dir().join(format!("bx-keep-mtime-{}.txt", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let secs = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        // 2023-11-14 22:13:20 UTC, as an SFTP listing gives it.
+        keep_modified(&path, Some(1_700_000_000));
+        assert_eq!(secs(&path), 1_700_000_000);
+        // No time (or a zero one) from the server: the file is left as it is.
+        keep_modified(&path, None);
+        keep_modified(&path, Some(0));
+        assert_eq!(secs(&path), 1_700_000_000);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,20 +36,22 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, STILL_ACTIVE, WPARAM};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Threading::{GetCurrentThreadId, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{CFSTR_PREFERREDDROPEFFECT, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, RegisterClassW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, RegisterClassW, SendMessageW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSW, WS_POPUP,
 };
 use windows_core::w;
 
 /// Thread message telling the clipboard thread to put `Shared::offer` on the clipboard.
 const WM_FILECLIP: u32 = WM_APP + 0x42;
+/// Thread message: announce the local clipboard again (see `FileClipBackend::watch`).
+const WM_REANNOUNCE: u32 = WM_APP + 0x43;
 const CF_HDROP: u32 = 15;
 /// Bytes asked from the server per FileContents request.
 const CHUNK: u32 = 4 * 1024 * 1024;
@@ -107,6 +109,131 @@ pub struct Shared {
     offer: AtomicUsize,
     /// How far the channel start-up got (CLIP_* below).
     stage: AtomicU32,
+    /// What the clipboard watch knows (session thread).
+    watch: Mutex<Watch>,
+    /// A local program's paste of remote data in progress: since when, which format.
+    local_paste: Mutex<Option<(Instant, u32)>>,
+}
+
+/// The native backend drops clipboard work it could not do while another
+/// program held the clipboard open (a clipboard history, another remote
+/// desktop's delayed rendering): after ten tries in about 5.5 s, and, when a
+/// second event comes while one waits, the first without a word. A local copy
+/// then never reaches the server (pasting there gives the copy before), and a
+/// remote copy never reaches this PC. The watch looks every second at what
+/// the clipboard holds and puts the missing step through again.
+#[derive(Default)]
+struct Watch {
+    /// Clipboard sequence number last announced to the server.
+    announced_seq: u32,
+    /// Clipboard sequence number when the server announced its last copy:
+    /// unchanged later means that copy is still the newest thing.
+    remote_copy_seq: u32,
+    /// The server's last copy, until it is seen on the local clipboard.
+    remote: Option<RemoteCopy>,
+    /// A local change not announced yet: its sequence number, when it was seen,
+    /// how often it was announced again, and when next.
+    local: Option<LocalChange>,
+}
+
+struct RemoteCopy {
+    formats: Vec<ClipboardFormat>,
+    at: Instant,
+    tries: u32,
+}
+
+struct LocalChange {
+    seq: u32,
+    tries: u32,
+    next: Instant,
+}
+
+/// What the clipboard holds, as the watch sees it.
+#[derive(Clone, Copy)]
+struct ClipboardNow {
+    seq: u32,
+    /// The native backend's window owns it: the remote's copy is on it.
+    native_owns: bool,
+    /// Our file window owns it: the remote's files are on it.
+    files_own: bool,
+    /// The server's clipboard program listens (Monitor Ready).
+    server_ready: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum WatchStep {
+    Nothing,
+    /// Give the native backend the server's last copy again.
+    RetryRemote(Vec<ClipboardFormat>),
+    /// Tell the native backend the local clipboard changed.
+    AnnounceLocal,
+}
+
+/// A remote copy is given this long to reach the local clipboard (the native
+/// backend's own retries take about 5.5 s), then tried again, 3 times at most.
+const REMOTE_LANDING: Duration = Duration::from_secs(7);
+const REMOTE_TRIES: u32 = 3;
+/// A local change not announced after this long is announced again, then
+/// after 2, 4, 8, 16 s more; 5 times at most.
+const LOCAL_GRACE: Duration = Duration::from_secs(3);
+const LOCAL_TRIES: u32 = 5;
+
+impl Watch {
+    /// One look at the clipboard (every second): the step to take, if any.
+    /// A local change is never announced while the server's last copy has
+    /// not reached the clipboard, nor when that copy is still the newest
+    /// change: an older local copy must not replace it on the server.
+    fn step(&mut self, now: Instant, clip: ClipboardNow, trace: &mut dyn FnMut(&str, String)) -> WatchStep {
+        if let Some(remote) = &mut self.remote {
+            if clip.native_owns {
+                self.remote = None;
+            } else if clip.seq != self.remote_copy_seq {
+                // Something else changed the clipboard since: whatever it was is
+                // newer than the lost copy, but it is not announced either (it
+                // may be another remote desktop's data being rendered).
+                trace("remoteLost", "the remote's copy did not reach the local clipboard (busy), and the clipboard changed since".into());
+                self.remote = None;
+                self.announced_seq = clip.seq;
+                self.local = None;
+                return WatchStep::Nothing;
+            } else if now.duration_since(remote.at) >= REMOTE_LANDING {
+                if remote.tries >= REMOTE_TRIES {
+                    trace("remoteLost", "the remote's copy did not reach the local clipboard: the clipboard stayed busy".into());
+                    self.remote = None;
+                    return WatchStep::Nothing;
+                }
+                remote.tries += 1;
+                remote.at = now;
+                trace("remoteRetry", format!("putting the remote's copy on the local clipboard again (try {})", remote.tries));
+                return WatchStep::RetryRemote(remote.formats.clone());
+            } else {
+                return WatchStep::Nothing;
+            }
+        }
+        if !clip.server_ready || clip.native_owns || clip.files_own || clip.seq == self.announced_seq || clip.seq == self.remote_copy_seq {
+            self.local = None;
+            return WatchStep::Nothing;
+        }
+        let local = match &mut self.local {
+            Some(local) if local.seq == clip.seq => local,
+            _ => {
+                self.local = Some(LocalChange { seq: clip.seq, tries: 0, next: now + LOCAL_GRACE });
+                return WatchStep::Nothing;
+            }
+        };
+        if now < local.next || local.tries > LOCAL_TRIES {
+            return WatchStep::Nothing;
+        }
+        if local.tries == LOCAL_TRIES {
+            local.tries += 1;
+            trace("busy", "the local clipboard stayed busy: its copy did not reach the server".into());
+            return WatchStep::Nothing;
+        }
+        local.next = now + Duration::from_secs(2u64 << local.tries);
+        local.tries += 1;
+        trace("reannounce", format!("the local copy did not reach the server: announcing it again (try {})", local.tries));
+        WatchStep::AnnounceLocal
+    }
 }
 
 /// Clipboard channel start-up ([MS-RDPECLIP] 1.3.2.1): the server sends its
@@ -243,7 +370,48 @@ impl Shared {
             sta_thread: AtomicU32::new(0),
             offer: AtomicUsize::new(0),
             stage: AtomicU32::new(CLIP_WAITING),
+            watch: Mutex::new(Watch::default()),
+            local_paste: Mutex::new(None),
         })
+    }
+
+    /// A local copy went to the server (the clipboard as it is now).
+    pub fn announced(&self) {
+        // SAFETY: no preconditions.
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        let mut w = self.watch.lock().unwrap();
+        w.announced_seq = seq;
+        w.local = None;
+    }
+
+    /// The server announced a copy of its own (before the native backend puts
+    /// it on the local clipboard); `formats` as handed to it, None for files.
+    fn note_remote_copy(&self, formats: Option<Vec<ClipboardFormat>>) {
+        // SAFETY: no preconditions.
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        let mut w = self.watch.lock().unwrap();
+        w.remote_copy_seq = seq;
+        w.local = None;
+        w.remote = formats.map(|formats| RemoteCopy { formats, at: Instant::now(), tries: 0 });
+    }
+
+    /// The clipboard as the watch needs it.
+    fn clipboard_now(&self) -> ClipboardNow {
+        // SAFETY: no preconditions.
+        let (seq, owner) = unsafe { (GetClipboardSequenceNumber(), GetClipboardOwner().map_or(0, |h| h.0 as isize)) };
+        ClipboardNow {
+            seq,
+            native_owns: owner != 0 && owner == NATIVE_WINDOW.load(Ordering::SeqCst),
+            files_own: owner != 0 && owner == FILES_WINDOW.load(Ordering::SeqCst),
+            server_ready: self.server_ready_for_copies(),
+        }
+    }
+
+    /// A local program asks for remote data (delayed rendering): the request
+    /// goes to the server now; its answer is timed for the diagnostic log.
+    pub fn local_paste_started(&self, format: ClipboardFormatId) {
+        *self.local_paste.lock().unwrap() = Some((Instant::now(), format.value()));
+        self.trace("localPaste", format!("a local program asks for remote format {}", format.value()));
     }
 
     /// One step of the clipboard channel, for the app's clipboard status and
@@ -624,6 +792,27 @@ impl ironrdp::core::AsAny for FileClipBackend {
     }
 }
 
+impl FileClipBackend {
+    /// Every second (session loop): see `Watch`. A remote copy is handed to the
+    /// native backend again here; a local one is announced again by telling
+    /// the native window the clipboard changed, on the clipboard thread.
+    pub fn watch(&mut self) {
+        let clip = self.shared.clipboard_now();
+        let shared = self.shared.clone();
+        let mut trace = |state: &str, detail: String| shared.trace(state, detail);
+        let step = self.shared.watch.lock().unwrap().step(Instant::now(), clip, &mut trace);
+        match step {
+            WatchStep::Nothing => {}
+            WatchStep::RetryRemote(formats) => self.inner.on_remote_copy(&formats),
+            WatchStep::AnnounceLocal => {
+                let thread = self.shared.sta_thread.load(Ordering::SeqCst);
+                // SAFETY: posting a thread message has no preconditions.
+                let _ = unsafe { PostThreadMessageW(thread, WM_REANNOUNCE, WPARAM(0), LPARAM(0)) };
+            }
+        }
+    }
+}
+
 impl CliprdrBackend for FileClipBackend {
     fn temporary_directory(&self) -> &str {
         self.inner.temporary_directory()
@@ -669,8 +858,28 @@ impl CliprdrBackend for FileClipBackend {
             .iter()
             .find(|f| f.name().is_some_and(|n| n.value().eq_ignore_ascii_case("FileGroupDescriptorW")));
         match files {
-            Some(format) => self.shared.remote_copied(format.id()),
-            None => self.inner.on_remote_copy(available_formats),
+            Some(format) => {
+                self.shared.note_remote_copy(None);
+                self.shared.remote_copied(format.id())
+            }
+            None => {
+                // OLE's internal formats are the remote process's own objects: of no
+                // use here, and each one a local program asks for (a clipboard
+                // history takes every format at once) is a round trip to the server.
+                let (kept, dropped): (Vec<ClipboardFormat>, Vec<ClipboardFormat>) = available_formats.iter().cloned().partition(|f| !crate::process_private(f));
+                let name = |f: &ClipboardFormat| f.name().map_or_else(|| f.id().value().to_string(), |n| n.value().to_string());
+                self.shared.trace(
+                    "remoteCopy",
+                    format!(
+                        "the remote copied: {}{}",
+                        kept.iter().map(name).collect::<Vec<_>>().join(", "),
+                        if dropped.is_empty() { String::new() } else { format!(" ({} internal formats left out)", dropped.len()) }
+                    ),
+                );
+                // Noted first: the clipboard thread may take it at once.
+                self.shared.note_remote_copy(Some(kept.clone()));
+                self.inner.on_remote_copy(&kept);
+            }
         }
     }
 
@@ -689,6 +898,16 @@ impl CliprdrBackend for FileClipBackend {
                 self.shared.changed.notify_all();
                 return;
             }
+        }
+        if let Some((since, format)) = self.shared.local_paste.lock().unwrap().take() {
+            self.shared.trace(
+                "localPasteData",
+                if response.is_error() {
+                    format!("the remote had no data in format {format} ({} ms)", since.elapsed().as_millis())
+                } else {
+                    format!("{} bytes of format {format} in {} ms", response.data().len(), since.elapsed().as_millis())
+                },
+            );
         }
         self.inner.on_format_data_response(response)
     }
@@ -746,9 +965,16 @@ pub fn init_thread(shared: &Arc<Shared>) -> Option<HWND> {
     unsafe {
         let class = WNDCLASSW { lpfnWndProc: Some(window_proc), lpszClassName: w!("BananaConnRdpFiles"), ..Default::default() };
         RegisterClassW(&class);
-        CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BananaConnRdpFiles"), None, WS_POPUP, 0, 0, 0, 0, None, None, None, None).ok()
+        let window = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BananaConnRdpFiles"), None, WS_POPUP, 0, 0, 0, 0, None, None, None, None).ok();
+        if let Some(window) = window {
+            FILES_WINDOW.store(window.0 as isize, Ordering::SeqCst);
+        }
+        window
     }
 }
+
+/// Our file window (the remote's files on the clipboard are its).
+static FILES_WINDOW: AtomicIsize = AtomicIsize::new(0);
 
 /// IronRDP's native clipboard announces a local copy to the server only while
 /// its monitor window is inactive (it was made for clients whose RDP window
@@ -759,12 +985,13 @@ pub fn init_thread(shared: &Arc<Shared>) -> Option<HWND> {
 /// after creating the WinClipboard.
 pub fn mark_native_window_inactive() {
     use windows_core::BOOL;
-    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, GetClassNameW, SendMessageW, WA_INACTIVE, WM_ACTIVATE};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, GetClassNameW, WA_INACTIVE, WM_ACTIVATE};
     unsafe extern "system" fn each(window: HWND, _: LPARAM) -> BOOL {
         let mut name = [0u16; 64];
         // SAFETY: a valid window of this thread and a writable buffer.
         let n = unsafe { GetClassNameW(window, &mut name) } as usize;
         if String::from_utf16_lossy(&name[..n]) == "IronRDPClipboardMonitor" {
+            NATIVE_WINDOW.store(window.0 as isize, Ordering::SeqCst);
             // SAFETY: a window of this thread; handled synchronously by its subclass.
             unsafe { SendMessageW(window, WM_ACTIVATE, Some(WPARAM(WA_INACTIVE as usize)), Some(LPARAM(0))) };
         }
@@ -772,6 +999,20 @@ pub fn mark_native_window_inactive() {
     }
     // SAFETY: enumerates this thread's own windows.
     let _ = unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(each), LPARAM(0)) };
+}
+
+/// The native backend's clipboard window (found by `mark_native_window_inactive`).
+static NATIVE_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// Announce the local clipboard again (the watch decided so): the native
+/// window is told the clipboard changed, as Windows tells it, so its own
+/// rules apply too (nothing is announced while it owns the clipboard).
+fn reannounce() {
+    let native = NATIVE_WINDOW.load(Ordering::SeqCst);
+    if native != 0 {
+        // SAFETY: a window of this thread; handled synchronously by its subclass.
+        unsafe { SendMessageW(HWND(native as *mut _), WM_CLIPBOARDUPDATE, None, None) };
+    }
 }
 
 /// The clipboard thread's message loop (also runs our offers). Never returns
@@ -785,6 +1026,10 @@ pub fn run_message_loop(shared: &Arc<Shared>, window: Option<HWND>) {
                 if let Some(window) = window {
                     offer_remote_files(shared, window);
                 }
+                continue;
+            }
+            if msg.hwnd == HWND::default() && msg.message == WM_REANNOUNCE {
+                reannounce();
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -985,6 +1230,158 @@ mod tests {
         backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
         let states: Vec<String> = std::iter::from_fn(|| events.try_recv().ok()).map(|e| e["state"].as_str().unwrap_or("").to_string()).collect();
         assert_eq!(states, ["capabilities", "monitorReady", "ready", "pasteRequest"]);
+    }
+
+    /// Stand-in for the native backend that keeps the remote copies it is given.
+    #[derive(Debug)]
+    struct Recorder(Arc<Mutex<Vec<Vec<u32>>>>);
+    impl ironrdp::core::AsAny for Recorder {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
+    }
+    impl CliprdrBackend for Recorder {
+        fn temporary_directory(&self) -> &str {
+            ""
+        }
+        fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+            ClipboardGeneralCapabilityFlags::empty()
+        }
+        fn on_ready(&mut self) {}
+        fn on_request_format_list(&mut self) {}
+        fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
+        fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+            self.0.lock().unwrap().push(formats.iter().map(|f| f.id().value()).collect());
+        }
+        fn on_format_data_request(&mut self, _: FormatDataRequest) {}
+        fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
+        fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
+        fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
+        fn on_lock(&mut self, _: LockDataId) {}
+        fn on_unlock(&mut self, _: LockDataId) {}
+    }
+
+    /// What Word or Explorer put on the remote clipboard for a bit of text:
+    /// the text and HTML reach the native backend; OLE's own objects (each a
+    /// round trip when a local clipboard history asks for every format) do not.
+    #[test]
+    fn a_remote_copy_leaves_out_process_private_formats() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events) = mpsc::unbounded_channel::<Value>();
+        let shared = Shared::new(tx, events_tx);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = FileClipBackend { inner: Box::new(Recorder(got.clone())), shared };
+        let named = |id: u32, n: &'static str| ClipboardFormat::new(ClipboardFormatId::new(id)).with_name(ClipboardFormatName::new_static(n));
+        backend.on_remote_copy(&[
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            named(0xC009, "DataObject"),
+            named(0xC0F0, "HTML Format"),
+            named(0xC013, "Ole Private Data"),
+            named(0xC00E, "Object Descriptor"),
+            named(0xC100, "System.String"),
+            ClipboardFormat::new(ClipboardFormatId::new(16)),
+        ]);
+        assert_eq!(*got.lock().unwrap(), [vec![13, 0xC0F0, 16]]);
+        let traced = events.try_recv().unwrap();
+        assert_eq!(traced["state"], "remoteCopy");
+        assert!(traced["detail"].as_str().unwrap().ends_with("(4 internal formats left out)"), "{traced}");
+    }
+
+    fn clip(seq: u32) -> ClipboardNow {
+        ClipboardNow { seq, native_owns: false, files_own: false, server_ready: true }
+    }
+
+    fn steps(w: &mut Watch, t: Instant, c: ClipboardNow) -> (WatchStep, Vec<String>) {
+        let mut traced = Vec::new();
+        let step = w.step(t, c, &mut |s: &str, _: String| traced.push(s.to_string()));
+        (step, traced)
+    }
+
+    /// A local copy the native backend dropped (the clipboard was busy) is
+    /// announced again 3 s after it is seen, then after 2, 4, 8, 16 s; five
+    /// times at most. One that went out, or is the remote's own, is left alone.
+    #[test]
+    fn a_dropped_local_copy_is_announced_again() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut w = Watch { announced_seq: 10, ..Default::default() };
+        assert_eq!(steps(&mut w, at(0), clip(10)).0, WatchStep::Nothing, "announced");
+        assert_eq!(steps(&mut w, at(0), clip(11)).0, WatchStep::Nothing, "just seen");
+        assert_eq!(steps(&mut w, at(2), clip(11)).0, WatchStep::Nothing);
+        let mut announced_at = Vec::new();
+        for s in 3..60 {
+            if steps(&mut w, at(s), clip(11)).0 == WatchStep::AnnounceLocal {
+                announced_at.push(s);
+            }
+        }
+        assert_eq!(announced_at, [3, 5, 9, 17, 33]);
+        // Announced at last: nothing more, and a new copy starts over.
+        w.announced_seq = 11;
+        assert_eq!(steps(&mut w, at(61), clip(11)).0, WatchStep::Nothing);
+        assert_eq!(steps(&mut w, at(62), clip(12)).0, WatchStep::Nothing);
+        assert_eq!(steps(&mut w, at(65), clip(12)).0, WatchStep::AnnounceLocal);
+        // Not before the server listens, nor what the native window (the remote's
+        // copy) or our file window (the remote's files) owns.
+        let mut w = Watch { announced_seq: 10, ..Default::default() };
+        for c in [ClipboardNow { server_ready: false, ..clip(11) }, ClipboardNow { native_owns: true, ..clip(11) }, ClipboardNow { files_own: true, ..clip(11) }] {
+            for s in 0..10 {
+                assert_eq!(steps(&mut w, at(s), c).0, WatchStep::Nothing);
+            }
+        }
+    }
+
+    /// The server's copy that did not reach the local clipboard is handed to
+    /// the native backend again (3 times at most); meanwhile no local change
+    /// is announced over it. Once the clipboard changed otherwise, that copy
+    /// is given up and the change is not announced either: it may be another
+    /// remote desktop's older data being rendered.
+    #[test]
+    fn a_dropped_remote_copy_is_put_on_the_clipboard_again() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let text = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        let remote = |w: &mut Watch, seq: u32| {
+            w.remote_copy_seq = seq;
+            w.remote = Some(RemoteCopy { formats: text.clone(), at: t0, tries: 0 });
+        };
+        // Reached the clipboard: done.
+        let mut w = Watch { announced_seq: 5, ..Default::default() };
+        remote(&mut w, 20);
+        assert_eq!(steps(&mut w, at(1), ClipboardNow { native_owns: true, ..clip(21) }).0, WatchStep::Nothing);
+        assert!(w.remote.is_none());
+        // Never reached it: tried again after 7 s, three times, then given up.
+        let mut w = Watch { announced_seq: 5, ..Default::default() };
+        remote(&mut w, 20);
+        let mut retried_at = Vec::new();
+        for s in 0..40 {
+            match steps(&mut w, at(s), clip(20)).0 {
+                WatchStep::RetryRemote(f) => {
+                    assert_eq!(f, text);
+                    retried_at.push(s);
+                }
+                other => assert_eq!(other, WatchStep::Nothing, "never a local announce over it"),
+            }
+        }
+        assert_eq!(retried_at, [7, 14, 21]);
+        assert!(w.remote.is_none());
+        // Its clipboard number is still the newest change: no local announce.
+        for s in 40..50 {
+            assert_eq!(steps(&mut w, at(s), clip(20)).0, WatchStep::Nothing);
+        }
+        // Lost, and the clipboard changed meanwhile: that change is not announced.
+        let mut w = Watch { announced_seq: 5, ..Default::default() };
+        remote(&mut w, 20);
+        let (step, traced) = steps(&mut w, at(3), clip(21));
+        assert_eq!((step, traced), (WatchStep::Nothing, vec!["remoteLost".to_string()]));
+        for s in 4..20 {
+            assert_eq!(steps(&mut w, at(s), clip(21)).0, WatchStep::Nothing);
+        }
+        // A later local copy is announced as usual.
+        assert_eq!(steps(&mut w, at(20), clip(22)).0, WatchStep::Nothing);
+        assert_eq!(steps(&mut w, at(23), clip(22)).0, WatchStep::AnnounceLocal);
     }
 
     fn powershell(script: &str) -> String {

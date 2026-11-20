@@ -178,23 +178,30 @@ fn clipboard_frame(
             return Ok(None);
         }
         // The remote's own files, offered on our clipboard: nothing new to announce.
-        ClipboardMessage::SendInitiateCopy(_) if files.is_own_clipboard() => return Ok(None),
+        ClipboardMessage::SendInitiateCopy(_) if files.is_own_clipboard() => {
+            files.announced();
+            return Ok(None);
+        }
         // Files copied in Explorer: announce them as a file list (FileGroupDescriptorW).
-        ClipboardMessage::SendInitiateCopy(formats) => match files.local_copy(&formats) {
-            Some(list) => match cliprdr.initiate_file_copy(list.clone()) {
-                // Start-up: the first copy also carries the client capabilities,
-                // so it must go out now (as an empty format list); the files follow.
-                Err(e) if not_ready(&e) => {
-                    *pending = Some(list);
-                    cliprdr.initiate_copy(&[])
+        ClipboardMessage::SendInitiateCopy(formats) => {
+            // The clipboard as it is now reaches the server (the watch then has nothing to redo).
+            files.announced();
+            match files.local_copy(&formats) {
+                Some(list) => match cliprdr.initiate_file_copy(list.clone()) {
+                    // Start-up: the first copy also carries the client capabilities,
+                    // so it must go out now (as an empty format list); the files follow.
+                    Err(e) if not_ready(&e) => {
+                        *pending = Some(list);
+                        cliprdr.initiate_copy(&[])
+                    }
+                    other => other,
+                },
+                None => {
+                    *pending = None;
+                    cliprdr.initiate_copy(&transferable(formats))
                 }
-                other => other,
-            },
-            None => {
-                *pending = None;
-                cliprdr.initiate_copy(&transferable(formats))
             }
-        },
+        }
         ClipboardMessage::SendFormatData(response) => {
             files.trace(
                 "pasteData",
@@ -202,7 +209,10 @@ fn clipboard_frame(
             );
             cliprdr.submit_format_data(response)
         }
-        ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+        ClipboardMessage::SendInitiatePaste(format) => {
+            files.local_paste_started(format);
+            cliprdr.initiate_paste(format)
+        }
         ClipboardMessage::SendInitiateFileCopy(list) => match cliprdr.initiate_file_copy(list.clone()) {
             Err(e) if not_ready(&e) => {
                 *pending = Some(list);
@@ -259,17 +269,24 @@ fn retry_file_copy(stage: &mut ironrdp::session::ActiveStage, pending: &mut Pend
 /// own CF_BITMAP from those — what mstsc does.
 fn transferable(formats: Vec<ClipboardFormat>) -> Vec<ClipboardFormat> {
     const HANDLES: [u32; 8] = [2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E];
-    const OLE_INTERNAL: [&str; 5] = ["DataObject", "Ole Private Data", "OleClipboardPersistOnFlush", "Object Descriptor", "Link Source Descriptor"];
     let had_bitmap = formats.iter().any(|f| matches!(f.id().value(), 2 | 8 | 17));
     let mut out: Vec<ClipboardFormat> = formats
         .into_iter()
         .filter(|f| !HANDLES.contains(&f.id().value()))
-        .filter(|f| !f.name().is_some_and(|n| OLE_INTERNAL.contains(&n.value()) || n.value().starts_with("System.")))
+        .filter(|f| !process_private(f))
         .collect();
     if had_bitmap && !out.iter().any(|f| f.id() == ClipboardFormatId::CF_DIB) {
         out.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
     }
     out
+}
+
+/// Formats that only mean something inside the process that copied: OLE's
+/// internal ones and .NET's serialized objects. Left out both ways (offered
+/// to the server, and taken from the server's copy).
+fn process_private(f: &ClipboardFormat) -> bool {
+    const OLE_INTERNAL: [&str; 5] = ["DataObject", "Ole Private Data", "OleClipboardPersistOnFlush", "Object Descriptor", "Link Source Descriptor"];
+    f.name().is_some_and(|n| OLE_INTERNAL.contains(&n.value()) || n.value().starts_with("System."))
 }
 
 /// Next clipboard message, or never when the session has no clipboard.
@@ -897,7 +914,8 @@ async fn session(
     clip_files: Option<Arc<fileclip::Shared>>,
 ) -> Result<String, Fail> {
     // CLIPRDR clipboard locks expire on a timer (MS-RDPECLIP lock/unlock); the
-    // same tick announces files that waited for the clipboard start-up.
+    // same tick announces files that waited for the clipboard start-up, and a
+    // local copy the clipboard was too busy to announce.
     let mut clip_timer = tokio::time::interval(Duration::from_secs(1));
     let mut pending_files: PendingFiles = None;
     clip_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1028,7 +1046,10 @@ async fn session(
                 if let Some(frame) = retry_file_copy(&mut stage, &mut pending_files)? {
                     out.push(ActiveStageOutput::ResponseFrame(frame));
                 }
-                let cliprdr = stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>();
+                let mut cliprdr = stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>();
+                if let Some(backend) = cliprdr.as_mut().and_then(|c| c.downcast_backend_mut::<fileclip::FileClipBackend>()) {
+                    backend.watch();
+                }
                 if let Some(Ok(messages)) = cliprdr.map(|c| c.drive_timeouts()) {
                     let frame = stage.process_svc_processor_messages(messages).map_err(session_fail)?;
                     if !frame.is_empty() {

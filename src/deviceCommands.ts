@@ -13,6 +13,9 @@ export interface DeviceInfo {
   network: boolean;
   /** The running configuration can be backed up. */
   backup: boolean;
+  /** The session-only command that turns the device's pager off (devmon.rs
+   * Kind::pager_off), when it has one. */
+  pagerOff?: string | null;
 }
 
 type Command = [label: string, command: string];

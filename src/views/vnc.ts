@@ -90,7 +90,9 @@ export class VncView implements View {
         key: `vnc:${endpoint(session)}`,
         system: "a computer seen through VNC; the engineer can attach screenshots of its screen",
         names: () => [session.host, session.name, session.username, this.desktopName],
-        canvas: () => this.screen.querySelector("canvas"),
+        // Only while connected: after a drop the canvas still holds the last
+        // frame, which a copy or the AI would take for the screen now.
+        canvas: () => (this.state === "connected" ? this.screen.querySelector("canvas") : null),
         focus: () => this.rfb?.focus(),
       }),
       () => {},

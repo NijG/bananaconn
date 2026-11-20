@@ -2,6 +2,7 @@ import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
 import { api, isTauri, revealInExplorer } from "./api";
+import { lastConnect } from "./connectLog";
 import { fileServerBadges, fileServers, initFileServers, openFileServer } from "./fileServers";
 import { ftpServer, ftpServerBadge, initFtpServer, openFtpServer } from "./ftpServer";
 import { initSyslog, openSyslog, setSyslogTabMarker, syslog, syslogBadge, syslogSender } from "./syslog";
@@ -198,7 +199,13 @@ setDeviceTabFinder((ip) => {
 // A tab's device that sent Syslog messages: they open from the tab's menu too.
 ws.tabMenuExtra = (s) => {
   const sender = syslogSender(s.host);
-  return sender ? [{ label: "이 장비의 Syslog 메시지", icon: "ScrollText", action: () => openSyslog(sender) }] : [];
+  // Its saved session's connection history (when it has one): how often it
+  // dropped today, seen from the tab without finding it in the session list.
+  const saved = state.sessions.find((x) => x.id === s.id);
+  return [
+    ...(saved && lastConnect(saved.id) ? [{ label: "연결 기록…", icon: "History", action: () => void import("./connectHistoryView").then((m) => m.openConnectHistory(saved, open)) }] : []),
+    ...(sender ? [{ label: "이 장비의 Syslog 메시지", icon: "ScrollText", action: () => openSyslog(sender) }] : []),
+  ];
 };
 // A sender of an err-or-worse (or alert-word) message: its open tabs marked until shown.
 setSyslogTabMarker((ip) => markDevice(ip, "이 장비에서 Syslog 경보 메시지가 왔습니다", true));

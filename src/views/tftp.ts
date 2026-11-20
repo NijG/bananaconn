@@ -144,6 +144,9 @@ export class TftpView implements View {
     $("[data-log]").addEventListener("click", (e) => {
       const b = (e.target as HTMLElement).closest<HTMLElement>("[data-reveal]");
       if (b?.dataset.reveal) revealInExplorer(b.dataset.reveal).catch((err) => toast(errorText(err), "error"));
+      // Or its SHA-256/SHA-512 (a device's backup or image, checked where it arrived).
+      const hash = (e.target as HTMLElement).closest<HTMLElement>("[data-hash]")?.dataset.hash;
+      if (hash) void import("../fileHash").then((f) => f.openSavedFileHash(hash));
     });
   }
 
@@ -245,7 +248,9 @@ export class TftpView implements View {
 
   /** One transfer in the list; `saved`: the file it received, to show in Explorer. */
   private log(ok: boolean, text: string, saved?: string) {
-    const reveal = saved ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button>` : "";
+    const reveal = saved
+      ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button><button type="button" class="btn btn-ghost btn-sm" data-hash="${esc(saved)}">${icon("ShieldCheck", 13)}해시 확인</button>`
+      : "";
     const li = h("li", { class: ok ? "ok" : "fail" }, `${icon(ok ? "Check" : "TriangleAlert", 13)}<span>${new Date().toLocaleTimeString()}</span> ${esc(text)}${reveal}`);
     this.el.querySelector("[data-log]")!.prepend(li);
   }

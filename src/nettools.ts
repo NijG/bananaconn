@@ -508,8 +508,16 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   copyBtn.addEventListener("click", () => {
     // As shown (a table as tab-separated rows), without the sweep's "new" marks:
     // an address cell pasted elsewhere stays just the address.
+    // Table cells one by one, so a name from DNS or a saved session that
+    // starts with "=" stays text in a spreadsheet; other text as shown.
+    const textOf = (el: HTMLElement): string =>
+      el instanceof HTMLTableElement
+        ? [...el.rows].map((row) => [...row.cells].map((c) => sheetCell(c.innerText.replace(/[\t\r\n]+/g, " ").trim())).join("\t")).join("\n")
+        : el.querySelector("table")
+          ? [...el.children].map((c) => textOf(c as HTMLElement)).filter(Boolean).join("\n")
+          : el.innerText.trim();
     out.classList.add("copying");
-    const text = out.innerText.trim();
+    const text = textOf(out).trim();
     out.classList.remove("copying");
     if (!text) return;
     void writeClipboard(text);
@@ -1094,10 +1102,9 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
  * notification (at most every half minute). Down is three echoes in a row
  * unanswered, back two answers in a row, as in the single continuous ping.
  * Each ping stops when the dialog closes. */
-export function openMultiWatch(sessions: { name: string; host: string; protocol?: Session["protocol"] }[]) {
-  const MAX = 32;
-  const LOST_AFTER = 3;
-  // Each address once, in the order given; a serial port has none.
+/** The devices openMultiWatch would watch of `sessions`: each address once, in
+ * the order given; a serial port has none. (Menus count by it too.) */
+export function watchTargets(sessions: { name: string; host: string; protocol?: Session["protocol"] }[]): { name: string; host: string }[] {
   const seen = new Set<string>();
   const all: { name: string; host: string }[] = [];
   for (const s of sessions) {
@@ -1107,6 +1114,13 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     seen.add(key);
     all.push({ name: s.name || host, host });
   }
+  return all;
+}
+
+export function openMultiWatch(sessions: { name: string; host: string; protocol?: Session["protocol"] }[]) {
+  const MAX = 32;
+  const LOST_AFTER = 3;
+  const all = watchTargets(sessions);
   if (!all.length) return void toast("지켜볼 주소가 없습니다", "info");
   // Its notices need the permission, asked from a user action: this one.
   ensureNotifyPermission();
@@ -1146,7 +1160,7 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
       <div class="mw-scroll"><table class="nettools-table mw-table"><thead><tr><th>이름</th><th>주소</th><th>상태</th><th>손실</th><th>끊김</th><th>마지막 변화</th></tr></thead><tbody></tbody></table></div>
       <div class="mw-add"><input data-add class="list-search" spellcheck="false" autocomplete="off" placeholder="주소 추가 (예: 10.0.0.5)" list="mw-hosts"/><datalist id="mw-hosts">${savedHostOptions()}</datalist><button type="button" class="btn btn-sm" data-add-go>${icon("Plus", 13)}추가</button></div>
       <ul class="watch-log" data-mw-log></ul>`,
-    footer: `<button class="btn" data-copy>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
+    footer: `<button class="btn" data-copy-log>${icon("ClipboardList", 14)}변화 기록 복사</button><button class="btn" data-copy>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
     onClose: () => {
       closed = true;
       clearTimeout(later);
@@ -1162,9 +1176,28 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
   };
   const log = (text: string) => {
-    logEl.prepend(h("li", {}, `<time>${time()}</time> <span>${esc(text)}</span>`));
+    const at = Date.now();
+    logEl.prepend(h("li", { "data-at": String(at) }, `<time>${time(at)}</time> <span>${esc(text)}</span>`));
     while (logEl.children.length > 300) logEl.lastElementChild!.remove();
   };
+  // The changes for an outage report: oldest first, each with its date and
+  // second, the words as shown (the screen language), cells kept as text in a
+  // spreadsheet; the marks that keep a device name apart in the text go.
+  m.root.querySelector("[data-copy-log]")!.addEventListener("click", () => {
+    const items = [...logEl.querySelectorAll<HTMLElement>("li[data-at]")].reverse();
+    if (!items.length) return void toast("복사할 기록이 없습니다", "info");
+    const day = (ms: number) => {
+      const d = new Date(ms);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    };
+    const lines = items.map((li) => {
+      const at = Number(li.dataset.at);
+      const text = (li.querySelector("span")?.textContent ?? "").replace(/[⁦-⁩]/g, "").replace(/[\t\r\n]+/g, " ").trim();
+      return `${sheetCell(`${day(at)} ${time(at)}`)}\t${sheetCell(text)}`;
+    });
+    void writeClipboard(lines.join("\n"));
+    toast(`변화 기록 ${lines.length}줄을 복사했습니다`, "success", 2000);
+  });
   // Told at most every half minute (a rack coming back is one notice, not ten).
   // A change within the half minute is not dropped: told once it is up, as
   // things stand then (which devices are down), unless that was told last.
@@ -1288,8 +1321,11 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     drawSummary();
   };
   m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
-    const head = ["이름", "주소", "상태", "손실", "끊김", "마지막 변화"].map((t) => tr(t)).join("\t");
-    const lines = rows.map((r) => [...r.el.querySelectorAll("td")].map((td) => td.textContent?.trim() ?? "").join("\t"));
+    // As shown: in the table's order (those not answering on top), the cells
+    // in the screen language, a name starting with "=" kept as text.
+    const cell = (s: string) => sheetCell(s.replace(/[\t\r\n]+/g, " ").trim());
+    const head = ["이름", "주소", "상태", "손실", "끊김", "마지막 변화"].map((t) => cell(tr(t))).join("\t");
+    const lines = [...body.rows].map((row) => [...row.cells].map((td) => cell(td.textContent ?? "")).join("\t"));
     void writeClipboard([head, ...lines].join("\n"));
     toast("결과를 복사했습니다", "success", 1500);
   });

@@ -200,6 +200,9 @@ export async function mockRdpOpen(
   onFrame: (b: ArrayBuffer) => void,
 ) {
   if (!req.password && !req.credentialId) throw "NEED_CREDENTIALS";
+  // The helper's other events (the clipboard's steps …) from the console while
+  // checking a feature: `__bxMockRdpEvent({ type: "clipboard", state: "ready", detail: "" })`.
+  (globalThis as { __bxMockRdpEvent?: (e: unknown) => void }).__bxMockRdpEvent = onEvent;
   (async () => {
     for (const stage of ["tcp", "tls"]) {
       onEvent({ type: "status", stage });
@@ -308,6 +311,10 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       await new Promise((r) => setTimeout(r, String(a.path).includes("slow") ? 2000 : 300));
       return ["ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"];
     case "local_stat":
+      // The two local files also on the preview server: as the local listing has them.
+      // localStorage "bx.mock.configEdited" = "1": config.yml saved again since it was listed (same size).
+      if (/[\\/]config\.yml$/.test(String(a.path))) return [(now - 3 * 86400 + (localStorage.getItem("bx.mock.configEdited") ? 60 : 0)) * 1000, 2_311];
+      if (/[\\/]README\.md$/.test(String(a.path))) return [(now - 4 * 86400) * 1000, 9_000];
       // [modified, size]: a file that grows as the preview runs (the Syslog file's
       // size). Its time stays put: the file windows read it to tell an edited
       // download, and one that always looks newer would ask to upload again.
@@ -319,6 +326,10 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
         ["Desktop", true, 0],
         ["Documents", true, 0],
         ["Downloads", true, 0],
+        // Also on the preview server (same place, so same time): config.yml the
+        // same file there, README.md changed (the "바뀐 것만 덮어쓰기" choice).
+        ["config.yml", false, 2_311],
+        ["README.md", false, 9_000],
         ["notes.txt", false, 1_204],
         ["backup.zip", false, 734_003_200],
       ]);
@@ -480,7 +491,7 @@ ${a.host}에 대한 Ping 통계:
       const device = /fw/i.test(host)
         ? { kind: "fortigate", vendor: "Fortinet", label: "FortiGate-100F v7.2.5", name: "FW-HQ", network: true, backup: true }
         : /sw/i.test(host) || a.req.protocol === "telnet"
-          ? { kind: "cisco-iosxe", vendor: "Cisco", label: "IOS-XE 17.06.04", name: "SW-CORE-01", network: true, backup: true }
+          ? { kind: "cisco-iosxe", vendor: "Cisco", label: "IOS-XE 17.06.04", name: "SW-CORE-01", network: true, backup: true, pagerOff: "terminal length 0" }
           : { kind: "linux", vendor: "Linux", label: "Red Hat Enterprise Linux release 9.2 (Plow)", name: "web01", network: false, backup: false };
       setTimeout(() => mockEmit("monitor-stats", { id: a.req.id, device }), 300);
       monitors.set(a.req.id, window.setInterval(() => {

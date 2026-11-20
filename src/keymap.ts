@@ -81,6 +81,7 @@ export const ACTIONS: ActionDef[] = [
   t("term.prevCommand", "이전 명령 줄로", ["Ctrl+Shift+Up"], { note: "긴 출력에서 명령을 입력한 줄로 이동" }),
   t("term.nextCommand", "다음 명령 줄로", ["Ctrl+Shift+Down"]),
   t("term.copyOutput", "명령 출력 복사", ["Ctrl+Shift+O"], { note: "마지막 명령(또는 이동해 간 명령)의 출력만" }),
+  t("term.saveOutput", "명령 출력을 파일로 저장", [], { note: "마지막 명령(또는 이동해 간 명령)의 출력만 텍스트 파일로 (장비 이름·명령·시각이 든 이름)" }),
   t("term.compareRuns", "이전 실행과 비교", [], { note: "마지막 명령(또는 이동해 간 명령)의 출력을 같은 명령을 앞서 실행했을 때와 줄 단위로 비교 (변경 전후 확인)" }),
   t("term.compare", "선택 영역 비교", ["Ctrl+Shift+D"], { note: "두 번 담으면 비교 창이 열림" }),
   t("term.copyTable", "표로 복사 (엑셀용)", ["Ctrl+Shift+X"], { note: "선택한 줄을 머리글 기준 열로 나눠 탭으로 구분" }),

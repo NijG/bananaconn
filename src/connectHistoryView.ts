@@ -21,6 +21,11 @@ const ENDED: Record<ConnectEnd, string> = {
   unknown: "끝난 시각 모름",
 };
 
+/** How a record's connection ended, in the words this dialog uses; none while it is open. */
+export function endedWord(r: ConnectRecord): string | null {
+  return r.how ? ENDED[r.how] : null;
+}
+
 /** The most records the dialog of every session lists. */
 const ALL_LIMIT = 300;
 
@@ -64,7 +69,8 @@ export function openConnectHistory(one?: Session, connect?: (s: Session) => void
   let shown = rows;
   const tools = named
     ? `<div class="history-tools"><input type="search" class="list-search" data-find placeholder="이름·주소·결과 검색" spellcheck="false" autocomplete="off" />
-        <label class="check"><input type="checkbox" data-today />오늘만</label><span class="muted small" data-count></span></div>`
+        <label class="check"><input type="checkbox" data-today />오늘만</label>
+        <label class="check" title="연결하지 못했거나 오류로 끊긴 기록만"><input type="checkbox" data-trouble />문제만</label><span class="muted small" data-count></span></div>`
     : "";
   const head = one ? `<b data-i18n-skip>${esc(one.name || one.host)}</b> · 최근 ${rows.length}번` : `세션 ${sessions}개 · 기록 ${rows.length}개`;
   const m = modal({
@@ -102,7 +108,8 @@ export function openConnectHistory(one?: Session, connect?: (s: Session) => void
   });
   const find = m.root.querySelector<HTMLInputElement>("[data-find]");
   const today = m.root.querySelector<HTMLInputElement>("[data-today]");
-  if (find && today) {
+  const trouble = m.root.querySelector<HTMLInputElement>("[data-trouble]");
+  if (find && today && trouble) {
     const tbody = m.root.querySelector<HTMLElement>("tbody")!;
     const count = m.root.querySelector<HTMLElement>("[data-count]")!;
     const copy = m.root.querySelector<HTMLButtonElement>("[data-copy]")!;
@@ -110,13 +117,20 @@ export function openConnectHistory(one?: Session, connect?: (s: Session) => void
     const filter = () => {
       const terms = searchTerms(find.value);
       const day = new Date().toDateString();
-      shown = rows.filter((x, i) => (!today.checked || new Date(x.r.at).toDateString() === day) && matchesTerms(hay[i], terms));
+      shown = rows.filter(
+        (x, i) =>
+          (!today.checked || new Date(x.r.at).toDateString() === day) &&
+          // The rows the table paints red: never connected, or dropped by an error.
+          (!trouble.checked || x.r.how === "failed" || x.r.how === "error") &&
+          matchesTerms(hay[i], terms),
+      );
       tbody.innerHTML = shown.length ? shown.map(rowHtml).join("") : `<tr><td colspan="${cols}" class="muted">결과 없음</td></tr>`;
       count.textContent = shown.length === rows.length ? "" : `${shown.length}개 표시`;
       copy.disabled = !shown.length;
     };
     find.addEventListener("input", filter);
     today.addEventListener("change", filter);
+    trouble.addEventListener("change", filter);
   }
   m.root.querySelector("[data-clear]")?.addEventListener("click", () => {
     if (!one) return;

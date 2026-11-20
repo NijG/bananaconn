@@ -46,7 +46,7 @@ import { icon } from "../icons";
 import type { Session } from "../model";
 import { choiceDialog, errorText, esc, h, toast, setPressed } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
-import { language, userText, type Language } from "../i18n";
+import { language, tr, userText, type Language } from "../i18n";
 import { subscribe } from "../store";
 
 /** CodeMirror's own words (find/replace and go-to-line panels). The editor is
@@ -184,6 +184,7 @@ export class EditorView implements View {
            <span class="editor-meta muted" data-meta></span>
            <button class="tool" data-act="find" title="찾기·바꾸기 (Ctrl+F)">${icon("Search", 15)}</button>
            <button class="tool" data-act="wrap" title="자동 줄 바꿈">${icon("WrapText", 15)}</button>
+           <button class="tool" data-act="changes" title="저장 전 변경 내용 보기">${icon("Columns2", 15)}</button>
            <button class="tool" data-act="reload" title="서버에서 다시 읽기">${icon("RefreshCw", 15)}</button>
            <button class="tool" data-act="local" title="내 PC에 다른 이름으로 저장">${icon("Download", 15)}</button>
            <button class="btn btn-sm btn-primary" data-act="save" title="서버에 저장 (Ctrl+S)">${icon("Save", 14)}<span>저장</span></button>
@@ -202,6 +203,7 @@ export class EditorView implements View {
       if (act === "find" && this.code) openSearchPanel(this.code);
       if (act === "wrap") this.toggleWrap();
       if (act === "goto" && this.code) gotoLine(this.code);
+      if (act === "changes") this.showChanges();
     });
     this.load();
   }
@@ -224,6 +226,19 @@ export class EditorView implements View {
    * copy of a large file per keystroke. Refreshed shortly after edits stop. */
   get dirty() {
     return this.isDirty;
+  }
+
+  /** What saving would change: the document as last loaded or saved against
+   * the one being edited, line by line in the comparison window (a server's
+   * config file looked over before it is replaced). The sides are named by
+   * the file and, in the screen language, which is which. */
+  private showChanges() {
+    if (!this.code) return;
+    const now = this.text();
+    if (now === this.savedDoc) return void toast("바뀐 내용이 없습니다", "info");
+    void import("../diffView").then((d) =>
+      d.openDiff({ title: `${this.name} · ${tr("저장된 내용")}`, text: this.savedDoc }, { title: `${this.name} · ${tr("편집 중")}`, text: now }),
+    );
   }
 
   private recheckDirty() {

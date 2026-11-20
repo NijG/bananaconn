@@ -88,9 +88,26 @@ export class ViewAi {
     contextMenu(r.left, r.bottom + 4, [
       { label: "화면 설명 (캡처해서 묻기)", icon: "ScanEye", action: () => void this.open().then((p) => p.explainScreen()).catch(() => {}) },
       { label: "화면 캡처해 대화에 첨부", icon: "Camera", action: () => void this.open().then((p) => (p.captureScreen(), p.focus())).catch(() => {}) },
+      // For a report or a chat, without the AI (it need not be set up).
+      { label: "화면을 이미지로 복사", icon: "Copy", action: () => void this.copyScreen() },
       { label: this.panel ? "AI 대화 닫기" : "AI 대화 열기", icon: "Bot", action: () => (this.panel ? this.close() : void this.open().then((p) => p.focus()).catch(() => {})) },
       ...(this.extras().length ? ["-" as const, ...this.extras()] : []),
     ]);
+  }
+
+  /** The remote screen as it is shown, as a PNG image on the clipboard (to
+   * paste into a report or a message). */
+  private async copyScreen() {
+    const canvas = this.host.capture?.();
+    if (!canvas || !canvas.width || !canvas.height) return void toast("캡처할 화면이 없습니다", "warn");
+    try {
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("no image");
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      toast("화면을 이미지로 복사했습니다", "success", 2000);
+    } catch {
+      toast("화면을 클립보드에 복사하지 못했습니다", "error", 4000);
+    }
   }
 
   dispose() {

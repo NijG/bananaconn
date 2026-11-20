@@ -1280,6 +1280,8 @@ pub(crate) async fn drive(
         "name": name,
         "network": kind.network(),
         "backup": kind.backup().is_some(),
+        // The tab offers it when the device's pager stops a long output.
+        "pagerOff": kind.pager_off(),
     }}));
 
     let mut prev = None;
@@ -1612,6 +1614,7 @@ mod device_tests {
         let device = &events.iter().find(|e| e.get("device").is_some()).expect("device")["device"];
         assert_eq!((device["kind"].as_str(), device["label"].as_str(), device["name"].as_str()), (Some("cisco-ios"), Some("IOS 15.2(7)E2"), Some("SW-CORE-01")));
         assert_eq!((device["network"].as_bool(), device["backup"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(device["pagerOff"].as_str(), Some("terminal length 0"));
         let first = events.iter().find(|e| e.get("stats").is_some()).expect("no sample");
         assert_eq!(first["stats"]["cpu"], 12.0, "{events:?}");
         assert_eq!(first["stats"]["memUsed"], 250);

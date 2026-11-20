@@ -2,15 +2,15 @@
 // here (UDP 514 by default, "logging host <this PC>") while they are worked
 // on. The messages are kept while it runs, the window open or not.
 
-import { api, on, pickSavePath, type SyslogMessage, type SyslogStatus } from "./api";
+import { api, on, pickSavePath, pickSavePathAt, type SyslogMessage, type SyslogStatus } from "./api";
 import { writeClipboard } from "./clipboard";
 import { tr, userText } from "./i18n";
 import { icon } from "./icons";
-import { linkDowns } from "./ipLinks";
+import { findLogMnemonics, linkDowns } from "./ipLinks";
 import { clockText } from "./lineTimes";
 import { state } from "./store";
 import { deviceItems, newSessionHandler, openNetworkTools } from "./nettools";
-import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, formatBytes, markTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, setPressed, timestamp, toast } from "./ui";
+import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, formatBytes, markTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, setPressed, sheetCell, timestamp, toast } from "./ui";
 
 /** Messages kept (the oldest go first), and the text they may hold in all. */
 const KEEP = 20000;
@@ -18,7 +18,8 @@ const KEEP_CHARS = 8_000_000;
 /** Rows drawn at once: the newest of those the filter lets through. */
 const SHOW = 2000;
 /** RFC 5424 severity keywords, shown as devices print them. */
-const SEVERITY = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
+/** RFC 5424 severity keywords 0-7, as devices print them (Cisco's log message numbers too). */
+export const SEVERITY = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
 
 /** A message kept: numbered in arrival order, its text lower-cased once for the filter. */
 type Kept = SyslogMessage & { seq: number; lower: string };
@@ -173,9 +174,15 @@ function setAlert(on: boolean) {
   }
 }
 
-/** A message as one line of text: time, sender, severity, the message. */
-const asText = (m: SyslogMessage, withDate: boolean) =>
-  [withDate ? new Date(m.at).toLocaleString("sv-SE").replace(",", "") : clockText(m.at), m.from, m.severity !== null ? SEVERITY[m.severity] : "-", m.text].join("\t");
+/** A message as one line of text: time, sender, severity, the message,
+ * tab-separated. The message is any sender's text: its own tabs and line
+ * breaks become blanks (as syslog.rs file_line writes them), so one message
+ * stays one line of four columns. `sheet` (the clipboard, often pasted into
+ * a spreadsheet): a cell starting with "=" stays text. */
+const asText = (m: SyslogMessage, withDate: boolean, sheet = false) =>
+  [withDate ? new Date(m.at).toLocaleString("sv-SE").replace(",", "") : clockText(m.at), m.from, m.severity !== null ? SEVERITY[m.severity] : "-", m.text.replace(/[\t\r\n]/g, " ")]
+    .map((c) => (sheet ? sheetCell(c) : c))
+    .join("\t");
 
 /** Saved sessions' names by their host (lower-case): a sender shown by its address is found by its name too. */
 function sessionNames(): Map<string, string> {
@@ -281,7 +288,10 @@ export function openSyslog(from?: string) {
   const saveIn = form.querySelector<HTMLInputElement>("[name=save]")!;
   const fileIn = form.querySelector<HTMLInputElement>("[name=file]")!;
   form.querySelector("[data-pick-file]")!.addEventListener("click", async () => {
-    const path = await pickSavePath(fileIn.value.trim() || `syslog_${timestamp()}.log`, [{ name: "로그", extensions: ["log", "txt"] }]);
+    // The field holds a full path (picked or typed before): its folder is kept.
+    const typed = fileIn.value.trim();
+    const filters = [{ name: "로그", extensions: ["log", "txt"] }];
+    const path = typed ? await pickSavePathAt(typed, filters) : await pickSavePath(`syslog_${timestamp()}.log`, filters);
     if (!path) return;
     fileIn.value = path;
     saveIn.checked = true;
@@ -609,7 +619,10 @@ export function openSyslog(from?: string) {
       confirm: "저장",
     });
     if (!r) return;
-    const typed = r.value.trim();
+    setWords(r.value.trim());
+  });
+  /** The alert words as typed: kept, used, and the rows shown marked again. */
+  const setWords = (typed: string) => {
     alertWords = parseWords(typed);
     savePrefs({ ...loadPrefs(), words: typed });
     setPressed(wordsBtn, alertWords.length > 0);
@@ -618,7 +631,51 @@ export function openSyslog(from?: string) {
     render();
     if (!alertWords.length) return void toast("경보 낱말을 지웠습니다", "info", 3000);
     toast(alertOn ? `경보 낱말 ${alertWords.length}개를 저장했습니다` : `경보 낱말 ${alertWords.length}개를 저장했습니다. 경보를 켜야 알립니다`, "success", 4000);
+  };
+  // A Cisco log message name in a message ("%LINK-3-UPDOWN"): those messages
+  // alone (the filter), or an alert word, so they alert whatever their severity.
+  // Only when the text holds one: a click elsewhere in a message does nothing.
+  // A double click selects a word in the text: the menu waits for a second
+  // click (and for the selection it makes) before it opens.
+  let menuTimer = 0;
+  list.addEventListener("click", (e) => {
+    clearTimeout(menuTimer);
+    const tx = (e.target as HTMLElement).closest<HTMLElement>(".syslog-row .tx");
+    if (!tx || e.detail > 1 || !document.getSelection()?.isCollapsed) return;
+    const names = [...new Set(findLogMnemonics(tx.textContent ?? "").map((m) => m.text))];
+    if (!names.length) return;
+    const x = e.clientX;
+    menuTimer = window.setTimeout(() => {
+      if (!tx.isConnected || !document.getSelection()?.isCollapsed) return;
+      openMnemonicMenu(tx, names, x);
+    }, 300);
   });
+  const openMnemonicMenu = (tx: HTMLElement, names: string[], x: number) => {
+    const r = tx.getBoundingClientRect();
+    contextMenu(
+      x || r.left,
+      r.bottom + 2,
+      names.flatMap((name) => {
+        const known = alertWords.includes(name.toLowerCase());
+        return [
+          { label: "이 메시지만 보기", icon: "ListFilter", hint: name, userHint: true, action: () => ((filterIn.value = name), render()) },
+          {
+            label: known ? "경보 낱말에 있음" : "경보 낱말에 추가",
+            icon: "Bell",
+            hint: name,
+            userHint: true,
+            disabled: known,
+            action: () => {
+              // parseWords keeps the first 20: a 21st would be dropped without a word.
+              if (alertWords.length >= 20) return void toast("경보 낱말은 20개까지입니다", "warn", 4000);
+              const typed = loadPrefs().words.trim();
+              setWords(typed ? `${typed}, ${name}` : name);
+            },
+          },
+        ];
+      }),
+    );
+  };
   // A sender's address: its messages alone, the network tools, a session, a copy.
   list.addEventListener("click", (e) => {
     const from = (e.target as HTMLElement).closest<HTMLElement>(".syslog-row .from");
@@ -652,7 +709,7 @@ export function openSyslog(from?: string) {
   m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
     const rows = visible().slice(-SHOW);
     if (!rows.length) return void toast("복사할 메시지가 없습니다", "info");
-    void writeClipboard(rows.map((x) => asText(x, false)).join("\n"));
+    void writeClipboard(rows.map((x) => asText(x, false, true)).join("\n"));
     toast(`${rows.length}줄을 복사했습니다`, "success", 2000);
   });
   m.root.querySelector("[data-save]")!.addEventListener("click", async () => {

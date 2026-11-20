@@ -749,7 +749,33 @@ export function linkDowns(messages: Iterable<{ from: string; text: string }>): L
 }
 
 /** A device log message's mnemonic ("%SW_MATM-4-MACFLAP_NOTIF"). */
-const LOG_MNEMONIC = /%[A-Z][A-Z0-9_]*-\d-[A-Z0-9_]+/;
+/** A Cisco log message name: %FACILITY-SEVERITY-MNEMONIC ("%LINK-3-UPDOWN"),
+ * IOS-XR's with more name parts first ("%PKT_INFRA-LINK-3-UPDOWN"); the
+ * severity one digit 0-7. The one pattern every use is built from. */
+const MNEMONIC_SOURCE = "%[A-Z][A-Z0-9_]*(?:-[A-Z][A-Z0-9_]*)*-([0-7])-[A-Z0-9_]+";
+const LOG_MNEMONIC = new RegExp(MNEMONIC_SOURCE);
+/** A cheap test for a line that may hold one (the terminal's links look only at such lines). */
+export const MAY_HOLD_MNEMONIC = /%[A-Z][A-Z0-9_]*(?:-[A-Z][A-Z0-9_]*)*-[0-7]-/;
+
+export interface LogMnemonicMatch {
+  index: number;
+  length: number;
+  /** "%LINK-3-UPDOWN" as written. */
+  text: string;
+  /** 0 (emergencies) to 7 (debugging). */
+  severity: number;
+}
+
+/** Cisco log message names in a line ("%LINK-3-UPDOWN", "%SYS-5-CONFIG_I",
+ * IOS-XR's "%PKT_INFRA-LINK-3-UPDOWN"); not inside a word. */
+export function findLogMnemonics(text: string): LogMnemonicMatch[] {
+  return [...text.matchAll(new RegExp(`(?<![\\w%])${MNEMONIC_SOURCE}(?![\\w-])`, "g"))].map((m) => ({
+    index: m.index,
+    length: m[0].length,
+    text: m[0],
+    severity: Number(m[1]),
+  }));
+}
 /** Fields an ARP table's line has at most (address, age, MAC, type,
  * interface, VLAN, flags…); a sentence has more. */
 const ARP_FIELDS = 12;

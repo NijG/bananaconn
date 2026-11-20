@@ -25,11 +25,18 @@ const HTML = /<\/?(a|b|br|code|em|i|kbd|li|ol|p|pre|small|span|strong|table|td|t
 const tags = (s) => [...s.matchAll(HTML)].map((m) => m[0].startsWith("</") ? `/${m[1]}` : m[1]).sort().join(",");
 // A leading "{0}" that is a button's icon (same rule as ICON in src/i18n.ts).
 const ICON = /^\{0\}(?=[\p{L}\p{N}])/u;
-const sectionIds = (file) => [...fs.readFileSync(file, "utf8").matchAll(/^\s*id: "([^"]+)",$/gm)].map((m) => m[1]);
+// LF line ends first: in a CRLF checkout (Windows CI) "$" would never match.
+const sectionIds = (file) => [...fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n").matchAll(/^\s*id: "([^"]+)",$/gm)].map((m) => m[1]);
 
 const reference = JSON.parse(fs.readFileSync(path.join(dictDir, "en.json"), "utf8"));
 const keys = new Set(reference.map((e) => e.ko));
 const koSections = sectionIds(path.join(root, "src", "help.ts"));
+// No sections found means the pattern no longer fits help.ts: every language
+// would then "match" an empty list and the comparison below would check nothing.
+if (!koSections.length) {
+  console.error("no help sections found in src/help.ts");
+  process.exit(1);
+}
 let problems = 0;
 const report = (lang, msg) => {
   problems++;

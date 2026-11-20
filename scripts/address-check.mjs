@@ -8,7 +8,7 @@
 //
 // Needs Node.js 23.6 or later (it imports the TypeScript directly).
 
-import { addressKind, arpPair, bandwidthAbove, findInterfaces, findIps, interfaceDescription, interfaceNeighbor, interfaceVlan, findMacs, findMasks, findRates, findUptimes, maskForms, readableRate, interfaceNames, interfaceSearchPattern, interfaceStateChange, linkDowns, macKind, parseSubnetInput, subnetInfo, subnetMatcher } from "../src/ipLinks.ts";
+import { addressKind, arpPair, bandwidthAbove, findInterfaces, findIps, interfaceDescription, interfaceNeighbor, interfaceVlan, findMacs, findMasks, findRates, findUptimes, findLogMnemonics, maskForms, readableRate, interfaceNames, interfaceSearchPattern, interfaceStateChange, linkDowns, macKind, parseSubnetInput, subnetInfo, subnetMatcher } from "../src/ipLinks.ts";
 
 let failed = 0;
 const fail = (...what) => {
@@ -359,8 +359,25 @@ for (const [text, want] of [
   if (JSON.stringify(got) !== JSON.stringify(want)) fail("linkDowns", got);
 }
 
+// ---- Cisco log message names: %FACILITY-SEVERITY-MNEMONIC, severity 0-7, not inside a word
+for (const [line, want] of [
+  ["*Mar  1 00:01:02: %LINK-3-UPDOWN: Interface Gi0/1, changed state to down", [["%LINK-3-UPDOWN", 3]]],
+  ["52: %SYS-5-CONFIG_I: Configured from console by admin on vty0", [["%SYS-5-CONFIG_I", 5]]],
+  ["%LINEPROTO-5-UPDOWN and %SEC_LOGIN-4-LOGIN_FAILED", [["%LINEPROTO-5-UPDOWN", 5], ["%SEC_LOGIN-4-LOGIN_FAILED", 4]]],
+  ["%FOO-8-BAR (severity past 7)", []],
+  ["100%LINK-3-UPDOWN 50%%X-1-Y", []],
+  ["%link-3-updown (lower case)", []],
+  // IOS-XR: more name parts before the severity.
+  ["RP/0/RSP0/CPU0:Nov 20 10:00:01: ifmgr[211]: %PKT_INFRA-LINK-3-UPDOWN : Interface Gi0/0/0/1", [["%PKT_INFRA-LINK-3-UPDOWN", 3]]],
+  ["%ROUTING-BGP-5-ADJCHANGE : neighbor 10.0.0.2 Up", [["%ROUTING-BGP-5-ADJCHANGE", 5]]],
+  ["000123: %SYS-5-RESTART: System restarted", [["%SYS-5-RESTART", 5]]],
+]) {
+  const got = findLogMnemonics(line).map((m) => [line.slice(m.index, m.index + m.length), m.severity]);
+  if (JSON.stringify(got) !== JSON.stringify(want)) fail("findLogMnemonics", line, got);
+}
+
 if (failed) {
   console.error(`${failed} failed`);
   process.exit(1);
 }
-console.log("address helpers ok (20000 subnets, output prefixes, address and MAC kinds, interface names and link changes)");
+console.log("address helpers ok (20000 subnets, output prefixes, address and MAC kinds, interface names and link changes, log message names)");
