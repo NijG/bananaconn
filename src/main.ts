@@ -11,7 +11,7 @@ import { appLock, initLock, lockNow } from "./lock";
 import { clearAllDeviceAlerts, clearDeviceAlert, deviceAlertList, markDeviceAlert, onDeviceAlerts } from "./deviceAlerts";
 import { lastWatchList, openMultiWatch, openNetworkTools, setDeviceMarker, setDeviceTabFinder, setNewSessionHandler, setSessionOpener } from "./nettools";
 import { openCommandPalette } from "./palette";
-import { fileSessionFor } from "./transfer";
+import { fileSessionFor, fileTabName } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
 import { icon } from "./icons";
 import { parseSubnetInput } from "./ipLinks";
@@ -80,7 +80,7 @@ function openFiles(s: Session, beside?: View) {
   // opens as it is; anything else (an SSH session) becomes an SFTP session that
   // keeps the account and proxy via fileSessionFor.
   const files: Session = fileProto
-    ? { ...s, id: s.id.startsWith("quick-") ? s.id : `quick-${crypto.randomUUID()}`, name: s.name || `${s.host} · 파일` }
+    ? { ...s, id: s.id.startsWith("quick-") ? s.id : `quick-${crypto.randomUUID()}`, name: s.name || fileTabName(s.host) }
     : fileSessionFor(s, "sftp");
   if (!beside) return open(files);
   addWhenLoaded(async () => {

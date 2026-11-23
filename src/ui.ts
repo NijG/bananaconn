@@ -168,6 +168,44 @@ export function listKeys(search: HTMLInputElement, list: HTMLElement, itemSelect
   });
 }
 
+/** A view's toolbar shows its buttons' captions only while they all fit; once
+ * they do not, the bar goes icon-only (".bar-icons", each button keeps its
+ * title). Measured, not a fixed width: the captions vary (a device's name, a
+ * key mode), and buttons that shrank broke their captions over two lines
+ * spilling out of the bar. Checked again when the bar resizes or a caption
+ * or button changes. Returns the call that stops watching. */
+export function fitToolbar(view: HTMLElement): () => void {
+  const bar = view.querySelector<HTMLElement>(".view-bar");
+  const actions = bar?.querySelector<HTMLElement>(".view-actions");
+  if (!bar || !actions) return () => {};
+  const over = () => actions.scrollWidth > actions.clientWidth + 1;
+  const fit = () => {
+    // Off screen (a parked tab): nothing to measure until it is shown.
+    if (!bar.clientWidth) return;
+    bar.classList.remove("bar-icons", "bar-scroll");
+    if (over()) bar.classList.add("bar-icons");
+    // Icons alone still too wide (a narrow split): a thin scrollbar says
+    // there are more buttons, which were cut off unseen at the edge.
+    if (over()) bar.classList.add("bar-scroll");
+  };
+  // The mouse wheel scrolls such a bar sideways.
+  const wheel = (e: WheelEvent) => {
+    if (!bar.classList.contains("bar-scroll") || !e.deltaY || e.deltaX) return;
+    e.preventDefault();
+    actions.scrollLeft += e.deltaY;
+  };
+  actions.addEventListener("wheel", wheel, { passive: false });
+  const sized = new ResizeObserver(fit);
+  sized.observe(bar);
+  const changed = new MutationObserver(fit);
+  changed.observe(actions, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden", "class", "style"] });
+  return () => {
+    sized.disconnect();
+    changed.disconnect();
+    actions.removeEventListener("wheel", wheel);
+  };
+}
+
 /** A toggle button's look ("on") and its state for screen readers, together. */
 export function setPressed(el: Element | null, on: boolean) {
   if (!el) return;

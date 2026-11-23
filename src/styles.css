@@ -950,7 +950,10 @@ kbd.word {
   flex: none;
 }
 .view-endpoint {
-  min-width: 0;
+  /* Gives way first (shortened with "…", status bar shows it whole), so the
+   * toolbar keeps its captions as long as it can. */
+  flex: 0 1000 auto;
+  min-width: 72px;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--text-2);
@@ -993,6 +996,20 @@ kbd.word {
   .view-actions .tool > span {
     display: none;
   }
+}
+/* Buttons keep their size and captions stay on one line; when they do not
+ * all fit, fitToolbar (ui.ts) turns the bar icon-only. */
+.view-actions > * {
+  flex-shrink: 0;
+}
+.view-actions .tool {
+  white-space: nowrap;
+}
+.view-bar.bar-icons .view-actions .tool > span {
+  display: none;
+}
+.view-bar.bar-scroll .view-actions {
+  scrollbar-width: thin;
 }
 @container (max-width: 680px) {
   .view-endpoint,
@@ -3033,13 +3050,21 @@ mark.term-hit {
   gap: 8px;
 }
 .theme-opt {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
   cursor: pointer;
 }
+/* Hidden in its own card: with no positioned card it was laid out across the
+ * whole list (840px wide, past the dialog's edge). */
 .theme-opt input {
   position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
   opacity: 0;
   pointer-events: none;
 }
@@ -4382,6 +4407,8 @@ mark.term-hit {
   border-radius: 4px;
   background: var(--bg-3);
   color: var(--text);
+  /* A long path breaks where it must rather than widening the page or a table. */
+  overflow-wrap: anywhere;
 }
 .help-body kbd {
   font-family: var(--mono);
@@ -4424,6 +4451,13 @@ mark.term-hit {
 }
 .help-table th {
   color: var(--text);
+}
+/* The first column names the row (a program, a key): kept on one line. A
+ * long path in the next one breaks instead of taking the width, which had
+ * squeezed the first column to one character a line. */
+.help-table th:first-child,
+.help-table td:first-child {
+  white-space: nowrap;
 }
 
 /* Log settings (settings dialog and session editor). */

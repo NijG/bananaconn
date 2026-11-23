@@ -2,7 +2,7 @@
   "name": "bananaconn",
   "private": true,
   "license": "MIT",
-  "version": "0.7.58",
+  "version": "0.7.59",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -49,6 +49,10 @@ export function interpreterOf(firstLine: string): string | null {
  * is offered once it is saved (a mistake there stops sshd, sudo or booting). */
 export function syntaxCheckFor(name: string, path: string, firstLine: string): { command: string; sudo: boolean; whole?: string; system?: boolean; reload?: string } | null {
   if (name === "sshd_config") return { command: "sshd -t -f {}", sudo: true, system: true };
+  // A drop-in (Debian/Ubuntu's "Include /etc/ssh/sshd_config.d/*.conf"): a
+  // piece is no whole configuration, so the main one is tested ("sshd -t"
+  // reads /etc/ssh/sshd_config and what it includes).
+  if (/^\/etc\/ssh\/sshd_config\.d\/[^/]+\.conf$/.test(path)) return { command: "sshd -t", sudo: true, whole: "sshd", system: true };
   if (SUDOERS.test(path)) return { command: SUDOERS_CHECK, sudo: true, system: true };
   if (path === "/etc/fstab") return { command: "findmnt --verify --tab-file {}", sudo: false, system: true };
   // A systemd unit file (not a drop-in: verify loads units): systemd-analyze(1)

@@ -442,6 +442,7 @@ export function editSession(
       s.port = rawPort === "" || badPort ? defaultPort(s.protocol, s.options) : port;
     };
 
+    const hostOf = { serial: "", net: "" };
     m.root.querySelectorAll<HTMLElement>("[data-proto]").forEach((b) =>
       b.addEventListener("click", () => {
         collect();
@@ -454,6 +455,14 @@ export function editSession(
           const kept = proxyOptions(s.options);
           if (s.options.gateway !== undefined) kept.gateway = s.options.gateway;
           s.options = kept;
+        }
+        // The host field holds a COM port for serial and an address for the
+        // rest: across that line each keeps its own ("COM3" stayed in a VNC
+        // session's host), and switching back brings the typed one back.
+        const wasSerial = s.protocol === "serial";
+        if (wasSerial !== (next === "serial")) {
+          hostOf[wasSerial ? "serial" : "net"] = s.host;
+          s.host = hostOf[wasSerial ? "net" : "serial"];
         }
         s.protocol = next;
         render();

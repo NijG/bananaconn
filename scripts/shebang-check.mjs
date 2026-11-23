@@ -65,6 +65,9 @@ for (const [name, path, first, want] of [
   ["old.py", "/srv/old.py", "#!/usr/bin/python2", null],
   ["any.py", "/srv/any.py", "#!/usr/bin/python", null],
   ["sshd_config", "/etc/ssh/sshd_config", "# comment", "sudo sshd -t -f {}"],
+  ["50-cloud-init.conf", "/etc/ssh/sshd_config.d/50-cloud-init.conf", "PasswordAuthentication no", "sudo sshd -t"],
+  ["notes.txt", "/etc/ssh/sshd_config.d/notes.txt", "", null],
+  ["x.conf", "/etc/ssh/sshd_config.d/sub/x.conf", "", null],
   ["sudoers", "/etc/sudoers", "Defaults env_reset", "sudo visudo -c -f {}"],
   ["fstab", "/etc/fstab", "# /etc/fstab", "findmnt --verify --tab-file {}"],
   // Apache (Debian's apache2ctl, RHEL's apachectl), HAProxy, BIND.

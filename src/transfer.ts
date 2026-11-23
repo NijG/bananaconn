@@ -8,6 +8,7 @@ import { api } from "./api";
 import { gatewayOf } from "./tunnels";
 import { newSession, type Session } from "./model";
 import { errorText } from "./ui";
+import { tr } from "./i18n";
 
 export type FileProtocol = "sftp" | "ftp" | "ftps";
 
@@ -22,6 +23,13 @@ function portFor(source: Session, protocol: FileProtocol): number {
   return 21;
 }
 
+/** A file tab's name for a server ("web · Files"), in the language shown
+ * when it is opened: the tab bar shows names as the user's own text, so a
+ * Korean suffix would stay Korean in any other language. */
+export function fileTabName(server: string): string {
+  return `${server} · ${tr("파일")}`;
+}
+
 /** A quick (unsaved) file-browser session reusing `source`'s host, account and
  * proxy. SSH credentials carry to SFTP; a telnet or VNC login is reused for FTP.
  * An SSH gateway is not reused here — the file backend connects directly, so
@@ -29,7 +37,7 @@ function portFor(source: Session, protocol: FileProtocol): number {
 export function fileSessionFor(source: Session, protocol: FileProtocol): Session {
   const s = newSession(protocol);
   s.id = `quick-${crypto.randomUUID()}`;
-  s.name = `${source.name || source.host} · 파일`;
+  s.name = fileTabName(source.name || source.host);
   s.host = source.host.trim();
   s.port = portFor(source, protocol);
   s.username = source.username;

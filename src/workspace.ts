@@ -14,7 +14,7 @@ import { clearDeviceAlert, deviceAlert } from "./deviceAlerts";
 import { connectEnded, connectFailed, connectStarted, type ConnectEnd } from "./connectLog";
 import { userText } from "./i18nTables";
 import { state, updateSettings, type Snippet } from "./store";
-import { confirmDialog, contextMenu, esc, h, promptDialog, sheetCell, toast, type MenuItem } from "./ui";
+import { confirmDialog, contextMenu, esc, fitToolbar, h, promptDialog, sheetCell, toast, type MenuItem } from "./ui";
 
 export type ViewState = "connecting" | "connected" | "closed" | "error";
 
@@ -144,6 +144,8 @@ export interface Tab {
   /** A name the user gave this tab (tab menu), shown instead of the view's
    * title while the tab is open. */
   label?: string;
+  /** Stops fitting the view's toolbar (fitToolbar), when the tab closes. */
+  unfit?: () => void;
   /** Left out of broadcast input (tab menu): it neither gets what is typed in
    * the others nor sends what is typed in it. While the tab is open. */
   noBroadcast?: boolean;
@@ -353,6 +355,7 @@ export class Workspace {
     this.endHistory(tab, "tab");
     tab.seenState = "closed";
     tab.view.dispose();
+    tab.unfit?.();
     tab.view.el.remove();
     tab.el.remove();
     this.tabs = this.tabs.filter((t) => t.id !== id);
@@ -533,6 +536,7 @@ export class Workspace {
   }
 
   private wireTab(tab: Tab) {
+    tab.unfit = fitToolbar(tab.view.el);
     tab.el.addEventListener("click", (e) => {
       if ((e.target as HTMLElement).closest("[data-close]")) return;
       this.activate(tab.id);
