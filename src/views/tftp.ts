@@ -63,6 +63,22 @@ function rememberName(host: string, name: string) {
   }
 }
 
+/** "running-config" as "running-config-20261122-134625", "c.cfg" as
+ * "c-20261122-134625.cfg": the local time put before the extension. */
+function timedName(name: string, now = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? `${name.slice(0, dot)}-${stamp}${name.slice(dot)}` : `${name}-${stamp}`;
+}
+
+/** A received file's copy on this PC: where, when, which save of that path, its size. */
+type Copy = { local: string; at: string; gen: number; bytes: number };
+type Comparison = { remote: string; old: Copy; now: Copy };
+/** Copies compared as text up to this size (the editor's limit); a larger
+ * one is an image, read whole for nothing. */
+const COMPARE_MAX = 5 * 1024 * 1024;
+
 let listSeq = 0;
 /** The TFTP tabs open now: a name remembered in one is offered at once in
  * the others to the same server. */
@@ -76,6 +92,14 @@ export class TftpView implements View {
   private running: string | null = null;
   private localFile = "";
   private disposed = false;
+  /** Server files received in this tab: where each was saved last, and when
+   * (a running-config fetched before and after a change, compared). */
+  private received = new Map<string, Copy>();
+  /** How many times this tab saved a received file to each local path: a
+   * comparison offered earlier names its copies by these, and is refused
+   * once one of them was received over again (it would show newer text
+   * under the older time). */
+  private writes = new Map<string, number>();
 
   constructor(
     private session: Session,
@@ -138,6 +162,7 @@ export class TftpView implements View {
       if (!this.session.id.startsWith("quick-")) patchSession(this.session.id, {}, { blockSize: v }).catch(() => {});
     });
     $<HTMLInputElement>("[name=getName]").addEventListener("keydown", (e) => e.key === "Enter" && this.get());
+    $<HTMLInputElement>("[name=putName]").addEventListener("keydown", (e) => e.key === "Enter" && this.put());
     this.fillNames();
     openViews.add(this);
     // A received file, shown where it was saved.
@@ -187,7 +212,11 @@ export class TftpView implements View {
     if (!remote) return toast("서버의 파일 이름을 입력하세요", "warn");
     // Busy is said before the file dialog, not after a file was picked.
     if (this.running) return toast("전송이 끝난 다음 시작할 수 있습니다", "warn");
-    const local = await pickSavePath(remote.split(/[\\/]/).pop() || "tftp-file");
+    // Received before in this tab: offered under a name with the time, so
+    // the earlier copy stays to compare with (running-config before and
+    // after a change) unless the user picks it.
+    const base = remote.split(/[\\/]/).pop() || "tftp-file";
+    const local = await pickSavePath(this.received.has(remote) ? timedName(base) : base);
     // The tab may have closed while the dialog was open.
     if (!local || this.disposed) return;
     this.run("get", remote, local);
@@ -214,7 +243,18 @@ export class TftpView implements View {
     try {
       const r = await api.tftpTransfer({ id, host: this.session.host, port: this.session.port, remote, local, direction, blockSize: this.blockSize });
       const secs = Math.max(r.millis, 1) / 1000;
-      this.log(true, `${what} · ${formatBytes(r.bytes)} · ${secs.toFixed(1)}초 · ${formatBytes(r.bytes / secs)}/초 · 블록 ${r.blockSize}`, direction === "get" ? local : undefined);
+      const at = new Date().toLocaleTimeString();
+      // The same server file received before in this tab, saved elsewhere:
+      // the two copies one click from a comparison.
+      // Not for a large file (a firmware image, not text to compare).
+      const before = direction === "get" ? this.received.get(remote) : undefined;
+      const now: Copy = { local, at, gen: (this.writes.get(local) ?? 0) + 1, bytes: r.bytes };
+      const compare = before && before.local !== local && before.bytes <= COMPARE_MAX && r.bytes <= COMPARE_MAX ? { remote, old: before, now } : undefined;
+      if (direction === "get") {
+        this.writes.set(local, now.gen);
+        this.received.set(remote, now);
+      }
+      this.log(true, `${what} · ${formatBytes(r.bytes)} · ${secs.toFixed(1)}초 · ${formatBytes(r.bytes / secs)}/초 · 블록 ${r.blockSize}`, direction === "get" ? local : undefined, compare, at, direction === "get" ? remote : undefined);
       rememberName(this.session.host, remote);
       const host = this.session.host.trim().toLowerCase();
       openViews.forEach((v) => v.session.host.trim().toLowerCase() === host && v.fillNames());
@@ -246,13 +286,44 @@ export class TftpView implements View {
     this.el.querySelector("[data-progress]")!.textContent = text;
   }
 
-  /** One transfer in the list; `saved`: the file it received, to show in Explorer. */
-  private log(ok: boolean, text: string, saved?: string) {
+  /** One transfer in the list; `saved`: the file it received, to show in
+   * Explorer; `compare`: the same server file received before, to compare. */
+  private log(ok: boolean, text: string, saved?: string, compare?: Comparison, at = new Date().toLocaleTimeString(), refetch?: string) {
     const reveal = saved
       ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button><button type="button" class="btn btn-ghost btn-sm" data-hash="${esc(saved)}">${icon("ShieldCheck", 13)}해시 확인</button>`
       : "";
-    const li = h("li", { class: ok ? "ok" : "fail" }, `${icon(ok ? "Check" : "TriangleAlert", 13)}<span>${new Date().toLocaleTimeString()}</span> ${esc(text)}${reveal}`);
+    const diff = compare ? `<button type="button" class="btn btn-ghost btn-sm" data-compare>${icon("Columns2", 13)}앞서 받은 것과 비교</button>` : "";
+    // The same server file fetched again (after a change on the device),
+    // under a new name so it can be compared with this one.
+    const again = refetch ? `<button type="button" class="btn btn-ghost btn-sm" data-again>${icon("RefreshCw", 13)}다시 받기</button>` : "";
+    const li = h("li", { class: ok ? "ok" : "fail" }, `${icon(ok ? "Check" : "TriangleAlert", 13)}<span>${at}</span> ${esc(text)}${reveal}${again}${diff}`);
+    if (compare) li.querySelector("[data-compare]")!.addEventListener("click", () => void this.compareReceived(compare));
+    if (refetch)
+      li.querySelector("[data-again]")!.addEventListener("click", () => {
+        // A transfer under way: said, and the name being typed left alone.
+        if (this.running) return void toast("전송이 끝난 다음 시작할 수 있습니다", "warn");
+        this.el.querySelector<HTMLInputElement>("[name=getName]")!.value = refetch;
+        void this.get();
+      });
     this.el.querySelector("[data-log]")!.prepend(li);
+  }
+
+  /** The two copies of a server file received in this tab, read from where
+   * they were saved and compared line by line; not a binary (an image). */
+  private async compareReceived(c: Comparison) {
+    if (this.writes.get(c.old.local) !== c.old.gen || this.writes.get(c.now.local) !== c.now.gen)
+      return void toast("그 뒤에 같은 위치로 다시 받아 이 두 사본을 비교할 수 없습니다", "warn", 6000);
+    try {
+      // One after the other: a binary first one is told without reading the second.
+      const a = await api.readTextFile(c.old.local);
+      if (a.includes("\0")) return void toast("텍스트 파일이 아닙니다", "warn");
+      const b = await api.readTextFile(c.now.local);
+      if (b.includes("\0")) return void toast("텍스트 파일이 아닙니다", "warn");
+      const d = await import("../diffView");
+      d.openDiff({ title: `${c.remote} · ${c.old.at}`, text: a }, { title: `${c.remote} · ${c.now.at}`, text: b });
+    } catch (err) {
+      toast(errorText(err), "error", 6000);
+    }
   }
 
   dispose() {

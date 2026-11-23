@@ -31,6 +31,13 @@ export interface ProtocolInfo {
   desc: string;
 }
 
+/** Drag data of rows dragged from a file tab's server pane: their paths, as
+ * JSON `{ from, paths }` (a terminal they are dropped on types them). `from`
+ * is DRAG_FROM_THIS_APP: a web page dragged into the window may set the same
+ * type, never this value. */
+export const REMOTE_PATHS_DRAG = "application/x-bananaconn-remote-paths";
+export const DRAG_FROM_THIS_APP = crypto.randomUUID();
+
 export const PROTOCOLS: Record<Protocol, ProtocolInfo> = {
   ssh: { label: "SSH", color: "#4ade80", port: 22, icon: "SquareTerminal", view: "terminal", desc: "보안 셸 터미널" },
   telnet: { label: "Telnet", color: "#c084fc", port: 23, icon: "Cable", view: "terminal", desc: "네트워크 장비·레거시 터미널" },
@@ -251,12 +258,29 @@ export function deviceWords(s: Session): string[] {
  * no address. */
 export function sessionDefaultsFor(text: string): Partial<Session> | null {
   const t = parseTarget(text);
-  if (!t) return null;
+  // A URL of something this app does not open ("https://host"): no address
+  // here either, as quick connect refuses it (not an SSH session to a web host).
+  if (!t || (hasScheme(text) && !schemeProtocol(text))) return null;
   const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
-  const scheme = /^([a-z]+):\/\//i.exec(text.trim())?.[1].toLowerCase();
-  const named = scheme && scheme !== "serial" && scheme in PROTOCOLS ? (scheme as Protocol) : null;
-  const protocol = named ?? ((t.port && byPort[t.port]) || "ssh");
+  const protocol = schemeProtocol(text) ?? ((t.port && byPort[t.port]) || "ssh");
   return { protocol, host: t.host, username: t.username, ...(t.port ? { port: t.port } : {}) };
+}
+
+/** The protocol a pasted URL's scheme names ("telnet://10.0.0.1" is Telnet,
+ * "SFTP://host" SFTP), or null: no scheme, or one that is no protocol here
+ * ("https://", and "serial://", which a port name is not written as). */
+/** A parsed target written back ("root@10.0.0.1:22"; an IPv6 address with a
+ * port in brackets), so that parseTarget reads the same target from it. */
+export function formatTarget(t: { username: string; host: string; port: number | null }): string {
+  const host = t.port !== null && t.host.includes(":") ? `[${t.host}]` : t.host;
+  return `${t.username ? `${t.username}@` : ""}${host}${t.port !== null ? `:${t.port}` : ""}`;
+}
+
+export const hasScheme =(text: string) => /^[a-z][\w+.-]*:\/\//i.test(text.trim());
+
+export function schemeProtocol(text: string): Protocol | null {
+  const scheme = /^([a-z]+):\/\//i.exec(text.trim())?.[1].toLowerCase();
+  return scheme && scheme !== "serial" && Object.hasOwn(PROTOCOLS, scheme) ? (scheme as Protocol) : null;
 }
 
 export function parseTarget(text: string): { host: string; port: number | null; username: string } | null {
@@ -266,7 +290,7 @@ export function parseTarget(text: string): { host: string; port: number | null; 
   // A URL's path, query or fragment ("ssh://host:22/", "https://host/admin")
   // is not part of the target either.
   const raw = text.trim();
-  const url = /^[a-zA-Z][\w+.-]*:\/\//.test(raw);
+  const url = hasScheme(raw);
   let t = url ? raw.replace(/^[a-zA-Z][\w+.-]*:\/\//, "").replace(/[/?#].*$/, "") : raw;
   // "user:password@" (a URL's userinfo, RFC 3986, and the same typed without
   // a scheme; up to the last "@", the user name up to its first ":"): the

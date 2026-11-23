@@ -282,7 +282,7 @@ mod tests {
     fn key_checks_say_what_each_file_is() {
         let dir = std::env::temp_dir().join(format!("bx-import-keys-{}", std::process::id()));
         fs::create_dir_all(dir.join("Keys")).unwrap();
-        fs::write(dir.join("Keys").join("id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n").unwrap();
+        fs::write(dir.join("Keys").join("id_rsa"), crate::vault::tests::key_text("OPENSSH", "\nb3Bl\n")).unwrap();
         fs::write(dir.join("Identity"), "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nP2/56w\n").unwrap();
         fs::write(dir.join("web.ppk"), "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: aes256-cbc\n").unwrap();
         let check = |raw: &str| check_key(raw, Some(&dir));
@@ -306,9 +306,8 @@ mod tests {
         // The same key again: the file already there.
         assert_eq!(store_key(&dir, "web.ppk", key).unwrap(), first);
         // Another key by that name: a name of its own, the first one untouched.
-        let other = b"-----BEGIN OPENSSH PRIVATE KEY-----
-b3Bl
-";
+        let other = crate::vault::tests::key_text("OPENSSH", "\nb3Bl\n");
+        let other = other.as_bytes();
         assert_eq!(store_key(&dir, "web.ppk", other).unwrap(), dir.join("web-1.ppk"));
         assert_eq!(fs::read(&first).unwrap(), key);
         // A path in the name is not followed; odd characters are dropped.

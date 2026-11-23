@@ -57,7 +57,7 @@ export interface StatusInfo {
 export type MonitorInfo =
   | { kind: "stats"; cpu: number; memUsed: number; memTotal: number; memPercent?: number; diskUsed?: number; diskTotal?: number; warmup: boolean }
   /** Waiting, or needs the user: login (password), hostkey (approve), or a message. */
-  | { kind: "starting" | "login" | "hostkey" | "unsupported" | "error"; message?: string; fingerprint?: string; needUser?: boolean };
+  | { kind: "starting" | "login" | "hostkey" | "unsupported" | "error"; message?: string; fingerprint?: string; needUser?: boolean; afterUp?: boolean };
 
 /** What typing at a terminal's cursor goes into (View.inputKind), judged as
  * a line is started: a session past its login ("shell": a command line, a

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ironrdp::connector::connection_activation::ConnectionActivationState;
-use ironrdp::connector::{self, ClientConnector, ConnectionResult, ConnectorErrorKind, Credentials, ServerName};
+use ironrdp::connector::{self, ClientConnector, ConnectionResult, ConnectorErrorKind, Credentials, Sequence as _, ServerName};
 use ironrdp::core::WriteBuf;
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
@@ -25,11 +25,13 @@ use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, 
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
-use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
+use ironrdp::pdu::rdp::capability_sets::{CapabilitySet, MajorPlatformType, client_codecs_capabilities};
+use ironrdp::pdu::rdp::headers::{ShareControlPdu, ShareDataPdu};
+use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, fast_path};
-use ironrdp_tokio::{FramedWrite as _, NetworkClient, TokioFramed, single_sequence_step_read, split_tokio_framed};
+use ironrdp_tokio::{FramedWrite as _, NetworkClient, TokioFramed, split_tokio_framed};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -896,6 +898,18 @@ fn union(a: Option<InclusiveRectangle>, b: &InclusiveRectangle) -> InclusiveRect
     }
 }
 
+/// A server's Refresh Rect support (refreshRectSupport in its General
+/// Capability Set, MS-RDPBCGR 2.2.7.1.1) when `frame` is its Demand Active;
+/// None for any other PDU. A Demand Active without a General set: false.
+fn refresh_rect_support(frame: &[u8]) -> Option<bool> {
+    let indication = ironrdp::pdu::mcs::decode_send_data_indication(frame).ok()?;
+    let share = ironrdp::pdu::rdp::headers::decode_share_control(indication).ok()?;
+    match share.pdu {
+        ShareControlPdu::ServerDemandActive(active) => Some(active.pdu.capability_sets.iter().any(|c| matches!(c, CapabilitySet::General(g) if g.refresh_rect_support))),
+        _ => None,
+    }
+}
+
 fn full(image: &DecodedImage) -> InclusiveRectangle {
     InclusiveRectangle {
         left: 0,
@@ -1084,10 +1098,25 @@ async fn session(
                     // Deactivation-Reactivation Sequence (e.g. after a resolution change).
                     let mut activation_seq = activation.create();
                     let mut buf = WriteBuf::new();
+                    // Whether this server takes the Refresh Rect PDU, from its
+                    // Demand Active (read here, as single_sequence_step_read does).
+                    let mut refresh_rect = false;
                     loop {
-                        let written = single_sequence_step_read(&mut reader, &mut activation_seq, &mut buf)
-                            .await
-                            .map_err(connector_fail)?;
+                        buf.clear();
+                        let written = match activation_seq.next_pdu_hint() {
+                            Some(hint) => {
+                                let pdu = reader
+                                    .read_by_hint(hint)
+                                    .await
+                                    .map_err(|e| Fail::new("session", format!("연결이 끊어졌습니다: {e}")))?;
+                                if let Some(ok) = refresh_rect_support(&pdu) {
+                                    refresh_rect = ok;
+                                }
+                                activation_seq.step(&pdu, &mut buf)
+                            }
+                            None => activation_seq.step_no_input(&mut buf),
+                        }
+                        .map_err(connector_fail)?;
                         if written.size().is_some() {
                             writer
                                 .write_all(buf.filled())
@@ -1115,6 +1144,19 @@ async fn session(
                             );
                             stage.set_share_id(share_id);
                             stage.set_enable_server_pointer(enable_server_pointer);
+                            // The new image starts black and the server repaints
+                            // only what it chooses to: parts it left out stayed
+                            // black until something there changed. Ask for the
+                            // whole screen (MS-RDPBCGR 2.2.11.2), where supported.
+                            if refresh_rect {
+                                let mut frame = WriteBuf::new();
+                                let pdu = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu { areas_to_refresh: vec![full(&image)] });
+                                stage.encode_static(&mut frame, pdu).map_err(session_fail)?;
+                                writer
+                                    .write_all(frame.filled())
+                                    .await
+                                    .map_err(|e| Fail::new("session", format!("전송 오류: {e}")))?;
+                            }
                             out.event(json!({
                                 "type": "resized",
                                 "width": desktop_size.width,
@@ -1391,6 +1433,32 @@ mod tests {
             user_data: std::borrow::Cow::Borrowed(user_data),
         }))
         .unwrap()
+    }
+
+    /// A server's Demand Active read for its Refresh Rect support; any other
+    /// PDU tells nothing.
+    #[test]
+    fn reads_refresh_rect_support_from_demand_active() {
+        use ironrdp::pdu::rdp::capability_sets::{DemandActive, General, ServerDemandActive};
+        use ironrdp::pdu::rdp::headers::ShareControlHeader;
+        let demand = |sets: Vec<CapabilitySet>| {
+            mcs_frame(
+                &ironrdp::core::encode_vec(&ShareControlHeader {
+                    share_control_pdu: ShareControlPdu::ServerDemandActive(ServerDemandActive {
+                        pdu: DemandActive { source_descriptor: "RDP".into(), capability_sets: sets },
+                    }),
+                    pdu_source: 1002,
+                    share_id: 0x0001_03EA,
+                })
+                .unwrap(),
+            )
+        };
+        let general = |refresh_rect_support| CapabilitySet::General(General { refresh_rect_support, ..Default::default() });
+        assert_eq!(refresh_rect_support(&demand(vec![general(true)])), Some(true));
+        assert_eq!(refresh_rect_support(&demand(vec![general(false)])), Some(false));
+        assert_eq!(refresh_rect_support(&demand(Vec::new())), Some(false));
+        // A Share Data PDU (here a Synchronize) is no Demand Active.
+        assert_eq!(refresh_rect_support(&mcs_frame(&share_data(0x1F, &[1, 0, 0xEA, 0x03]))), None);
     }
 
     fn decode_io(frame: &[u8]) -> ironrdp::pdu::rdp::headers::ShareDataPdu {

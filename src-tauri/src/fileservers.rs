@@ -35,6 +35,10 @@ pub struct FileServerConfig {
     /// TFTP: refuse uploads (WRQ).
     #[serde(default = "yes")]
     pub read_only: bool,
+    /// TFTP: an upload over a file there keeps that file under its name with
+    /// the time added ("router-confg.20261122-141601"), not overwritten.
+    #[serde(default)]
+    pub keep_previous: bool,
     /// HTTP: Basic auth when both are set.
     #[serde(default)]
     pub username: String,
@@ -54,6 +58,7 @@ pub struct FileServerStatus {
     pub port: u16,
     pub lan: bool,
     pub read_only: bool,
+    pub keep_previous: bool,
     pub auth: bool,
     pub addresses: Vec<String>,
 }
@@ -75,10 +80,48 @@ struct Notify(Option<AppHandle>, &'static str);
 
 impl Notify {
     fn emit(&self, kind: &str, peer: &str, detail: String) {
+        self.emit_kept(kind, peer, detail, None);
+    }
+    /// With `kept`: the name the file there before an upload was kept under
+    /// (in the same folder), for the log to compare the two.
+    fn emit_kept(&self, kind: &str, peer: &str, detail: String, kept: Option<String>) {
         if let Some(app) = &self.0 {
-            let _ = app.emit("file-server-event", json!({ "server": self.1, "kind": kind, "user": peer, "detail": detail }));
+            let _ = app.emit("file-server-event", json!({ "server": self.1, "kind": kind, "user": peer, "detail": detail, "kept": kept }));
         }
     }
+}
+
+/// A received file (`tmp`) put in place at `path`. With `keep`, a file there
+/// first goes aside under its name with `now` added ("router-confg" as
+/// "router-confg.20261122-141601", "-2" and on when that is taken too), so a
+/// device's earlier backup is not overwritten; if the new one then cannot go
+/// in, the kept one is put back. Returns the kept file's name.
+fn put_in_place(tmp: &Path, path: &Path, keep: bool, now: &str) -> Result<Option<String>, String> {
+    // One at a time: two uploads of a name finishing in the same second
+    // would both pick the same kept name, and a rename on Windows replaces
+    // what is there (the earlier backup lost). Short file work only.
+    static PLACING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = PLACING.lock().unwrap_or_else(|p| p.into_inner());
+    let kept = if keep && path.is_file() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut aside = path.with_file_name(format!("{name}.{now}"));
+        let mut n = 1;
+        while aside.exists() {
+            n += 1;
+            aside = path.with_file_name(format!("{name}.{now}-{n}"));
+        }
+        std::fs::rename(path, &aside).map_err(|e| format!("이전 파일을 보관할 수 없습니다: {e}"))?;
+        Some(aside)
+    } else {
+        None
+    };
+    if let Err(e) = std::fs::rename(tmp, path) {
+        if let Some(aside) = &kept {
+            let _ = std::fs::rename(aside, path);
+        }
+        return Err(format!("저장할 수 없습니다: {e}"));
+    }
+    Ok(kept.and_then(|k| k.file_name().map(|n| n.to_string_lossy().into_owned())))
 }
 
 // ---- path confinement ------------------------------------------------------------------
@@ -153,6 +196,7 @@ pub async fn file_server_start(app: AppHandle, state: State<'_, FileServersState
         port: config.port,
         lan: config.lan,
         read_only: kind == "http" || config.read_only,
+        keep_previous: kind == "tftp" && !config.read_only && config.keep_previous,
         auth: kind == "http" && auth,
         addresses: addresses(&kind, config.port, config.lan),
     };
@@ -189,7 +233,7 @@ async fn start(config: &FileServerConfig, root: PathBuf, notify: Notify, ctl: Co
             StdUdpSocket::bind(("127.0.0.1", config.port)).map_err(in_use)?;
         }
         let sock = UdpSocket::bind(&addr).await.map_err(in_use)?;
-        let opts = TftpOptions { read_only: config.read_only, lan: config.lan };
+        let opts = TftpOptions { read_only: config.read_only, lan: config.lan, keep_previous: config.keep_previous };
         Ok(tauri::async_runtime::spawn(tftp_serve(sock, root, opts, notify, ctl)))
     } else {
         if config.lan {
@@ -245,6 +289,7 @@ const TFTP_MAX_TRANSFERS: u32 = 16;
 struct TftpOptions {
     read_only: bool,
     lan: bool,
+    keep_previous: bool,
 }
 
 /// Shared by a server's transfers: stop flag and transfer count.
@@ -380,8 +425,8 @@ async fn tftp_transfer(
         let Some(path) = resolve_in_root(root, &req.file, false) else {
             return deny(2, "Access violation", format!("{} 경로 거부", req.file)).await;
         };
-        let bytes = t.receive(&path, oack).await.map_err(|e| ("error", format!("{}: {e}", req.file)))?;
-        notify.emit("upload", &who, format!("{} ({bytes} bytes)", req.file));
+        let (bytes, kept) = t.receive(&path, oack, opts.keep_previous).await.map_err(|e| ("error", format!("{}: {e}", req.file)))?;
+        notify.emit_kept("upload", &who, format!("{} ({bytes} bytes)", req.file), kept);
     } else {
         let Some(path) = resolve_in_root(root, &req.file, true).filter(|p| p.is_file()) else {
             return deny(1, "File not found", format!("{} 없음 또는 경로 거부", req.file)).await;
@@ -485,21 +530,25 @@ impl Transfer<'_> {
         }
     }
 
-    /// Receive into a hidden temp file next to `path`, then move it into place.
+    /// Receive into a hidden temp file next to `path`, then move it into place
+    /// (with `keep`, the file there before kept beside it, see put_in_place).
     /// The final ACK goes out only once the file is saved, so the device learns
-    /// whether its backup really landed. Returns the size.
-    async fn receive(&self, path: &Path, oack: Vec<(String, String)>) -> Result<u64, String> {
+    /// whether its backup really landed. Returns the size and the kept name.
+    async fn receive(&self, path: &Path, oack: Vec<(String, String)>, keep: bool) -> Result<(u64, Option<String>), String> {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let tag: u32 = rand::random();
         let tmp = path.with_file_name(format!(".{name}.{tag:08x}.bxpart"));
         let saved = match self.receive_into(&tmp, oack).await {
-            Ok((size, last_ack)) => std::fs::rename(&tmp, path).map(|()| (size, last_ack)).map_err(|e| format!("저장할 수 없습니다: {e}")),
+            Ok((size, last_ack)) => {
+                let now = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                put_in_place(&tmp, path, keep, &now).map(|kept| (size, last_ack, kept))
+            }
             Err(e) => Err(e),
         };
         match saved {
-            Ok((size, last_ack)) => {
+            Ok((size, last_ack, kept)) => {
                 let _ = self.sock.send(&last_ack).await;
-                Ok(size)
+                Ok((size, kept))
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -751,6 +800,67 @@ pub(crate) async fn test_start(config: FileServerConfig) -> JoinHandle<()> {
 mod tests {
     use super::*;
 
+    /// An upload put in place: over a file there it is replaced, or with
+    /// `keep` that file goes aside under its name and the time ("-2" when
+    /// that name is taken too); a new name keeps nothing.
+    #[test]
+    fn an_upload_keeps_the_earlier_file_when_asked() {
+        let dir = std::env::temp_dir().join(format!("bananaconn-keep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, tmp) = (dir.join("router-confg"), dir.join(".router-confg.part"));
+        let put = |text: &str, keep: bool| {
+            std::fs::write(&tmp, text).unwrap();
+            put_in_place(&tmp, &path, keep, "20261122-141601").unwrap()
+        };
+        assert_eq!(put("one", true), None);
+        assert_eq!(put("two", false), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(put("three", true).as_deref(), Some("router-confg.20261122-141601"));
+        assert_eq!(put("four", true).as_deref(), Some("router-confg.20261122-141601-2"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four");
+        assert_eq!(std::fs::read_to_string(dir.join("router-confg.20261122-141601")).unwrap(), "two");
+        assert_eq!(std::fs::read_to_string(dir.join("router-confg.20261122-141601-2")).unwrap(), "three");
+        assert!(!tmp.exists());
+        // The new file cannot go in (no temp file): the kept one is put back.
+        assert!(put_in_place(&tmp, &path, true, "20261122-141700").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four");
+        assert!(!dir.join("router-confg.20261122-141700").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Uploads of one name finishing at once, in the same second: every
+    /// earlier version is kept under a name of its own, none overwritten.
+    #[test]
+    fn uploads_at_once_keep_every_earlier_file() {
+        let dir = std::env::temp_dir().join(format!("bananaconn-keep-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("router-confg");
+        std::fs::write(&path, "original").unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (dir, path) = (dir.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let tmp = dir.join(format!(".router-confg.{i}.part"));
+                    std::fs::write(&tmp, format!("upload {i}")).unwrap();
+                    put_in_place(&tmp, &path, true, "20261122-141601").unwrap()
+                })
+            })
+            .collect();
+        let kept: Vec<String> = threads.into_iter().map(|t| t.join().unwrap().unwrap()).collect();
+        // Eight kept names, all different, and the original among the files.
+        let unique: std::collections::HashSet<_> = kept.iter().collect();
+        assert_eq!(unique.len(), 8);
+        let texts: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+        assert_eq!(texts.len(), 9);
+        assert!(texts.iter().any(|t| t == "original"));
+        for i in 0..8 {
+            assert!(texts.iter().any(|t| t == &format!("upload {i}")));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn paths_stay_inside_the_root() {
         let dir = std::env::temp_dir().join(format!("bx-fs-root-{}", std::process::id()));
@@ -778,6 +888,7 @@ mod tests {
             port,
             lan: false,
             read_only: true,
+            keep_previous: false,
             username: String::new(),
             password: String::new(),
         };

@@ -924,6 +924,9 @@ pub(crate) struct SshConfig {
     pub port: u16,
     /// Name the host key is recorded under (HostKeyAlias or hostname).
     pub key_host: String,
+    /// IdentityFile entries ("~" expanded; one with a % token left out) and
+    /// IdentitiesOnly, for a login made here rather than by ssh.exe.
+    pub keys: crate::remote::KeyHints,
 }
 
 pub(crate) fn ssh_config(host: &str, port: u16, username: &str) -> SshConfig {
@@ -946,7 +949,40 @@ pub(crate) fn ssh_config(host: &str, port: u16, username: &str) -> SshConfig {
         key_host: get("hostkeyalias").unwrap_or_else(|| hostname.clone()),
         port: get("port").and_then(|p| p.parse().ok()).unwrap_or(port),
         hostname,
+        keys: key_hints(&text, dirs::home_dir().as_deref()),
     }
+}
+
+/// The key settings in `ssh -G` output: every "identityfile" line in order
+/// ("~/" put as the home folder; one with a % token, which ssh expands
+/// itself, or not absolute is left out), and "identitiesonly yes".
+fn key_hints(text: &str, home: Option<&Path>) -> crate::remote::KeyHints {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for v in text.lines().filter_map(|l| l.strip_prefix("identityfile ")).map(str::trim) {
+        if v.is_empty() || v == "none" || v.contains('%') {
+            continue;
+        }
+        let path = match v.strip_prefix("~/").or_else(|| v.strip_prefix("~\\")) {
+            Some(rest) => match home {
+                Some(h) => h.join(rest),
+                None => continue,
+            },
+            None => PathBuf::from(v),
+        };
+        if path.is_absolute() && !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    // `ssh -G` lists OpenSSH's default files when the config names none: no
+    // IdentityFile then, and the login's own order of the defaults stands.
+    const DEFAULTS: [&str; 7] = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_xmss", "id_dsa"];
+    let ssh_dir = home.map(|h| h.join(".ssh"));
+    let only_defaults = files.iter().all(|f| ssh_dir.as_deref() == f.parent() && f.file_name().is_some_and(|n| DEFAULTS.iter().any(|d| n == *d)));
+    if only_defaults {
+        files.clear();
+    }
+    let identities_only = text.lines().any(|l| l.trim() == "identitiesonly yes");
+    crate::remote::KeyHints { files, identities_only }
 }
 
 /// How known_hosts names a server: the bare name on port 22, "[name]:port"
@@ -1579,6 +1615,28 @@ mod ssh_arg_tests {
 #[cfg(test)]
 mod tests {
     use super::AnsiStripper;
+
+    /// `ssh -G` key lines read: IdentityFile entries in order with "~/" put
+    /// as the home folder, a % token or "none" left out, no repeats; and
+    /// IdentitiesOnly. Other lines (identityagent, certificatefile) ignored.
+    #[test]
+    fn key_hints_follow_ssh_g() {
+        let home = std::path::Path::new(r"C:\Users\me");
+        let text = "user root\nidentityfile ~/.ssh/work_ed25519\nidentityfile C:\\keys\\ops\nidentityfile ~/.ssh/id_%r\nidentityfile ~/.ssh/work_ed25519\nidentityfile none\nidentityagent none\ncertificatefile ~/.ssh/c\nidentitiesonly yes\n";
+        let h = super::key_hints(text, Some(home));
+        assert_eq!(h.files, vec![home.join(".ssh/work_ed25519"), std::path::PathBuf::from(r"C:\keys\ops")]);
+        assert!(h.identities_only);
+        let none = super::key_hints("user root\nidentitiesonly no\n", Some(home));
+        assert!(none.files.is_empty() && !none.identities_only);
+        // No home folder known: "~" entries cannot be placed, others still are.
+        assert_eq!(super::key_hints("identityfile ~/.ssh/a\nidentityfile C:\\k\n", None).files, vec![std::path::PathBuf::from(r"C:\k")]);
+        // What `ssh -G` prints with no IdentityFile configured (OpenSSH 10.3
+        // on Windows): the defaults, which leave the login's own order.
+        let defaults = "identitiesonly no\nidentityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ecdsa\nidentityfile ~/.ssh/id_ecdsa_sk\nidentityfile ~/.ssh/id_ed25519\nidentityfile ~/.ssh/id_ed25519_sk\n";
+        assert!(super::key_hints(defaults, Some(home)).files.is_empty());
+        // One of them named on its own, beside another: kept as configured.
+        assert_eq!(super::key_hints("identityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/work\n", Some(home)).files.len(), 2);
+    }
 
     #[test]
     fn known_host_names_follow_openssh() {

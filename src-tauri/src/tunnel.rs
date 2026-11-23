@@ -163,6 +163,7 @@ pub async fn tunnel_open(app: AppHandle, state: State<'_, TunnelState>, req: Tun
         known_hosts: known_hosts_path(),
         proxy: req.gateway_proxy.clone(),
         proxy_auth,
+        keys: Default::default(),
     })
     .await?;
     let info = TunnelInfo {

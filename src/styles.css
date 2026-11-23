@@ -3367,6 +3367,31 @@ mark.term-hit {
   background: var(--bg-2);
   font-size: 12.5px;
 }
+.syslog-list-wrap {
+  position: relative;
+}
+/* "N new messages": over the list's foot while it is scrolled up. */
+.syslog-newer {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.syslog-newer[hidden] {
+  display: none;
+}
 .syslog-row {
   display: grid;
   grid-template-columns: auto 104px 64px minmax(0, 1fr);
@@ -3381,6 +3406,14 @@ mark.term-hit {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+/* Filtered: a time opens "every message around it". */
+.syslog-list.filtered .syslog-row time {
+  cursor: pointer;
+}
+.syslog-list.filtered .syslog-row time:hover {
+  color: var(--accent);
+  text-decoration: underline dotted;
 }
 .syslog-row .from {
   color: var(--accent);
@@ -3508,6 +3541,9 @@ mark.term-hit {
   padding: 4px 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
   white-space: nowrap;
+  /* An upload's buttons (show, hash, compare) go to a second line rather
+     than squeezing its file name away. */
+  flex-wrap: wrap;
 }
 .ftpd-row time {
   color: var(--muted);
@@ -3521,6 +3557,7 @@ mark.term-hit {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  flex: 1 1 10em;
 }
 .ftpd-row.k-upload svg,
 .ftpd-row.k-started svg,
@@ -3594,6 +3631,10 @@ mark.term-hit {
 }
 .editor-pos:hover {
   background: var(--bg-2);
+}
+/* A script with Windows line endings (editor.ts scriptCR). */
+.editor-pos.warn {
+  color: var(--warn);
 }
 
 /* ==========================================================================
@@ -3816,6 +3857,18 @@ mark.term-hit {
 }
 .mw-table tr.down td {
   background: var(--danger-soft);
+}
+/* The last minute's echoes as bars (nettools.ts sparkline). */
+.mw-spark svg {
+  display: block;
+  width: 90px;
+  height: 16px;
+}
+.mw-spark rect {
+  fill: var(--ok);
+}
+.mw-spark rect.miss {
+  fill: var(--danger);
 }
 .mw-table .ok-text {
   color: var(--ok);

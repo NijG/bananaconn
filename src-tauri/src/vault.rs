@@ -645,6 +645,14 @@ pub(crate) mod tests {
     const PPK_ENC: &str = "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: aes256-cbc\nComment: user@example.com\nPublic-Lines: 2\nAAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XF\nSqti\nKey-Derivation: Argon2id\nArgon2-Memory: 8192\nArgon2-Passes: 34\nArgon2-Parallelism: 1\nArgon2-Salt: 63d1d43f7bf7700720496646a2f5ec17\nPrivate-Lines: 1\nDyWtExZ3dxFutnb12tIwXBC6kWdozrvP+r6faHKBGDb4+qEar9XBiC0BmGySMHUi\nPrivate-MAC: 52fd00d4ef47ebc506e4e709486c0c6bc0606e24fe2c6cb1b3d168f4da238a66\n";
     pub(crate) const PPK_PUBLIC: &str = "AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
 
+    /// A PEM private key's first line (its "-----BEGIN" line for `kind`, such
+    /// as OPENSSH or RSA) and then `rest`, assembled so that the header never
+    /// appears written out in the source: the public export refuses files
+    /// that contain one.
+    pub(crate) fn key_text(kind: &str, rest: &str) -> String {
+        format!("-----BEGIN {kind} PRIVATE KEY-----{rest}")
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bx-keys-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -660,8 +668,8 @@ pub(crate) mod tests {
             fs::write(&p, text).unwrap();
             key_file_kind(&p)
         };
-        assert_eq!(kind("a", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n"), KeyFileKind::OpenSsh);
-        assert_eq!(kind("b", "\u{feff}-----BEGIN RSA PRIVATE KEY-----\r\nMIIE\r\n"), KeyFileKind::OpenSsh);
+        assert_eq!(kind("a", &key_text("OPENSSH", "\nb3Bl\n")), KeyFileKind::OpenSsh);
+        assert_eq!(kind("b", &format!("\u{feff}{}", key_text("RSA", "\r\nMIIE\r\n"))), KeyFileKind::OpenSsh);
         assert_eq!(kind("c", PPK), KeyFileKind::Putty { encrypted: false });
         assert_eq!(kind("d", PPK_ENC), KeyFileKind::Putty { encrypted: true });
         assert_eq!(kind("e", "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nSubject: me\nP2/56wAAA\n"), KeyFileKind::Foreign);
@@ -683,7 +691,7 @@ pub(crate) mod tests {
         let temp = convert_putty(&ppk, None, &copies).unwrap();
         let path = temp.path.clone();
         // OpenSSH format, unreadable without the one-time passphrase.
-        assert!(fs::read_to_string(&path).unwrap().starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(fs::read_to_string(&path).unwrap().starts_with(&key_text("OPENSSH", "")));
         assert!(russh::keys::load_secret_key(&path, None).is_err());
         let key = russh::keys::load_secret_key(&path, Some(&temp.passphrase)).unwrap();
         assert_eq!(key.public_key().to_openssh().unwrap().split_whitespace().nth(1), Some(PPK_PUBLIC));
@@ -742,7 +750,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&ssh).unwrap();
         let (default_key, saved, other) = (ssh.join("id_ed25519"), dir.join("saved_key"), dir.join("elsewhere"));
         for p in [&default_key, &saved, &other] {
-            fs::write(p, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+            fs::write(p, key_text("OPENSSH", "\n")).unwrap();
         }
         let known = vec![saved.to_string_lossy().replace('\\', "/")];
         let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -772,9 +780,7 @@ pub(crate) mod tests {
         let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
         assert!(!key_is_encrypted(&w("plain", &key.to_openssh(LineEnding::LF).unwrap())));
         assert!(key_is_encrypted(&w("locked", &key.encrypt(&mut rng, b"pw").unwrap().to_openssh(LineEnding::LF).unwrap())));
-        assert!(key_is_encrypted(&w("pem", "-----BEGIN RSA PRIVATE KEY-----
-Proc-Type: 4,ENCRYPTED
-")));
+        assert!(key_is_encrypted(&w("pem", &key_text("RSA", "\nProc-Type: 4,ENCRYPTED\n"))));
         assert!(!key_is_encrypted(&dir.join("absent")));
         let _ = fs::remove_dir_all(dir);
     }

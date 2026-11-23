@@ -489,6 +489,7 @@ mod tests {
             port,
             lan: false,
             read_only: false,
+            keep_previous: false,
             username: String::new(),
             password: String::new(),
         })

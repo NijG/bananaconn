@@ -3,7 +3,7 @@
 // the action list and sessions; the caller runs the chosen action or session.
 
 import { icon } from "./icons";
-import { endpoint, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
+import { endpoint, parseTarget, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
 import { ACTIONS, bindings, SNIPPET_PREFIX } from "./keymap";
 import { state, updateSettings, type Snippet } from "./store";
 import { TERM_THEMES } from "./themes";
@@ -158,12 +158,15 @@ export function openCommandPalette(opts: {
   /** What can be done with the query when it is an address ("10.0.0.9",
    * "root@sw1:22"), after what it matched: one not saved yet starts a session. */
   const forAddress = (q: string): Item[] => {
-    const defaults = /[.@:]/.test(q) ? sessionDefaultsFor(q) : null;
-    if (!defaults?.host) return [];
-    const shown = endpoint({ protocol: defaults.protocol ?? "ssh", host: defaults.host, port: defaults.port ?? null, username: defaults.username ?? "" });
-    const host = defaults.host;
+    const target = /[.@:]/.test(q) ? parseTarget(q) : null;
+    if (!target?.host) return [];
+    // A session only for what this app opens ("https://host" is none); the
+    // network tools for any host (a web server answering ping or not).
+    const defaults = sessionDefaultsFor(q);
+    const host = target.host;
+    const shown = defaults && endpoint({ protocol: defaults.protocol ?? "ssh", host, port: defaults.port ?? null, username: defaults.username ?? "" });
     return [
-      ...(opts.newSession ? [{ label: tr("이 주소로 새 세션 만들기…"), sub: shown, icon: "Plus", keys: [], hay: "", run: () => opts.newSession!(defaults) }] : []),
+      ...(opts.newSession && defaults && shown ? [{ label: tr("이 주소로 새 세션 만들기…"), sub: shown, icon: "Plus", keys: [], hay: "", run: () => opts.newSession!(defaults) }] : []),
       ...(opts.netTools ? [{ label: tr("네트워크 도구"), sub: host, icon: "Activity", keys: [], hay: "", run: () => opts.netTools!(host) }] : []),
     ];
   };

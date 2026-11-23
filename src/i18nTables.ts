@@ -48,9 +48,12 @@ export const ICON = /^\{0\}(?=[\p{L}\p{N}])/u;
 const ENGLISH_SINGULAR: Record<string, string> = {
   items: "item", sessions: "session", files: "file", folders: "folder", entries: "entry", lines: "line", tunnels: "tunnel",
   snippets: "snippet", credentials: "credential", matches: "match", ports: "port", tabs: "tab", connections: "connection",
-  times: "time",
+  times: "time", devices: "device", addresses: "address", messages: "message", names: "name", hops: "hop",
+  terminals: "terminal", commands: "command", alerts: "alert", words: "word", records: "record", transfers: "transfer",
+  IPs: "IP", models: "model", scripts: "script", minutes: "minute", seconds: "second", hours: "hour", days: "day",
 };
-const ONE_PLURAL = new RegExp(`(?<![\\d.,])(1 (?:[A-Za-z-]+ )?)(${Object.keys(ENGLISH_SINGULAR).join("|")})\\b`, "g");
+// A count stands alone: not "11", "2.1" or the end of a word ("v1", "Q1").
+const ONE_PLURAL = new RegExp(`(?<![\\w.,])(1 (?:[A-Za-z-]+ )?)(${Object.keys(ENGLISH_SINGULAR).join("|")})\\b`, "g");
 /** Outside a user's value (userText): a file named "1 files.txt" stays so. */
 export const englishSingulars = (s: string) =>
   s

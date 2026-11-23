@@ -165,3 +165,44 @@ export function unusableKey(lines: string[]): { path: string; why: "missing" | "
   }
   return null;
 }
+
+/** What an SSH or Telnet connection that ended (`code`, its last output as
+ * `lines`) calls for, never another login where one failed or did not finish:
+ * - "failed": the login was refused (`failure` says why); not tried again;
+ * - "unfinished": it ended after a login question (or, for Telnet, before
+ *   the device's own prompt), the login not through; not tried again;
+ * - "unreached": an SSH attempt that never logged in, retried on its own only
+ *   inside a chain begun by a logged-in session that dropped, and only when
+ *   ssh never reached the server ("ssh: connect to host H port P: …",
+ *   "ssh: Could not resolve hostname …", OpenSSH's own words); otherwise this;
+ * - "dropped": a connection that may reconnect on its own (ssh.exe's 255, a
+ *   Telnet connection that broke at the device's prompt);
+ * - "ended": the remote shell ended (any other code), as the user chose.
+ * `chain`: whether an automatic chain goes on after it (a logged-in session
+ * that dropped starts one; the caller resets it on a reconnect the user asks for). */
+export function afterExit(e: {
+  protocol: string;
+  code: number;
+  lines: string[];
+  loginAsked: boolean;
+  loggedIn: boolean;
+  chain: boolean;
+}): { verdict: "failed" | "unfinished" | "unreached" | "dropped" | "ended"; failure?: "auth" | "hostkey"; chain: boolean } {
+  const dropped = e.protocol === "ssh" ? e.code === 255 : e.code !== 0;
+  // A logged-in session that dropped (not one whose shell the user ended).
+  const chain = e.chain || (e.loggedIn && dropped);
+  if (e.protocol === "ssh" && e.code) {
+    const failure = loginFailure(e.lines);
+    if (failure) return { verdict: "failed", failure, chain: e.chain };
+    if (e.loginAsked && !e.loggedIn && !loginThrough(e.lines)) return { verdict: "unfinished", chain: e.chain };
+    if (e.code === 255 && !e.loggedIn) {
+      const unreached = e.lines.some((l) => /^ssh: (?:connect to host \S+ port \d+: |Could not resolve hostname )/.test(l.trim()));
+      if (!e.chain || !unreached) return { verdict: "unreached", chain: e.chain };
+    }
+  }
+  if (e.protocol === "telnet" && e.code) {
+    if (loginFailure(e.lines)) return { verdict: "failed", failure: "auth", chain };
+    if (!e.loggedIn || !loginThrough(e.lines)) return { verdict: "unfinished", chain };
+  }
+  return { verdict: dropped ? "dropped" : "ended", chain };
+}

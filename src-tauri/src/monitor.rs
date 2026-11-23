@@ -245,18 +245,6 @@ pub(crate) fn parse_block(lines: &[String], prev: &mut Option<(u64, u64)>) -> Op
     })
 }
 
-/// Unencrypted default keys in ~/.ssh, tried when the session has no vault
-/// credential (the terminal's ssh.exe would use them too).
-fn default_keys() -> Vec<String> {
-    let Some(dir) = dirs::home_dir().map(|h| h.join(".ssh")) else { return Vec::new() };
-    ["id_ed25519", "id_ecdsa", "id_rsa"]
-        .iter()
-        .map(|n| dir.join(n))
-        .filter(|p| p.is_file())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect()
-}
-
 #[tauri::command]
 pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: MonitorRequest) -> Result<(), String> {
     // Vault read + DPAPI decrypt and the proxy auth lookup are blocking (disk +
@@ -321,27 +309,15 @@ pub async fn monitor_start(app: AppHandle, state: State<'_, MonitorState>, req: 
         known_hosts: known_hosts_path(),
         proxy: req.proxy.clone(),
         proxy_auth: proxy_auth.clone(),
+        // The keys ~/.ssh/config names for this host, as the terminal's ssh.exe uses them.
+        keys: cfg.keys.clone(),
     };
 
-    // Vault credential or typed password first; otherwise the default keys.
-    let mut result = if cred.is_some() || password.is_some() { ssh_login(login(cred, password)).await } else { Err("NEED_PASSWORD".into()) };
-    if matches!(&result, Err(e) if e == "NEED_PASSWORD") {
-        for key in default_keys() {
-            let as_key = vault::Resolved { username: username.clone(), password: None, key_path: Some(key), passphrase: None };
-            match ssh_login(login(Some(as_key), None)).await {
-                Ok(h) => {
-                    result = Ok(h);
-                    break;
-                }
-                Err(e) if e.starts_with("HOSTKEY_") => {
-                    result = Err(e);
-                    break;
-                }
-                Err(_) => {}
-            }
-        }
-    }
-    let handle = Arc::new(result?);
+    // Vault credential or typed password; with neither, ssh_login tries the
+    // agent's and the default key files within one connection, at most three
+    // attempts as ssh.exe would ("NEED_PASSWORD" when none works): not one
+    // more connection (and failed login) per key file.
+    let handle = Arc::new(ssh_login(login(cred, password)).await?);
     let channel = handle.channel_open_session().await.map_err(|e| format!("모니터링 채널을 열 수 없습니다: {e}"))?;
     // Network devices may refuse exec; they get the interactive shell below.
     let exec_ok = channel.exec(true, SCRIPT).await.is_ok();

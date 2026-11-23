@@ -23,6 +23,12 @@ function fake(dir: string, names: [string, boolean, number][]): FileEntry[] {
 }
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
+/** Files made with "newfile" in this preview. */
+const mockMade = new Set<string>();
+/** Files changed "on the server" (another session) by __bxMockTouch(path, text). */
+const mockTouched = new Map<string, { text: string; stamp: [number, number] }>();
+(window as unknown as { __bxMockTouch: (path: string, text: string) => void }).__bxMockTouch = (path, text) =>
+  void mockTouched.set(path, { text, stamp: [Math.floor(Date.now() / 1000), text.length] });
 
 /** The preview terminal opened last, and a way to show device output in it
  * from the browser console while checking a feature (`__bxMockOut("…")`):
@@ -295,6 +301,12 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
     // Preview of a delete or chmod the server refuses: README.md (the rest succeed).
     case "remote_op":
       if ((a.op === "delete" || a.op === "chmod") && /readme/i.test(String(a.path))) throw "Permission denied (미리보기: README 거부)";
+      // A name made in this preview is taken (two backups in one second).
+      if (a.op === "newfile") {
+        if (mockMade.has(String(a.path))) throw "같은 이름이 이미 있습니다";
+        mockMade.add(String(a.path));
+      }
+      if (a.op === "delete") mockMade.delete(String(a.path));
       return;
     case "remote_list":
       return fake(a.path, [
@@ -302,8 +314,35 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
         ["releases", true, 0],
         ["app.tar.gz", false, 48_213_004],
         ["config.yml", false, 2_311],
+        ["deploy.sh", false, 64],
+        ["run.sh", false, 32],
+        // Uploaded before (644, as SFTP creates it): the "chmod +x" offer.
+        ["install.sh", false, 58],
         ["README.md", false, 9_120],
-      ]);
+      ]).concat(
+        // Links: "current" → releases (a folder), "app.conf" → config.yml, "old" → nowhere.
+        fake(a.path, [
+          ["current", true, 0],
+          ["app.conf", false, 2_311],
+          ["old", false, 0],
+        ]).map((e) => ({ ...e, isLink: true })),
+      );
+    case "remote_stat": {
+      // One path: the preview's folders by name, a file else; "nothing" is not there.
+      const p = String(a.path);
+      if (/nothing/.test(p)) return null;
+      const name = p.slice(p.lastIndexOf("/") + 1);
+      const isDir = ["logs", "releases", "current", "home", "user", "etc"].includes(name);
+      return { name, path: p, isDir, isLink: name === "current", size: isDir ? 0 : 2_311, modified: now, perm: isDir ? "drwxr-xr-x" : "-rw-r--r--" };
+    }
+    case "remote_link_target": {
+      const dir = String(a.path).slice(0, String(a.path).lastIndexOf("/")) || "/";
+      const name = String(a.path).slice(dir.length).replace(/^\//, "");
+      if (name === "current") return { target: "releases", resolved: `${dir === "/" ? "" : dir}/releases`, exists: true, isDir: true };
+      if (name === "app.conf") return { target: "./config.yml", resolved: `${dir === "/" ? "" : dir}/config.yml`, exists: true, isDir: false };
+      if (name === "old") return { target: "/opt/app-1.0", resolved: "/opt/app-1.0", exists: false, isDir: false };
+      throw "링크를 읽을 수 없습니다: 링크가 아닙니다 (미리보기)";
+    }
     case "local_home":
       return "C:\\Users\\me";
     case "local_hash":
@@ -331,6 +370,8 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
         ["config.yml", false, 2_311],
         ["README.md", false, 9_000],
         ["notes.txt", false, 1_204],
+        // Saved in Notepad (CRLF): the "bad interpreter: ^M" warning on upload.
+        ["install.sh", false, 58],
         ["backup.zip", false, 734_003_200],
       ]);
     case "transfer": {
@@ -361,8 +402,16 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
     case "vault_reveal":
       return null;
     case "read_text_file":
+      if (/\.sh$/i.test(a.path)) return "#!/bin/sh\r\necho install\r\n";
       if (/SecureCRT.*XML/i.test(a.path)) return CRT_XML;
       if (/SSH2\.ini$/i.test(a.path)) return crt(['S:"Identity Filename V2"=${VDS_CONFIG_PATH}\\Keys\\id_ed25519', 'D:"Public Key Type"=00000000']);
+      // A device's configuration received over TFTP before ("-1") and after
+      // ("-2") a change: the TFTP tab's comparison of two received copies.
+      if (/running-config-[12]$/.test(a.path))
+        return `hostname SW1\n!\ninterface Gi1/0/1\n description ${a.path.endsWith("2") ? "uplink-core" : "uplink"}\n switchport mode trunk\n!\nend\n`;
+      // The TFTP server's kept backup ("router-confg.<time>") and the new one.
+      if (/router-confg(\.\d{8}-\d{6})?$/.test(a.path))
+        return `hostname R1\n!\ninterface Gi0/0\n ip address 10.0.0.${/\.\d{8}-\d{6}$/.test(a.path) ? 1 : 254} 255.255.255.0\n!\nend\n`;
       // The preview picker returns a fake path named after the dialog title.
       if (/OpenSSH/.test(a.path)) return SSH_SAMPLE;
       if (/JSON/.test(a.path))
@@ -478,8 +527,14 @@ ${a.host}에 대한 Ping 통계:
       const c = a.config;
       if (!c.root) throw "공유할 폴더가 없습니다. 폴더를 다시 선택하세요.";
       setTimeout(() => mockEmit("file-server-event", { server: c.kind, kind: "started", user: "", detail: `${c.kind}://127.0.0.1:${c.port}` }), 50);
-      const started = { kind: c.kind, root: c.root, port: c.port, lan: c.lan, readOnly: c.kind === "http" || c.readOnly, auth: !!c.username, addresses: [...(c.lan ? [`${c.kind}://192.168.0.10:${c.port}`] : []), `${c.kind}://127.0.0.1:${c.port}`] };
+      const started = { kind: c.kind, root: c.root, port: c.port, lan: c.lan, readOnly: c.kind === "http" || c.readOnly, keepPrevious: c.kind === "tftp" && !c.readOnly && !!c.keepPrevious, auth: !!c.username, addresses: [...(c.lan ? [`${c.kind}://192.168.0.10:${c.port}`] : []), `${c.kind}://127.0.0.1:${c.port}`] };
       fileServersMock.set(c.kind, started);
+      // A device backing its configuration up twice to a TFTP server that
+      // keeps the earlier file: the second upload names the kept one.
+      if (started.keepPrevious) {
+        setTimeout(() => mockEmit("file-server-event", { server: "tftp", kind: "upload", user: "10.0.0.2", detail: "router-confg (98 bytes)", kept: null }), 600);
+        setTimeout(() => mockEmit("file-server-event", { server: "tftp", kind: "upload", user: "10.0.0.2", detail: "router-confg (103 bytes)", kept: "router-confg.20261122-141601" }), 1200);
+      }
       return started;
     }
     case "serial_ports":
@@ -568,13 +623,46 @@ ${a.host}에 대한 Ping 통계:
     case "tunnel_close":
       mockTunnels.delete(a.id);
       return;
+    case "remote_file_stamp": {
+      // Changed "on the server" by __bxMockTouch: its new stamp; else unknown
+      // (the editor then leaves the file as it is).
+      const s = mockTouched.get(String(a.path));
+      if (!s) throw "미리보기: 바뀌지 않음";
+      return s.stamp;
+    }
     case "remote_read_text":
+      if (mockTouched.has(String(a.path))) {
+        const s = mockTouched.get(String(a.path))!;
+        return { text: s.text, bom: false, stamp: s.stamp };
+      }
+      // A script saved on Windows (CRLF): the editor's "bad interpreter: ^M" warning.
+      // A script saved with a UTF-8 BOM (older Notepad): "#!/bin/sh: not found".
+      if (String(a.path).endsWith("run.sh")) return { text: "#!/bin/sh\necho run\n", bom: true, stamp: [now, 32] };
+      // YAML indented with a tab: the editor's warning on lines 2 and 4 (the
+      // comment and the Makefile kept in a block scalar are allowed one).
+      if (String(a.path).endsWith("tabs.yml")) return { text: "server:\n\tport: 8080\n\t# comment\n  \thost: 0.0.0.0\nmakefile: |\n  all:\n  \techo hi\nend: 1\n", bom: false, stamp: [now, 48] };
+      // A script with no extension: coloured by its "#!" line.
+      if (String(a.path).endsWith("/backup")) return { text: "#!/usr/bin/env bash\n# nightly backup\nfor d in /etc /srv; do\n  tar czf \"/backup/$(basename $d).tgz\" \"$d\"\ndone\n", bom: false, stamp: [now, 70] };
+      // A crontab whose last line has no line break: cron would skip it.
+      if (/(?:^|\/)crontab$/.test(String(a.path))) return { text: "SHELL=/bin/sh\n0 3 * * * /usr/local/bin/backup.sh", bom: false, stamp: [now, 50] };
+      // A Makefile: Tab must insert a tab there.
+      if (/(?:^|\/)Makefile$/.test(String(a.path))) return { text: "all:\n\techo hi\n", bom: false, stamp: [now, 16] };
+      // A .json file to break and save: the editor asks first.
+      if (String(a.path).endsWith(".json")) return { text: '{\n  "port": 8080,\n  "hosts": ["a", "b"]\n}\n', bom: false, stamp: [now, 40] };
+      if (String(a.path).endsWith(".sh")) return { text: "#!/bin/sh\r\necho deploy\r\nexit 0\r\n", bom: false, stamp: [now, 64] };
       return {
         text: "# 미리보기 파일\nserver:\n  port: 8080\n  host: 0.0.0.0\nlog_level: info  # ERROR, WARN\n",
         bom: false,
         stamp: [now, 64],
       };
     case "remote_write_text":
+      // A root's file saved as a user: refused (the editor offers sudo).
+      if (String(a.path).startsWith("/etc/")) throw "작업에 실패했습니다: Permission denied (미리보기)";
+      // Changed on the "server" (__bxMockTouch) since it was read: refused as
+      // the backend does, unless the save is forced.
+      if (!a.force && mockTouched.has(String(a.path)) && a.stamp && String(a.stamp) !== String(mockTouched.get(String(a.path))!.stamp)) throw "CONFLICT::";
+      // Saved here: the stamp is the one this returns, no outside change left.
+      mockTouched.delete(String(a.path));
       return [now + 1, a.text.length];
     case "ftp_server_start": {
       const c = a.config;

@@ -13,7 +13,7 @@ import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc,
 export type NetTool = "ping" | "trace" | "ports" | "dns" | "subnet" | "sweep";
 
 /** An IPv4 address as typed ("10.0.0.1"): the echo tools take only these. */
-const isIPv4 = (a: string) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(a) && a.split(".").every((o) => Number(o) <= 255);
+export const isIPv4 = (a: string) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(a) && a.split(".").every((o) => Number(o) <= 255);
 
 /** What a router's "unreachable" answer to a trace says (its IP status). */
 const UNREACHABLE: Record<number, string> = {
@@ -409,7 +409,10 @@ function sweepTime(at: number): string {
  * with a prefix length (one read next to the address in terminal output). */
 /** `startNow`: start the tool at once on `initialHost` (an address picked in the output).
  * `continuous`: the ping as "Keep sending" (watching a device come back after a restart). */
-export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping", initialPrefix: number | null = null, startNow = false, continuous = false) {
+/** `closeUnder`: closes the windows this one was opened from (the Syslog
+ * window): going to a device's tab or connecting closes them too, so the tab
+ * is not left behind them. */
+export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping", initialPrefix: number | null = null, startNow = false, continuous = false, closeUnder?: () => void) {
   let tool: NetTool = "ping";
   /** The host box's suggestions (one list per dialog). */
   const hostListId = `nettools-hosts-${crypto.randomUUID()}`;
@@ -436,6 +439,11 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     const id = traceId;
     traceId = null;
     if (id && traceStarted) void api.netTraceStop(id).catch(() => {});
+  };
+  /** This window and those it was opened from: for going to a tab or connecting. */
+  const closeAll = () => {
+    m.close();
+    closeUnder?.();
   };
   const m = modal({
     title: "네트워크 도구",
@@ -498,7 +506,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   watchBtn.addEventListener("click", () => {
     if (!answered.length) return;
     const names = savedNames();
-    openMultiWatch(answered.map((ip) => ({ name: names.get(ip) || ip, host: ip })));
+    openMultiWatch(answered.map((ip) => ({ name: names.get(ip) || ip, host: ip })), closeAll);
   });
   freeBtn.addEventListener("click", () => {
     if (!free.length) return;
@@ -998,8 +1006,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     const protocol = PORT_PROTOCOL[port];
     if (protocol)
       return void contextMenu(r.left, r.bottom + 2, [
-        { label: "이 포트로 새 세션 만들기…", icon: "Plus", hint: `${PROTOCOLS[protocol].label} :${port}`, action: () => newSession?.({ protocol, host: ip, port }, () => m.close()) },
-        ...deviceItems(ip, () => m.close()),
+        { label: "이 포트로 새 세션 만들기…", icon: "Plus", hint: `${PROTOCOLS[protocol].label} :${port}`, action: () => newSession?.({ protocol, host: ip, port }, closeAll) },
+        ...deviceItems(ip, closeAll),
       ]);
     contextMenu(r.left, r.bottom + 2, [
       // Each says which ping it is: the "Keep sending" box set to match.
@@ -1007,8 +1015,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => ((cont.checked = true), runOn("ping", ip)) },
       { label: "경로 추적", icon: "Waypoints", action: () => runOn("trace", ip) },
       { label: "포트 확인", icon: "Unplug", action: () => runOn("ports", ip) },
-      ...deviceItems(ip, () => m.close()),
-      ...(newSession ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => newSession?.({ protocol: "ssh" as const, host: ip }, () => m.close()) }] : []),
+      ...deviceItems(ip, closeAll),
+      ...(newSession ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => newSession?.({ protocol: "ssh" as const, host: ip }, closeAll) }] : []),
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(ip) },
     ]);
   });
@@ -1117,7 +1125,56 @@ export function watchTargets(sessions: { name: string; host: string; protocol?: 
   return all;
 }
 
-export function openMultiWatch(sessions: { name: string; host: string; protocol?: Session["protocol"] }[]) {
+/** The devices watched last (openMultiWatch), to watch again from the tools
+ * menu: a morning check of the same switches, without picking them again.
+ * Kept in this PC's storage only; a damaged value is no list. */
+const LAST_WATCH = "bx.lastWatch";
+export function lastWatchList(): { name: string; host: string }[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(LAST_WATCH) ?? "[]");
+    if (!Array.isArray(v)) return [];
+    // Named as the sessions are now (one renamed since keeps up), else as kept.
+    const names = savedNames();
+    return v
+      .filter((x) => x && typeof x.name === "string" && typeof x.host === "string" && x.host.trim())
+      .slice(0, 32)
+      .map((x: { name: string; host: string }) => ({ name: names.get(x.host.toLowerCase()) || x.name, host: x.host }));
+  } catch {
+    return [];
+  }
+}
+function rememberWatch(list: { name: string; host: string }[]) {
+  try {
+    // All taken out: no list left to offer.
+    if (list.length) localStorage.setItem(LAST_WATCH, JSON.stringify(list.map(({ name, host }) => ({ name, host }))));
+    else localStorage.removeItem(LAST_WATCH);
+  } catch {
+    // Storage full or off: the tools menu just has no list.
+  }
+}
+
+/** A device's last minute as bars, the newest on the right: an echo answered
+ * is a bar as tall as it was slow (to the slowest shown, 10 ms at least, so
+ * a quiet LAN of 1 ms reads flat), one unanswered a full red bar. Flapping
+ * and a link growing slow show here, not in a loss percentage. */
+function sparkline(history: (number | null)[]): string {
+  if (!history.length) return "";
+  const N = 60;
+  const top = Math.max(10, ...history.map((v) => v ?? 0));
+  const bars = history
+    .map((v, i) => {
+      const x = N - history.length + i;
+      if (v === null) return `<rect class="miss" x="${x}" y="0" width="0.8" height="16"/>`;
+      const h = 2 + Math.round(14 * Math.min(1, v / top));
+      return `<rect x="${x}" y="${16 - h}" width="0.8" height="${h}"/>`;
+    })
+    .join("");
+  return `<svg viewBox="0 0 ${N} 16" preserveAspectRatio="none" aria-hidden="true">${bars}</svg>`;
+}
+
+/** `closeUnder`: closes the windows this one was opened from (Syslog, the
+ * network tools), as going to a device's tab or connecting closes this one. */
+export function openMultiWatch(sessions: { name: string; host: string; protocol?: Session["protocol"] }[], closeUnder?: () => void, remember = false) {
   const MAX = 32;
   const LOST_AFTER = 3;
   const all = watchTargets(sessions);
@@ -1144,9 +1201,11 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     down: number | null;
     outages: number;
     changed: number;
+    /** The last minute's echoes, oldest first: the time each took, or null (none). */
+    history: (number | null)[];
     el: HTMLTableRowElement;
   };
-  const rows: Row[] = targets.map((t) => ({ ...t, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, el: document.createElement("tr") }));
+  const rows: Row[] = targets.map((t) => ({ ...t, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, history: [], el: document.createElement("tr") }));
   let closed = false;
   /** The replies are listened to: a row added from now on starts at once. */
   let listening = false;
@@ -1157,7 +1216,7 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     width: 820,
     body: `<p class="muted small" data-mw-summary></p>
       ${all.length > MAX ? `<p class="muted small">${esc(`처음 ${MAX}개만 지켜봅니다`)}</p>` : ""}
-      <div class="mw-scroll"><table class="nettools-table mw-table"><thead><tr><th>이름</th><th>주소</th><th>상태</th><th>손실</th><th>끊김</th><th>마지막 변화</th></tr></thead><tbody></tbody></table></div>
+      <div class="mw-scroll"><table class="nettools-table mw-table"><thead><tr><th>이름</th><th>주소</th><th>상태</th><th>손실</th><th title="최근 60번의 응답 시간 (막대가 높을수록 느림, 빨강은 응답 없음)">최근 1분</th><th>끊김</th><th>마지막 변화</th></tr></thead><tbody></tbody></table></div>
       <div class="mw-add"><input data-add class="list-search" spellcheck="false" autocomplete="off" placeholder="주소 추가 (예: 10.0.0.5)" list="mw-hosts"/><datalist id="mw-hosts">${savedHostOptions()}</datalist><button type="button" class="btn btn-sm" data-add-go>${icon("Plus", 13)}추가</button></div>
       <ul class="watch-log" data-mw-log></ul>`,
     footer: `<button class="btn" data-copy-log>${icon("ClipboardList", 14)}변화 기록 복사</button><button class="btn" data-copy>${icon("Copy", 14)}결과 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
@@ -1249,8 +1308,8 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     // rebuilt every second would lose a click whose press and release
     // fell on either side of the redraw.
     if (!r.el.cells.length)
-      r.el.innerHTML = `<td><button type="button" class="sweep-link" data-row="${r.id}" title="이 장비의 탭으로 이동, 연결, 주소 복사"><span data-i18n-skip>${esc(r.name)}</span></button><span data-dot></span></td><td data-i18n-skip></td><td></td><td></td><td></td><td></td>`;
-    const [, addr, st, lossCell, downs, changed] = r.el.cells;
+      r.el.innerHTML = `<td><button type="button" class="sweep-link" data-row="${r.id}" title="이 장비의 탭으로 이동, 연결, 주소 복사"><span data-i18n-skip>${esc(r.name)}</span></button><span data-dot></span></td><td data-i18n-skip></td><td></td><td></td><td class="mw-spark"></td><td></td><td></td>`;
+    const [, addr, st, lossCell, spark, downs, changed] = r.el.cells;
     const set = (el: HTMLElement, html: string) => {
       if (el.innerHTML !== html) el.innerHTML = html;
     };
@@ -1258,6 +1317,26 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     set(addr, esc(r.ip && r.ip !== r.host ? `${r.host} (${r.ip})` : r.host));
     set(st, status);
     set(lossCell, loss);
+    // Redrawn when the minute changed (the browser writes the bars back in
+    // another form, so their markup cannot be compared).
+    const sparkKey = r.history.join(",");
+    if (spark.dataset.key !== sparkKey) {
+      spark.dataset.key = sparkKey;
+      spark.innerHTML = sparkline(r.history);
+    }
+    // The bars' numbers, on hover: that minute's times and loss.
+    const times = r.history.filter((v): v is number => v !== null);
+    const minute = r.history.length
+      ? [
+          tr("최근 1분"),
+          ...(times.length ? [tr(`최소/평균/최대 ${Math.min(...times)}/${Math.round(times.reduce((a, b) => a + b, 0) / times.length)}/${Math.max(...times)} ms`)] : []),
+          tr(`손실 ${Math.round((100 * (r.history.length - times.length)) / r.history.length)}%`),
+        ].join(" · ")
+      : "";
+    if (spark.title !== minute) spark.title = minute;
+    // Copied as its numbers ("최소/평균/최대 1/3/5 ms · 손실 2%"), not "58/60",
+    // which a spreadsheet reads as a date.
+    spark.dataset.copy = minute ? minute.split(" · ").slice(1).join(" · ") : "-";
     set(downs, String(r.outages || "-"));
     set(changed, r.changed ? time(r.changed) : "-");
   };
@@ -1289,6 +1368,11 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     draw(r);
   }
   drawSummary();
+  // Only a list the user put together (sessions, a folder, the last list
+  // again) is offered again: a one-off watch of a scan's or Syslog's
+  // devices does not replace the daily one.
+  const keep = () => remember && rememberWatch(rows);
+  keep();
   // The "응답 없음 · 1:23" clocks move on between replies too.
   const tick = window.setInterval(() => {
     if (closed) return clearInterval(tick);
@@ -1302,10 +1386,14 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     // By its id, not its place: rows come and go (added, taken out).
     const r = b && rows.find((x) => x.id === b.dataset.row);
     if (!b || !r) return;
+    const trace = r.ip ?? (isIPv4(r.host) ? r.host : null);
     const at = b.getBoundingClientRect();
     contextMenu(at.left, at.bottom + 2, [
-      ...deviceItems(r.host, () => m.close()),
+      ...deviceItems(r.host, () => (m.close(), closeUnder?.())),
       { label: "주소 복사", icon: "ClipboardList", hint: r.host, userHint: true, action: () => void writeClipboard(r.host) },
+      // Not answering: where on the way it stops (this window keeps watching
+      // under the tools). The address its pings go to; IPv4 only, as the trace.
+      ...(trace ? [{ label: "경로 추적", icon: "Waypoints", hint: trace, userHint: true, action: () => openNetworkTools(trace, "trace", null, true) }] : []),
       "-",
       // No longer of interest (back and fine, or added by mistake): its pings stop, its row goes.
       { label: "지켜보기에서 빼기", icon: "X", action: () => remove(r) },
@@ -1318,14 +1406,16 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     if (r.started) void api.netWatchStop(r.id).catch(() => {});
     r.el.remove();
     log(`${userText(r.name)}: 지켜보기에서 뺌`);
+    keep();
     drawSummary();
   };
   m.root.querySelector("[data-copy]")!.addEventListener("click", () => {
     // As shown: in the table's order (those not answering on top), the cells
     // in the screen language, a name starting with "=" kept as text.
     const cell = (s: string) => sheetCell(s.replace(/[\t\r\n]+/g, " ").trim());
-    const head = ["이름", "주소", "상태", "손실", "끊김", "마지막 변화"].map((t) => cell(tr(t))).join("\t");
-    const lines = [...body.rows].map((row) => [...row.cells].map((td) => cell(td.textContent ?? "")).join("\t"));
+    const head = ["이름", "주소", "상태", "손실", "최근 1분", "끊김", "마지막 변화"].map((t) => cell(tr(t))).join("\t");
+    // The last minute as its answered count ("58/60"), not its bars.
+    const lines = [...body.rows].map((row) => [...row.cells].map((td) => cell(td.dataset.copy ?? td.textContent ?? "")).join("\t"));
     void writeClipboard([head, ...lines].join("\n"));
     toast("결과를 복사했습니다", "success", 1500);
   });
@@ -1335,6 +1425,8 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
       if (!r || closed) return;
       r.sent++;
       r.last = p.ms;
+      r.history.push(p.ms);
+      if (r.history.length > 60) r.history.shift();
       if (p.ms !== null) {
         r.got++;
         r.misses = 0;
@@ -1406,13 +1498,14 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
     if (rows.some((r) => r.host.toLowerCase() === host.toLowerCase())) return void toast("이미 지켜보는 주소입니다", "info");
     if (rows.length >= MAX) return void toast(`처음 ${MAX}개만 지켜봅니다`, "info");
     const names = savedNames();
-    const r: Row = { name: names.get(host.toLowerCase()) || host, host, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, el: document.createElement("tr") };
+    const r: Row = { name: names.get(host.toLowerCase()) || host, host, id: crypto.randomUUID(), ip: null, started: false, problem: "", ended: false, sent: 0, got: 0, last: null, misses: 0, firstMiss: 0, answers: 0, firstBack: 0, down: null, outages: 0, changed: 0, history: [], el: document.createElement("tr") };
     rows.push(r);
     body.appendChild(r.el);
     draw(r);
     drawSummary();
     addIn.value = "";
     log(`${userText(r.name)}: 지켜보기에 추가`);
+    keep();
     if (listening) start(r);
   };
   addIn.addEventListener("keydown", (e) => {

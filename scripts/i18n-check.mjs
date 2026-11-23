@@ -146,6 +146,28 @@ for (const file of fs.readdirSync(dictDir).filter((f) => f.endsWith(".json"))) {
       }
       const kept = tr(`${userText("1 files.txt")} 을(를) 저장했습니다`);
       if (!kept.includes(userText("1 files.txt"))) report(lang, `a user's value was changed: ${kept}`);
+      // Every phrase counting something ("{0}개", "{0}대", "{0}번" …) read
+      // with a count of 1 and of 2: the words after the count must differ
+      // ("1 address" / "2 addresses"). The same plural after both ("1
+      // scripts" / "2 scripts") is a noun missing from i18nTables.ts
+      // ENGLISH_SINGULAR. Units that keep their form ("1 ms") are no nouns.
+      const KEEP = new Set(["ms", "s"]);
+      const after = (s, n) => new RegExp(`(?<![\\w.,])${n} ((?:[A-Za-z-]+ )?[A-Za-z]+)`).exec(s)?.[1];
+      for (const e of entries) {
+        for (const m of e.ko.matchAll(/\{(\d)\}\s*(?:개|대|번|줄|건|명|홉|초|분|시간|일)/g)) {
+          const at = (n) => e.ko.replace(/\{(\d)\}/g, (_, i) => (i === m[1] ? String(n) : `Q${i}`));
+          const one = after(tr(at(1)), 1);
+          const two = after(tr(at(2)), 2);
+          const noun = one?.split(" ").pop();
+          if (one && one === two && noun.endsWith("s") && !KEEP.has(noun)) report(lang, `"${at(1).slice(0, 40)}" comes out as "${tr(at(1)).slice(0, 60)}": "${noun}" needs a singular in ENGLISH_SINGULAR`);
+        }
+      }
+      // A count with a verb that must agree with it ("{0} lines are …"): the
+      // noun becomes singular for 1, the verb does not ("1 line are"). Such a
+      // message is put as "Lines indented with tabs: {0}" instead.
+      for (const e of entries) {
+        if (/\{\d\}\s+(?:[A-Za-z-]+\s+)?[A-Za-z]+s\s+(?:are|were|have|need|aren't|weren't|don't)\b/.test(e.t)) report(lang, `"${e.t.slice(0, 60)}" reads wrong for 1 (the verb does not follow the count); put the count after a label`);
+      }
     }
   }
   const missing = [...keys].filter((k) => !seen.has(k));

@@ -2,23 +2,25 @@
 // remote server on the right, with a transfer queue at the bottom.
 
 import { api, on, openWithDefaultApp, type FileEntry, type TransferProgress } from "../api";
+import { lacksExecute, modeOf, SCRIPT_NAME, withExecute } from "../remotePerm";
 import { proxyOf } from "../proxy";
 import { writeClipboard } from "../clipboard";
 import { icon } from "../icons";
 import { actionFor, keyHint, withKey } from "../keymap";
-import { defaultPort, endpoint, PROTOCOLS, type Session } from "../model";
+import { defaultPort, DRAG_FROM_THIS_APP, endpoint, PROTOCOLS, REMOTE_PATHS_DRAG, type Session } from "../model";
 import { natural } from "../sessionOrder";
 import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
 import { forgetHostKey } from "../hostKeys";
 import { canOsNotify, choiceDialog, ensureNotifyPermission, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, toast, setPressed, type MenuItem } from "../ui";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
-import { tr, userText } from "../i18n";
+import { onLanguageApplied, tr, userText } from "../i18n";
 import { hasPendingDiff, openDiff, pendingTitle, takeForDiff, type DiffSide } from "../diffView";
 
 /** The file last taken for a comparison (Pane.fileKey), to tell it from another of the same name. */
 let takenKey: string | null = null;
 import { notesButton } from "../sessionNotes";
+import { installFor, unitReloadFor } from "../shebang";
 
 type Side = "local" | "remote";
 type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean; trustedCert?: string };
@@ -105,22 +107,6 @@ function isSafeLocalName(name: string): boolean {
   return !/^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])$/.test(stem);
 }
 
-/** The mode an "-rwsr-xr-x" listing string stands for (setuid, setgid and
- * sticky included), or null when there is none. */
-function modeOf(perm: string | null): number | null {
-  if (!perm || !/^[-dl][-r][-w][-xsS][-r][-w][-xsS][-r][-w][-xtT]$/.test(perm)) return null;
-  let mode = 0;
-  [0o4000, 0o2000, 0o1000].forEach((special, i) => {
-    const [r, w, x] = perm.slice(1 + 3 * i, 4 + 3 * i);
-    const shift = 6 - 3 * i;
-    if (r === "r") mode |= 4 << shift;
-    if (w === "w") mode |= 2 << shift;
-    if ("xst".includes(x)) mode |= 1 << shift;
-    if ("sStT".includes(x)) mode |= special;
-  });
-  return mode;
-}
-
 /** Bookmarked remote folders, per server ("sftp://user@host:port", FTP and
  * FTPS as "ftp://…"): a saved session, a quick connection and the SFTP pane
  * of an SSH tab to the same server share them. Kept on this PC. */
@@ -155,6 +141,42 @@ function saveFolderBookmarks(server: string, paths: string[]) {
   }
 }
 
+/** Server files opened in the built-in editor lately, per server (the same
+ * key as BOOKMARKS), the latest first: offered under the bookmark button to
+ * open again (the same configuration file, visit after visit). Kept on this PC. */
+const RECENT_EDITS = "bx.recentEdits";
+const MAX_RECENT_EDITS = 10;
+
+function recentEditMap(): Record<string, string[]> {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(RECENT_EDITS) ?? "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    return Object.fromEntries(
+      Object.entries(raw as Record<string, unknown>).map(([k, v]) => [k, Array.isArray(v) ? v.filter((p): p is string => typeof p === "string") : []]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function recentEdits(server: string): string[] {
+  return recentEditMap()[server] ?? [];
+}
+
+/** `path` read in the editor (put first), or not readable there (gone,
+ * refused: `drop`, taken off the list). */
+function noteRecentEdit(server: string, path: string, drop = false) {
+  const all = recentEditMap();
+  const rest = (all[server] ?? []).filter((p) => p !== path);
+  all[server] = (drop ? rest : [path, ...rest]).slice(0, MAX_RECENT_EDITS);
+  if (!all[server].length) delete all[server];
+  try {
+    localStorage.setItem(RECENT_EDITS, JSON.stringify(all));
+  } catch {
+    // A convenience only: storage full or blocked.
+  }
+}
+
 /** A remote file opened in a local app, watched for saves. */
 interface EditWatch {
   remote: string;
@@ -168,8 +190,11 @@ interface EditWatch {
   upload: Promise<void> | null;
   /** "Stop watching" is in progress (dialog open or final upload): the poll keeps out. */
   stopping: boolean;
-  /** mtime whose upload last failed (0 = none); reported once, retried each poll. */
+  /** mtime whose upload last failed (0 = none), on the connection `failedOn`:
+   * told once and not sent again on its own (a new save, "다시 시도" or a
+   * reconnect sends it). */
   failedAt: number;
+  failedOn: string;
 }
 
 /** Folders with more entries than this draw only the rows in view (see drawWindow). */
@@ -344,7 +369,9 @@ class Pane {
   }
 
   /** `nav`: a step back or forward through the history (others start a new branch). */
-  async load(path: string, nav?: "back" | "forward") {
+  /** True once `path` is the folder shown; false when it could not be read
+   * (said) or a later request took its place. */
+  async load(path: string, nav?: "back" | "forward"): Promise<boolean> {
     // "C:" alone means the current folder of drive C to Windows, while joins
     // would put files in C: — always use the drive's root.
     // One spelling per folder (bookmarks, history and "same folder" compare
@@ -361,7 +388,7 @@ class Pane {
     try {
       const list =
         this.side === "local" ? await api.localList(path) : await api.remoteList(this.owner.remoteId, path);
-      if (seq !== this.loadSeq) return;
+      if (seq !== this.loadSeq) return false;
       this.entries = list;
       // Windows names ignore case: "c:\\users" is the folder shown as "C:\\Users".
       const same = this.side === "local" ? path.toLowerCase() === this.path.toLowerCase() : path === this.path;
@@ -370,6 +397,9 @@ class Pane {
         this.filterInput.value = "";
       }
       // A refresh of the same folder (after a transfer) keeps the selection.
+      // Links looked up again for the listing now (a refresh may follow a change).
+      this.linkTargets.clear();
+      this.linkGen++;
       if (!same) {
         this.selected.clear();
         this.anchor = null;
@@ -398,10 +428,12 @@ class Pane {
       this.visited = true;
       this.path = path;
       this.render();
+      return true;
     } catch (err) {
-      if (seq !== this.loadSeq) return;
+      if (seq !== this.loadSeq) return false;
       toast(errorText(err), "error");
       this.pathInput.value = this.path;
+      return false;
     } finally {
       if (seq === this.loadSeq) this.requested = null;
       if (--this.pendingLoads === 0) this.el.classList.remove("busy");
@@ -433,6 +465,7 @@ class Pane {
     const r = btn.getBoundingClientRect();
     const server = this.owner.bookmarkKey;
     const list = folderBookmarks(server);
+    const recent = recentEdits(server);
     const here = this.path;
     const save = (paths: string[]) => {
       saveFolderBookmarks(server, paths);
@@ -452,6 +485,10 @@ class Pane {
       ...(list.length
         ? list.map((p) => ({ label: p, icon: "Folder", userLabel: true, action: () => void this.load(p) }))
         : [{ label: "즐겨찾는 폴더가 없습니다", disabled: true }]),
+      // Files of this server opened in the editor lately: opened again in one click.
+      ...(this.side === "remote" && recent.length
+        ? ["-" as const, { label: "최근 편집한 파일", icon: "FileText", heading: true }, ...recent.map((p) => ({ label: p, icon: "FileText", userLabel: true, action: () => this.owner.openPath(p) }))]
+        : []),
     ]);
   }
 
@@ -503,10 +540,50 @@ class Pane {
     this.renderFoot(this.entries.length - vis.length);
   }
 
+  /** Where this folder's links lead, as looked up on hover ("→ releases/v2"),
+   * for the listing shown; null while being asked. */
+  private linkTargets = new Map<string, string | null>();
+
+  /** A link's "링크" badge; its target on hover once looked up. */
+  private linkBadge(path: string): string {
+    const known = this.linkTargets.get(path);
+    // Kept from the page translation: the title is a server path, which a
+    // dictionary phrase in a Korean folder name must not change.
+    return `<em data-link data-i18n-skip${known ? ` title="${esc(known)}"` : ""}>${esc(tr("링크"))}</em>`;
+  }
+  /** Which listing the link targets belong to: an answer for an earlier one
+   * (the same folder read again) is not kept. */
+  private linkGen = 0;
+
+  /** A link's badge hovered (server side, SFTP): where it leads, asked once
+   * per listing, after a short rest so passing over a column asks nothing. */
+  private hoverLink(badge: HTMLElement) {
+    const row = badge.closest<HTMLElement>(".file-row");
+    const path = row?.dataset.path;
+    if (!path || this.side !== "remote" || !this.owner.canReadLinks || this.linkTargets.has(path)) return;
+    const gen = this.linkGen;
+    window.setTimeout(() => {
+      if (!badge.matches(":hover") || this.linkTargets.has(path) || this.linkGen !== gen) return;
+      this.linkTargets.set(path, null);
+      api.remoteLinkTarget(this.owner.remoteId, path).then(
+        (t) => {
+          if (this.linkGen !== gen) return;
+          const text = t.exists ? `→ ${t.target}` : `→ ${t.target} (${tr("대상 없음")})`;
+          this.linkTargets.set(path, text);
+          // The row may have been drawn again meanwhile: the one there now.
+          const shown = [...this.listEl.querySelectorAll<HTMLElement>(".file-row")].find((r) => r.dataset.path === path);
+          shown?.querySelector<HTMLElement>("em[data-link]")?.setAttribute("title", text);
+        },
+        // Not readable: asked again on a later hover (of this listing).
+        () => void (this.linkGen === gen && this.linkTargets.delete(path)),
+      );
+    }, 350);
+  }
+
   private rowHtml(e: FileEntry): string {
     const ico = e.isDir ? (this.path === "" && this.side === "local" ? "HardDrive" : "Folder") : "File";
     return `<div class="file-row${this.selected.has(e.path) ? " selected" : ""}${e.isDir ? " dir" : ""}" draggable="true" data-path="${esc(e.path)}">
-          <span class="fname">${icon(ico, 15)}<span data-i18n-skip>${markTerms(e.name, this.filterTerms)}</span>${e.isLink ? `<em>링크</em>` : ""}</span>
+          <span class="fname">${icon(ico, 15)}<span data-i18n-skip>${markTerms(e.name, this.filterTerms)}</span>${e.isLink ? this.linkBadge(e.path) : ""}</span>
           <span class="fsize">${e.isDir ? "" : formatBytes(e.size)}</span>
           <span class="fdate">${formatDate(e.modified)}</span>
           ${this.side === "remote" ? `<span class="fperm">${esc(e.perm ?? "")}</span>` : ""}
@@ -600,15 +677,48 @@ class Pane {
       this.selected = new Set([path]);
       this.anchor = path;
     }
-    this.cursor = path;
+    this.showCursor(i);
+  }
+
+  /** Row `i` is the cursor: scrolled into view, the selection drawn. */
+  private showCursor(i: number) {
+    this.cursor = this.rows[i].path;
     // Rows are ROW_H high whether all are drawn or only those in view, below
     // the list's own top padding.
     const top = i * ROW_H + (parseFloat(getComputedStyle(this.listEl).paddingTop) || 0);
     if (top < this.listEl.scrollTop) this.listEl.scrollTop = top;
     else if (top + ROW_H > this.listEl.scrollTop + this.listEl.clientHeight) this.listEl.scrollTop = top + ROW_H - this.listEl.clientHeight;
-    if (n > VIRTUAL_MIN) this.drawWindow();
+    if (this.rows.length > VIRTUAL_MIN) this.drawWindow();
     this.listEl.querySelectorAll<HTMLElement>(".file-row").forEach((r) => r.classList.toggle("selected", this.selected.has(r.dataset.path!)));
     this.renderFoot();
+  }
+
+  /** A link on the server followed: its folder opened, or the folder of the
+   * file it leads to with that file selected. Where it leads is said either
+   * way (the text as `ls -l` shows it after "->"); a broken link goes nowhere. */
+  private async followLink(link: FileEntry) {
+    // Another folder opened while the server answered: that one stays.
+    const seq = this.loadSeq;
+    let t: Awaited<ReturnType<typeof api.remoteLinkTarget>>;
+    try {
+      t = await api.remoteLinkTarget(this.owner.remoteId, link.path);
+    } catch (err) {
+      return void toast(errorText(err), "error");
+    }
+    if (this.loadSeq !== seq) return;
+    if (!t.exists) return void toast(`링크가 가리키는 곳이 없습니다: ${userText(t.target)}`, "warn", 6000);
+    const dir = t.isDir ? t.resolved : t.resolved.slice(0, t.resolved.lastIndexOf("/")) || "/";
+    await this.load(dir);
+    // Moved elsewhere meanwhile (another folder asked for): left as it is.
+    if (this.path !== dir) return;
+    toast(`${userText(link.name)} → ${userText(t.target)}`, "info", 4000);
+    if (t.isDir) return;
+    const i = this.rows.findIndex((r) => r.path === t.resolved);
+    // Hidden (a dot name with hidden files off) or filtered out: the folder only.
+    if (i < 0) return;
+    this.selected = new Set([t.resolved]);
+    this.anchor = t.resolved;
+    this.showCursor(i);
   }
 
   private open(entry: FileEntry) {
@@ -696,12 +806,19 @@ class Pane {
     // a dragend event (lost when the dragged row is re-rendered) and a tab or
     // any other drag can never be mistaken for a file drag.
     const other = this.side === "local" ? "remote" : "local";
+    this.listEl.addEventListener("mouseover", (e) => {
+      const badge = (e.target as HTMLElement).closest<HTMLElement>("em[data-link]");
+      if (badge) this.hoverLink(badge);
+    });
     this.listEl.addEventListener("dragstart", (e) => {
       const row = (e.target as HTMLElement).closest<HTMLElement>(".file-row");
       if (!row) return;
       if (!this.selected.has(row.dataset.path!)) this.select(row.dataset.path!, e);
       e.dataTransfer!.effectAllowed = "copy";
       e.dataTransfer!.setData(this.owner.dragType(this.side), "1");
+      // Dropped on a terminal: their paths typed there (server paths only;
+      // this PC's mean nothing to a shell on the server).
+      if (this.side === "remote") e.dataTransfer!.setData(REMOTE_PATHS_DRAG, JSON.stringify({ from: DRAG_FROM_THIS_APP, paths: this.selection().map((s) => s.path) }));
     });
     const fromOther = (e: DragEvent) => !!e.dataTransfer?.types.includes(this.owner.dragType(other));
     this.el.addEventListener("dragover", (e) => {
@@ -785,8 +902,11 @@ class Pane {
       "-",
       { label: "이름 바꾸기", icon: "Pencil", hint: keyHint("files.rename"), disabled: sel.length !== 1, action: () => this.rename(sel[0]) },
       { label: "경로 복사", icon: "Copy", disabled: !sel.length, action: () => writeClipboard(sel.map((s) => s.path).join("\n")) },
+      // "current -> releases/v2": the real folder, or the file's, opened.
+      ...(remote && target?.isLink && this.owner.canReadLinks ? [{ label: "링크가 가리키는 곳으로 이동", icon: "CornerDownLeft", action: () => void this.followLink(target) }] : []),
       // The folder clicked, else the one shown: which subfolder takes the space.
       // Not on the list of drives (no folder open): that would be every disk.
+      { label: "하위 폴더에서 이름으로 찾기…", icon: "Search", disabled: !target?.isDir && !this.path, action: () => void this.findByName(target?.isDir ? target.path : this.path) },
       { label: "폴더 크기 계산", icon: "HardDrive", disabled: !target?.isDir && !this.path, action: () => this.folderSize(target?.isDir ? target : { name: this.path.split(/[\\/]/).filter(Boolean).pop() || this.path, path: this.path, isDir: true, isLink: false, size: 0, modified: null, perm: null }) },
       this.compareItem(sel),
       // An image checked against its vendor's published value before it goes up.
@@ -844,6 +964,8 @@ class Pane {
     let files = 0;
     let dirs = 0;
     let failed = 0;
+    /** Why the walk ended early at a failed listing (walkStopsOnFailure). */
+    let cut = "";
     let entries = 0;
     const counts = () => [tr(`파일 ${files}개`), tr(`폴더 ${dirs}개`), formatBytes(bytes)].join(" · ");
     let shownAt = 0;
@@ -893,7 +1015,12 @@ class Pane {
         let got: FileEntry[];
         try {
           got = await list(path);
-        } catch {
+        } catch (err) {
+          // Over FTP, or once disconnected: ended here (see walkStopsOnFailure).
+          if (this.walkStopsOnFailure()) {
+            cut = errorText(err);
+            break;
+          }
           // No permission to read it (a system folder): counted as not read.
           failed++;
           continue;
@@ -921,7 +1048,136 @@ class Pane {
       stopBtn.hidden = true;
       show(true);
       if (stopped) stateEl.insertAdjacentHTML("beforeend", ` <span class="muted">· ${esc(tr("중지했습니다"))}</span>`);
+      if (cut) stateEl.insertAdjacentHTML("beforeend", ` <span class="danger-text">· ${esc(tr(`목록을 읽지 못해 멈췄습니다: ${userText(cut)}`))}</span>`);
     })();
+  }
+
+  /** Whether a folder walk (size, find) ends at a listing that failed rather
+   * than counting it and going on: over FTP a failed listing may open the
+   * connection again (a login), so a lost connection would log in once per
+   * folder left; and once this tab is not connected, nothing more can be read. */
+  private walkStopsOnFailure(): boolean {
+    return this.side !== "local" && (this.owner.isFtp || this.owner.state !== "connected");
+  }
+
+  /** Files and folders under `folder` whose names hold the words asked for
+   * (as the pane's filter reads them: every word, any case), folder by
+   * folder as "폴더 크기" goes: links are not followed, a folder that cannot
+   * be read is counted, and it ends at Stop, on closing, past LIMIT entries
+   * looked at or MAX found. A result opens its folder with the name in the
+   * filter (the editor for a text file is one double-click away there). */
+  private async findByName(folder: string) {
+    const res = await promptDialog({ title: "이름으로 찾기", label: "찾을 이름 (일부만 써도 되고, 여러 낱말이면 모두 포함)", icon: "Search", confirm: "찾기 시작" });
+    const terms = searchTerms(res?.value ?? "");
+    if (!terms.length) return;
+    const LIMIT = 200_000;
+    const MAX = 500;
+    let stopped = false;
+    const m = modal({
+      title: "이름으로 찾기",
+      icon: "Search",
+      width: 640,
+      body: `<p class="muted small mono" data-i18n-skip>${esc(folder)} · ${esc(res!.value.trim())}</p>
+        <p data-fs-state><span class="spinner sm"></span> <span>찾는 중...</span></p>
+        <div class="fs-list" data-fs-list></div>`,
+      footer: `<button class="btn" data-stop>${icon("Square", 14)}중지</button><button class="btn btn-primary" data-close>닫기</button>`,
+      onClose: () => (stopped = true),
+    });
+    const stateEl = m.root.querySelector<HTMLElement>("[data-fs-state]")!;
+    const listEl = m.root.querySelector<HTMLElement>("[data-fs-list]")!;
+    const stopBtn = m.root.querySelector<HTMLButtonElement>("[data-stop]")!;
+    stopBtn.addEventListener("click", () => (stopped = true));
+    // On the press, as in "폴더 크기": the rows are redrawn as the search goes on.
+    listEl.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      const row = (e.target as HTMLElement).closest<HTMLElement>("[data-dir]");
+      if (!row) return;
+      e.preventDefault();
+      m.close();
+      // Once there (a new folder's listing clears the filter first), and
+      // only if it is there: not on the folder shown when it could not be read.
+      const name = row.dataset.name!;
+      void this.load(row.dataset.dir!).then((shown) => {
+        if (!shown) return;
+        this.filterInput.value = name;
+        this.filter = name;
+        // A hidden one (".bashrc") would not be listed: hidden files shown, as the button does.
+        if (name.startsWith(".") && !Pane.showHidden) {
+          Pane.showHidden = true;
+          try {
+            localStorage.setItem("bx.showHidden", "1");
+          } catch {
+            // The choice is a convenience only.
+          }
+          this.owner.onHiddenToggled();
+        }
+        this.render();
+      });
+    });
+    const list = (path: string) => (this.side === "local" ? api.localList(path) : api.remoteList(this.owner.remoteId, path));
+    const found: { entry: FileEntry; dir: string }[] = [];
+    let entries = 0;
+    let failed = 0;
+    /** Why the walk ended early at a failed listing (walkStopsOnFailure). */
+    let cut = "";
+    let shownAt = 0;
+    const show = (done: boolean) => {
+      const extra = [
+        ...(failed ? [tr(`목록을 읽지 못한 폴더 ${failed}개`)] : []),
+        ...(found.length >= MAX ? [tr(`찾은 항목 ${MAX}개에서 멈췄습니다`)] : []),
+        ...(entries >= LIMIT ? [tr(`항목 ${LIMIT}개까지 살펴보고 멈췄습니다`)] : []),
+      ];
+      const count = tr(`찾은 항목 ${found.length}개`);
+      stateEl.innerHTML = done
+        ? `<b>${esc(count)}</b>${extra.length ? ` <span class="muted">${esc(extra.join(" · "))}</span>` : ""}`
+        : `<span class="spinner sm"></span> <span>${esc(count)}</span>`;
+      listEl.innerHTML = found.length
+        ? `<table class="nettools-table"><tbody>${found
+            .map(
+              ({ entry, dir }) =>
+                `<tr class="fs-row" data-dir="${esc(dir)}" data-name="${esc(entry.name)}" title="${esc(tr("이 폴더로 이동"))}"><td class="fs-name" data-i18n-skip>${icon(entry.isDir ? "Folder" : "FileText", 13)}<span>${markTerms(entry.name, terms)}</span></td><td class="muted small mono" data-i18n-skip>${esc(dir)}</td><td>${entry.isDir ? "" : formatBytes(entry.size)}</td></tr>`,
+            )
+            .join("")}</tbody></table>`
+        : done
+          ? `<p class="muted">${esc(tr("찾은 항목이 없습니다"))}</p>`
+          : "";
+    };
+    const queue = [folder];
+    while (queue.length && !stopped && entries < LIMIT && found.length < MAX) {
+      const dir = queue.shift()!;
+      let got: FileEntry[];
+      try {
+        got = await list(dir);
+      } catch (err) {
+        // The folder asked for itself: said; one inside it: counted.
+        if (dir === folder) {
+          stateEl.innerHTML = `<span class="danger-text">${esc(errorText(err))}</span>`;
+          stopBtn.hidden = true;
+          return;
+        }
+        // Over FTP, or once disconnected: ended here (see walkStopsOnFailure).
+        if (this.walkStopsOnFailure()) {
+          cut = errorText(err);
+          break;
+        }
+        failed++;
+        continue;
+      }
+      for (const e of got) {
+        entries++;
+        if (matchesTerms(e.name.toLowerCase(), terms) && found.length < MAX) found.push({ entry: e, dir });
+        if (e.isDir && !e.isLink) queue.push(e.path);
+      }
+      if (Date.now() - shownAt > 200) {
+        shownAt = Date.now();
+        show(false);
+      }
+    }
+    if (!m.root.isConnected) return;
+    stopBtn.hidden = true;
+    show(true);
+    if (stopped) stateEl.insertAdjacentHTML("beforeend", ` <span class="muted">· ${esc(tr("중지했습니다"))}</span>`);
+    if (cut) stateEl.insertAdjacentHTML("beforeend", ` <span class="danger-text">· ${esc(tr(`목록을 읽지 못해 멈췄습니다: ${userText(cut)}`))}</span>`);
   }
 
   /** Compare files as text (a configuration backup with the one on the
@@ -1212,9 +1468,7 @@ export class FilesView implements View, EditorHost {
   get bookmarkKey(): string {
     const s = this.session;
     const family = s.protocol === "sftp" ? "sftp" : "ftp";
-    // The login the server sees: the credential's user when the session names none.
-    const user = s.username || (s.credentialId ? (store.credentials.find((c) => c.id === s.credentialId)?.username ?? "") : "");
-    return `${family}://${user}@${s.host.trim().toLowerCase()}:${s.port ?? defaultPort(s.protocol, s.options)}`;
+    return `${family}://${this.loginUser}@${s.host.trim().toLowerCase()}:${s.port ?? defaultPort(s.protocol, s.options)}`;
   }
   /** An FTP or FTPS server (its file names may ignore case: a Windows server). */
   get isFtp(): boolean {
@@ -1226,6 +1480,77 @@ export class FilesView implements View, EditorHost {
   }
   /** Permissions can be set on this server (SFTP; FTP has no standard command). */
   get canChmod(): boolean {
+    return this.session.protocol === "sftp";
+  }
+  /** Opened beside an SSH terminal (SFTP): a refused save can be done with
+   * sudo there, a file checked there. */
+  get hasShellBeside(): boolean {
+    return this.session.protocol === "sftp" && typeof (this.terminal as { sudoCopy?: unknown } | undefined)?.sudoCopy === "function";
+  }
+
+  /** The login's home folder on the server, as it said when connected. */
+  get home(): string {
+    return this.userHome;
+  }
+
+  /** A command about the file at `path` put on the SSH terminal's input line
+   * ("{}" in it is the quoted path), and `said` told once it is there. */
+  offerInTerminal(command: string, path: string, sudo: boolean, said: string) {
+    const term = this.terminal as (View & { offerCheck?(command: string, path: string, sudo: boolean): boolean }) | undefined;
+    if (!term?.offerCheck) return void toast("옆에 SSH 터미널이 없어 명령을 넣을 수 없습니다", "warn", 5000);
+    if (!term.offerCheck(command, path, sudo)) return;
+    toast(said, "info", 8000);
+  }
+
+  /** The SFTP login is root's (a command on its server needs no sudo). */
+  get asRoot(): boolean {
+    return this.loginUser === "root";
+  }
+
+  /** The login the server sees: the credential's user when the session names none. */
+  private get loginUser(): string {
+    const s = this.session;
+    return s.username || (s.credentialId ? (store.credentials.find((c) => c.id === s.credentialId)?.username ?? "") : "");
+  }
+
+  /** The editor's text saved as a copy in the user's home folder (made
+   * owner-only before anything is written to it), and "sudo cp copy file &&
+   * rm copy" put on the SSH terminal's input line for the user to run; for
+   * sudoers, checked and rolled back as installFor says; for a
+   * system unit file, "&& sudo systemctl daemon-reload" after it. */
+  async sudoSave(path: string, text: string, bom: boolean) {
+    const term = this.terminal as (View & { sudoCopy?(from: string, to: string, steps?: { install?: (copy: string, file: string) => string; then?: string }): boolean }) | undefined;
+    if (!term?.sudoCopy) return;
+    if (this.state !== "connected") return void toast("서버에 연결된 다음 열 수 있습니다", "warn");
+    const name = (path.split("/").pop() || "file").replace(/[^\w.-]/g, "_");
+    const copy = `${this.userHome.replace(/\/+$/, "")}/.bananaconn-save-${crypto.randomUUID().slice(0, 8)}-${name}`;
+    // Only a copy this made is taken away again (a name already there, made
+    // by something else, is left alone).
+    let made = false;
+    try {
+      await api.remoteOp(this.remoteId, "newfile", copy);
+      made = true;
+      await api.remoteOp(this.remoteId, "chmod", copy, "600");
+      await api.remoteWriteText(this.remoteId, copy, text, bom, null, true);
+    } catch (err) {
+      if (made) api.remoteOp(this.remoteId, "delete", copy).catch(() => {});
+      return void toast(`사본을 만들지 못했습니다: ${errorText(err)}`, "error", 8000);
+    }
+    const reload = unitReloadFor(path, this.userHome);
+    const steps = { install: installFor(path, text) ?? undefined, then: reload?.system ? reload.command : undefined };
+    if (!term.sudoCopy(copy, path, steps)) return void api.remoteOp(this.remoteId, "delete", copy).catch(() => {});
+    // Not run (or refused by sudo), the copy stays: said, as it holds the text.
+    if (steps.install)
+      return void toast(
+        `터미널에 sudo 명령을 넣었습니다. Enter를 누르고 비밀번호를 입력하면 visudo 검사를 통과한 경우에만 저장됩니다(실패하면 파일은 그대로입니다). 그다음 편집기에서 다시 읽어 확인하세요. 저장되지 않았으면 사본 ${userText(copy)}을(를) 지우세요`,
+        "info",
+        15_000,
+      );
+    toast(`터미널에 sudo 명령을 넣었습니다. Enter를 누르고 비밀번호를 입력하면 저장됩니다. 그다음 편집기에서 다시 읽어 확인하세요. 실행하지 않으면 사본 ${userText(copy)}을(를) 지우세요`, "info", 15_000);
+  }
+
+  /** Where a link leads can be asked (SFTP's readlink; FTP's LIST does not say). */
+  get canReadLinks(): boolean {
     return this.session.protocol === "sftp";
   }
   state: ViewState = "connecting";
@@ -1248,10 +1573,14 @@ export class FilesView implements View, EditorHost {
   /** Built-in editor tabs using this connection. */
   private editors = new Set<EditorView>();
   /** Files whose editor is being created (CodeMirror still loading). */
-  private editorsLoading = new Set<string>();
+  /** Editors whose code is loading, by path, with the line last asked for
+   * meanwhile (a second "path:40:" clicked before the first opened). */
+  private editorsLoading = new Map<string, number | undefined>();
   private localPane: Pane;
   private remotePane: Pane;
   private remoteHome = "/";
+  /** The account's own home folder as the server says (not a session's start folder). */
+  private userHome = "/tmp";
   private localHome = "";
   private queue: Job[] = [];
   /** Jobs queued or running, kept in step with every status change so the
@@ -1261,6 +1590,7 @@ export class FilesView implements View, EditorHost {
   private jobsEl: HTMLElement;
   private overlay: HTMLElement;
   private disposed = false;
+  private unsubscribeLang: () => void = () => {};
   private editing: EditWatch[] = [];
   private editTimer = 0;
   private polling = false;
@@ -1299,6 +1629,13 @@ export class FilesView implements View, EditorHost {
     );
     this.localPane = new Pane("local", this);
     this.remotePane = new Pane("remote", this);
+    // Rows hold words kept from the page translation (a link's badge): drawn
+    // again once a new language is in place.
+    this.unsubscribeLang = onLanguageApplied(() => {
+      if (this.disposed) return;
+      this.localPane.render();
+      this.remotePane.render();
+    });
     const panes = this.el.querySelector(".panes")!;
     panes.append(this.localPane.el, this.remotePane.el);
     this.jobsEl = this.el.querySelector(".transfer-list")!;
@@ -1356,22 +1693,79 @@ export class FilesView implements View, EditorHost {
     return this.disposed;
   }
 
-  openEditor(entry: FileEntry) {
+  /** A path asked for before the connection was up; the latest one only. */
+  private pendingPath: { path: string; line?: number } | null = null;
+
+  /** A server path named elsewhere (a path clicked in the terminal beside):
+   * a folder opened in the server pane, a file in the editor. Kept until
+   * this tab is connected when it is still connecting. */
+  openPath(path: string, line?: number) {
+    if (this.state === "connecting") {
+      this.pendingPath = { path, line };
+      return;
+    }
+    // Down or failed: said now, not opened whenever it is reconnected later.
+    if (this.state !== "connected") return void toast("서버에 연결된 다음 열 수 있습니다", "warn");
+    void this.showPath(path, line);
+  }
+
+  /** `line`: a file's line to show (grep's "path:12:"). */
+  private async showPath(path: string, line?: number) {
+    let entry: FileEntry | null | undefined;
+    try {
+      // Over SFTP the path itself (its folder may be one that can be passed
+      // through but not listed, as a home folder of mode 711); else its
+      // folder's listing.
+      if (this.canReadLinks) entry = await api.remoteStat(this.remoteId, path);
+      else {
+        const dir = path.slice(0, path.lastIndexOf("/")) || "/";
+        entry = (await api.remoteList(this.remoteId, dir)).find((e) => e.path === path);
+      }
+    } catch (err) {
+      return void toast(errorText(err), "error");
+    }
+    if (this.disposed) return;
+    if (!entry) return void toast(`서버에 없는 경로입니다: ${userText(path)}`, "warn", 5000);
+    if (entry.isDir) {
+      await this.remotePane.load(path);
+      return void this.ws.focusView(this);
+    }
+    if (entry.size > EDITOR_MAX) return void toast("5MB보다 큰 파일은 편집기로 열 수 없습니다", "warn");
+    this.openEditor(entry, line);
+  }
+
+  /** `line`: shown once it is open (1-based). */
+  openEditor(entry: FileEntry, line?: number) {
     if (this.state !== "connected") return toast("서버에 연결된 다음 열 수 있습니다", "warn");
     const open = [...this.editors].find((e) => e.path === entry.path);
-    if (open) return this.ws.focusView(open);
-    if (this.editorsLoading.has(entry.path)) return;
+    if (open) {
+      this.ws.focusView(open);
+      if (line) open.goToLine(line);
+      return;
+    }
+    if (this.editorsLoading.has(entry.path)) {
+      if (line) this.editorsLoading.set(entry.path, line);
+      return;
+    }
     const tabSession: Session = { ...this.session, id: `quick-${crypto.randomUUID()}`, name: entry.name };
     // CodeMirror loads with the first editor.
-    this.editorsLoading.add(entry.path);
+    this.editorsLoading.set(entry.path, line);
     import("./editor")
       .then(({ EditorView }) => {
         if (this.disposed) return;
         const editor = new EditorView(tabSession, this.ws, this, entry.path);
+        const latest = this.editorsLoading.get(entry.path);
+        if (latest) editor.goToLine(latest);
         this.editors.add(editor);
         this.ws.add(tabSession, editor);
       }, (err) => toast(errorText(err), "error"))
       .finally(() => this.editorsLoading.delete(entry.path));
+  }
+
+  /** The editor read `path` (offered again under the bookmark button), or
+   * could not (taken off that list: a file since removed or refused). */
+  editorRead(path: string, ok: boolean) {
+    noteRecentEdit(this.bookmarkKey, path, !ok);
   }
 
   editorClosed(editor: EditorView) {
@@ -1405,7 +1799,7 @@ export class FilesView implements View, EditorHost {
       await openWithDefaultApp(local);
       // Watch only once the editor actually opened; a failed open leaves nothing behind.
       if (this.disposed) throw new Error("탭이 닫혔습니다");
-      this.editing.push({ remote: entry.path, local, name: entry.name, mtime, pending: 0, upload: null, stopping: false, failedAt: 0 });
+      this.editing.push({ remote: entry.path, local, name: entry.name, mtime, pending: 0, upload: null, stopping: false, failedAt: 0, failedOn: "" });
       toast(`${userText(entry.name)} 을(를) 열었습니다. 저장하면 서버에 자동으로 올립니다.`, "success", 5000);
       this.renderEditing();
       this.ensureEditTimer();
@@ -1452,6 +1846,10 @@ export class FilesView implements View, EditorHost {
         w.pending = mtime;
         continue;
       }
+      // This version failed on this connection already: not sent again on
+      // its own (each try is a transfer, over FTP a login); a new save, the
+      // toast's "다시 시도" or a reconnect sends it.
+      if (w.failedAt === mtime && w.failedOn === this.remoteId) continue;
       const upload = (async () => {
         try {
           await api.transfer({ id: this.remoteId, transferId: crypto.randomUUID(), direction: "upload", remotePath: w.remote, localPath: w.local, isDir: false });
@@ -1461,10 +1859,18 @@ export class FilesView implements View, EditorHost {
           toast(`${userText(w.name)} 변경 내용을 서버에 저장했습니다`, "success");
           this.remotePane.refresh();
         } catch (err) {
-          // Retried on the next poll; report each failing version only once.
-          if (w.failedAt !== mtime && !this.disposed && this.state === "connected")
-            toast(`${userText(w.name)} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있으며 다시 시도합니다)`, "error", 8000);
+          // Told once; sent again only when asked (or saved again).
           w.failedAt = mtime;
+          w.failedOn = this.remoteId;
+          if (!this.disposed && this.state === "connected")
+            toast(`${userText(w.name)} 업로드 실패: ${errorText(err)} (저장한 내용은 내 PC에 남아 있습니다. 다시 저장하거나 '다시 시도'를 누르면 올립니다)`, "error", 15_000, {
+              label: "다시 시도",
+              run: () => {
+                if (w.failedAt !== mtime) return;
+                w.failedAt = 0;
+                void this.pollEdits();
+              },
+            });
         } finally {
           w.upload = null;
           w.pending = 0;
@@ -1505,6 +1911,10 @@ export class FilesView implements View, EditorHost {
             toast(`${userText(w.name)} 변경 내용을 서버에 저장했습니다`, "success");
             this.remotePane.refresh();
           } catch (err) {
+            // Watched on, but this version not sent again on its own (as a
+            // failed upload of the poll): a new save or a reconnect sends it.
+            w.failedAt = mtime;
+            w.failedOn = this.remoteId;
             return toast(`${userText(w.name)} 업로드 실패: ${errorText(err)} (감시를 계속합니다)`, "error", 8000);
           }
         }
@@ -1617,6 +2027,7 @@ export class FilesView implements View, EditorHost {
         return;
       }
       this.remoteHome = (this.session.options.startPath as string) || res.home;
+      this.userHome = res.home;
       this.overlay.hidden = true;
       this.setState("connected");
       if (res.banner) toast(res.banner, "info");
@@ -1637,6 +2048,10 @@ export class FilesView implements View, EditorHost {
       // Jobs queued before a reconnect continue on the new connection.
       this.pump();
       await this.remotePane.load(this.remoteHome);
+      // A path asked for while this tab was still connecting (a terminal's).
+      const waiting = this.pendingPath;
+      this.pendingPath = null;
+      if (waiting && !this.disposed && rid === this.remoteId) void this.showPath(waiting.path, waiting.line);
     } catch (err) {
       if (this.disposed || rid !== this.remoteId) return;
       await this.handleConnectError(errorText(err), extra);
@@ -1842,6 +2257,27 @@ export class FilesView implements View, EditorHost {
   // ---- transfers --------------------------------------------------------------
 
   /** Queue the given entries from one side to the other side's current folder. */
+  /** Scripts going up with Windows line endings ("#!/bin/sh" then CRLF, as
+   * Notepad saves them), which Linux and Unix refuse ("bad interpreter: ^M"):
+   * told, not changed (the file goes as it is; the editor's "LF로 바꾸기"
+   * fixes it on the server). Script names only, small files only, read here. */
+  private async warnScriptLineEnds(entries: FileEntry[]) {
+    const scripts = entries.filter((e) => !e.isDir && e.size <= 1024 * 1024 && SCRIPT_NAME.test(e.name)).slice(0, 20);
+    const crlf: string[] = [];
+    for (const e of scripts) {
+      try {
+        const text = await api.readTextFile(e.path);
+        const end = text.indexOf("\n");
+        if (text.startsWith("#!") && end > 0 && text[end - 1] === "\r") crlf.push(e.name);
+      } catch {
+        // Unreadable here: the upload says so if it fails.
+      }
+    }
+    if (!crlf.length || this.disposed) return;
+    const names = userText(crlf.slice(0, 3).join(", ") + (crlf.length > 3 ? " …" : ""));
+    toast(`줄 끝이 CRLF인 스크립트 ${crlf.length}개를 올립니다 (${names}). 리눅스·유닉스에서 "bad interpreter: ^M"으로 실행되지 않을 수 있습니다. 올린 뒤 편집기에서 LF로 바꿀 수 있습니다`, "warn", 12_000);
+  }
+
   /** Of `candidates` (files whose listed size and time match the file of the
    * same name at the destination), those that still match when read again
    * now: the local file's stat, and the remote folder listed afresh. Times in
@@ -2000,6 +2436,7 @@ export class FilesView implements View, EditorHost {
     }
     this.el.querySelector(".transfers")!.classList.remove("collapsed");
     this.updateCount();
+    if (to === "remote") void this.warnScriptLineEnds(entries);
     // The "finished" notice (see pump) needs the permission, asked from a
     // user action: this one (asked once; nothing when already decided).
     ensureNotifyPermission();
@@ -2008,6 +2445,8 @@ export class FilesView implements View, EditorHost {
 
   /** The transfers since the queue was last empty (see pump). */
   private batch: { began: number; ok: number; failed: number } | null = null;
+  /** Scripts uploaded in this batch (offerExecute when it is over). */
+  private scriptsUp: string[] = [];
 
   private async pump() {
     if (this.running) return;
@@ -2064,6 +2503,8 @@ export class FilesView implements View, EditorHost {
       }
       job.requeue = false;
       if (job.status === "done") batch.ok++;
+      // A script sent up over SFTP: offered "chmod +x" once the batch is over.
+      if (job.status === "done" && job.direction === "upload" && !job.isDir && this.canChmod && SCRIPT_NAME.test(job.name)) this.scriptsUp.push(job.dest);
       else if (job.status === "error") batch.failed++;
       this.active--;
       jobs.delete(job.id);
@@ -2084,6 +2525,7 @@ export class FilesView implements View, EditorHost {
     if (!drained) return;
     // Over: the next transfer starts a new batch.
     this.batch = null;
+    if (this.scriptsUp.length) void this.offerExecute(this.scriptsUp.splice(0));
     const { began, ok, failed } = batch;
     if ((ok || failed) && Date.now() - began >= 10_000 && !document.hasFocus()) {
       requestAttention();
@@ -2095,6 +2537,57 @@ export class FilesView implements View, EditorHost {
         });
       }
     }
+  }
+
+  /** Scripts sent up in the batch just over that cannot be run (no execute
+   * bit for their owner, as SFTP creates files with the server's default,
+   * 644 mostly): "Permission denied" on "./install.sh". Offered, not done:
+   * a button gives execute where read is ("chmod +x" with the usual umask:
+   * rw-r--r-- becomes rwxr-xr-x). Modes as the server lists them now; a
+   * file not listed (or of a mode not read) is left alone. */
+  private async offerExecute(paths: string[]) {
+    const byDir = new Map<string, string[]>();
+    for (const p of paths.slice(0, 50)) {
+      const dir = p.slice(0, p.lastIndexOf("/")) || "/";
+      byDir.set(dir, [...(byDir.get(dir) ?? []), p]);
+    }
+    const todo: { path: string; name: string; mode: number }[] = [];
+    for (const [dir, files] of byDir) {
+      try {
+        const listed = new Map((await api.remoteList(this.remoteId, dir)).map((e) => [e.path, e]));
+        for (const f of files) {
+          const e = listed.get(f);
+          const mode = e && !e.isDir && !e.isLink ? modeOf(e.perm) : null;
+          // Owner may read but not run it: "+x" makes it runnable (an owner
+          // who cannot read it could not run it after +x either).
+          if (mode !== null && lacksExecute(mode)) todo.push({ path: f, name: e!.name, mode });
+        }
+      } catch {
+        // Not listed now (disconnected): nothing offered.
+      }
+    }
+    if (!todo.length || this.disposed) return;
+    const names = userText(todo.slice(0, 3).map((x) => x.name).join(", ") + (todo.length > 3 ? " …" : ""));
+    toast(`올린 스크립트 ${todo.length}개에 실행 권한이 없습니다 (${names})`, "info", 15_000, {
+      label: "실행 권한 주기 (chmod +x)",
+      run: () => void this.giveExecute(todo),
+    });
+  }
+
+  private async giveExecute(todo: { path: string; name: string; mode: number }[]) {
+    if (this.disposed || this.state !== "connected") return void toast("파일 탭의 연결이 끊어졌습니다", "warn");
+    let done = 0;
+    for (const x of todo) {
+      try {
+        await api.remoteOp(this.remoteId, "chmod", x.path, withExecute(x.mode));
+        done++;
+      } catch (err) {
+        toast(`${userText(x.name)} 권한 변경 실패: ${errorText(err)}`, "error", 8000);
+        break;
+      }
+    }
+    if (done) toast(`실행 권한을 주었습니다 (${done}개)`, "success", 3000);
+    this.refreshRemote();
   }
 
   /** Keep only the most recent finished rows, so a long session of many small
@@ -2185,6 +2678,7 @@ export class FilesView implements View, EditorHost {
 
   dispose() {
     this.disposed = true;
+    this.unsubscribeLang();
     this.notes.dispose();
     if (this.editTimer) clearInterval(this.editTimer);
     this.localPane.dispose();

@@ -47,7 +47,14 @@ enum Remote {
     },
     /// opts is kept to reconnect: suppaftp leaves the control connection out
     /// of sync after an aborted transfer, so a fresh connection replaces it.
-    Ftp { conn: Mutex<Box<dyn FtpOps>>, opts: FtpOptions },
+    Ftp {
+        conn: Mutex<Box<dyn FtpOps>>,
+        opts: FtpOptions,
+        /// A transfer's own connection could not be opened (a server allowing
+        /// one per user, a password changed meanwhile): transfers share the
+        /// browsing one from then on, rather than log in once more per transfer.
+        own_refused: AtomicBool,
+    },
 }
 
 /// The FTP operations the browser needs, implemented for both the plain and the
@@ -68,6 +75,11 @@ trait FtpOps: Send {
     fn quit(&mut self) -> FtpResult<()>;
     /// A raw command; returns the reply body when it is one of `ok`.
     fn command(&mut self, cmd: &str, ok: &[suppaftp::Status]) -> FtpResult<String>;
+    /// A connection that could not be opened again (DeadFtp): no command
+    /// works, and none opens a new one (see reopen_ftp).
+    fn is_dead(&self) -> bool {
+        false
+    }
 }
 
 macro_rules! impl_ftp_ops {
@@ -167,6 +179,9 @@ impl FtpOps for DeadFtp {
     }
     fn command(&mut self, _: &str, _: &[suppaftp::Status]) -> FtpResult<String> {
         dead_ftp()
+    }
+    fn is_dead(&self) -> bool {
+        true
     }
 }
 
@@ -402,6 +417,18 @@ pub(crate) struct SshLogin {
     /// The session's proxy, and its login from the vault.
     pub proxy: Option<ProxyConfig>,
     pub proxy_auth: ProxyAuth,
+    /// Which keys to try with no credential or password (default_keys).
+    pub keys: KeyHints,
+}
+
+/// What ~/.ssh/config says about keys for this host, as `ssh -G` resolves it
+/// (term::ssh_config): its IdentityFile entries, in order, and IdentitiesOnly
+/// (then the agent's other keys are not offered, as ssh.exe would not).
+/// Empty: the default key files, agent keys first.
+#[derive(Clone, Default)]
+pub(crate) struct KeyHints {
+    pub files: Vec<PathBuf>,
+    pub identities_only: bool,
 }
 
 /// Connect and authenticate. Errors use the shared codes the UI understands:
@@ -489,7 +516,7 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
         // A given password goes first: hardened servers (MaxAuthTries 3)
         // would hang up after the default keys had used the tries.
         handle.authenticate_password(username, pw).await
-    } else if default_keys(&mut handle, username).await {
+    } else if default_keys(&mut handle, username, &l.keys).await {
         return Ok(handle);
     } else {
         return Err("NEED_PASSWORD".into());
@@ -502,15 +529,39 @@ pub(crate) async fn ssh_login(l: SshLogin) -> Result<client::Handle<HostCheck>, 
 }
 
 /// What ssh.exe tries before asking for a password: keys held by the SSH agent
-/// (Windows OpenSSH's, else Pageant) and the unencrypted default key files in
+/// (Windows OpenSSH's, else Pageant) and the unencrypted key files: those
+/// ~/.ssh/config names for the host (`hints.files`), else the default ones in
 /// ~/.ssh. At most three attempts in all: a failed key counts toward the
 /// server's MaxAuthTries (6 by default), and the password must still get its
-/// turn. True when one of them logged in.
-async fn default_keys(handle: &mut client::Handle<HostCheck>, username: &str) -> bool {
+/// turn. As OpenSSH does: under IdentitiesOnly only the agent keys that are
+/// one of those files' (by public key), and a key the agent offered already
+/// is not tried again from its file. True when one of them logged in.
+async fn default_keys(handle: &mut client::Handle<HostCheck>, username: &str, hints: &KeyHints) -> bool {
     use russh::keys::agent::client::AgentClient;
     let mut tries = 3;
     let hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
     let short = Duration::from_secs(3);
+
+    let files: Vec<PathBuf> = if hints.files.is_empty() {
+        let Some(dir) = dirs::home_dir().map(|h| h.join(".ssh")) else { return false };
+        ["id_ed25519", "id_ecdsa", "id_rsa"].iter().map(|n| dir.join(n)).collect()
+    } else {
+        hints.files.clone()
+    };
+    // A security key's ("id_ed25519_sk", as `ssh -G` lists by default) needs
+    // the device, which no login here can use: never a try spent on it.
+    let files: Vec<PathBuf> = files.into_iter().filter(|f| !f.file_name().is_some_and(|n| n.to_string_lossy().ends_with("_sk"))).collect();
+    // Each file's public key, from its ".pub" beside it or from the key itself
+    // when it opens without a passphrase: what an agent key is matched with.
+    let file_key = |f: &PathBuf| {
+        let mut pub_path = f.clone().into_os_string();
+        pub_path.push(".pub");
+        russh::keys::load_public_key(PathBuf::from(pub_path))
+            .ok()
+            .map(|k| k.key_data().clone())
+            .or_else(|| russh::keys::load_secret_key(f, None).ok().map(|k| k.public_key().key_data().clone()))
+    };
+    let wanted: Vec<_> = if hints.identities_only { files.iter().filter_map(file_key).collect() } else { Vec::new() };
 
     let agent = async {
         if let Ok(a) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
@@ -518,15 +569,20 @@ async fn default_keys(handle: &mut client::Handle<HostCheck>, username: &str) ->
         }
         AgentClient::connect_pageant().await.ok().map(|a| a.dynamic())
     };
+    let mut offered = Vec::new();
     if let Ok(Some(mut agent)) = tokio::time::timeout(short, agent).await
         && let Ok(Ok(ids)) = tokio::time::timeout(short, agent.request_identities()).await
     {
         for id in ids.iter() {
+            let key = id.public_key().into_owned();
+            if hints.identities_only && !wanted.contains(key.key_data()) {
+                continue;
+            }
             if tries == 0 {
                 return false;
             }
             tries -= 1;
-            let key = id.public_key().into_owned();
+            offered.push(key.key_data().clone());
             if let Ok(r) = handle.authenticate_publickey_with(username, key, hash, &mut agent).await
                 && r.success()
             {
@@ -535,10 +591,13 @@ async fn default_keys(handle: &mut client::Handle<HostCheck>, username: &str) ->
         }
     }
 
-    let Some(dir) = dirs::home_dir().map(|h| h.join(".ssh")) else { return false };
-    for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+    for file in files {
         // Encrypted keys need a passphrase: those go through the vault.
-        let Ok(key) = russh::keys::load_secret_key(dir.join(name), None) else { continue };
+        let Ok(key) = russh::keys::load_secret_key(&file, None) else { continue };
+        // Offered by the agent already: refused once, not again.
+        if offered.contains(key.public_key().key_data()) {
+            continue;
+        }
         if tries == 0 {
             return false;
         }
@@ -570,6 +629,7 @@ async fn connect_sftp(
         known_hosts,
         proxy: req.proxy.clone(),
         proxy_auth,
+        keys: Default::default(),
     })
     .await?;
     let channel = handle.channel_open_session().await.map_err(|e| e.to_string())?;
@@ -752,7 +812,7 @@ impl rustls::client::danger::ServerCertVerifier for CertCheck {
 
 fn connect_ftp(o: &FtpOptions) -> Result<(Remote, Connected), String> {
     let (conn, connected) = open_ftp(o)?;
-    Ok((Remote::Ftp { conn: Mutex::new(conn), opts: o.clone() }, connected))
+    Ok((Remote::Ftp { conn: Mutex::new(conn), opts: o.clone(), own_refused: AtomicBool::new(false) }, connected))
 }
 
 fn open_ftp(o: &FtpOptions) -> Result<(Box<dyn FtpOps>, Connected), String> {
@@ -886,10 +946,22 @@ fn lock_ftp<'a>(conn: &'a FtpConn, opts: &FtpOptions) -> std::sync::MutexGuard<'
         Err(poisoned) => {
             conn.clear_poison();
             let mut g = poisoned.into_inner();
-            *g = open_ftp(opts).map(|(f, _)| f).unwrap_or_else(|_| Box::new(DeadFtp));
+            reopen_ftp(&mut g, opts);
             g
         }
     }
+}
+
+/// A connection out of step or broken, replaced by a fresh one (a login with
+/// the session's credentials), or by a dead one if that fails. Once dead it
+/// stays dead: no command opens it again, so a server gone or a password
+/// changed meanwhile is not logged in to again and again (once per command,
+/// per folder of a walk, per queued transfer); the user reconnects.
+fn reopen_ftp(ftp: &mut Box<dyn FtpOps>, opts: &FtpOptions) {
+    if ftp.is_dead() {
+        return;
+    }
+    *ftp = open_ftp(opts).map(|(f, _)| f).unwrap_or_else(|_| Box::new(DeadFtp));
 }
 
 /// After a failed FTP command, make sure the next command will read its own
@@ -897,8 +969,8 @@ fn lock_ftp<'a>(conn: &'a FtpConn, opts: &FtpOptions) -> std::sync::MutexGuard<'
 /// A NOOP answered correctly proves the connection is in step; otherwise it
 /// is replaced by a fresh one (or a dead one if the server is gone).
 fn resync_ftp(ftp: &mut Box<dyn FtpOps>, opts: &FtpOptions) {
-    if ftp.command("NOOP", &[suppaftp::Status::CommandOk]).is_err() {
-        *ftp = open_ftp(opts).map(|(f, _)| f).unwrap_or_else(|_| Box::new(DeadFtp));
+    if !ftp.is_dead() && ftp.command("NOOP", &[suppaftp::Status::CommandOk]).is_err() {
+        reopen_ftp(ftp, opts);
     }
 }
 
@@ -1191,7 +1263,7 @@ pub async fn remote_list(state: State<'_, RemoteState>, id: String, path: String
         Remote::Ftp { .. } => {
             let r = remote.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, .. } = r.as_ref() else { unreachable!() };
                 let mut ftp = lock_ftp(conn, opts);
                 let res = list_ftp(ftp.as_mut(), &path);
                 if res.is_err() {
@@ -1233,7 +1305,7 @@ pub async fn remote_op(
         Remote::Ftp { .. } => {
             let r = remote.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, .. } = r.as_ref() else { unreachable!() };
                 let mut ftp = lock_ftp(conn, opts);
                 let res = (|| match op.as_str() {
                     "mkdir" => ftp.mkdir(&path).map_err(|e| format!("작업에 실패했습니다: {e}")),
@@ -1259,6 +1331,107 @@ pub async fn remote_op(
             .map_err(|e| e.to_string())?
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkTarget {
+    /// The link's own text, as `ls -l` shows it after "->".
+    pub target: String,
+    /// Where it leads, as an absolute path.
+    pub resolved: String,
+    /// It leads to something (a broken link does not), and to a folder.
+    pub exists: bool,
+    pub is_dir: bool,
+}
+
+/// Where a link on the server leads (SFTP; FTP has no way to ask).
+#[tauri::command]
+pub async fn remote_link_target(state: State<'_, RemoteState>, id: String, path: String) -> Result<LinkTarget, String> {
+    decodable(&path)?;
+    let remote = conn(&state, &id)?;
+    let Remote::Sftp { sftp, .. } = remote.as_ref() else {
+        return Err("이 연결에서는 링크가 가리키는 곳을 읽을 수 없습니다".into());
+    };
+    link_target(sftp, &path).await
+}
+
+async fn link_target(sftp: &SftpSession, path: &str) -> Result<LinkTarget, String> {
+    let target = sftp.read_link(path.to_string()).await.map_err(|e| format!("링크를 읽을 수 없습니다: {e}"))?;
+    let parent = match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(i) => &path[..i],
+    };
+    // The text taken from the link's folder ("../shared" from /srv/app/current).
+    let written = normalize_remote(&if target.starts_with('/') { target.clone() } else { join_remote(parent, &target) });
+    // Only "no such file" makes a link broken: a target this user may not
+    // look at (permission denied) is there, and saying it is not would mislead.
+    let followed = match sftp.metadata(path.to_string()).await {
+        Ok(m) => Some(m),
+        Err(russh_sftp::client::error::Error::Status(s)) if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile => None,
+        Err(e) => return Err(format!("링크가 가리키는 곳을 확인할 수 없습니다: {e}")),
+    };
+    // The server's own answer when it resolves links (OpenSSH does, every
+    // one on the way: a folder above that is itself a link, which ".." in
+    // the text does not account for). One that only tidies the path gives
+    // the link's own path back; a broken link has nowhere to resolve to.
+    // Tidied as the file tab names folders ("/data/v2/" is "/data/v2").
+    let resolved = match (&followed, sftp.canonicalize(path.to_string()).await) {
+        (Some(_), Ok(real)) if real.starts_with('/') && normalize_remote(&real) != normalize_remote(path) => normalize_remote(&real),
+        _ => written,
+    };
+    Ok(LinkTarget { target, resolved, exists: followed.is_some(), is_dir: followed.is_some_and(|m| m.file_type().is_dir()) })
+}
+
+/// One server path as the file list shows it, or None when there is no such
+/// path (SFTP; FTP has no standard way to ask). Its own folder need not be
+/// readable: a home folder of mode 711 can be passed through, not listed.
+#[tauri::command]
+pub async fn remote_stat(state: State<'_, RemoteState>, id: String, path: String) -> Result<Option<FileEntry>, String> {
+    decodable(&path)?;
+    let remote = conn(&state, &id)?;
+    let Remote::Sftp { sftp, .. } = remote.as_ref() else {
+        return Err("이 연결에서는 경로를 바로 확인할 수 없습니다".into());
+    };
+    stat_sftp(sftp, &path).await
+}
+
+async fn stat_sftp(sftp: &SftpSession, path: &str) -> Result<Option<FileEntry>, String> {
+    let no_such = |e: &russh_sftp::client::error::Error| matches!(e, russh_sftp::client::error::Error::Status(s) if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile);
+    // The entry itself (a link as a link), then what it leads to, as list_sftp shows it.
+    let own = match sftp.symlink_metadata(path.to_string()).await {
+        Ok(m) => m,
+        Err(e) if no_such(&e) => return Ok(None),
+        Err(e) => return Err(format!("경로를 확인할 수 없습니다: {e}")),
+    };
+    let is_link = own.file_type().is_symlink();
+    let meta = if is_link { sftp.metadata(path.to_string()).await.unwrap_or(own) } else { own };
+    let is_dir = meta.file_type().is_dir();
+    Ok(Some(FileEntry {
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        path: path.to_string(),
+        perm: meta.permissions.map(|p| perm_string(p, is_dir)),
+        modified: meta.mtime.map(u64::from),
+        size: meta.size.unwrap_or(0),
+        is_dir,
+        is_link,
+    }))
+}
+
+/// An absolute server path without "." , ".." and doubled slashes ("/" stays
+/// "/"; ".." above the root stays at the root, as the server takes it).
+fn normalize_remote(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for p in path.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 async fn delete_sftp_tree(sftp: &SftpSession, root: &str) -> Result<(), String> {
@@ -1566,7 +1739,7 @@ pub async fn transfer(app: AppHandle, state: State<'_, RemoteState>, req: Transf
             let r = remote.clone();
             let mut moved = rep;
             let res = tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, own_refused } = r.as_ref() else { unreachable!() };
                 let run = |ftp: &mut dyn FtpOps, rep: &mut Reporter| {
                     if req.direction == "download" {
                         ftp_download(ftp, &req.remote_path, Path::new(&req.local_path), req.is_dir, rep)
@@ -1577,23 +1750,32 @@ pub async fn transfer(app: AppHandle, state: State<'_, RemoteState>, req: Transf
                 // A transfer gets its own connection (like FileZilla), so the
                 // folder view and the editor keep working while it runs. A
                 // server that allows one connection only shares the browsing one.
-                if let Ok((mut own, _)) = open_ftp(opts) {
+                // Not tried again once refused, nor while the browsing one is
+                // dead (the server gone, or no longer taking the login): a
+                // queue of transfers would otherwise log in once per file.
+                let shared_dead = conn.try_lock().map(|g| g.is_dead()).unwrap_or(false);
+                let own = if own_refused.load(Ordering::Relaxed) || shared_dead {
+                    None
+                } else {
+                    let opened = open_ftp(opts).ok();
+                    if opened.is_none() {
+                        own_refused.store(true, Ordering::Relaxed);
+                    }
+                    opened
+                };
+                if let Some((mut own, _)) = own {
                     let res = run(own.as_mut(), &mut moved);
                     let _ = own.quit();
                     // Closed first: a server allowing two connections per user
                     // needs that slot for the cleanup.
                     drop(own);
+                    // The temp file left by a failed upload goes over the
+                    // browsing connection, already logged in: not one more
+                    // login for it (a failing upload retried would log in
+                    // twice per try). A dead one fails without logging in.
                     if res.is_err()
                         && let Some(tmp) = moved.leftover.take() {
-                            match open_ftp(opts) {
-                                Ok((mut clean, _)) => {
-                                    let _ = clean.rm(&tmp);
-                                    let _ = clean.quit();
-                                }
-                                Err(_) => {
-                                    let _ = lock_ftp(conn, opts).rm(&tmp);
-                                }
-                            }
+                            let _ = lock_ftp(conn, opts).rm(&tmp);
                         }
                     return (res, moved);
                 }
@@ -1603,10 +1785,7 @@ pub async fn transfer(app: AppHandle, state: State<'_, RemoteState>, req: Transf
                 // connection; start a clean one so browsing keeps working. If
                 // that fails, never keep using the desynchronised one.
                 if res.is_err() {
-                    *ftp = match open_ftp(opts) {
-                        Ok((fresh, _)) => fresh,
-                        Err(_) => Box::new(DeadFtp),
-                    };
+                    reopen_ftp(&mut ftp, opts);
                     if let Some(tmp) = moved.leftover.take() {
                         let _ = ftp.rm(&tmp);
                     }
@@ -1890,9 +2069,6 @@ async fn sftp_upload(sftp: &SftpSession, local: &Path, remote: &str, is_dir: boo
     .await
 }
 
-/// Upload one file without ever leaving a truncated file at `rpath`: write a
-/// hidden temporary next to it, then swap it into place (keeping the old
-/// file's permissions). A symlink target is written through to keep the link.
 /// Where an upload's bytes come from: a local file, or text from the editor.
 #[derive(Clone, Copy)]
 enum Source<'a> {
@@ -1918,6 +2094,31 @@ impl<'a> Source<'a> {
     }
 }
 
+/// The staged copy `tmp` owned (uid and gid) as the file it will replace,
+/// where the server lets the session do so: root saving an application's
+/// config file leaves it the application's, not root's. Nothing when the
+/// owner is not known (a new file, a server that does not say) or cannot be
+/// given back (a user saving another's file by group write): the file then
+/// becomes the saver's, as it always did; never written in place for it,
+/// which would leave the original cut short if the save failed. Both ids
+/// are set together: the protocol sends them as a pair (one missing is 0).
+async fn give_owner_back(sftp: &SftpSession, tmp: &str, existing: Option<&russh_sftp::client::fs::Metadata>) {
+    let Some((uid, gid)) = existing.and_then(|m| Some((m.uid?, m.gid?))) else {
+        return;
+    };
+    let owned = |m: &russh_sftp::client::fs::Metadata| m.uid == Some(uid) && m.gid == Some(gid);
+    if sftp.metadata(tmp.to_string()).await.is_ok_and(|m| owned(&m)) {
+        return;
+    }
+    let attrs = russh_sftp::protocol::FileAttributes { uid: Some(uid), gid: Some(gid), ..Default::default() };
+    let _ = sftp.set_metadata(tmp.to_string(), attrs).await;
+}
+
+/// Upload one file without ever leaving a truncated file at `rpath`: write a
+/// hidden temporary next to it, then swap it into place (keeping the old
+/// file's permissions, and its owner where the session may set it). A
+/// symlink target is written through to keep the link; a folder that lets
+/// files be replaced but not created is written in place.
 async fn sftp_put(sftp: &SftpSession, source: Source<'_>, rpath: &str, buf: &mut [u8], rep: &mut Reporter) -> Result<(), String> {
     let mut src = source.open_async().await?;
     let existing = sftp.symlink_metadata(rpath.to_string()).await.ok();
@@ -1929,10 +2130,26 @@ async fn sftp_put(sftp: &SftpSession, source: Source<'_>, rpath: &str, buf: &mut
     // Folders where we may replace files but not create new ones fall back to
     // writing in place.
     let (mut dst, staged) = match (!is_link).then_some(()) {
-        Some(()) => match sftp.create(tmp.clone()).await {
-            Ok(f) => (f, true),
-            Err(_) => (sftp.create(rpath.to_string()).await.map_err(|e| format!("{rpath} 를 만들 수 없습니다: {e}"))?, false),
-        },
+        Some(()) => {
+            // Replacing a file whose mode is restored before the swap: the
+            // copy stays its owner's alone while written (a 0600 secret is
+            // not readable under the umask's 0644 meanwhile). A new file
+            // gets the server's default, as before.
+            let attrs = russh_sftp::protocol::FileAttributes {
+                permissions: existing.as_ref().and_then(|m| m.permissions).map(|_| 0o600),
+                ..russh_sftp::protocol::FileAttributes::empty()
+            };
+            let flags = russh_sftp::protocol::OpenFlags::CREATE | russh_sftp::protocol::OpenFlags::TRUNCATE | russh_sftp::protocol::OpenFlags::WRITE;
+            match sftp.open_with_flags_and_attributes(tmp.clone(), flags, attrs).await {
+                Ok(f) => {
+                    // Owned as the file it replaces where that can be done
+                    // (root saving an account's file); else as before.
+                    give_owner_back(sftp, &tmp, existing.as_ref()).await;
+                    (f, true)
+                }
+                Err(_) => (sftp.create(rpath.to_string()).await.map_err(|e| format!("{rpath} 를 만들 수 없습니다: {e}"))?, false),
+            }
+        }
         None => (sftp.create(rpath.to_string()).await.map_err(|e| format!("{rpath} 를 만들 수 없습니다: {e}"))?, false),
     };
     let copied: Result<(), String> = async {
@@ -2165,17 +2382,23 @@ pub struct TextFile {
 }
 
 /// Modification time and size of a remote file, to detect changes by others.
+/// A file's stamp now, as the editor's save compares it (remote_write_text):
+/// for telling the editor the file changed on the server since it was read.
+#[tauri::command]
+pub async fn remote_file_stamp(state: State<'_, RemoteState>, id: String, path: String) -> Result<(u64, u64), String> {
+    decodable(&path)?;
+    let remote = conn(&state, &id)?;
+    remote_stamp(&remote, &path).await
+}
+
 async fn remote_stamp(remote: &Arc<Remote>, path: &str) -> Result<(u64, u64), String> {
     match remote.as_ref() {
-        Remote::Sftp { sftp, .. } => {
-            let m = sftp.metadata(path.to_string()).await.map_err(|e| format!("{path} 정보를 읽을 수 없습니다: {e}"))?;
-            Ok((m.mtime.map(u64::from).unwrap_or(0), m.size.unwrap_or(0)))
-        }
+        Remote::Sftp { sftp, .. } => sftp_stamp(sftp, path).await,
         Remote::Ftp { .. } => {
             let r = remote.clone();
             let path = path.to_string();
             tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, .. } = r.as_ref() else { unreachable!() };
                 let mut ftp = lock_ftp(conn, opts);
                 // MDTM has second resolution (LIST often only minutes); fall
                 // back to the listing for servers without it.
@@ -2226,33 +2449,72 @@ fn decode_for_edit(bytes: Vec<u8>) -> Result<(String, bool), String> {
         .map_err(|_| "UTF-8이 아닌 파일이라 내장 편집기로 열 수 없습니다. 다운로드해서 편집하세요.".into())
 }
 
+/// Read a file for the editor with the stamp that goes with what was read:
+/// stamped before and after the read, and (SFTP, whose size is the bytes')
+/// the size against the bytes. A file being written meanwhile (a "sudo cp"
+/// in the terminal) is read again, up to three times, so a save later is
+/// checked against the stamp of the text the editor holds; still changing,
+/// it is refused rather than given a stamp of another moment.
 #[tauri::command]
 pub async fn remote_read_text(state: State<'_, RemoteState>, id: String, path: String) -> Result<TextFile, String> {
     decodable(&path)?;
     let remote = conn(&state, &id)?;
-    let stamp = remote_stamp(&remote, &path).await?;
-    if stamp.1 > EDIT_MAX {
-        return Err("5MB보다 큰 파일은 내장 편집기로 열 수 없습니다".into());
-    }
-    let bytes = match remote.as_ref() {
-        Remote::Sftp { sftp, .. } => {
-            let mut f = sftp.open(path.clone()).await.map_err(|e| format!("{path} 를 열 수 없습니다: {e}"))?;
-            let mut out = Vec::new();
-            (&mut f).take(EDIT_MAX + 1).read_to_end(&mut out).await.map_err(|e| format!("읽기 오류: {e}"))?;
-            out
+    for _ in 0..3 {
+        let stamp = remote_stamp(&remote, &path).await?;
+        if stamp.1 > EDIT_MAX {
+            return Err("5MB보다 큰 파일은 내장 편집기로 열 수 없습니다".into());
         }
+        let bytes = read_for_edit(&remote, &path).await?;
+        if bytes.len() as u64 > EDIT_MAX {
+            return Err("5MB보다 큰 파일은 내장 편집기로 열 수 없습니다".into());
+        }
+        if read_matches_stamp(stamp, remote_stamp(&remote, &path).await?, bytes.len(), matches!(remote.as_ref(), Remote::Sftp { .. })) {
+            let (text, bom) = decode_for_edit(bytes)?;
+            return Ok(TextFile { text, bom, stamp });
+        }
+    }
+    Err("파일이 바뀌는 중이라 읽지 못했습니다. 잠시 뒤 다시 여세요".into())
+}
+
+/// Whether bytes read between two stamps are the file as `before` names it:
+/// the stamp unchanged, and over SFTP (a size in bytes; an FTP SIZE may count
+/// ASCII-mode bytes) as many bytes as it says, unless it gave no size (0).
+fn read_matches_stamp(before: (u64, u64), after: (u64, u64), read: usize, sized: bool) -> bool {
+    before == after && (!sized || after.1 == 0 || after.1 == read as u64)
+}
+
+/// An SFTP file's (modified time, size) as its stat gives them (0 where it
+/// gives none).
+async fn sftp_stamp(sftp: &SftpSession, path: &str) -> Result<(u64, u64), String> {
+    let m = sftp.metadata(path.to_string()).await.map_err(|e| format!("{path} 정보를 읽을 수 없습니다: {e}"))?;
+    Ok((m.mtime.map(u64::from).unwrap_or(0), m.size.unwrap_or(0)))
+}
+
+/// An SFTP file's bytes for the editor, at most EDIT_MAX + 1.
+async fn sftp_read_for_edit(sftp: &SftpSession, path: &str) -> Result<Vec<u8>, String> {
+    let mut f = sftp.open(path.to_string()).await.map_err(|e| format!("{path} 를 열 수 없습니다: {e}"))?;
+    let mut out = Vec::new();
+    (&mut f).take(EDIT_MAX + 1).read_to_end(&mut out).await.map_err(|e| format!("읽기 오류: {e}"))?;
+    Ok(out)
+}
+
+/// A file's bytes for the editor, at most EDIT_MAX + 1 (a larger one is told).
+async fn read_for_edit(remote: &Arc<Remote>, path: &str) -> Result<Vec<u8>, String> {
+    let path = path.to_string();
+    let bytes = match remote.as_ref() {
+        Remote::Sftp { sftp, .. } => sftp_read_for_edit(sftp, &path).await?,
         Remote::Ftp { .. } => {
             let r = remote.clone();
             let p = path.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, .. } = r.as_ref() else { unreachable!() };
                 let mut ftp = lock_ftp(conn, opts);
                 let mut out = Vec::new();
                 let res = ftp.retr_with(&p, &mut |s| {
                     s.take(EDIT_MAX + 1).read_to_end(&mut out).map(|_| ()).map_err(suppaftp::FtpError::ConnectionError)
                 });
                 if res.is_err() {
-                    *ftp = open_ftp(opts).map(|(f, _)| f).unwrap_or_else(|_| Box::new(DeadFtp));
+                    reopen_ftp(&mut ftp, opts);
                 }
                 res.map(|()| out).map_err(|e| format!("{p} 를 읽을 수 없습니다: {e}"))
             })
@@ -2260,11 +2522,7 @@ pub async fn remote_read_text(state: State<'_, RemoteState>, id: String, path: S
             .map_err(|e| e.to_string())??
         }
     };
-    if bytes.len() as u64 > EDIT_MAX {
-        return Err("5MB보다 큰 파일은 내장 편집기로 열 수 없습니다".into());
-    }
-    let (text, bom) = decode_for_edit(bytes)?;
-    Ok(TextFile { text, bom, stamp })
+    Ok(bytes)
 }
 
 /// Save editor text. Unless `force`, refuses with `CONFLICT::` when the file
@@ -2312,11 +2570,11 @@ pub async fn remote_write_text(
             let r = remote.clone();
             let p = path.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let Remote::Ftp { conn, opts } = r.as_ref() else { unreachable!() };
+                let Remote::Ftp { conn, opts, .. } = r.as_ref() else { unreachable!() };
                 let mut ftp = lock_ftp(conn, opts);
                 let res = ftp_stat(ftp.as_mut(), &p).and_then(|existing| ftp_put(ftp.as_mut(), Source::Bytes(&bytes), &p, existing, &mut rep));
                 if res.is_err() {
-                    *ftp = open_ftp(opts).map(|(f, _)| f).unwrap_or_else(|_| Box::new(DeadFtp));
+                    reopen_ftp(&mut ftp, opts);
                     if let Some(tmp) = rep.leftover.take() {
                         let _ = ftp.rm(&tmp);
                     }
@@ -2749,9 +3007,555 @@ pub fn test_connect_ftp(host: &str, port: u16, security: &str) -> Result<(Vec<Fi
     Ok((entries, String::from_utf8_lossy(&readme).into_owned()))
 }
 
+/// The file tab's SFTP operations against a server in memory, as the real
+/// protocol carries them (russh-sftp's own server over a pipe): what a save
+/// does to the file it replaces (content, permissions, owner) and leaves
+/// behind, chmod, and a new file.
+#[cfg(test)]
+mod sftp_server_tests {
+    use super::*;
+    use russh_sftp::protocol::{Attrs, Data, File as Entry, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone)]
+    struct Node {
+        data: Vec<u8>,
+        perm: u32,
+        uid: u32,
+        gid: u32,
+    }
+
+    /// A file system and the session's rights: `uid` its user, `root` whether
+    /// it may give files to others. Every open is logged (path, truncate,
+    /// permissions asked).
+    #[derive(Default)]
+    struct Fs {
+        files: HashMap<String, Node>,
+        uid: u32,
+        root: bool,
+        fail_writes: bool,
+        opens: Vec<(String, bool, Option<u32>)>,
+        /// Folders, and links (name → target), beside the files.
+        dirs: HashSet<String>,
+        links: HashMap<String, String>,
+        /// The folder lets files be replaced, not created (a drop box with
+        /// fixed names): an open that would create one is refused.
+        no_new_files: bool,
+        /// A link's text as readlink gives it, where it is not the target
+        /// path in `links` (a relative one).
+        link_text: HashMap<String, String>,
+        /// How realpath answers: 0 not at all, 1 the path tidied only, 2 links followed.
+        realpath: u8,
+        /// Paths whose stat is refused (a folder this user may not enter);
+        /// their lstat too when `lstat_denied`.
+        denied: HashSet<String>,
+        lstat_denied: bool,
+    }
+
+    impl Fs {
+        /// A name with its links followed (one step is enough here).
+        fn resolve(&self, path: &str) -> String {
+            self.links.get(path).cloned().unwrap_or_else(|| path.to_string())
+        }
+        fn attrs(&self, path: &str, follow: bool) -> Option<FileAttributes> {
+            if !follow && self.links.contains_key(path) {
+                return Some(FileAttributes { permissions: Some(0o120777), ..FileAttributes::empty() });
+            }
+            let path = self.resolve(path);
+            if self.dirs.contains(&path) {
+                return Some(FileAttributes { permissions: Some(0o040755), ..FileAttributes::empty() });
+            }
+            let n = self.files.get(&path)?;
+            Some(FileAttributes { size: Some(n.data.len() as u64), uid: Some(n.uid), gid: Some(n.gid), permissions: Some(0o100000 | n.perm), ..FileAttributes::empty() })
+        }
+        /// The names right inside `dir`.
+        fn children(&self, dir: &str) -> Vec<String> {
+            let prefix = format!("{dir}/");
+            let all = self.files.keys().chain(self.dirs.iter()).chain(self.links.keys());
+            all.filter(|p| p.strip_prefix(&prefix).is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))).cloned().collect()
+        }
+    }
+
+    struct Server {
+        fs: Arc<Mutex<Fs>>,
+        handles: HashMap<String, String>,
+        next: u32,
+        /// An open folder's listing, until it has been read once.
+        listings: HashMap<String, Option<Vec<Entry>>>,
+    }
+
+    fn ok(id: u32) -> Status {
+        Status { id, status_code: StatusCode::Ok, error_message: "Ok".into(), language_tag: "en-US".into() }
+    }
+
+    impl russh_sftp::server::Handler for Server {
+        type Error = StatusCode;
+        fn unimplemented(&self) -> StatusCode {
+            StatusCode::OpUnsupported
+        }
+        async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, attrs: FileAttributes) -> Result<Handle, StatusCode> {
+            let mut fs = self.fs.lock().unwrap();
+            fs.opens.push((filename.clone(), pflags.contains(OpenFlags::TRUNCATE), attrs.permissions));
+            // Opened through a link: its target.
+            let filename = fs.resolve(&filename);
+            let (uid, exists) = (fs.uid, fs.files.contains_key(&filename));
+            if !exists && fs.no_new_files {
+                return Err(StatusCode::PermissionDenied);
+            }
+            // "Create, not open": refused for a name taken (v3 says no more).
+            if exists && pflags.contains(OpenFlags::EXCLUDE) {
+                return Err(StatusCode::Failure);
+            }
+            if !exists {
+                if !pflags.contains(OpenFlags::CREATE) {
+                    return Err(StatusCode::NoSuchFile);
+                }
+                // Created as the session's own, with the mode asked for or the umask's.
+                fs.files.insert(filename.clone(), Node { data: Vec::new(), perm: attrs.permissions.unwrap_or(0o644) & 0o7777, uid, gid: uid });
+            } else if pflags.contains(OpenFlags::TRUNCATE) {
+                fs.files.get_mut(&filename).unwrap().data.clear();
+            }
+            self.next += 1;
+            let handle = self.next.to_string();
+            self.handles.insert(handle.clone(), filename);
+            Ok(Handle { id, handle })
+        }
+        async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusCode> {
+            self.handles.remove(&handle);
+            Ok(ok(id))
+        }
+        async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, StatusCode> {
+            let path = self.handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
+            let fs = self.fs.lock().unwrap();
+            let node = fs.files.get(&path).ok_or(StatusCode::NoSuchFile)?;
+            let start = offset as usize;
+            // Past the end: EOF, as SFTP v3 ends a read.
+            if start >= node.data.len() {
+                return Err(StatusCode::Eof);
+            }
+            let end = (start + len as usize).min(node.data.len());
+            Ok(Data { id, data: node.data[start..end].to_vec() })
+        }
+        async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, StatusCode> {
+            let path = self.handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
+            let mut fs = self.fs.lock().unwrap();
+            if fs.fail_writes {
+                return Err(StatusCode::Failure);
+            }
+            let node = fs.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
+            let end = offset as usize + data.len();
+            if node.data.len() < end {
+                node.data.resize(end, 0);
+            }
+            node.data[offset as usize..end].copy_from_slice(&data);
+            Ok(ok(id))
+        }
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+            let refused = {
+                let fs = self.fs.lock().unwrap();
+                fs.lstat_denied && fs.denied.contains(&path)
+            };
+            if refused {
+                return Err(StatusCode::PermissionDenied);
+            }
+            let attrs = self.fs.lock().unwrap().attrs(&path, false).ok_or(StatusCode::NoSuchFile)?;
+            Ok(Attrs { id, attrs })
+        }
+        async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+            if self.fs.lock().unwrap().denied.contains(&path) {
+                return Err(StatusCode::PermissionDenied);
+            }
+            let attrs = self.fs.lock().unwrap().attrs(&path, true).ok_or(StatusCode::NoSuchFile)?;
+            Ok(Attrs { id, attrs })
+        }
+        async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
+            let fs = self.fs.lock().unwrap();
+            let dir = fs.resolve(&path);
+            if !fs.dirs.contains(&dir) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            // Listed with each entry's own attributes (a link as a link), under
+            // the name asked for, as a server lists a linked folder.
+            let entries = fs
+                .children(&dir)
+                .into_iter()
+                .map(|p| {
+                    let name = p.rsplit('/').next().unwrap().to_string();
+                    Entry { filename: name.clone(), longname: name, attrs: fs.attrs(&p, false).unwrap() }
+                })
+                .collect();
+            drop(fs);
+            self.next += 1;
+            let handle = self.next.to_string();
+            self.listings.insert(handle.clone(), Some(entries));
+            Ok(Handle { id, handle })
+        }
+        async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, StatusCode> {
+            match self.listings.get_mut(&handle).and_then(Option::take) {
+                Some(files) => Ok(Name { id, files }),
+                None => Err(StatusCode::Eof),
+            }
+        }
+        async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, StatusCode> {
+            let mut fs = self.fs.lock().unwrap();
+            if !fs.dirs.contains(&path) || !fs.children(&path).is_empty() {
+                return Err(StatusCode::Failure);
+            }
+            fs.dirs.remove(&path);
+            Ok(ok(id))
+        }
+        async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, StatusCode> {
+            let mut fs = self.fs.lock().unwrap();
+            let (me, root) = (fs.uid, fs.root);
+            let n = fs.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
+            if let (Some(uid), Some(gid)) = (attrs.uid, attrs.gid) {
+                // chown: root only (a group of one's own aside, not modelled).
+                if !root && (uid != me || gid != n.gid) {
+                    return Err(StatusCode::PermissionDenied);
+                }
+                n.uid = uid;
+                n.gid = gid;
+            }
+            if let Some(p) = attrs.permissions {
+                n.perm = p & 0o7777;
+            }
+            Ok(ok(id))
+        }
+        async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, StatusCode> {
+            let mut fs = self.fs.lock().unwrap();
+            // SFTP v3: never onto an existing name.
+            if fs.files.contains_key(&newpath) {
+                return Err(StatusCode::Failure);
+            }
+            let n = fs.files.remove(&oldpath).ok_or(StatusCode::NoSuchFile)?;
+            fs.files.insert(newpath, n);
+            Ok(ok(id))
+        }
+        async fn remove(&mut self, id: u32, filename: String) -> Result<Status, StatusCode> {
+            let mut fs = self.fs.lock().unwrap();
+            // A link goes as a link, never its target; a folder is no file.
+            if fs.links.remove(&filename).is_none() {
+                fs.files.remove(&filename).ok_or(StatusCode::Failure)?;
+            }
+            Ok(ok(id))
+        }
+        async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+            let fs = self.fs.lock().unwrap();
+            let text = fs.link_text.get(&path).or_else(|| fs.links.get(&path)).cloned().ok_or(StatusCode::NoSuchFile)?;
+            Ok(Name { id, files: vec![Entry { filename: text.clone(), longname: text, attrs: FileAttributes::empty() }] })
+        }
+        async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+            let fs = self.fs.lock().unwrap();
+            let real = match fs.realpath {
+                1 => path,
+                // As some servers write it: a slash after a folder.
+                2 => format!("{}/", fs.resolve(&path)),
+                _ => return Err(StatusCode::OpUnsupported),
+            };
+            Ok(Name { id, files: vec![Entry { filename: real.clone(), longname: real, attrs: FileAttributes::empty() }] })
+        }
+    }
+
+    async fn session(fs: Arc<Mutex<Fs>>) -> SftpSession {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        tokio::spawn(russh_sftp::server::run(server, Server { fs, handles: HashMap::new(), next: 0, listings: HashMap::new() }));
+        SftpSession::new(client).await.unwrap()
+    }
+
+    fn reporter() -> Reporter {
+        Reporter { app: None, id: String::new(), cancel: Arc::new(AtomicBool::new(false)), done: 0, total: 3, files_done: 0, skipped: 0, leftover: None, file: String::new(), last: Instant::now(), lanes: None }
+    }
+
+    fn with(uid: u32, root: bool, file: Option<Node>) -> Arc<Mutex<Fs>> {
+        let mut fs = Fs { uid, root, ..Fs::default() };
+        if let Some(n) = file {
+            fs.files.insert("/etc/app/app.conf".into(), n);
+        }
+        Arc::new(Mutex::new(fs))
+    }
+
+    async fn save(fs: &Arc<Mutex<Fs>>) -> Result<(), String> {
+        let sftp = session(fs.clone()).await;
+        let mut buf = vec![0u8; 64];
+        sftp_put(&sftp, Source::Bytes(b"new"), "/etc/app/app.conf", &mut buf, &mut reporter()).await
+    }
+
+    fn only_the_file(fs: &Fs) -> Node {
+        assert_eq!(fs.files.len(), 1, "temp files left: {:?}", fs.files.keys().collect::<Vec<_>>());
+        fs.files["/etc/app/app.conf"].clone()
+    }
+
+    /// A deploy layout: /srv/app/current → releases/v2 (a folder), conf →
+    /// ../shared/app.conf (a file), old → /gone (broken).
+    fn deploy(realpath: u8) -> Arc<Mutex<Fs>> {
+        let mut fs = Fs { realpath, ..Fs::default() };
+        fs.dirs.extend(["/srv".to_string(), "/srv/app".into(), "/srv/app/releases".into(), "/srv/app/releases/v2".into(), "/srv/shared".into()]);
+        fs.files.insert("/srv/shared/app.conf".into(), Node { data: b"x".to_vec(), perm: 0o644, uid: 0, gid: 0 });
+        fs.links.insert("/srv/app/current".into(), "/srv/app/releases/v2".into());
+        fs.link_text.insert("/srv/app/current".into(), "releases/v2".into());
+        fs.links.insert("/srv/app/conf".into(), "/srv/shared/app.conf".into());
+        fs.link_text.insert("/srv/app/conf".into(), "../shared/app.conf".into());
+        fs.links.insert("/srv/app/old".into(), "/gone".into());
+        Arc::new(Mutex::new(fs))
+    }
+
+    async fn target_of(fs: &Arc<Mutex<Fs>>, path: &str) -> (String, String, bool, bool) {
+        let t = link_target(&session(fs.clone()).await, path).await.unwrap();
+        (t.target, t.resolved, t.exists, t.is_dir)
+    }
+
+    /// The link's text, taken from its folder, when the server does not
+    /// resolve links itself (no realpath, or one that only tidies the path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_leads_where_its_text_says() {
+        for realpath in [0, 1] {
+            let fs = deploy(realpath);
+            assert_eq!(target_of(&fs, "/srv/app/current").await, ("releases/v2".into(), "/srv/app/releases/v2".into(), true, true));
+            assert_eq!(target_of(&fs, "/srv/app/conf").await, ("../shared/app.conf".into(), "/srv/shared/app.conf".into(), true, false));
+            assert_eq!(target_of(&fs, "/srv/app/old").await, ("/gone".into(), "/gone".into(), false, false));
+        }
+    }
+
+    /// A server that resolves links is believed over the text: a folder on the
+    /// way may be a link itself, which ".." in the text does not see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_servers_resolution_wins() {
+        let fs = deploy(2);
+        fs.lock().unwrap().links.insert("/srv/app/current".into(), "/data/v2".into());
+        fs.lock().unwrap().dirs.insert("/data/v2".into());
+        assert_eq!(target_of(&fs, "/srv/app/current").await, ("releases/v2".into(), "/data/v2".into(), true, true));
+        // Broken: nothing to resolve to, the text it is.
+        assert_eq!(target_of(&fs, "/srv/app/old").await.1, "/gone");
+        // Not a link at all: said so, not guessed.
+        assert!(link_target(&session(fs.clone()).await, "/srv/shared/app.conf").await.is_err());
+    }
+
+    /// One path looked up on its own: a file, a link to a folder (as a folder,
+    /// and a link), nothing, and a path this user may not look at (an error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_is_looked_up_on_its_own() {
+        let fs = deploy(0);
+        let sftp = session(fs.clone()).await;
+        let f = stat_sftp(&sftp, "/srv/shared/app.conf").await.unwrap().unwrap();
+        assert_eq!((f.name.as_str(), f.is_dir, f.is_link, f.size), ("app.conf", false, false, 1));
+        let d = stat_sftp(&sftp, "/srv/app/current").await.unwrap().unwrap();
+        assert_eq!((d.is_dir, d.is_link), (true, true));
+        assert!(stat_sftp(&sftp, "/srv/nothing").await.unwrap().is_none());
+        fs.lock().unwrap().denied.insert("/srv/shared/app.conf".into());
+        fs.lock().unwrap().lstat_denied = true;
+        assert!(stat_sftp(&sftp, "/srv/shared/app.conf").await.is_err());
+    }
+
+    /// A target this user may not look at is not called broken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_target_out_of_reach_is_not_broken() {
+        let fs = deploy(0);
+        fs.lock().unwrap().denied.insert("/srv/app/current".into());
+        // An error to show, not a link said to lead nowhere.
+        assert!(link_target(&session(fs.clone()).await, "/srv/app/current").await.is_err());
+    }
+
+    #[test]
+    fn remote_paths_are_tidied() {
+        for (path, want) in [("/a/./b//c/", "/a/b/c"), ("/a/b/../c", "/a/c"), ("/../x", "/x"), ("/", "/"), ("/a/..", "/")] {
+            assert_eq!(normalize_remote(path), want, "{path}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_saving_an_accounts_file_keeps_it_theirs() {
+        let fs = with(0, true, Some(Node { data: b"old".to_vec(), perm: 0o640, uid: 1001, gid: 1001 }));
+        save(&fs).await.unwrap();
+        let fs = fs.lock().unwrap();
+        let n = only_the_file(&fs);
+        assert_eq!((n.data.as_slice(), n.perm, n.uid, n.gid), (b"new".as_slice(), 0o640, 1001, 1001));
+        // Written to a temp copy made owner-only, never the file truncated in place.
+        assert!(fs.opens.iter().all(|(p, ..)| p != "/etc/app/app.conf"), "{:?}", fs.opens);
+        assert_eq!(fs.opens[0].2, Some(0o600));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_saving_anothers_file_replaces_it_whole() {
+        let fs = with(1000, false, Some(Node { data: b"old".to_vec(), perm: 0o664, uid: 1001, gid: 1001 }));
+        save(&fs).await.unwrap();
+        let fs = fs.lock().unwrap();
+        let n = only_the_file(&fs);
+        // Its owner cannot be given back: the saver's, as always; its mode kept.
+        assert_eq!((n.data.as_slice(), n.perm, n.uid), (b"new".as_slice(), 0o664, 1000));
+        assert!(fs.opens.iter().all(|(p, ..)| p != "/etc/app/app.conf"), "{:?}", fs.opens);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_save_leaves_the_file_as_it_was() {
+        let fs = with(0, true, Some(Node { data: b"old".to_vec(), perm: 0o600, uid: 1001, gid: 1001 }));
+        fs.lock().unwrap().fail_writes = true;
+        assert!(save(&fs).await.is_err());
+        let fs = fs.lock().unwrap();
+        let n = only_the_file(&fs);
+        assert_eq!((n.data.as_slice(), n.perm, n.uid), (b"old".as_slice(), 0o600, 1001));
+    }
+
+    /// The editor's read over SFTP: the bytes as they are (CRLF, a BOM, more
+    /// than one read's worth), and the stamp taken around them matches them;
+    /// a file grown between two stamps does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_editor_reads_a_file_with_its_own_stamp() {
+        let mut big = b"\xEF\xBB\xBFline one\r\n".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 200_000));
+        for data in [b"a: 1\r\nb: 2\n".to_vec(), Vec::new(), big] {
+            let fs = with(0, true, Some(Node { data: data.clone(), perm: 0o644, uid: 0, gid: 0 }));
+            let sftp = session(fs.clone()).await;
+            let before = sftp_stamp(&sftp, "/etc/app/app.conf").await.unwrap();
+            let read = sftp_read_for_edit(&sftp, "/etc/app/app.conf").await.unwrap();
+            let after = sftp_stamp(&sftp, "/etc/app/app.conf").await.unwrap();
+            assert_eq!(read, data);
+            assert_eq!(before.1, data.len() as u64);
+            assert!(read_matches_stamp(before, after, read.len(), true));
+        }
+        // Written to between the stamps (a "sudo cp" under way).
+        let fs = with(0, true, Some(Node { data: b"old".to_vec(), perm: 0o644, uid: 0, gid: 0 }));
+        let sftp = session(fs.clone()).await;
+        let before = sftp_stamp(&sftp, "/etc/app/app.conf").await.unwrap();
+        let read = sftp_read_for_edit(&sftp, "/etc/app/app.conf").await.unwrap();
+        fs.lock().unwrap().files.get_mut("/etc/app/app.conf").unwrap().data = b"new text".to_vec();
+        let after = sftp_stamp(&sftp, "/etc/app/app.conf").await.unwrap();
+        assert!(!read_matches_stamp(before, after, read.len(), true));
+    }
+
+    /// chmod as the file tab sends it ("권한 변경", "chmod +x"): three digits
+    /// keep setuid, setgid and sticky; four set them too; anything else is
+    /// refused before the server is asked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chmod_keeps_special_bits_with_three_digits() {
+        let fs = with(0, true, Some(Node { data: b"x".to_vec(), perm: 0o4644, uid: 0, gid: 0 }));
+        let sftp = session(fs.clone()).await;
+        let path = "/etc/app/app.conf";
+        let perm = |fs: &Arc<Mutex<Fs>>| fs.lock().unwrap().files[path].perm;
+        chmod_sftp(&sftp, path, "755").await.unwrap();
+        assert_eq!(perm(&fs), 0o4755);
+        chmod_sftp(&sftp, path, "0750").await.unwrap();
+        assert_eq!(perm(&fs), 0o750);
+        chmod_sftp(&sftp, path, "2750").await.unwrap();
+        assert_eq!(perm(&fs), 0o2750);
+        for bad in ["", "75", "8", "77777", "rwx", "-755"] {
+            assert!(chmod_sftp(&sftp, path, bad).await.is_err(), "{bad:?} taken");
+        }
+        assert_eq!(perm(&fs), 0o2750);
+        // The name is the target's, as chmod follows a link; a missing one says so.
+        assert!(chmod_sftp(&sftp, "/etc/app/none", "644").await.unwrap_err().contains("/etc/app/none"));
+    }
+
+    /// "새 파일": made only where the name is free, never over a file there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_file_never_replaces_one_there() {
+        let fs = with(1000, false, Some(Node { data: b"keep".to_vec(), perm: 0o600, uid: 1000, gid: 1000 }));
+        let sftp = session(fs.clone()).await;
+        assert_eq!(new_sftp_file(&sftp, "/etc/app/app.conf").await.unwrap_err(), "같은 이름이 이미 있습니다");
+        new_sftp_file(&sftp, "/etc/app/new.txt").await.unwrap();
+        let fs = fs.lock().unwrap();
+        assert_eq!(fs.files["/etc/app/app.conf"].data, b"keep");
+        assert!(fs.files["/etc/app/new.txt"].data.is_empty());
+    }
+
+    /// A folder tree, with a link to a folder and one to a file elsewhere:
+    /// /srv/app/{a.txt, sub/b.txt, data → /srv/shared, conf → /srv/shared/keep.conf}.
+    fn tree() -> Arc<Mutex<Fs>> {
+        let file = |s: &str| Node { data: s.as_bytes().to_vec(), perm: 0o644, uid: 1000, gid: 1000 };
+        let mut fs = Fs { uid: 1000, ..Fs::default() };
+        for d in ["/srv", "/srv/app", "/srv/app/sub", "/srv/shared"] {
+            fs.dirs.insert(d.into());
+        }
+        for f in ["/srv/app/a.txt", "/srv/app/sub/b.txt", "/srv/shared/keep.conf", "/srv/shared/x.txt"] {
+            fs.files.insert(f.into(), file(f));
+        }
+        fs.links.insert("/srv/app/data".into(), "/srv/shared".into());
+        fs.links.insert("/srv/app/conf".into(), "/srv/shared/keep.conf".into());
+        fs.links.insert("/srv/link".into(), "/srv/shared".into());
+        Arc::new(Mutex::new(fs))
+    }
+
+    /// Deleting a folder takes it and everything in it, links as links: what
+    /// they point to, outside it, is left whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_folder_never_follows_its_links() {
+        let fs = tree();
+        let sftp = session(fs.clone()).await;
+        delete_sftp_tree(&sftp, "/srv/app").await.unwrap();
+        let fs = fs.lock().unwrap();
+        let mut left: Vec<&str> = fs.files.keys().chain(fs.dirs.iter()).chain(fs.links.keys()).map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["/srv", "/srv/link", "/srv/shared", "/srv/shared/keep.conf", "/srv/shared/x.txt"]);
+    }
+
+    /// A link to a folder, deleted, goes alone: the folder it points to stays full.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_link_to_a_folder_leaves_the_folder() {
+        let fs = tree();
+        let sftp = session(fs.clone()).await;
+        delete_sftp_tree(&sftp, "/srv/link").await.unwrap();
+        let fs = fs.lock().unwrap();
+        assert!(!fs.links.contains_key("/srv/link"));
+        assert!(fs.dirs.contains("/srv/shared") && fs.files.contains_key("/srv/shared/x.txt") && fs.files.contains_key("/srv/shared/keep.conf"));
+    }
+
+    /// A file saved through a link (/srv/app/conf → /srv/shared/keep.conf)
+    /// changes the file it points to; the link stays a link, nothing is left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_through_a_link_keeps_the_link() {
+        let fs = tree();
+        let sftp = session(fs.clone()).await;
+        let mut buf = vec![0u8; 64];
+        sftp_put(&sftp, Source::Bytes(b"new"), "/srv/app/conf", &mut buf, &mut reporter()).await.unwrap();
+        let fs = fs.lock().unwrap();
+        assert_eq!(fs.links["/srv/app/conf"], "/srv/shared/keep.conf");
+        assert_eq!(fs.files["/srv/shared/keep.conf"].data, b"new");
+        assert_eq!(fs.files.len(), 4, "{:?}", fs.files.keys().collect::<Vec<_>>());
+    }
+
+    /// A folder that lets a file be replaced but no new one made: saved in
+    /// place, its mode and owner untouched, no temp file tried there twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_without_new_files_is_written_in_place() {
+        let fs = with(1000, false, Some(Node { data: b"old".to_vec(), perm: 0o640, uid: 1000, gid: 1000 }));
+        fs.lock().unwrap().no_new_files = true;
+        save(&fs).await.unwrap();
+        let fs = fs.lock().unwrap();
+        let n = only_the_file(&fs);
+        assert_eq!((n.data.as_slice(), n.perm, n.uid), (b"new".as_slice(), 0o640, 1000));
+        assert_eq!(fs.opens.len(), 2, "{:?}", fs.opens);
+        assert_eq!(fs.opens[1].0, "/etc/app/app.conf");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_file_gets_the_servers_default_mode() {
+        let fs = with(1000, false, None);
+        save(&fs).await.unwrap();
+        let fs = fs.lock().unwrap();
+        let n = only_the_file(&fs);
+        assert_eq!((n.data.as_slice(), n.perm, n.uid), (b"new".as_slice(), 0o644, 1000));
+        assert_eq!(fs.opens[0].2, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes read for the editor go with the stamp taken before them only
+    /// when the file did not change meanwhile: same stamp, and over SFTP as
+    /// many bytes as its size (a server giving no size, 0, is not judged by it).
+    #[test]
+    fn read_matches_stamp_only_when_the_file_held_still() {
+        assert!(read_matches_stamp((100, 5), (100, 5), 5, true));
+        // Written meanwhile: a new time or size after the read.
+        assert!(!read_matches_stamp((100, 5), (101, 5), 5, true));
+        assert!(!read_matches_stamp((100, 5), (100, 9), 9, true));
+        // Same stamp, other bytes: caught mid-write within the same second.
+        assert!(!read_matches_stamp((100, 9), (100, 9), 4, true));
+        // No size from the server; FTP sizes are not compared with the bytes.
+        assert!(read_matches_stamp((100, 0), (100, 0), 7, true));
+        assert!(read_matches_stamp((100, 9), (100, 9), 8, false));
+    }
 
     /// A local delete goes to the Recycle Bin (and leaves nothing behind); a
     /// relative path is refused. Ignored by default: it puts a small file in
@@ -2828,6 +3632,24 @@ mod tests {
             proxy: None,
             proxy_auth: Default::default(),
         }
+    }
+
+    /// A connection that could not be opened again stays dead: neither a
+    /// resync after a failed command nor a reopen connects (logs in) again,
+    /// however many commands fail after it (a walk, a queue of transfers).
+    #[test]
+    fn a_dead_ftp_connection_is_never_logged_in_again() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let opts = ftp_opts(listener.local_addr().unwrap().port());
+        let mut ftp: Box<dyn FtpOps> = Box::new(DeadFtp);
+        for _ in 0..5 {
+            assert!(ftp.list().is_err());
+            resync_ftp(&mut ftp, &opts);
+            reopen_ftp(&mut ftp, &opts);
+        }
+        assert!(ftp.is_dead());
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "a dead connection connected again");
     }
 
     /// A server that accepts but never greets (wrong port, a hung NAS): every

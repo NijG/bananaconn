@@ -2,14 +2,14 @@
   "name": "bananaconn",
   "private": true,
   "license": "MIT",
-  "version": "0.7.57",
+  "version": "0.7.58",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:rdp": "node scripts/build-rdp.mjs",
     "preview": "vite preview",
-    "check": "node scripts/i18n-check.mjs && node scripts/secrets-check.mjs && node scripts/table-check.mjs && node scripts/address-check.mjs && node scripts/rust-i18n-check.mjs && node scripts/hidden-chars-check.mjs && node scripts/highlight-check.mjs && node scripts/help-check.mjs",
+    "check": "node scripts/i18n-check.mjs && node scripts/dynamic-i18n-check.mjs && node scripts/secrets-check.mjs && node scripts/table-check.mjs && node scripts/address-check.mjs && node scripts/clock-check.mjs && node scripts/visearch-check.mjs && node scripts/perm-check.mjs && node scripts/icons-check.mjs && node scripts/json-check.mjs && node scripts/cron-check.mjs && node scripts/indent-check.mjs && node scripts/paths-check.mjs && node scripts/shebang-check.mjs && node scripts/target-check.mjs && node scripts/login-check.mjs && node scripts/rust-i18n-check.mjs && node scripts/hidden-chars-check.mjs && node scripts/highlight-check.mjs && node scripts/help-check.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -294,6 +294,8 @@ export interface FileServerStatus {
   port: number;
   lan: boolean;
   readOnly: boolean;
+  /** TFTP: an upload over a file keeps that file under its name and the time. */
+  keepPrevious: boolean;
   auth: boolean;
   addresses: string[];
 }
@@ -401,6 +403,13 @@ export const api = {
   remoteConnect: (req: RemoteConnect) => call<{ home: string; banner: string | null }>("remote_connect", { req }),
   remoteDisconnect: (id: string) => call<void>("remote_disconnect", { id }),
   remoteList: (id: string, path: string) => call<FileEntry[]>("remote_list", { id, path }),
+  /** Where a link on the server leads (SFTP): its text, the absolute path it
+   * comes to, and whether that exists and is a folder. */
+  remoteLinkTarget: (id: string, path: string) => call<{ target: string; resolved: string; exists: boolean; isDir: boolean }>("remote_link_target", { id, path }),
+  /** A file's stamp on the server now ([modified, size]), as a save compares it. */
+  remoteFileStamp: (id: string, path: string) => call<[number, number]>("remote_file_stamp", { id, path }),
+  /** One server path as the file list shows it, or null when there is none (SFTP). */
+  remoteStat: (id: string, path: string) => call<FileEntry | null>("remote_stat", { id, path }),
   remoteOp: (id: string, op: string, path: string, target?: string, isDir?: boolean) =>
     call<void>("remote_op", { id, op, path, target: target ?? null, isDir: isDir ?? null }),
   transfer: (req: {

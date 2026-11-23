@@ -43,7 +43,7 @@ import { notesButton } from "../sessionNotes";
 import { savedSessionItems } from "../nettools";
 import { openSyslog, SEVERITY, syslogSender } from "../syslog";
 import { icon } from "../icons";
-import { endpoint, keepaliveOf, PROTOCOLS, serialSettings, type Protocol, type Session } from "../model";
+import { DRAG_FROM_THIS_APP, endpoint, keepaliveOf, PROTOCOLS, REMOTE_PATHS_DRAG, serialSettings, type Protocol, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
 import { addMacro, askSnippetValues, asksValues, snippetMenu } from "../snippets";
 import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit } from "../riskRules";
@@ -61,8 +61,11 @@ import { deviceCommands, deviceTitle, type DeviceInfo } from "../deviceCommands"
 import { backendLogOptions, LOG_TOKENS, logConfig, previewPath, type LogConfig } from "../logOptions";
 import { GatewayLink } from "../tunnels";
 import { forgetHostKey } from "../hostKeys";
-import { asksAtEnd, asksLogin, loginFailure, loginThrough, plainLines, SECRET_WORD, unusableKey, USER_WORD } from "../sshLogin";
+import { afterExit, asksAtEnd, asksLogin, loginFailure, loginThrough, plainLines, SECRET_WORD, unusableKey, USER_WORD } from "../sshLogin";
 import { tr, userText } from "../i18n";
+import { findPerms, octal } from "../remotePerm";
+import { findPaths } from "../serverPaths";
+import { syntaxCheckFor, unitFileOf } from "../shebang";
 import { actionFor, appTakesInTerminal, keyHint, SNIPPET_PREFIX, withKey } from "../keymap";
 
 /** Editing keys in recorded macros, as private-use marks U+E100.. in this
@@ -106,6 +109,18 @@ const USER_ANSWERED_ANGLE = new RegExp(`^[^>]{0,80}?\\b${USER_WORD}\\s*>\\s*\\S`
  * before it (not a host named "R1-PASS" or "FW-PIN"). The same words as the
  * login check's (sshLogin), so a question is never a finished login there. */
 const SECRET_ANGLE = new RegExp(String.raw`(?:^|\s)${SECRET_WORD}\s*[>＞]$`, "i");
+/** A path the '…' quoting (with '\'' for a quote) does not keep whole in
+ * every shell: fish reads \' inside quotes as a quote, tcsh expands ! there. */
+const QUOTE_UNSAFE = (path: string) => /[\\!]/.test(path);
+/** A clicked path that names a text log: a log's file suffix (rotated ones
+ * too: "app.log.1"), or a syslog file's name under /var/log or /var/adm. Not
+ * anything under /var/log: wtmp, btmp, lastlog and the journal are binary
+ * (their bytes would set the terminal's modes), and folders cannot be followed. */
+const LOG_PATH = /\.(?:log|out|err)(?:\.\d+)?$|^\/var\/(?:log|adm)\/(?:[^/]+\/)*(?:messages|syslog|secure|maillog|cron|dmesg|warn)(?:\.\d+)?$/i;
+const QUOTE_UNSAFE_TEXT = "이름에 \\ 또는 !가 있어 셸에 따라 다르게 읽히므로 보내지 않습니다";
+/** Single-quoted, so no character of the path means anything to the shell. */
+const shellQuote = (path: string) => `'${path.replace(/'/g, `'\\''`)}'`;
+
 /** ssh.exe asking about a host key: "... continue connecting (yes/no/[fingerprint])?",
  * its "Please type 'yes', 'no' or the fingerprint:", an answer echoed after it. */
 const HOSTKEY_WORDS = /continue connecting|fingerprint|host key/i;
@@ -409,12 +424,25 @@ const monitorsById = new Map<string, SharedMonitor>();
  * instead of trying the same keys on the server once more; failed key attempts
  * count toward its limits. The user starts it again from the status bar. */
 const monitorNeedsLogin = new Set<string>();
+/** Monitors whose start failed otherwise (an error during the login, a
+ * Telnet login that timed out, a changed host key), with what it said: a
+ * later automatic start shows that again rather than log in once more; the
+ * user starts it from the status bar. One that ended after it was up
+ * (`afterUp`: dropped, a device that hung up, samples it cannot read) had
+ * logged in, and is started again. */
+const monitorStartFailed = new Map<string, MonitorInfo>();
 const loginKey = (m: SharedMonitor, credentialId: string | null) => `${m.key}|${credentialId ?? ""}`;
+const DROPPED = "모니터링 연결이 끊어졌습니다";
 
 function setMonitorInfo(m: SharedMonitor, info: MonitorInfo | null) {
   m.info = info;
-  if (info?.kind === "login") monitorNeedsLogin.add(loginKey(m, m.credentialId ?? null));
-  else if (info?.kind === "stats") monitorNeedsLogin.delete(loginKey(m, m.credentialId ?? null));
+  const lk = loginKey(m, m.credentialId ?? null);
+  if (info?.kind === "login") monitorNeedsLogin.add(lk);
+  else if (info?.kind === "stats" || info?.kind === "unsupported") {
+    // Logged in (a device it cannot read logged in too): nothing held against it.
+    monitorNeedsLogin.delete(lk);
+    monitorStartFailed.delete(lk);
+  } else if (info?.kind === "error" && !info.afterUp) monitorStartFailed.set(lk, info);
   // Only a tab on screen shows the monitor (status bar of the active tab), and
   // all tabs live in one workspace, so one redraw covers them; samples for
   // tabs in the background cost nothing.
@@ -433,10 +461,15 @@ function failedMonitor(msg: string): MonitorInfo {
 }
 
 function nextMonitorInfo(prev: MonitorInfo | null, e: MonitorEvent): MonitorInfo | null {
-  if (e.error) return failedMonitor(e.error);
+  if (e.error) {
+    const info = failedMonitor(e.error);
+    // Ended after it was up (a device that hung up, samples it cannot read):
+    // it had logged in, so a later automatic start may try again.
+    return info.kind === "error" && prev?.kind === "stats" ? { ...info, afterUp: true } : info;
+  }
   if (e.stats) return { kind: "stats", ...e.stats, warmup: !!e.warmup };
   if (e.unsupported) return { kind: "unsupported", message: "지원하지 않는 장비입니다" };
-  if (e.closed && prev?.kind === "stats") return { kind: "error", message: "모니터링 연결이 끊어졌습니다" };
+  if (e.closed && prev?.kind === "stats") return { kind: "error", message: DROPPED, afterUp: true };
   return prev;
 }
 
@@ -551,6 +584,10 @@ export class TerminalView implements View {
   private startupSent = false;
   /** Auto-reconnect attempt count, countdown timer, and "don't reconnect" choice. */
   private reAttempts = 0;
+  /** An automatic reconnect chain under way, begun by a session that was
+   * logged in and dropped: only then may an attempt that ends before any
+   * login be tried again (when the server was not reached at all). */
+  private reChain = false;
   private reTimer = 0;
   private reDeclined = false;
   /** The SSH login of the current connection, read from its output (sshLogin.ts).
@@ -775,7 +812,9 @@ export class TerminalView implements View {
         // A cheap test first: an address, a MAC, an interface name ("Gi1/0/1", "Po1")
         // or a log message name ("%SYS-5-CONFIG_I", often on a line with nothing else).
         const lineText = line?.translateToString(true) ?? "";
-        if (!line || !(/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average/.test(lineText) || mayHoldInterface(lineText) || MAY_HOLD_MNEMONIC.test(lineText)))
+        // Server paths: on SSH to a Linux or Unix host (a switch's CLI has none to open).
+        const paths = this.session.protocol === "ssh" && !this.device?.network;
+        if (!line || !((paths && /(?:^|[^\p{L}\p{N}_.~/:@$\\-])\/[\p{L}\p{N}_.+@~-]/u.test(lineText)) ||/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average|[-dlcbps][-r][-w][-xsS][-r][-w][-xsS][-r][-w][-xtT]/.test(lineText) || mayHoldInterface(lineText) || MAY_HOLD_MNEMONIC.test(lineText)))
           return callback(undefined);
         // The text with the screen cell of each character: a wide character
         // (Hangul) takes two cells, so string positions are not columns.
@@ -812,12 +851,14 @@ export class TerminalView implements View {
           ...findRates(text).map((m) => link(m.index, m.length, (e) => this.rateMenu(m.bitsPerSecond, y - 1, e.clientX, e.clientY))),
           ...findUptimes(text).map((m) => link(m.index, m.length, (e) => this.uptimeMenu(m, y - 1, e.clientX, e.clientY))),
           ...findLogMnemonics(text).map((m) => link(m.index, m.length, (e) => this.logMnemonicMenu(m.text, m.severity, e.clientX, e.clientY))),
+          ...findPerms(text).map((m) => link(m.index, m.length, (e) => this.permMenu(m.perm, m.mode, e.clientX, e.clientY))),
+          ...(paths ? findPaths(text).map((m) => link(m.index, m.length, (e) => this.pathMenu(m.path, m.line, e.clientX, e.clientY))) : []),
         ];
         callback(links.length ? links : undefined);
       },
     });
     this.term.open(this.host);
-    this.fullSearch = new FullScreenSearch(this.term, () => this.atShellLine());
+    this.fullSearch = new FullScreenSearch(this.term, () => this.shellCommandTyped());
     this.applyThemeBackground();
     this.wireBlink();
     this.assist = new CmdAssist(
@@ -844,7 +885,10 @@ export class TerminalView implements View {
     this.term.onData((data) => {
       if (this.state !== "connected" && this.state !== "connecting") return;
       // Enter typed: a search line at the bottom (vi's "/text") marks its matches.
-      if (!this.pasting && data.includes("\r")) this.fullSearch.enterTyped();
+      if (data.includes("\r")) {
+        if (this.pasting) this.fullSearch.enterPasted();
+        else this.fullSearch.enterTyped();
+      }
       // Broadcast only what the user typed; xterm's automatic replies (device
       // reports, focus and mouse events) belong to this terminal alone, and
       // pastes are mirrored as text below.
@@ -884,6 +928,29 @@ export class TerminalView implements View {
       },
       true,
     );
+    // Files and folders dragged from a file tab's server pane: their paths
+    // typed at the cursor, as dropping files into a terminal does elsewhere.
+    this.host.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types.includes(REMOTE_PATHS_DRAG)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    });
+    this.host.addEventListener("drop", (e) => {
+      const raw = e.dataTransfer?.getData(REMOTE_PATHS_DRAG);
+      if (!raw) return;
+      e.preventDefault();
+      // Not also a tab moved by the workspace's own drop handling.
+      e.stopPropagation();
+      let data: { from?: unknown; paths?: unknown };
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      // Only a drag from this app's own file tab (not a web page's).
+      const paths = data?.from === DRAG_FROM_THIS_APP ? data.paths : null;
+      if (Array.isArray(paths) && paths.length && paths.every((p) => typeof p === "string" && p)) this.typePaths(paths);
+    });
     this.term.onSelectionChange(() => {
       if (state.settings.copyOnSelect && this.term.hasSelection()) writeClipboard(this.term.getSelection());
     });
@@ -1082,17 +1149,109 @@ export class TerminalView implements View {
     // terminal: Ctrl+U, Ctrl+C or Enter in it would edit or end the line and
     // run what follows, quotes or not.
     if (/[\x00-\x1f\x7f-\x9f]/.test(path)) return void toast("폴더 이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000);
-    if (this.disposed || this.state !== "connected" || !this.loggedIn || this.inputKind() !== "shell") return void toast("명령 줄에서만 보낼 수 있습니다", "warn");
-    const kind = this.device?.kind;
-    if (kind && !["linux", "aix", "hpux", "solaris"].includes(kind)) return void toast("Linux·Unix 셸에서만 쓸 수 있습니다", "warn");
-    const prompt = this.idlePrompt();
-    if (prompt === null) return void toast("명령 프롬프트에서 아무것도 입력하지 않았을 때 보낼 수 있습니다", "warn", 5000);
-    // Not recognised: a shell's own prompt ends with "$" or "#" (not "C:\>", "R1>").
-    if (!kind && !/[$#]$/.test(prompt.trimEnd())) return void toast("Linux·Unix 셸에서만 쓸 수 있습니다", "warn");
-    // Single-quoted, so no character of the path means anything to the shell.
-    const quoted = `'${path.replace(/'/g, `'\\''`)}'`;
+    if (QUOTE_UNSAFE(path)) return void toast(QUOTE_UNSAFE_TEXT, "warn", 6000);
+    const problem = this.idleShellProblem();
+    if (problem) return void toast(problem, "warn", 5000);
     this.interruptRepeat();
-    this.sendInput(`cd ${quoted}\r`);
+    this.sendInput(`cd ${shellQuote(path)}\r`);
+    this.ws.focusView(this);
+  }
+
+  /** Why a command cannot go to this shell now: as notAShellLine, and the
+   * prompt must be idle (nothing typed) and, for a device not recognised,
+   * look like a Unix shell's ("$" or "#" at its end, not "C:\>" or "R1>"). */
+  private idleShellProblem(): string | null {
+    const problem = this.notAShellLine();
+    if (problem) return problem;
+    const prompt = this.idlePrompt();
+    if (prompt === null) return "명령 프롬프트에서 아무것도 입력하지 않았을 때 보낼 수 있습니다";
+    if (!this.device?.kind && !/[$#]$/.test(prompt.trimEnd())) return "Linux·Unix 셸에서만 쓸 수 있습니다";
+    return null;
+  }
+
+  /** A check of a file that does not run it ("bash -n 'file'", "sudo nginx
+   * -t"), put on the input line for the user to run (Enter and any sudo
+   * password are theirs). `command` holds "{}" for the quoted path. As
+   * sudoCopy: an idle Unix shell prompt, this tab only. */
+  offerCheck(command: string, path: string, sudo: boolean): boolean {
+    // The path is typed only where "{}" is ("systemctl daemon-reload" has
+    // none; a mount unit's name holds "\x2d", harmless there).
+    const typed = command.includes("{}");
+    if (typed && /[\x00-\x1f\x7f-\x9f]/.test(path)) return void toast("이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000), false;
+    if (typed && QUOTE_UNSAFE(path)) return void toast(QUOTE_UNSAFE_TEXT, "warn", 6000), false;
+    const problem = this.idleShellProblem();
+    if (problem) return void toast(problem, "warn", 5000), false;
+    if (this.inputScope().peers.length) return void toast("동시 입력 중에는 보낼 수 없습니다", "warn", 5000), false;
+    this.putOnInputLine(`${sudo ? "sudo " : ""}${command.replace("{}", () => shellQuote(path))}`);
+    this.ws.focusView(this);
+    return true;
+  }
+
+  /** "sudo cp" of a copy saved beside a file the editor could not write
+   * (a root's /etc file opened as a user): put on the input line, never
+   * run; the user presses Enter and types the sudo password. cp onto the
+   * file keeps its owner and mode; the copy goes once it is in. False when
+   * it could not be put there (said why). Only this tab, not broadcast. */
+  sudoCopy(from: string, to: string, steps: { install?: (copy: string, file: string) => string; then?: string } = {}): boolean {
+    for (const p of [from, to]) {
+      if (/[\x00-\x1f\x7f-\x9f]/.test(p)) return void toast("이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000), false;
+      if (QUOTE_UNSAFE(p)) return void toast(QUOTE_UNSAFE_TEXT, "warn", 6000), false;
+    }
+    const problem = this.idleShellProblem();
+    if (problem) return void toast(problem, "warn", 5000), false;
+    if (this.inputScope().peers.length) return void toast("동시 입력 중에는 보낼 수 없습니다", "warn", 5000), false;
+    // "--": no path read as an option. "test -f" first: a file gone since it
+    // was opened is not made anew as root's (with the copy's mode).
+    const [src, dst] = [shellQuote(from), shellQuote(to)];
+    // Fixed commands of this app's, never a user's text, run as root:
+    // `install` in place of the plain copy, given the quoted paths (sudoers:
+    // checked, put in, the whole policy checked and rolled back on failure,
+    // installFor); `then` once it is in ("systemctl daemon-reload" after a
+    // unit file). A failure stops the line there and the copy stays.
+    const put = steps.install ? steps.install(src, dst) : `sudo test -f ${dst} && sudo cp -- ${src} ${dst} && rm -f -- ${src}`;
+    const then = steps.then ? ` && sudo ${steps.then}` : "";
+    this.putOnInputLine(`${put}${then}`);
+    this.ws.focusView(this);
+    return true;
+  }
+
+  /** Why a path from the file tab cannot be typed here now: not connected
+   * and logged in, not at a command line (a password or other question), or
+   * a device recognised as other than a Unix shell (a switch's CLI). */
+  private notAShellLine(): string | null {
+    // A full-screen program (vi, less) would take the text as its keys; a
+    // paced paste under way would run it with the paste's next line.
+    if (this.disposed || this.state !== "connected" || !this.loggedIn || this.inputKind() !== "shell" || this.term.buffer.active.type !== "normal" || this.pasteActive)
+      return "명령 줄에서만 보낼 수 있습니다";
+    const kind = this.device?.kind;
+    if (kind && !["linux", "aix", "hpux", "solaris"].includes(kind)) return "Linux·Unix 셸에서만 쓸 수 있습니다";
+    return null;
+  }
+
+  /** Server paths typed at the cursor, each single-quoted, a space after
+   * (no Enter: the user finishes the command). As cdTo: a shell's command
+   * line only, past its login, this tab only. Typed text there stays; the
+   * paths go where the cursor is. */
+  private typePaths(paths: string[]) {
+    if (paths.some((p) => /[\x00-\x1f\x7f-\x9f]/.test(p))) return void toast("이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000);
+    if (paths.some(QUOTE_UNSAFE)) return void toast(QUOTE_UNSAFE_TEXT, "warn", 6000);
+    const problem = this.notAShellLine();
+    if (problem) return void toast(problem, "warn");
+    // Typed in one tab only: with input going to other tabs too, they would
+    // get the rest of the line (and its Enter) without the paths.
+    if (this.inputScope().peers.length) return void toast("동시 입력 중에는 경로를 끌어다 놓을 수 없습니다", "warn", 5000);
+    // Right after a word ("ls" typed without its space): set apart from it,
+    // else the path would join that word ("ls'/etc'"). Not after "=", ":" or
+    // a quote ("if=", "host:", where the path belongs to the word), nor after
+    // a prompt's "$", "#" or ">" (a leading space keeps a command out of
+    // bash's history with ignorespace).
+    const buf = this.term.buffer.active;
+    // The whole row up to the cursor: a wide character's second cell alone reads as "".
+    const before = buf.getLine(buf.baseY + buf.cursorY)?.translateToString(false, 0, buf.cursorX) ?? "";
+    const data = (/[\p{L}\p{N}_.,/~+@%-]$/u.test(before) ? " " : "") + paths.map((p) => `${shellQuote(p)} `).join("");
+    this.interruptRepeat();
+    this.assist.note(data);
+    this.sendInput(data);
     this.ws.focusView(this);
   }
 
@@ -1482,6 +1641,9 @@ export class TerminalView implements View {
     const lk = loginKey(m, this.session.credentialId);
     m.credentialId = this.session.credentialId;
     if (auto && monitorNeedsLogin.has(lk)) return setMonitorInfo(m, { kind: "login", message: "" });
+    // An earlier start failed otherwise: shown again, not tried again on its own.
+    const failed = auto ? monitorStartFailed.get(lk) : undefined;
+    if (failed) return setMonitorInfo(m, failed);
     setMonitorInfo(m, { kind: "starting" });
     try {
       await api.monitorStart({
@@ -1494,6 +1656,9 @@ export class TerminalView implements View {
         proxy: this.session.options.gateway ? null : proxyOf(this.session),
         ...extra,
       });
+      // Over SSH the call returns once its login went through: an earlier
+      // failure is past, before any sample (a device's CLI is read later).
+      if (proto === "ssh") monitorStartFailed.delete(lk);
       // The login can outlast the tabs: if all of them closed meanwhile, the
       // connection would otherwise stay open.
       if (monitorsById.get(m.id) !== m) api.monitorStop(m.id).catch(() => {});
@@ -3126,6 +3291,8 @@ export class TerminalView implements View {
     if (userInitiated) {
       this.reDeclined = false;
       this.reAttempts = 0;
+      // A connection the user starts begins no automatic chain of its own.
+      this.reChain = false;
     }
     this.stopPortWait();
     this.portWaitDeclined = false;
@@ -3786,6 +3953,106 @@ export class TerminalView implements View {
       ...(this.otherTerminals().length
         ? [{ label: "모든 터미널 탭에서 찾기", icon: "ListFilter", action: () => this.matchList(macSearchPattern(hex), { regex: true, caseSensitive: false }, true) }]
         : []),
+    ]);
+  }
+
+  /** A server path clicked in the output ("cat: /var/log/x: …", grep's
+   * "/etc/x.conf:12:"): opened over SFTP beside this terminal (a file in
+   * the editor, a folder in the file tab), or copied. */
+  private pathMenu(path: string, line: number | undefined, x: number, y: number) {
+    // A system configuration known by its path alone (sshd_config, sudoers,
+    // nginx, a unit file…), not by a "#!" line this menu cannot see: its
+    // check run in this shell, the one that printed the path.
+    const check = syntaxCheckFor(path.slice(path.lastIndexOf("/") + 1), path, "");
+    const unit = unitFileOf(path);
+    contextMenu(x, y, [
+      // With grep's line number: the file opens at that line.
+      { label: line ? `${path}:${line}` : path, userLabel: true, icon: "File", heading: true },
+      // On this session's server: after an ssh or su inside the shell, the
+      // path printed may be another machine's, so the server is named.
+      { label: "파일 탭에서 열기", icon: "FolderLock", hint: this.session.host, userHint: true, action: () => this.openServerPath(path, line) },
+      { label: "경로 복사", icon: "Copy", action: () => void writeClipboard(path) },
+      // Into the command being written, quoted, where the cursor is.
+      { label: "명령 줄에 경로 넣기", icon: "SquareTerminal", action: () => this.typePaths([path]) },
+      // A log named in the output, followed from here: put on the idle
+      // input line, not run (Enter is the user's; Ctrl+C ends it). "-f" as
+      // every Unix tail has it; "--" so no name is read as an option.
+      ...(LOG_PATH.test(path) ? [{ label: "tail -f로 따라 보기", icon: "ScrollText", action: () => void this.offerCheck("tail -f -- {}", path, false) }] : []),
+      // sudo left out at a root shell's "#" prompt (one may have no sudo).
+      ...(check?.system
+        ? [{ label: "문법 검사 넣기", icon: "ShieldCheck", hint: check.command.replace("{}", path.slice(path.lastIndexOf("/") + 1)), userHint: true, action: () => void this.offerCheck(check.command, path, check.sudo && !/#$/.test(this.idlePrompt()?.trimEnd() ?? "")) }]
+        : []),
+      // A unit file: its unit's state and latest log lines, read only
+      // (systemctl(1) "status"; "--" as "-.mount" is a unit's name; no pager
+      // so it stays in the output). Not a template ("x@.service"), which has
+      // no state of its own; a user unit asks the shell's own user manager.
+      ...(unit && !/@\.[^.]+$/.test(unit.name)
+        ? [{ label: "systemctl status로 상태 보기", icon: "Activity", hint: unit.name, userHint: true, action: () => void this.offerCheck(`systemctl ${unit.user ? "--user " : ""}status --no-pager -- {}`, unit.name, false) }]
+        : []),
+    ]);
+  }
+
+  /** The file tab beside this terminal (its SFTP browser) opens `path`; one
+   * is opened first when there is none, and takes the path once connected. */
+  private openServerPath(path: string, line?: number) {
+    type Files = View & { terminal?: unknown; openPath?(p: string, line?: number): void };
+    const beside = () => this.ws.tabs.map((t) => t.view as Files).find((v) => v.terminal === this && typeof v.openPath === "function");
+    const files = beside();
+    if (files) return files.openPath!(path, line);
+    // A file tab already on its way (a second click before it appeared):
+    // it takes this path instead, and no second tab (or login) is made.
+    if (this.filesComing) {
+      this.filesComing = Object.assign(this.filesComing, { path, line });
+      return;
+    }
+    const blocked = fileTransferBlockedReason(this.session);
+    if (blocked) return void toast(blocked, "error", 7000);
+    const coming = (this.filesComing = { path, line });
+    this.openFiles(this.session, this);
+    // The file tab is made once its code has loaded: given the path then.
+    let tries = 0;
+    const handOver = () => {
+      const f = !this.disposed && beside();
+      if (f || this.disposed || ++tries >= 50) {
+        if (this.filesComing === coming) this.filesComing = null;
+        if (f) f.openPath!(coming.path, coming.line);
+        return;
+      }
+      window.setTimeout(handOver, 100);
+    };
+    window.setTimeout(handOver, 100);
+  }
+
+  /** A file tab opened for a clicked path, not yet made, and the path it takes. */
+  private filesComing: { path: string; line?: number } | null = null;
+
+  /** An "ls -l" permission string clicked: what it allows whom, and its
+   * number for chmod ("-rwsr-xr-x" is 4755). */
+  private permMenu(perm: string, mode: number, x: number, y: number) {
+    const rights = (shift: number) =>
+      [
+        [4, "읽기(r)"],
+        [2, "쓰기(w)"],
+        [1, "실행(x)"],
+      ]
+        .filter(([bit]) => (mode >> shift) & (bit as number))
+        .map(([, word]) => tr(word as string))
+        .join(" · ") || tr("권한 없음");
+    const special = [
+      // A folder's setuid and a file's sticky bit do nothing on Linux.
+      [0o4000, perm[0] === "d" ? "setuid: 폴더에는 보통 효과 없음" : "setuid: 실행하면 파일 소유자의 권한으로 실행"],
+      [0o2000, perm[0] === "d" ? "setgid: 안에 만든 파일이 이 폴더의 그룹을 가짐" : "setgid: 실행하면 파일 그룹의 권한으로 실행"],
+      [0o1000, perm[0] === "d" ? "sticky: 파일 주인만 지우거나 이름을 바꿀 수 있음" : "sticky: 파일에는 보통 효과 없음"],
+    ] as const;
+    const number = octal(mode);
+    contextMenu(x, y, [
+      { label: perm, userLabel: true, icon: "Info", heading: true },
+      { label: "소유자", icon: "User", hint: rights(6), userHint: true, disabled: true },
+      { label: "그룹", icon: "Users", hint: rights(3), userHint: true, disabled: true },
+      { label: "기타 사용자", icon: "Globe", hint: rights(0), userHint: true, disabled: true },
+      ...special.filter(([bit]) => mode & bit).map(([, text]) => ({ label: text, icon: "TriangleAlert", disabled: true })),
+      "-",
+      { label: `${number} 복사`, icon: "Copy", hint: `chmod ${number}`, userHint: true, action: () => void writeClipboard(number) },
     ]);
   }
 
@@ -4538,7 +4805,30 @@ export class TerminalView implements View {
     const learnt = this.assist?.knownPrompt().trim() ?? "";
     const head = learnt ? promptHead(learnt) : "";
     if (head) return promptHead(row) === head;
-    return buf.cursorY === this.term.rows - 1 && this.idlePrompt() !== null;
+    // A bare prompt ("$ ", "# " on Unix): a vi's "# comment" row starts so
+    // too, so only with what the user typed after it, as the command
+    // assistant followed it, or an idle prompt on the bottom row.
+    const typed = this.assist?.typedText().trim() ?? "";
+    if (learnt && typed && row.startsWith(learnt) && row.slice(learnt.length).trim() === typed) return true;
+    if (buf.cursorY !== this.term.rows - 1) return false;
+    // Idle on the bottom row: that very prompt, not any row that ends like
+    // one (vi's search "/[0-9]" or "/end$", a "#####" banner line).
+    // (Another bare prompt after "su": an idle one, never a vi's command line.)
+    if (learnt && row.trimEnd() === learnt) return true;
+    return !/^[/?:]/.test(row) && this.idlePrompt() !== null;
+  }
+
+  /** At the shell's command line (atShellLine), the command typed on it: as
+   * the command assistant follows it, else the row after the learnt prompt,
+   * else "" (not known). Null away from the shell. */
+  private shellCommandTyped(): string | null {
+    if (!this.atShellLine()) return null;
+    const typed = this.assist?.typedText() ?? "";
+    if (typed) return typed;
+    const buf = this.term.buffer.active;
+    const row = (buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true) ?? "").trimStart();
+    const learnt = this.assist?.knownPrompt().trim() ?? "";
+    return learnt && row.startsWith(learnt) ? row.slice(learnt.length).trim() : "";
   }
 
   /** The selection's lines, whole: its first and last buffer row, wrapped
@@ -4689,34 +4979,23 @@ export class TerminalView implements View {
     this.writeNote(`\r\n\x1b[90m[${tr("연결이 종료되었습니다")}${code ? ` ${tr(`· 종료 코드 ${code}`)}` : ""}]\x1b[0m\r\n`);
     // A serial line ends with an error only when the port went away.
     if (code && this.waitForPort("연결이 끊어졌습니다.")) return;
-    if (this.session.protocol === "ssh" && code) {
-      const lines = plainLines(new TextDecoder().decode(this.endBytes));
-      // A login that failed (wrong credentials, or a changed host key) must not
-      // auto-reconnect: retrying the same login only gets the account or IP blocked.
-      const failure = loginFailure(lines);
-      if (failure) return this.showLoginFailure(failure);
-      // Ended after a password (passphrase, host key) question and before the
-      // login went through: reconnecting would only ask, or try, again.
-      if (this.loginAsked && !this.loggedIn && !loginThrough(lines)) {
-        return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
-      }
-    }
-    // A Telnet login runs inside the connection, so only its last output tells:
-    // a broken connection is reconnected when that was the device's own prompt,
-    // not a login question or a failed login (a device that resets the
-    // connection after wrong passwords must not be sent them again).
-    if (this.session.protocol === "telnet" && code) {
-      const lines = plainLines(new TextDecoder().decode(this.endBytes));
-      if (loginFailure(lines)) return this.showLoginFailure("auth");
-      if (!this.loggedIn || !loginThrough(lines)) {
-        return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
-      }
-    }
-    // Dropped unexpectedly: reconnect on its own. ssh.exe ends with 255 when the
-    // connection fails or is lost; any other code is the exit status of the
-    // remote shell, which the user ended.
-    const dropped = this.session.protocol === "ssh" ? code === 255 : code !== 0;
-    if (dropped && this.scheduleAutoReconnect()) return;
+    // What the end calls for, never another login where one failed or did
+    // not finish (afterExit says why for each case).
+    const next = afterExit({
+      protocol: this.session.protocol,
+      code,
+      lines: code ? plainLines(new TextDecoder().decode(this.endBytes)) : [],
+      loginAsked: this.loginAsked,
+      loggedIn: this.loggedIn,
+      chain: this.reChain,
+    });
+    this.reChain = next.chain;
+    if (next.verdict === "failed") return this.showLoginFailure(next.failure!);
+    if (next.verdict === "unfinished")
+      return this.showOverlay("로그인하지 못했습니다", "로그인을 마치기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
+    if (next.verdict === "unreached")
+      return this.showOverlay("연결하지 못했습니다", "로그인하기 전에 연결이 끝나 자동으로 다시 연결하지 않았습니다. 다시 연결하거나 탭을 닫을 수 있습니다.");
+    if (next.verdict === "dropped" && this.scheduleAutoReconnect()) return;
     this.showOverlay("연결이 종료되었습니다", "다시 연결하거나 탭을 닫을 수 있습니다.");
   }
 

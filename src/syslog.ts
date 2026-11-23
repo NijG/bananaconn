@@ -4,12 +4,13 @@
 
 import { api, on, pickSavePath, pickSavePathAt, type SyslogMessage, type SyslogStatus } from "./api";
 import { writeClipboard } from "./clipboard";
-import { tr, userText } from "./i18n";
+import { onLanguageApplied, tr, userText } from "./i18n";
 import { icon } from "./icons";
 import { findLogMnemonics, linkDowns } from "./ipLinks";
 import { clockText } from "./lineTimes";
 import { state } from "./store";
-import { deviceItems, newSessionHandler, openNetworkTools } from "./nettools";
+import { deviceClock, skewText } from "./deviceClock";
+import { deviceItems, isIPv4, newSessionHandler, openMultiWatch, openNetworkTools } from "./nettools";
 import { beep, canOsNotify, contextMenu, ensureNotifyPermission, errorText, esc, formatBytes, markTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, setPressed, sheetCell, timestamp, toast } from "./ui";
 
 /** Messages kept (the oldest go first), and the text they may hold in all. */
@@ -22,7 +23,9 @@ const SHOW = 2000;
 export const SEVERITY = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
 
 /** A message kept: numbered in arrival order, its text lower-cased once for the filter. */
-type Kept = SyslogMessage & { seq: number; lower: string };
+/** `name`: the message's own name ("%link-3-updown", lower case: the first in
+ * its text), or null; another name quoted later in the text is not it. */
+type Kept = SyslogMessage & { seq: number; lower: string; name: string | null };
 
 let status: SyslogStatus | null = null;
 const messages: Kept[] = [];
@@ -53,7 +56,7 @@ export async function initSyslog() {
       status = { ...status, file: null };
     }
     // Each message's lower case made once: the alert words and the filter both use it.
-    const kept: Kept[] = b.messages.map((m) => ({ ...m, seq: ++seq, lower: m.text.toLowerCase() }));
+    const kept: Kept[] = b.messages.map((m) => ({ ...m, seq: ++seq, lower: m.text.toLowerCase(), name: findLogMnemonics(m.text)[0]?.text.toLowerCase() ?? null }));
     alertOf(kept, b.droppedBad ?? 0);
     for (const m of kept) {
       messages.push(m);
@@ -250,6 +253,7 @@ export function openSyslog(from?: string) {
         <div class="syslog-tools">
           <label class="pane-filter syslog-filter" title="주소나 내용으로 거르기">${icon("Search", 13)}<input placeholder="필터" spellcheck="false"/></label>
           <button type="button" class="syslog-only" data-only hidden title="모든 장비의 메시지 보기">${icon("X", 12)}<span>보낸 곳</span><code data-i18n-skip></code></button>
+          <button type="button" class="syslog-only" data-hidden-names hidden data-i18n-skip>${icon("X", 12)}<span></span></button>
           <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기 · 링크가 자주 끊긴 포트도 함께 보기">${icon("Server", 13)}보낸 곳</button>
           <select name="level" title="심각도">
             <option value="7">모든 심각도</option>
@@ -267,7 +271,10 @@ export function openSyslog(from?: string) {
           </span>
         </div>
         <div class="syslog-rate" data-rate hidden><span class="muted small" data-rate-label></span><svg viewBox="0 0 60 24" preserveAspectRatio="none" aria-hidden="true"></svg></div>
-        <div class="syslog-list mono" role="log"></div>
+        <div class="syslog-list-wrap">
+          <div class="syslog-list mono" role="log"></div>
+          <button type="button" class="syslog-newer" data-newer hidden>${icon("ArrowDown", 13)}<span></span></button>
+        </div>
       </div>`,
     footer: `<button class="btn" data-close>닫기</button><button class="btn btn-primary" data-toggle></button>`,
     onClose: () => {
@@ -279,6 +286,7 @@ export function openSyslog(from?: string) {
       off();
       cancelAnimationFrame(frame);
       document.removeEventListener("selectionchange", onSelection);
+      window.removeEventListener("pointerup", letGo);
     },
   });
   openWindow = m.root;
@@ -303,6 +311,8 @@ export function openSyslog(from?: string) {
   const count = m.root.querySelector<HTMLElement>("[data-count]")!;
   const toggle = m.root.querySelector<HTMLButtonElement>("[data-toggle]")!;
   const onlyChip = m.root.querySelector<HTMLButtonElement>("[data-only]")!;
+  // The names hidden (their count; the names on hover): a click shows them again.
+  const hiddenChip = m.root.querySelector<HTMLButtonElement>("[data-hidden-names]")!;
   let busy = false;
   let frame = 0;
 
@@ -365,6 +375,8 @@ export function openSyslog(from?: string) {
     const first = messages.find((x) => x.at >= from && x.at < from + 60_000 && shown.has(x.seq));
     const row = first && shown.get(first.seq);
     if (!row) return void toast("그 분의 메시지가 목록에 없습니다 (필터나 표시 개수 때문)", "info", 2500);
+    // Read there: new messages do not pull the list away (back at the bottom, they do).
+    follow = false;
     row.scrollIntoView({ block: "center" });
     row.classList.remove("flash");
     void row.offsetWidth;
@@ -374,6 +386,11 @@ export function openSyslog(from?: string) {
   /** Only the messages of this sender, its address exactly (the filter box
    * matches parts: "10.0.0.2" there lets "10.0.0.20" through too). */
   let onlyFrom: string | null = null;
+  /** Message names hidden from the list ("%SEC-6-IPACCESSLOGP" that floods
+   * it), lower case; for this window only, so nothing stays hidden unseen. */
+  const hiddenNames = new Set<string>();
+  /** The list shows some messages only (a word, a severity, one device, names hidden). */
+  const filtered = () => filterIn.value.trim() !== "" || level.value !== "7" || onlyFrom !== null || hiddenNames.size > 0;
 
   /** Whether the sender, the filter and the severity let a message through. */
   const passes = () => {
@@ -382,8 +399,11 @@ export function openSyslog(from?: string) {
     const from = onlyFrom;
     const names = sessionNames();
     // A term matches the address, the message, or a saved session's name for that address.
+    // A hidden name: the message's own, exactly ("%X-5-FAIL" leaves "%X-5-FAILED",
+    // and an EEM line quoting it, alone).
     return (x: Kept) =>
       (from === null || x.from === from) &&
+      !(x.name !== null && hiddenNames.has(x.name)) &&
       (max >= 7 || (x.severity !== null && x.severity <= max)) &&
       terms.every((t) => x.from.includes(t) || x.lower.includes(t) || !!names.get(x.from)?.toLowerCase().includes(t));
   };
@@ -393,6 +413,20 @@ export function openSyslog(from?: string) {
     // The address as text: never parsed as HTML or translated.
     onlyChip.querySelector("code")!.textContent = from ?? "";
     render();
+  };
+  /** A message name hidden, or (null) every one shown again. */
+  const hideName = (name: string | null) => {
+    if (name === null) hiddenNames.clear();
+    else hiddenNames.add(name.toLowerCase());
+    render();
+  };
+  /** The chip: how many names are hidden, in the screen language (drawn on
+   * every render, so a language change reaches it). */
+  const drawHiddenChip = () => {
+    hiddenChip.hidden = !hiddenNames.size;
+    if (!hiddenNames.size) return;
+    hiddenChip.querySelector("span")!.textContent = tr(`숨긴 메시지 ${hiddenNames.size}종류`);
+    hiddenChip.title = `${tr("숨긴 메시지 다시 보기")}: ${[...hiddenNames].join(", ").toUpperCase()}`;
   };
   const visible = () => messages.filter(passes());
   // Ports whose link went down, the most often first (ipLinks.linkDowns), as
@@ -432,6 +466,9 @@ export function openSyslog(from?: string) {
     const names = sessionNames();
     const top = [...per].sort((a, b) => b[1].n - a[1].n || a[0].localeCompare(b[0])).slice(0, 20);
     const ports = portItems(names);
+    // The busiest senders (IPv4, as the pings go), up: a storm of messages
+    // in an outage, and whether those devices still answer.
+    const watch = top.map(([ip]) => ip).filter(isIPv4);
     contextMenu(r.left, r.bottom + 4, [
       ...(onlyFrom !== null ? [{ label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }, "-" as const] : []),
       ...top.map(([ip, c]) => ({
@@ -442,6 +479,17 @@ export function openSyslog(from?: string) {
         userHint: true,
         action: () => showOnly(ip),
       })),
+      ...(watch.length
+        ? [
+            "-" as const,
+            {
+              label: `보낸 장비 ${watch.length}대를 연속 ping으로 지켜보기`,
+              icon: "Activity",
+              // Going to a device's tab from there closes this window too.
+              action: () => openMultiWatch(watch.map((ip) => ({ name: names.get(ip) ?? ip, host: ip })), () => m.close()),
+            },
+          ]
+        : []),
       ...(ports.length ? ["-" as const, { label: "포트 상태 변화", icon: "Activity", heading: true }, ...ports] : []),
     ]);
   });
@@ -498,6 +546,97 @@ export function openSyslog(from?: string) {
   let drawnUpTo = 0;
   let shownCount = 0;
   let firstKept = 0;
+  /** Messages (passing the filter) that came below while the list was
+   * scrolled up to read: told on a button that goes down to them. */
+  let unseen = 0;
+  const newer = m.root.querySelector<HTMLButtonElement>("[data-newer]")!;
+  const showUnseen = () => {
+    newer.hidden = unseen === 0;
+    if (unseen) newer.querySelector("span")!.textContent = tr(`새 메시지 ${unseen}개`);
+  };
+  /** The list follows new messages until the user scrolls up, and again once
+   * back at the bottom. Kept as a state, not read off the geometry each time:
+   * rows out of view are laid out at a guessed height (content-visibility),
+   * so a long wrapped message grows the list after it was scrolled to the
+   * bottom, and the next batch would have taken that for a scroll up. Only
+   * the user's own scrolling (wheel, scroll bar, a drag, keys) stops it;
+   * the code's scrolling and rows taken from the top never do. */
+  let follow = true;
+  /** A row was put in view for the user (a time's "around it"): not left by
+   * itself even at the bottom, until the user scrolls. */
+  let hold = false;
+  /** When the user last scrolled, or holds a pointer down on the list. */
+  let userAt = -Infinity;
+  let pressing = false;
+  const userScrolling = () => pressing || performance.now() - userAt < 1000;
+  const nearBottom = () => list.scrollHeight - list.scrollTop - list.clientHeight < 24;
+  /** Where the list was last seen or put: a scroll up is a move above it
+   * (rows growing to their real height below the view move nothing). */
+  let lastTop = 0;
+  const seenAll = () => {
+    if (!unseen) return;
+    unseen = 0;
+    showUnseen();
+  };
+  /** To the bottom, again over the next frames while rows coming into view
+   * take their real height (a few at most). */
+  const toBottom = () => {
+    list.scrollTop = list.scrollHeight;
+    lastTop = list.scrollTop;
+    let height = list.scrollHeight;
+    let left = 3;
+    const again = () =>
+      requestAnimationFrame(() => {
+        if (!follow) return;
+        list.scrollTop = list.scrollHeight;
+        lastTop = list.scrollTop;
+        if (list.scrollHeight !== height && --left > 0) {
+          height = list.scrollHeight;
+          again();
+        }
+      });
+    again();
+  };
+  const userInput = () => {
+    userAt = performance.now();
+    hold = false;
+  };
+  list.addEventListener(
+    "wheel",
+    (e) => {
+      userInput();
+      // Up: stop at once (a batch drawn before the scroll event would pull it back).
+      if (e.deltaY < 0) follow = false;
+    },
+    { passive: true },
+  );
+  list.addEventListener("pointerdown", () => {
+    userInput();
+    pressing = true;
+  });
+  const letGo = () => (pressing = false);
+  window.addEventListener("pointerup", letGo);
+  // Keys that scroll the list (not typing in the filter box).
+  m.root.addEventListener("keydown", (e) => {
+    const t = e.target as HTMLElement;
+    if (/^(?:PageUp|PageDown|ArrowUp|ArrowDown|Home|End| )$/.test(e.key) && !t.closest("input, select, textarea")) userInput();
+  });
+  newer.addEventListener("click", () => {
+    hold = false;
+    follow = true;
+    toBottom();
+    seenAll();
+  });
+  list.addEventListener("scroll", () => {
+    const up = list.scrollTop < lastTop - 1;
+    lastTop = list.scrollTop;
+    if (nearBottom()) {
+      if (!hold) {
+        follow = true;
+        seenAll();
+      }
+    } else if (up && userScrolling()) follow = false;
+  });
 
   /** The list: new messages appended to what is there (a whole redraw only
    * for another filter, or a clear), the oldest rows over SHOW taken away;
@@ -505,8 +644,10 @@ export function openSyslog(from?: string) {
   function renderList() {
     const names = sessionNames();
     const terms = searchTerms(filterIn.value);
-    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
-    const key = `${filterIn.value}\u0000${level.value}\u0000${onlyFrom ?? ""}`;
+    const atBottom = follow;
+    // A time clicked then shows the messages around it (below).
+    list.classList.toggle("filtered", filtered());
+    const key = `${filterIn.value}\u0000${level.value}\u0000${onlyFrom ?? ""}\u0000${[...hiddenNames].join(",")}`;
     const lead = messages[0]?.seq ?? seq + 1;
     if (key !== drawnFor || !messages.length || messages[messages.length - 1].seq < drawnUpTo) {
       // Another filter, or the messages cleared: drawn again whole.
@@ -517,6 +658,7 @@ export function openSyslog(from?: string) {
         ? rows.map((x) => rowHtml(x, names, terms)).join("")
         : `<p class="muted ftpd-empty">${messages.length ? "필터에 맞는 메시지가 없습니다." : "아직 받은 메시지가 없습니다."}</p>`;
       drawnFor = key;
+      unseen = 0;
     } else {
       const ok = passes();
       // The messages that came since (at the end: they are in arrival order).
@@ -527,6 +669,7 @@ export function openSyslog(from?: string) {
       if (lead !== firstKept) shownCount = messages.filter(ok).length;
       else shownCount += fresh.length;
       if (fresh.length) {
+        if (!atBottom) unseen += fresh.length;
         list.querySelector(".ftpd-empty")?.remove();
         list.insertAdjacentHTML("beforeend", fresh.slice(-SHOW).map((x) => rowHtml(x, names, terms)).join(""));
       }
@@ -544,7 +687,10 @@ export function openSyslog(from?: string) {
         if (keep) range.setEndBefore(keep);
         else range.setEndAfter(rows[rows.length - 1]);
         range.deleteContents();
-        if (removed) list.scrollTop -= removed;
+        if (removed) {
+          list.scrollTop -= removed;
+          lastTop = list.scrollTop;
+        }
       }
       if (!list.querySelector(".syslog-row"))
         list.innerHTML = `<p class="muted ftpd-empty">${messages.length ? "필터에 맞는 메시지가 없습니다." : "아직 받은 메시지가 없습니다."}</p>`;
@@ -560,7 +706,14 @@ export function openSyslog(from?: string) {
     ]
       .filter(Boolean)
       .join(" · ");
-    if (atBottom) list.scrollTop = list.scrollHeight;
+    // Nothing to scroll any more (a filter or a clear left a short list): no
+    // scroll event can say the bottom is reached, so it is taken so here.
+    if (!follow && !hold && list.scrollHeight <= list.clientHeight + 1) follow = true;
+    if (atBottom || follow) {
+      toBottom();
+      unseen = 0;
+    }
+    showUnseen();
   }
 
   /** Text being selected in the list: redrawn once the selection is let go. */
@@ -583,12 +736,17 @@ export function openSyslog(from?: string) {
     frame = requestAnimationFrame(() => {
       frame = 0;
       renderState();
+      drawHiddenChip();
       drawRate();
       if (selecting()) waiting = true;
       else renderList();
     });
   };
-  const off = syslog.onChange(render);
+  // Messages in, and a new UI language in place (the hidden-names chip is
+  // kept from the page translation): drawn again.
+  const offMessages = syslog.onChange(render);
+  const offLanguage = onLanguageApplied(render);
+  const off = () => (offMessages(), offLanguage());
 
   stateBox.addEventListener("click", async (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>("[data-addr]");
@@ -599,6 +757,7 @@ export function openSyslog(from?: string) {
   filterIn.addEventListener("input", render);
   level.addEventListener("change", render);
   onlyChip.addEventListener("click", () => showOnly(null));
+  hiddenChip.addEventListener("click", () => hideName(null));
   const bell = m.root.querySelector<HTMLButtonElement>("[data-bell]")!;
   setPressed(bell, alertOn);
   bell.addEventListener("click", () => {
@@ -659,6 +818,8 @@ export function openSyslog(from?: string) {
         const known = alertWords.includes(name.toLowerCase());
         return [
           { label: "이 메시지만 보기", icon: "ListFilter", hint: name, userHint: true, action: () => ((filterIn.value = name), render()) },
+          // A flood of one kind (ACL logs, a flapping port) out of the way.
+          { label: "이 메시지 숨기기", icon: "EyeOff", hint: name, userHint: true, action: () => hideName(name) },
           {
             label: known ? "경보 낱말에 있음" : "경보 낱말에 추가",
             icon: "Bell",
@@ -677,6 +838,49 @@ export function openSyslog(from?: string) {
     );
   };
   // A sender's address: its messages alone, the network tools, a session, a copy.
+  // A message's time clicked while the list is filtered (one device, a word,
+  // a severity): every device's messages around it, to see what came just
+  // before and after (the uplink that went down first, the neighbor that
+  // reacted).
+  list.addEventListener("click", (e) => {
+    const time = (e.target as HTMLElement).closest<HTMLElement>(".syslog-row time");
+    if (!time || !filtered() || !document.getSelection()?.isCollapsed) return;
+    const seq = Number(time.parentElement!.dataset.seq);
+    const r = time.getBoundingClientRect();
+    contextMenu(r.left, r.bottom + 4, [
+      {
+        label: "이 시각 앞뒤의 모든 메시지 보기",
+        icon: "ListFilter",
+        hint: time.textContent ?? "",
+        userHint: true,
+        action: () => {
+          filterIn.value = "";
+          level.value = "7";
+          onlyFrom = null;
+          onlyChip.hidden = true;
+          onlyChip.querySelector("code")!.textContent = "";
+          hiddenNames.clear();
+          drawHiddenChip();
+          // Drawn now, the view kept where the row will be put.
+          follow = false;
+          hold = true;
+          cancelAnimationFrame(frame);
+          frame = 0;
+          renderState();
+          drawRate();
+          renderList();
+          const row = list.querySelector<HTMLElement>(`.syslog-row[data-seq="${seq}"]`);
+          if (!row) return void toast(`그 메시지는 모든 메시지 중 최근 ${SHOW}개 밖이라 목록에 없습니다`, "info", 4000);
+          row.scrollIntoView({ block: "center" });
+          // Again once the rows around it have their real height.
+          requestAnimationFrame(() => row.isConnected && hold && row.scrollIntoView({ block: "center" }));
+          row.classList.remove("flash");
+          void row.offsetWidth;
+          row.classList.add("flash");
+        },
+      },
+    ]);
+  });
   list.addEventListener("click", (e) => {
     const from = (e.target as HTMLElement).closest<HTMLElement>(".syslog-row .from");
     // A drag that selected text is no click on the address.
@@ -685,14 +889,37 @@ export function openSyslog(from?: string) {
     if (!ip) return;
     const r = from.getBoundingClientRect();
     const make = newSessionHandler();
+    // Its clock against this PC's, by its latest message with a time of its
+    // own: log times of devices that disagree do not line up in an outage.
+    let clock: ReturnType<typeof deviceClock> = null;
+    for (let i = messages.length - 1, n = 0; i >= 0 && n < 500 && !clock; i--) {
+      if (messages[i].from !== ip) continue;
+      n++;
+      clock = deviceClock(messages[i]);
+    }
+    const clockItem = clock && {
+      label: clock.utcGuess
+        ? "장비 시계: UTC로 기록하는 것으로 보임"
+        : Math.abs(clock.skew) < 2000
+          ? "장비 시계: 이 PC와 같음"
+          : clock.skew > 0
+            ? `장비 시계: 이 PC보다 ${skewText(clock.skew)} 빠름`
+            : `장비 시계: 이 PC보다 ${skewText(clock.skew)} 느림`,
+      icon: "Clock",
+      hint: clock.mark === "*" ? "동기화 안 됨 (*)" : clock.mark === "." ? "NTP 동기화 끊김 (.)" : undefined,
+      disabled: true,
+    };
     contextMenu(r.left, r.bottom + 2, [
+      ...(clockItem ? [clockItem, "-" as const] : []),
       onlyFrom === ip
         ? { label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }
         : { label: "이 장비의 메시지만 보기", icon: "ListFilter", action: () => showOnly(ip) },
       // Its console or shell, already open: the window steps aside for it.
       // Otherwise its saved sessions, to connect (the window closes first; receiving goes on).
       ...deviceItems(ip, () => m.close()),
-      { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools(ip) },
+      { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools(ip, "ping", null, false, false, () => m.close()) },
+      // Does it still answer (a device sending "link down" or a reload)?
+      { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => openNetworkTools(ip, "ping", null, true, true, () => m.close()) },
       // The window closes as the session connects (receiving goes on), so its tab is not left behind it.
       ...(make ? [{ label: "이 주소로 새 세션 만들기…", icon: "Plus", action: () => make({ protocol: "ssh", host: ip }, () => m.close()) }] : []),
       { label: "주소 복사", icon: "ClipboardList", action: () => void writeClipboard(ip) },

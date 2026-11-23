@@ -150,6 +150,16 @@ function restore() {
   pruneAt = 1024;
 }
 
+/** Told once a new language is in place, its dictionary loaded: for text
+ * kept from the page translation (data-i18n-skip) and put together with
+ * tr(), which until then still gives the Korean. */
+const applied = new Set<() => void>();
+export function onLanguageApplied(fn: () => void): () => void {
+  applied.add(fn);
+  return () => void applied.delete(fn);
+}
+const tellApplied = () => applied.forEach((fn) => fn());
+
 /** Switch the UI language now (and keep following new UI in English). */
 export function setLanguage(next: Language) {
   if (next === lang) return;
@@ -160,7 +170,7 @@ export function setLanguage(next: Language) {
   active = null;
   memo.clear();
   restore();
-  if (next === "ko") return;
+  if (next === "ko") return void tellApplied();
   // Watch at once (nothing added meanwhile is missed); the walk over what is
   // already there waits for the dictionary. A language without its own
   // dictionary shows English.
@@ -168,9 +178,12 @@ export function setLanguage(next: Language) {
   loadDictionary(next)
     .then((t) => t ?? loadDictionary("en"))
     .then((t) => {
-      if (lang !== next || !t) return;
-      active = t;
-      translateTree(document.body);
+      if (lang !== next) return;
+      if (t) {
+        active = t;
+        translateTree(document.body);
+      }
+      tellApplied();
     });
 }
 

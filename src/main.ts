@@ -9,13 +9,13 @@ import { initSyslog, openSyslog, setSyslogTabMarker, syslog, syslogBadge, syslog
 import { mountHome } from "./home";
 import { appLock, initLock, lockNow } from "./lock";
 import { clearAllDeviceAlerts, clearDeviceAlert, deviceAlertList, markDeviceAlert, onDeviceAlerts } from "./deviceAlerts";
-import { openNetworkTools, setDeviceMarker, setDeviceTabFinder, setNewSessionHandler, setSessionOpener } from "./nettools";
+import { lastWatchList, openMultiWatch, openNetworkTools, setDeviceMarker, setDeviceTabFinder, setNewSessionHandler, setSessionOpener } from "./nettools";
 import { openCommandPalette } from "./palette";
 import { fileSessionFor } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
 import { icon } from "./icons";
 import { parseSubnetInput } from "./ipLinks";
-import { endpoint, newSession, parseTarget, PROTOCOLS, type Protocol, type Session } from "./model";
+import { endpoint, formatTarget, hasScheme, newSession, parseTarget, PROTOCOLS, schemeProtocol, type Protocol, type Session } from "./model";
 import { editSession } from "./sessionEditor";
 import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
@@ -356,6 +356,20 @@ function openQuickSerial(text: string) {
 
 $("#quick").addEventListener("submit", (e) => {
   e.preventDefault();
+  // A pasted URL's scheme ("telnet://10.0.0.1") says the protocol: the
+  // picker follows it, so this and the next quick connection use it.
+  const named = schemeProtocol(quickTarget.value);
+  // A URL of something this app does not open ("https://host"): said, not
+  // tried as the picker's protocol (an SSH login to a web address).
+  if (hasScheme(quickTarget.value) && !named) {
+    const scheme = quickTarget.value.trim().slice(0, quickTarget.value.trim().indexOf("://") + 3);
+    return void toast(`${userText(scheme)} 주소는 빠른 연결로 열 수 없습니다`, "warn", 5000);
+  }
+  // Only for an address that connects ("telnet://" alone leaves the picker).
+  if (named && named !== quickProto.value && parseTarget(quickTarget.value) && [...quickProto.options].some((o) => o.value === named)) {
+    quickProto.value = named;
+    quickProto.dispatchEvent(new Event("change"));
+  }
   const protocol = quickProto.value as Protocol;
   if (protocol === "serial") return void openQuickSerial(quickTarget.value);
   const target = parseTarget(quickTarget.value);
@@ -380,7 +394,10 @@ $("#quick").addEventListener("submit", (e) => {
   };
   s.name = endpoint(s);
   open(s);
-  rememberQuick(protocol, quickTarget.value.trim());
+  // Remembered as connected to (user, host, port; with the URL's scheme):
+  // never a password, and never a host other than this one (a path's "@").
+  const scheme = named ? `${named}://` : "";
+  rememberQuick(protocol, scheme + formatTarget(target));
   quickTarget.value = "";
 });
 
@@ -416,10 +433,13 @@ $("#btn-lock").addEventListener("click", () => lockNow());
 appLock.onChange(() => ($("#btn-lock").hidden = !appLock.enabled));
 $("#btn-tools").addEventListener("click", (e) => {
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const lastWatch = lastWatchList();
   contextMenu(r.left, r.bottom + 4, [
     { label: "SSH 터널", icon: "Waypoints", hint: "포트 포워딩", action: () => openTunnelManager() },
     { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => openNetworkTools() },
     { label: "서브넷 계산", icon: "Network", action: () => openNetworkTools("", "subnet") },
+    // The devices watched last time, watched again (a daily check of the same ones).
+    ...(lastWatch.length ? ["-" as const, { label: "여러 장비 지켜보기", icon: "Radar", hint: `지난 목록 ${lastWatch.length}대`, action: () => openMultiWatch(lastWatch, undefined, true) }] : []),
   ]);
 });
 $("#btn-settings").addEventListener("click", () => openSettings());

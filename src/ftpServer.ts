@@ -6,6 +6,7 @@ import { api, on, pickFolder, type FtpServerConfig, type FtpServerStatus } from 
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
+import { userText } from "./i18n";
 
 export interface LogEntry {
   /** Increasing per log: tells a dialog which rows it has not drawn yet. */
@@ -17,6 +18,9 @@ export interface LogEntry {
   /** The file on this PC a received upload was saved as, when known: a
    * "show in Explorer" button on its row. */
   saved?: string;
+  /** Where the file it replaced was kept (TFTP, "keep the earlier file"):
+   * a "compare with the earlier file" button on its row. */
+  kept?: string;
 }
 
 /** Event kinds whose detail is only a path, or "a → b" (ftpserver.rs, fileservers.rs). */
@@ -36,6 +40,10 @@ export function logRenderer(box: HTMLElement, kinds: Record<string, [string, str
           ${e.user ? `<span class="who" data-i18n-skip>${esc(e.user)}</span>` : ""}<span class="what"${pathOnly ? " data-i18n-skip" : ""}>${esc(e.detail)}</span>${
             e.saved
               ? ` <button type="button" class="btn btn-ghost btn-sm" data-reveal="${esc(e.saved)}">${icon("FolderOpen", 13)}탐색기에서 보기</button><button type="button" class="btn btn-ghost btn-sm" data-hash="${esc(e.saved)}">${icon("ShieldCheck", 13)}해시 확인</button>`
+              : ""
+          }${
+            e.saved && e.kept
+              ? `<button type="button" class="btn btn-ghost btn-sm" data-kept="${esc(e.kept)}" data-now="${esc(e.saved)}">${icon("Columns2", 13)}이전 파일과 비교</button>`
               : ""
           }</div>`;
   };
@@ -146,6 +154,31 @@ export function ftpServerBadge(): string {
   return `<button class="sb-server" data-ftp-server title="${esc(status.addresses.join("\n"))}">${icon("Server", 13)}FTP 서버 :${status.port}</button>`;
 }
 
+/** For the FTP server on its own port (21), reachable from other PCs, with
+ * an account: the Cisco IOS commands a device runs to use it (the IOS file
+ * system's URL, ftp://username:password@location/filename), this PC's
+ * address and the user filled in, to copy (never typed into a terminal from
+ * here). The password is left as PASSWORD for the user to put in: it is
+ * not kept, and in a URL some of its characters would need escaping. */
+function deviceCommands(s: FtpServerStatus): string {
+  if (s.port !== 21 || !s.username || /[:@/\s]/.test(s.username)) return "";
+  const ip = s.addresses.map((a) => /^ftp:\/\/(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(a)?.[1]).find((a) => a && a !== "127.0.0.1");
+  if (!ip) return "";
+  const at = `${s.username}:PASSWORD@${ip}`;
+  const rows: [string, string, string][] = [
+    [`copy running-config ftp://${at}/router-confg`, "장비 설정을 이 PC로 백업 (PASSWORD를 비밀번호로 바꿔서)", s.readOnly ? "읽기 전용이라 받을 수 없음 · 읽기/쓰기로 다시 시작" : ""],
+    [`copy ftp://${at}/FILE flash:`, "이 PC의 파일을 장비로 (PASSWORD와 FILE을 바꿔서)", ""],
+  ];
+  return `<details class="tftp-cmds"><summary class="muted small" title="장비에서 쓸 명령 (Cisco IOS, 눌러서 복사)">${icon("SquareTerminal", 13)}<span>장비용 명령</span></summary>${rows
+    .map(
+      ([cmd, what, note]) =>
+        `<button type="button" class="ftpd-addr" data-cmd="${esc(cmd)}" title="${esc(what)}">${icon("Copy", 13)}<code data-i18n-skip>${esc(cmd)}</code>${
+          note ? `<span class="danger-text small">${esc(note)}</span>` : ""
+        }</button>`,
+    )
+    .join("")}</details>`;
+}
+
 export function openFtpServer() {
   const p = loadPrefs();
   // A server left running by a page reload: its password is not known here.
@@ -228,12 +261,13 @@ export function openFtpServer() {
     } else {
       const s = status;
       html = `<div class="ftpd-on"><span class="sb-dot connected"></span><b>실행 중</b>
-          <span class="muted">${esc(s.root)} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.anonymous ? " · 익명 허용" : ""}</span></div>
+          <span class="muted">${esc(userText(s.root))} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.anonymous ? " · 익명 허용" : ""}</span></div>
         <div class="ftpd-addrs">${s.addresses
           .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
           .join("")}</div>
         ${s.addresses.some(isPublicAddress) ? `<p class="ftpd-public">${icon("ShieldAlert", 14)}이 PC는 공인 IP를 쓰고 있어 방화벽이 허용하면 인터넷 어디에서나 접속을 시도할 수 있습니다. 필요할 때만 켜 두세요.</p>` : ""}
-        <p class="muted small">계정: <code data-i18n-skip>${esc(s.username || "anonymous")}</code>${s.anonymous && s.username ? " 또는 <code>anonymous</code>" : ""}</p>`;
+        <p class="muted small">계정: <code data-i18n-skip>${esc(s.username || "anonymous")}</code>${s.anonymous && s.username ? " 또는 <code>anonymous</code>" : ""}</p>
+        ${deviceCommands(s)}`;
     }
     if (html !== drawnState) {
       drawnState = html;
@@ -241,6 +275,11 @@ export function openFtpServer() {
     }
   }
   stateBox.addEventListener("click", async (e) => {
+    const cmd = (e.target as HTMLElement).closest<HTMLElement>("[data-cmd]");
+    if (cmd) {
+      await writeClipboard(cmd.dataset.cmd!);
+      return void toast("명령을 복사했습니다", "success", 1600);
+    }
     const b = (e.target as HTMLElement).closest<HTMLElement>("[data-addr]");
     if (!b) return;
     await writeClipboard(b.dataset.addr!);

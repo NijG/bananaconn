@@ -112,6 +112,10 @@ export class RdpView implements View {
     this.wireToolbar();
     this.wireInput();
     this.resizer.observe(this.screen);
+    // The browser may drop a canvas's pixels (its GPU reset: a display
+    // change, a driver update, a long sleep) and hand it back blank; the
+    // helper's updates draw only what changed, so the rest stayed black.
+    this.canvas.addEventListener("contextrestored", () => void this.redrawAll());
     this.watchDpi();
     this.syncFit();
     // Not if the tab was closed before the first frame (the helper would be orphaned).
@@ -843,6 +847,17 @@ export class RdpView implements View {
   shownChanged(shown: boolean) {
     this.onScreen = shown;
     if (this.id && this.state === "connected") api.rdpVisible(this.id, shown).catch(() => {});
+  }
+
+  /** The whole remote screen drawn again from the helper's image: off then
+   * on screen, after which it sends the whole screen once (in that order:
+   * the second waits for the first). Only while connected and shown. */
+  private async redrawAll() {
+    const id = this.id;
+    if (!id || this.state !== "connected" || !this.onScreen) return;
+    await api.rdpVisible(id, false).catch(() => {});
+    // Shown or not by now: the helper is told what is true.
+    if (id === this.id && this.state === "connected") await api.rdpVisible(id, this.onScreen).catch(() => {});
   }
 
   private cleanup() {

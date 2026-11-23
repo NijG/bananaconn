@@ -6,6 +6,7 @@ import { writeClipboard } from "./clipboard";
 import { isPublicAddress, logRenderer, type LogEntry } from "./ftpServer";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
+import { userText } from "./i18n";
 
 const LOG_MAX = 300;
 let logSeq = 0;
@@ -53,7 +54,7 @@ const now = () => {
 };
 
 export async function initFileServers() {
-  await on<{ server: string; kind: string; user: string; detail: string }>("file-server-event", (e) => {
+  await on<{ server: string; kind: string; user: string; detail: string; kept?: string | null }>("file-server-event", (e) => {
     const kind = e.server as FileServerKind;
     if (!logs[kind]) return;
     // A file a device sent (a configuration backup over TFTP): where it was
@@ -61,7 +62,10 @@ export async function initFileServers() {
     const root = status[kind]?.root;
     const file = e.kind === "upload" && root ? /^(.+) \(\d+ bytes\)$/.exec(e.detail)?.[1] : undefined;
     const saved = file ? `${root!.replace(/[\\/]+$/, "")}\\${file.replace(/^[\\/]+/, "").replace(/\//g, "\\")}` : undefined;
-    logs[kind].push({ seq: ++logSeq, at: now(), kind: e.kind, user: e.user, detail: e.detail, ...(saved ? { saved } : {}) });
+    // The file it replaced, kept beside it under a name of its own (a plain
+    // name, in the same folder): "compare with the earlier file".
+    const kept = saved && e.kept && !/[\\/]/.test(e.kept) ? `${saved.slice(0, saved.lastIndexOf("\\") + 1)}${e.kept}` : undefined;
+    logs[kind].push({ seq: ++logSeq, at: now(), kind: e.kind, user: e.user, detail: e.detail, ...(saved ? { saved } : {}), ...(kept ? { kept } : {}) });
     if (logs[kind].length > LOG_MAX) logs[kind].splice(0, logs[kind].length - LOG_MAX);
     if (e.kind === "started" || e.kind === "stopped") refreshStatus();
     else notify();
@@ -110,14 +114,31 @@ export function fileServerBadges(): string {
     .join("");
 }
 
-type Prefs = { root: string; port: number; lan: boolean; readOnly: boolean; username: string };
+type Prefs = { root: string; port: number; lan: boolean; readOnly: boolean; keepPrevious: boolean; username: string };
 
 function loadPrefs(kind: FileServerKind): Prefs {
-  const d: Prefs = { root: "", port: INFO[kind].port, lan: kind === "tftp", readOnly: true, username: "" };
+  const d: Prefs = { root: "", port: INFO[kind].port, lan: kind === "tftp", readOnly: true, keepPrevious: false, username: "" };
   try {
     return { ...d, ...JSON.parse(localStorage.getItem(`bx.${kind}Server`) ?? "{}") };
   } catch {
     return d;
+  }
+}
+
+/** A device's upload against the file it replaced (kept beside it), line by
+ * line; read one after the other, not a binary (a firmware image). Either
+ * may have been moved or replaced since: said as the read fails. */
+async function compareKept(kept: string, now: string) {
+  try {
+    const a = await api.readTextFile(kept);
+    if (a.includes("\0")) return void toast("텍스트 파일이 아닙니다", "warn");
+    const b = await api.readTextFile(now);
+    if (b.includes("\0")) return void toast("텍스트 파일이 아닙니다", "warn");
+    const name = (p: string) => p.slice(p.lastIndexOf("\\") + 1);
+    const d = await import("./diffView");
+    d.openDiff({ title: name(kept), text: a }, { title: name(now), text: b });
+  } catch (err) {
+    toast(errorText(err), "error", 6000);
   }
 }
 
@@ -144,7 +165,9 @@ export function openFileServer(kind: FileServerKind) {
             ${
               kind === "tftp"
                 ? `<label class="check block"><input type="checkbox" name="readOnly" ${p.readOnly ? "checked" : ""}/>
-                     <span><b>읽기 전용</b><small>끄면 장비가 이 폴더로 파일을 올릴 수 있습니다(설정 백업).</small></span></label>`
+                     <span><b>읽기 전용</b><small>끄면 장비가 이 폴더로 파일을 올릴 수 있습니다(설정 백업).</small></span></label>
+                   <label class="check block"><input type="checkbox" name="keepPrevious" ${p.keepPrevious ? "checked" : ""}/>
+                     <span><b>같은 이름이면 이전 파일 보관</b><small>장비가 같은 이름으로 다시 올리면 있던 파일을 이름 뒤에 날짜·시각을 붙여 남기고, 기록에서 둘을 비교할 수 있습니다.</small></span></label>`
                 : ""
             }
             <label class="check block"><input type="checkbox" name="lan" ${p.lan ? "checked" : ""}/>
@@ -176,6 +199,9 @@ export function openFileServer(kind: FileServerKind) {
     // Or its SHA-256/SHA-512: a device's backup or image checked where it arrived.
     const hash = (e.target as HTMLElement).closest<HTMLElement>("[data-hash]")?.dataset.hash;
     if (hash) void import("./fileHash").then((f) => f.openSavedFileHash(hash));
+    // Or the file it replaced, kept beside it: what the device's backup changed.
+    const kept = (e.target as HTMLElement).closest<HTMLElement>("[data-kept]");
+    if (kept?.dataset.kept && kept.dataset.now) void compareKept(kept.dataset.kept, kept.dataset.now);
   });
   let drawnControls = "";
   let drawnState = "";
@@ -202,7 +228,7 @@ export function openFileServer(kind: FileServerKind) {
     }
     const html = s
       ? `<div class="ftpd-on"><span class="sb-dot connected"></span><b>실행 중</b>
-           <span class="muted">${esc(s.root)} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.auth ? " · 인증 사용" : ""}</span></div>
+           <span class="muted">${esc(userText(s.root))} · ${s.readOnly ? "읽기 전용" : "읽기/쓰기"}${s.keepPrevious ? " · 이전 파일 보관" : ""}${s.auth ? " · 인증 사용" : ""}</span></div>
          <div class="ftpd-addrs">${s.addresses
            .map((a) => `<button type="button" class="ftpd-addr" data-addr="${esc(a)}" title="주소 복사">${icon("Copy", 13)}<code>${esc(a)}</code></button>`)
            .join("")}${deviceCommands(s)}</div>
@@ -247,6 +273,7 @@ export function openFileServer(kind: FileServerKind) {
           port,
           lan: field("lan")!.checked,
           readOnly: field("readOnly")?.checked ?? true,
+          keepPrevious: field("keepPrevious")?.checked ?? false,
           username: field("username")?.value.trim() ?? "",
           password: field("password")?.value ?? "",
         };

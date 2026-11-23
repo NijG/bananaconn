@@ -4,6 +4,7 @@
 import {
   AppWindow,
   ArrowUp,
+  ArrowDown,
   ArrowLeft,
   ArrowLeftRight,
   ArrowRight,
@@ -116,6 +117,8 @@ import {
   PinOff,
   History,
   Palette,
+  Pilcrow,
+  Users,
 } from "lucide";
 
 type IconNode = Parameters<typeof createElement>[0];
@@ -126,12 +129,12 @@ const ICONS: Record<string, IconNode> = {
   CircleHelp,
   ClipboardPaste,
   CopyPlus,
-  AppWindow, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, ArrowUpDown, Cable, Check, ChevronDown, ChevronRight, ClipboardType, Columns2, Copy, CornerDownLeft, Download,
+  AppWindow, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, ArrowDown, ArrowUpDown, Cable, Check, ChevronDown, ChevronRight, ClipboardType, Columns2, Copy, CornerDownLeft, Download,
   Eraser, ExternalLink, Eye, EyeOff, File, Folder, FolderKey, FolderLock, FolderOpen, FolderPlus, FolderSync, HardDrive, House, Info, Key, Keyboard, KeyRound,
   LayoutGrid, Lock, Maximize2, Minus, Monitor, PanelLeft, Pencil, Play, Plus, Radar, Radio, RefreshCw, Repeat, RotateCcw, RotateCw, Rows2, Save,
   ScreenShare, ScrollText, Search, Server, Settings, ShieldAlert, ShieldCheck, Sparkles, Square, SquareTerminal, StickyNote, Star, Table,
   Trash2, TriangleAlert, Unlink, Upload, WifiOff, X, ZoomIn, ZoomOut,
-  Activity, Braces, Timer, TimerOff, Circle, CircleStop, Clock, FilePlus, FileText, Globe, ListFilter, Highlighter, LockKeyhole, Network, PanelRight, Unplug, Usb, Waypoints, WrapText, Zap,
+  Activity, Braces, Timer, TimerOff, Circle, CircleStop, Clock, FilePlus, FileText, Globe, ListFilter, Highlighter, LockKeyhole, Network, PanelRight, Unplug, Usb, Waypoints, WrapText, Zap, Pilcrow, Users,
 };
 
 const cache = new Map<string, string>();

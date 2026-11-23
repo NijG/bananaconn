@@ -10,7 +10,7 @@ const SESSION_H = 42;
 const TREE_WINDOW_MIN = 400;
 const TREE_MARGIN = 40;
 
-import { endpoint, jumpHostOk, normalizeJumpHost, parseTarget, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
+import { endpoint, jumpHostOk, normalizeJumpHost, PROTOCOLS, sessionDefaultsFor, sessionSearchText, type Session } from "./model";
 import { fileSessionFor, fileTransferBlockedReason } from "./transfer";
 import { canBeGateway, confirmGatewayBreak, gatewayChoices, GATEWAY_PROTOCOLS, gatewayUserList, gatewayUsers } from "./tunnels";
 import { checkReachable, checkReachableMany, openMultiWatch, watchTargets } from "./nettools";
@@ -266,9 +266,11 @@ export class Sidebar {
   /** The search text read as an address ("10.0.0.5", "root@host:2222"), when
    * it looks like one (a dot, @ or colon): a new session can start from it. As
    * typed, not lower-cased (a user name keeps its case). */
-  private searchTarget() {
+  /** A new session's settings for the search text when it is an address this
+   * app opens (not "https://…"): the offer and Enter both go by it. */
+  private searchDefaults() {
     const raw = this.searchText();
-    return /[.@:]/.test(raw) ? parseTarget(raw) : null;
+    return /[.@:]/.test(raw) ? sessionDefaultsFor(raw) : null;
   }
 
   /** The search box's text as typed (the filter itself is lower-cased). */
@@ -279,8 +281,7 @@ export class Sidebar {
   /** A new session from the address searched for (nothing matched it): the
    * editor opens filled in; nothing connects before the user saves. */
   private newFromSearch(): boolean {
-    if (!this.searchTarget()) return false;
-    const defaults = sessionDefaultsFor(this.searchText());
+    const defaults = this.searchDefaults();
     if (!defaults) return false;
     this.actions.edit(null, defaults);
     return true;
@@ -425,7 +426,7 @@ export class Sidebar {
                <button class="btn btn-sm" data-reset-sessions>${icon("RotateCcw", 14)}빈 목록으로 새로 시작…</button></div>`
           : this.query
           ? `<div class="tree-empty">${icon("Search", 22)}<p>"${esc(userText(this.searchText() || this.query))}"와 일치하는 세션이 없습니다</p>${
-              this.searchTarget() ? `<button class="btn btn-sm" data-new-from-search>${icon("Plus", 14)}이 주소로 새 세션 만들기…</button>` : ""
+              this.searchDefaults() ? `<button class="btn btn-sm" data-new-from-search>${icon("Plus", 14)}이 주소로 새 세션 만들기…</button>` : ""
             }</div>`
           : `<div class="tree-empty">${icon("Server", 26)}<p>저장된 세션이 없습니다</p>
                <button class="btn btn-primary btn-sm" data-first>${icon("Plus", 14)}첫 세션 만들기</button>
@@ -633,7 +634,7 @@ export class Sidebar {
           },
           // A floor's or a site's switches after maintenance, as the multi-selection offers it.
           // Counted as the window takes them (no serial ports, each address once).
-          { label: `이 폴더의 장비 ${watchable}개를 연속 ping으로 지켜보기`, icon: "Radar", disabled: !watchable, action: () => openMultiWatch(inside) },
+          { label: `이 폴더의 장비 ${watchable}개를 연속 ping으로 지켜보기`, icon: "Radar", disabled: !watchable, action: () => openMultiWatch(inside, undefined, true) },
           // One per line, as the multi-selection copies them: a host list to paste elsewhere.
           { label: `이 폴더의 주소 ${inside.length}개 복사`, icon: "ClipboardList", disabled: !inside.length, action: () => void copyAddresses(inside) },
           { label: "여기에 붙여넣기", icon: "ClipboardPaste", hint: keyHint("tree.paste"), disabled: !this.clip, action: () => this.pasteSession(path) },
@@ -797,7 +798,7 @@ export class Sidebar {
       "-",
       { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
       // After a maintenance window: which of them are back, as it happens.
-      { label: `${list.length}개 장비를 연속 ping으로 지켜보기`, icon: "Radar", action: () => openMultiWatch(list) },
+      { label: `${list.length}개 장비를 연속 ping으로 지켜보기`, icon: "Radar", action: () => openMultiWatch(list, undefined, true) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: keyHint("tree.edit"), action: () => this.bulkEdit(list) },
       { label: "폴더로 이동…", icon: "FolderSync", action: () => this.bulkMove(list) },
       // One per line, in the order shown: a list of hosts to paste elsewhere.

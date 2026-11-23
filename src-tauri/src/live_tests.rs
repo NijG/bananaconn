@@ -433,6 +433,7 @@ async fn ssh_gateway_tunnel_forwards_after_host_key_approval() {
         known_hosts: kh.clone(),
         proxy: None,
         proxy_auth: Default::default(),
+        keys: Default::default(),
     };
 
     // Unknown host key is reported, never silently trusted.
@@ -592,6 +593,7 @@ async fn linux_monitor_samples_on_request_and_pauses() {
         known_hosts: kh.clone(),
         proxy: None,
         proxy_auth: Default::default(),
+        keys: Default::default(),
     };
     let fp = match crate::remote::ssh_login(login(None)).await {
         Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
@@ -704,6 +706,7 @@ async fn builtin_tftp_and_http_servers_confine_and_serve() {
         port,
         lan: false,
         read_only,
+        keep_previous: false,
         username: user.into(),
         password: pw.into(),
     };
@@ -963,6 +966,7 @@ async fn an_encrypted_key_asks_for_its_passphrase() {
         known_hosts: kh.clone(),
         proxy: None,
         proxy_auth: Default::default(),
+        keys: Default::default(),
     };
     let fp = match crate::remote::ssh_login(login(None, None)).await {
         Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
@@ -1037,6 +1041,7 @@ async fn a_typed_password_replaces_a_refused_plain_key() {
         known_hosts: kh.clone(),
         proxy: None,
         proxy_auth: Default::default(),
+        keys: Default::default(),
     };
     let fp = match crate::remote::ssh_login(login(None, None)).await {
         Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
@@ -1051,5 +1056,119 @@ async fn a_typed_password_replaces_a_refused_plain_key() {
     assert!(crate::remote::ssh_login(login(Some("secret"), Some(fp))).await.is_ok());
     assert_eq!(take(), ["password"]);
     accept.abort();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---- keys named in ~/.ssh/config, with no credential -----------------------------------------
+
+/// Records each key offered (by its public key, once per key) and accepts one.
+#[derive(Clone)]
+struct OfferedKeys {
+    accept: russh::keys::ssh_key::public::KeyData,
+    offered: std::sync::Arc<std::sync::Mutex<Vec<russh::keys::ssh_key::public::KeyData>>>,
+}
+
+impl OfferedKeys {
+    fn note(&self, key: &russh::keys::ssh_key::PublicKey) -> russh::server::Auth {
+        let mut seen = self.offered.lock().unwrap();
+        if seen.last() != Some(key.key_data()) {
+            seen.push(key.key_data().clone());
+        }
+        if key.key_data() == &self.accept { russh::server::Auth::Accept } else { russh::server::Auth::reject() }
+    }
+}
+
+impl russh::server::Handler for OfferedKeys {
+    type Error = russh::Error;
+
+    async fn auth_publickey_offered(&mut self, _user: &str, key: &russh::keys::ssh_key::PublicKey) -> Result<russh::server::Auth, Self::Error> {
+        Ok(self.note(key))
+    }
+
+    async fn auth_publickey(&mut self, _user: &str, key: &russh::keys::ssh_key::PublicKey) -> Result<russh::server::Auth, Self::Error> {
+        Ok(self.note(key))
+    }
+}
+
+/// With no credential, the keys ~/.ssh/config names (KeyHints) are tried in
+/// its order, three at most: an encrypted one and a security key ("_sk") are
+/// passed over without a try, and under IdentitiesOnly no agent key that is
+/// not one of them is offered (so this runs the same with an agent or not).
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_keys_are_tried_in_order_three_at_most() {
+    use std::sync::Arc;
+    let base = std::env::temp_dir().join(format!("bx-config-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let mut rng = rand::rngs::ThreadRng::default();
+    let mut write = |name: &str, locked: bool| {
+        let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let data = key.public_key().key_data().clone();
+        let key = if locked { key.encrypt(&mut rng, b"pw").unwrap() } else { key };
+        let path = base.join(name);
+        std::fs::write(&path, key.to_openssh(russh::keys::ssh_key::LineEnding::LF).unwrap().as_bytes()).unwrap();
+        (path, data)
+    };
+    let (locked, _) = write("locked", true);
+    let (sk, _) = write("id_ed25519_sk", false);
+    let (k1, d1) = write("k1", false);
+    let (k2, d2) = write("k2", false);
+    let (k3, d3) = write("k3", false);
+    let (k4, d4) = write("k4", false);
+    let files = vec![locked, sk, k1, k2, k3, k4];
+
+    let run = |accept: russh::keys::ssh_key::public::KeyData| {
+        let files = files.clone();
+        let base = base.clone();
+        async move {
+            let config = Arc::new(russh::server::Config {
+                keys: vec![russh::keys::PrivateKey::random(&mut rand::rngs::ThreadRng::default(), russh::keys::Algorithm::Ed25519).unwrap()],
+                ..Default::default()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = OfferedKeys { accept, offered: Default::default() };
+            let offered = server.offered.clone();
+            let accept_loop = tokio::spawn(async move {
+                while let Ok((s, _)) = listener.accept().await {
+                    let (config, server) = (config.clone(), server.clone());
+                    tokio::spawn(async move {
+                        if let Ok(running) = russh::server::run_stream(config, s, server).await {
+                            let _ = running.await;
+                        }
+                    });
+                }
+            });
+            let login = |fp: Option<String>| crate::remote::SshLogin {
+                host: "127.0.0.1".into(),
+                port,
+                username: "tester".into(),
+                password: None,
+                cred: None,
+                trusted_fingerprint: fp,
+                known_hosts: base.join("known_hosts"),
+                proxy: None,
+                proxy_auth: Default::default(),
+                keys: crate::remote::KeyHints { files: files.clone(), identities_only: true },
+            };
+            let fp = match crate::remote::ssh_login(login(None)).await {
+                Err(e) if e.starts_with("HOSTKEY_UNKNOWN::") => e["HOSTKEY_UNKNOWN::".len()..].to_string(),
+                other => panic!("expected a host key prompt: {:?}", other.err()),
+            };
+            let result = crate::remote::ssh_login(login(Some(fp))).await.map(|_| ());
+            accept_loop.abort();
+            let seen = offered.lock().unwrap().clone();
+            (result, seen)
+        }
+    };
+
+    // The third tried is the one: k1, k2, k3, in the config's order.
+    let (result, seen) = run(d3.clone()).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(seen, vec![d1.clone(), d2.clone(), d3.clone()]);
+    // The one accepted is fourth: never reached, the password is asked for.
+    let (result, seen) = run(d4).await;
+    assert_eq!(result.err().as_deref(), Some("NEED_PASSWORD"));
+    assert_eq!(seen, vec![d1, d2, d3]);
     let _ = std::fs::remove_dir_all(&base);
 }
