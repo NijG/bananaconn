@@ -188,6 +188,11 @@ pub async fn net_ports(host: String, ports: Vec<u16>) -> Result<Vec<PortResult>,
 #[serde(rename_all = "camelCase")]
 pub struct DnsResult {
     addresses: Vec<String>,
+    /// For an address looked up (not a name): its name (PTR record), when it
+    /// has one; `addresses` then holds the address itself.
+    name: Option<String>,
+    /// An address was looked up: whether it has a name is in `name`.
+    reverse: bool,
     ms: u64,
 }
 
@@ -196,13 +201,29 @@ pub async fn net_dns(host: String) -> Result<DnsResult, String> {
     let host = parse_host(&host)?;
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
+        // An address: what it is called (reverse lookup), as nslookup does. A
+        // link-local one may carry its interface ("fe80::1%12", as ipconfig
+        // writes it), which the lookup needs to ask on that link.
+        let (literal, zone) = host.split_once('%').map_or((host.as_str(), None), |(a, z)| (a, Some(z)));
+        if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+            let scope = match (ip, zone) {
+                (std::net::IpAddr::V6(_), Some(z)) => z.parse::<u32>().ok(),
+                (_, None) => Some(0),
+                _ => None,
+            };
+            // A zone this lookup cannot use (a name, or on an IPv4 address): the forward lookup below, as before.
+            if let Some(scope) = scope {
+                let name = name_of(ip, scope).map_err(|code| format!("{host}의 이름을 조회하지 못했습니다 (오류 {code})"))?;
+                return Ok(DnsResult { addresses: vec![host.clone()], name, reverse: true, ms: started.elapsed().as_millis() as u64 });
+            }
+        }
         let mut addresses: Vec<String> = (host.as_str(), 0)
             .to_socket_addrs()
             .map_err(|e| format!("{host} 주소를 찾을 수 없습니다: {e}"))?
             .map(|a| a.ip().to_string())
             .collect();
         unique_in_order(&mut addresses);
-        Ok(DnsResult { addresses, ms: started.elapsed().as_millis() as u64 })
+        Ok(DnsResult { addresses, name: None, reverse: false, ms: started.elapsed().as_millis() as u64 })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -296,6 +317,19 @@ fn sweep_targets(network: std::net::Ipv4Addr, prefix: u8) -> Result<Vec<std::net
     let last = first | !mask;
     let range = if prefix >= 31 { first..=last } else { first + 1..=last - 1 };
     Ok(range.map(std::net::Ipv4Addr::from).collect())
+}
+
+/// Most addresses one range sweep pings (a /22's 1022 hosts, rounded up).
+const RANGE_SWEEP_MAX: u32 = 1024;
+
+/// Every address from `a` to `b` (either order), as typed: a range is not a
+/// subnet, so its ends are hosts too. At most RANGE_SWEEP_MAX in one sweep.
+fn range_targets(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr) -> Result<Vec<std::net::Ipv4Addr>, String> {
+    let (lo, hi) = (u32::from(a).min(u32::from(b)), u32::from(a).max(u32::from(b)));
+    if hi - lo >= RANGE_SWEEP_MAX {
+        return Err("한 번에 주소 1024개까지 검사할 수 있습니다".into());
+    }
+    Ok((lo..=hi).map(std::net::Ipv4Addr::from).collect())
 }
 
 /// Sweeps running, by the id the dialog gave: "Stop" and closing the dialog end them.
@@ -392,14 +426,19 @@ struct SweepProgress {
     total: usize,
 }
 
-/// Ping every host address of `network`/`prefix` (a /22 at most) and return
+/// Ping every host address of `network`/`prefix` (a /22 at most), or, with
+/// `to`, every address from `network` to `to` (range_targets), and return
 /// the ones that answered; "sweep-progress" events tell how far it is.
 /// Fails with "CANCELLED" when net_sweep_cancel stops it.
 #[tauri::command]
-pub async fn net_sweep(app: tauri::AppHandle, id: String, network: String, prefix: u8, timeout_ms: u32) -> Result<Vec<SweepHit>, String> {
+pub async fn net_sweep(app: tauri::AppHandle, id: String, network: String, prefix: u8, timeout_ms: u32, to: Option<String>) -> Result<Vec<SweepHit>, String> {
     use tauri::Emitter;
-    let network: std::net::Ipv4Addr = network.trim().parse().map_err(|_| "IPv4 네트워크 주소가 올바르지 않습니다".to_string())?;
-    let targets = sweep_targets(network, prefix)?;
+    let bad = || "IPv4 네트워크 주소가 올바르지 않습니다".to_string();
+    let network: std::net::Ipv4Addr = network.trim().parse().map_err(|_| bad())?;
+    let targets = match to.as_deref().map(str::trim) {
+        Some(end) => range_targets(network, end.parse().map_err(|_| bad())?)?,
+        None => sweep_targets(network, prefix)?,
+    };
     let timeout_ms = timeout_ms.clamp(200, 5000);
     let cancel = sweep_flag(&id);
     let total = targets.len();
@@ -708,24 +747,49 @@ fn neighbor_macs() -> HashMap<std::net::Ipv4Addr, (String, bool)> {
     out
 }
 
-/// The DNS (or hosts file) name of an address, when it has one.
-fn name_of(ip: std::net::Ipv4Addr) -> Option<String> {
-    use windows_sys::Win32::Networking::WinSock::{GetNameInfoW, AF_INET, IN_ADDR, IN_ADDR_0, NI_NAMEREQD, SOCKADDR, SOCKADDR_IN};
+/// The DNS (or hosts file) name of an address (its PTR record), when it has one.
+/// `scope`: an IPv6 address's interface (0 for none). Ok(None) when it has
+/// no name; Err(the Winsock error) when the lookup itself failed (a DNS server
+/// that did not answer), which is not the same as having none.
+fn name_of(ip: std::net::IpAddr, scope: u32) -> Result<Option<String>, i32> {
+    use windows_sys::Win32::Networking::WinSock::{
+        GetNameInfoW, WSAGetLastError, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, NI_NAMEREQD, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
+        WSAHOST_NOT_FOUND, WSANO_DATA,
+    };
     // Winsock must be started for the process; any std socket does that, once.
     static WINSOCK: std::sync::Once = std::sync::Once::new();
     WINSOCK.call_once(|| drop(std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))));
-    let sa = SOCKADDR_IN { sin_family: AF_INET, sin_port: 0, sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(ip.octets()) } }, sin_zero: [0; 8] };
     // NI_MAXHOST characters and the terminating NUL.
     let mut host = [0u16; 1026];
-    let r = unsafe {
-        GetNameInfoW(&sa as *const SOCKADDR_IN as *const SOCKADDR, std::mem::size_of::<SOCKADDR_IN>() as i32, host.as_mut_ptr(), host.len() as u32, std::ptr::null_mut(), 0, NI_NAMEREQD as i32)
+    let r = match ip {
+        std::net::IpAddr::V4(v4) => {
+            let sa = SOCKADDR_IN { sin_family: AF_INET, sin_port: 0, sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(v4.octets()) } }, sin_zero: [0; 8] };
+            unsafe {
+                GetNameInfoW(&sa as *const SOCKADDR_IN as *const SOCKADDR, std::mem::size_of::<SOCKADDR_IN>() as i32, host.as_mut_ptr(), host.len() as u32, std::ptr::null_mut(), 0, NI_NAMEREQD as i32)
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let sa = SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: v6.octets() } },
+                Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: scope },
+            };
+            unsafe {
+                GetNameInfoW(&sa as *const SOCKADDR_IN6 as *const SOCKADDR, std::mem::size_of::<SOCKADDR_IN6>() as i32, host.as_mut_ptr(), host.len() as u32, std::ptr::null_mut(), 0, NI_NAMEREQD as i32)
+            }
+        }
     };
     if r != 0 {
-        return None;
+        // No PTR record (or none in the hosts file): no name. Anything else is
+        // the lookup failing, not an answer.
+        let code = unsafe { WSAGetLastError() };
+        return if code == WSAHOST_NOT_FOUND || code == WSANO_DATA { Ok(None) } else { Err(code) };
     }
     let len = host.iter().position(|&c| c == 0).unwrap_or(host.len());
     let name = String::from_utf16_lossy(&host[..len]);
-    (!name.is_empty() && name != ip.to_string()).then_some(name)
+    Ok((!name.is_empty() && name != ip.to_string()).then_some(name))
 }
 
 /// The names of `ips`, in their order, those found within `wait`. Lookups run
@@ -741,7 +805,7 @@ fn names(ips: Vec<std::net::Ipv4Addr>, wait: Duration) -> Vec<Option<String>> {
         let (ips, next, stop, tx) = (ips.clone(), next.clone(), stop.clone(), tx.clone());
         std::thread::spawn(move || loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= ips.len() || stop.load(Ordering::Relaxed) || tx.send((i, name_of(ips[i]))).is_err() {
+            if i >= ips.len() || stop.load(Ordering::Relaxed) || tx.send((i, name_of(ips[i].into(), 0).ok().flatten())).is_err() {
                 break;
             }
         });
@@ -770,8 +834,39 @@ pub async fn net_names(ips: Vec<String>) -> Result<Vec<Option<String>>, String> 
 }
 
 #[cfg(test)]
+mod dns_tests {
+    use super::net_dns;
+
+    /// An address is looked up the other way (its name), IPv4 and IPv6 alike;
+    /// a name keeps the forward lookup. Uses this PC's resolver (Windows names
+    /// its own loopback addresses after the computer), so not run by default.
+    #[test]
+    #[ignore]
+    fn an_address_is_looked_up_by_name() {
+        let rt = tauri::async_runtime::block_on(async {
+            (net_dns("127.0.0.1".into()).await, net_dns("::1".into()).await, net_dns("[::1]".into()).await, net_dns("localhost".into()).await)
+        });
+        let (v4, v6, bracketed, name) = (rt.0.unwrap(), rt.1.unwrap(), rt.2.unwrap(), rt.3.unwrap());
+        assert!(v4.reverse && v6.reverse && bracketed.reverse && !name.reverse);
+        assert_eq!(v4.addresses, ["127.0.0.1"]);
+        assert_eq!(v6.addresses, ["::1"]);
+        let host = std::env::var("COMPUTERNAME").unwrap().to_lowercase();
+        for r in [&v4, &v6, &bracketed] {
+            let got = r.name.as_deref().unwrap_or_default().to_lowercase();
+            assert!(got == host || got.starts_with(&format!("{host}.")), "{got:?} is not {host:?}");
+        }
+        assert!(name.name.is_none() && !name.addresses.is_empty());
+        // With its interface ("%1", the loopback's index): still looked up the
+        // other way, the address shown as written.
+        let zoned = tauri::async_runtime::block_on(net_dns("::1%1".into())).unwrap();
+        assert!(zoned.reverse);
+        assert_eq!(zoned.addresses, ["::1%1"]);
+    }
+}
+
+#[cfg(test)]
 mod sweep_tests {
-    use super::{net_sweep_cancel, sweep, sweep_flag, sweep_targets};
+    use super::{net_sweep_cancel, range_targets, sweep, sweep_flag, sweep_targets};
     use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicBool;
 
@@ -785,6 +880,24 @@ mod sweep_tests {
         assert_eq!(sweep_targets(Ipv4Addr::new(10, 0, 0, 0), 22).unwrap().len(), 1022);
         assert!(sweep_targets(Ipv4Addr::new(10, 0, 0, 0), 21).is_err());
         assert!(sweep_targets(Ipv4Addr::new(10, 0, 0, 0), 33).is_err());
+    }
+
+    /// A range is every address from one end to the other, both ends included
+    /// (in either order): not a subnet, so no network or broadcast to leave out.
+    #[test]
+    fn a_range_is_every_address_in_it() {
+        let ip = |d: u8| Ipv4Addr::new(10, 0, 0, d);
+        let t = range_targets(ip(8), ip(15)).unwrap();
+        assert_eq!((t.len(), t[0], t[7]), (8, ip(8), ip(15)));
+        assert_eq!(range_targets(ip(20), ip(5)).unwrap().len(), 16);
+        assert_eq!(range_targets(ip(7), ip(7)).unwrap(), vec![ip(7)]);
+        // Across an octet: 10.0.0.250 to 10.0.1.5.
+        let t = range_targets(ip(250), Ipv4Addr::new(10, 0, 1, 5)).unwrap();
+        assert_eq!((t.len(), t[6], t[11]), (12, Ipv4Addr::new(10, 0, 1, 0), Ipv4Addr::new(10, 0, 1, 5)));
+        // 1024 addresses at most; the top of the address space is no overflow.
+        assert_eq!(range_targets(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(10, 0, 3, 255)).unwrap().len(), 1024);
+        assert!(range_targets(Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(10, 0, 4, 0)).is_err());
+        assert_eq!(range_targets(Ipv4Addr::new(255, 255, 255, 250), Ipv4Addr::BROADCAST).unwrap().len(), 6);
     }
 
     #[test]

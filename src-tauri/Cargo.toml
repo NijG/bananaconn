@@ -1,6 +1,6 @@
 [package]
 name = "bananaconn"
-version = "0.7.59"
+version = "0.7.60"
 description = "Personal all-in-one remote terminal: SSH, Telnet, SFTP, FTP, FTPS, RDP, VNC"
 authors = ["BananaConn contributors"]
 license = "MIT"
@@ -41,10 +41,13 @@ russh-sftp = "3"
 suppaftp = { version = "6", features = ["rustls", "deprecated"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
+# The network tools' certificate check reads the certificate a server offers
+# (the same version libunftp already brings in).
+x509-parser = "0.18"
 # In-process SSH key generation (same version russh already uses) and secure tokens.
 rand = "0.10"
 # Drive enumeration without touching (possibly disconnected) drives.
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging", "Win32_Devices_Communication", "Win32_System_IO", "Win32_System_Pipes", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging", "Win32_Devices_Communication", "Win32_System_IO", "Win32_System_Pipes", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_NetworkManagement_Dns"] }
 # Credential vault backed by Windows Credential Manager.
 keyring = { version = "3", features = ["windows-native"] }
 # Built-in FTP server (share a local folder over FTP/FTPS).

@@ -22,6 +22,20 @@ export function modeOf(perm: string | null | undefined): number | null {
   return mode;
 }
 
+/** A mode as "ls -l" writes it after the file type ("rwsr-xr-x"): the
+ * inverse of modeOf. setuid and setgid show as s (S without execute), the
+ * sticky bit as t (T without execute). */
+export function permString(mode: number): string {
+  return [0o4000, 0o2000, 0o1000]
+    .map((special, i) => {
+      const bits = (mode >> (6 - 3 * i)) & 7;
+      const x = bits & 1;
+      const mark = i === 2 ? (x ? "t" : "T") : x ? "s" : "S";
+      return `${bits & 4 ? "r" : "-"}${bits & 2 ? "w" : "-"}${mode & special ? mark : x ? "x" : "-"}`;
+    })
+    .join("");
+}
+
 /** The mode as chmod takes it: three digits, four with setuid, setgid or
  * sticky ("4755"). */
 export const octal = (mode: number) => (mode > 0o777 ? mode.toString(8).padStart(4, "0") : mode.toString(8).padStart(3, "0"));

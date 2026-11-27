@@ -9,9 +9,11 @@ import { icon } from "../icons";
 import { actionFor, keyHint, withKey } from "../keymap";
 import { defaultPort, DRAG_FROM_THIS_APP, endpoint, PROTOCOLS, REMOTE_PATHS_DRAG, type Session } from "../model";
 import { natural } from "../sessionOrder";
-import { patchSession, reloadCredentials, state as store, takeSavedSession } from "../store";
+import { patchSession, reloadCredentials, saveLocal, state as store, takeSavedSession } from "../store";
 import { forgetHostKey } from "../hostKeys";
-import { canOsNotify, choiceDialog, ensureNotifyPermission, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, toast, setPressed, type MenuItem } from "../ui";
+import { canOsNotify, choiceDialog, ensureNotifyPermission, confirmDialog, contextMenu, errorText, esc, formatBytes, formatDate, h, markTerms, matchesTerms, modal, osNotify, promptDialog, requestAttention, searchTerms, timestamp, toast, setPressed, type MenuItem } from "../ui";
+import { shellQuote } from "../shellQuote";
+import { archiveCommands } from "../archiveCommands";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
 import type { EditorHost, EditorView } from "./editor";
 import { onLanguageApplied, tr, userText } from "../i18n";
@@ -20,7 +22,10 @@ import { hasPendingDiff, openDiff, pendingTitle, takeForDiff, type DiffSide } fr
 /** The file last taken for a comparison (Pane.fileKey), to tell it from another of the same name. */
 let takenKey: string | null = null;
 import { notesButton } from "../sessionNotes";
-import { installFor, unitReloadFor } from "../shebang";
+import { installFor, statusUnitOf, unitReloadFor } from "../shebang";
+import { fileTabName, fileTabServer } from "../transfer";
+import { askGrep, GREP_PUT } from "../grepPrompt";
+import { grepUnsupported } from "../grepCommand";
 
 type Side = "local" | "remote";
 type ConnectExtra = { password?: string; trustedFingerprint?: string; allowInvalidCert?: boolean; trustedCert?: string };
@@ -54,8 +59,33 @@ interface Job {
   el: HTMLElement;
 }
 
+/** An archive's menu items (archiveCommands): its listing and its unpacking
+ * beside it, each put on the SSH terminal's input line by `offer`. */
+function archiveItems(path: string, kind: string | undefined, offer: (command: string, said: string) => void): MenuItem[] {
+  const c = archiveCommands(path, kind);
+  if (!c) return [];
+  return [
+    { label: "압축 파일 내용 보기", icon: "FileSearch", hint: c.tool, action: () => offer(c.list, "터미널에 내용 보기 명령을 넣었습니다. Enter를 눌러 실행하세요") },
+    {
+      label: "같은 폴더에 압축 풀기",
+      icon: "FolderOpen",
+      hint: c.tool,
+      action: () =>
+        offer(
+          c.extract,
+          c.tool === "tar"
+            ? "터미널에 압축 풀기 명령을 넣었습니다. Enter를 누르면 같은 폴더에 풉니다 (이미 있는 파일은 바꾸지 않습니다)"
+            : "터미널에 압축 풀기 명령을 넣었습니다. Enter를 누르면 같은 폴더에 풉니다 (이미 있는 파일은 바꿀지 묻습니다)",
+        ),
+    },
+  ];
+}
+
 /** No progress for this long: the speed and time left give way to how long it has been still. */
 const STALL_MS = 5000;
+
+/** A Unix server's kernel views, passed over by a folder walk met on its way (walkSkips). */
+const PSEUDO_FS = new Set(["/proc", "/sys", "/dev"]);
 const stalledFor = (j: Job) => (j.seenAt === undefined ? 0 : Date.now() - j.seenAt);
 
 /** The time left at `rate` bytes per second: "0:42", "1:05:00". */
@@ -768,7 +798,7 @@ class Pane {
     this.el.querySelector('[data-p="bookmarks"]')?.addEventListener("click", () => this.bookmarkMenu());
     this.el.querySelector('[data-p="hidden"]')!.addEventListener("click", () => {
       Pane.showHidden = !Pane.showHidden;
-      localStorage.setItem("bx.showHidden", Pane.showHidden ? "1" : "0");
+      saveLocal("bx.showHidden", Pane.showHidden ? "1" : "0");
       this.owner.onHiddenToggled();
     });
     this.pathInput.addEventListener("keydown", (e) => {
@@ -891,6 +921,16 @@ class Pane {
         ? [
             { label: "편집", icon: "FileText", hint: "더블클릭", disabled: target.size > EDITOR_MAX, action: () => this.owner.openEditor(target) },
             { label: "내 PC 앱으로 열어 편집", icon: "ExternalLink", hint: "저장하면 자동 업로드", action: () => this.owner.editRemote(target) },
+            // A dated copy beside it before a change ("cp -p" keeps its mode and
+            // time), on the SSH terminal's input line. Not a Windows server's shell.
+            ...(this.owner.hasShellBeside && (this.owner.terminal as { device?: { kind?: string } } | undefined)?.device?.kind !== "windows"
+              ? [
+                  { label: "백업 사본 만들기 (cp -p)", icon: "CopyPlus", hint: ".bak-날짜", action: () => this.backupCopy(target.path) },
+                  // A log to watch as it grows, as from a search's result.
+                  { label: "터미널에서 끝부분 계속 보기", icon: "SquareTerminal", hint: "tail -f", action: () => this.followInTerminal(target.path) },
+                  ...archiveItems(target.path, (this.owner.terminal as { device?: { kind?: string } } | undefined)?.device?.kind, (command, said) => this.owner.offerInTerminal(command, target.path, false, said)),
+                ]
+              : []),
           ]
         : []),
       {
@@ -907,6 +947,19 @@ class Pane {
       // The folder clicked, else the one shown: which subfolder takes the space.
       // Not on the list of drives (no folder open): that would be every disk.
       { label: "하위 폴더에서 이름으로 찾기…", icon: "Search", disabled: !target?.isDir && !this.path, action: () => void this.findByName(target?.isDir ? target.path : this.path) },
+      // What changed lately (before a service broke): newest first, by the server's times.
+      // Not over FTP: its listing's times have no time zone (hours off) and
+      // may have no year, so "the last hour" cannot be told from them.
+      ...(remote && this.owner.isFtp
+        ? []
+        : [{ label: "하위 폴더에서 최근 바뀐 파일 찾기…", icon: "History", disabled: !target?.isDir && !this.path, action: () => void this.findRecent(target?.isDir ? target.path : this.path) }]),
+      // What fills a disk: one by one, the largest first ("폴더 크기" totals per folder).
+      { label: "하위 폴더에서 큰 파일 찾기", icon: "HardDrive", disabled: !target?.isDir && !this.path, action: () => void this.findLargest(target?.isDir ? target.path : this.path) },
+      // Text inside the files: grep in the SSH shell beside, whose "path:line:"
+      // results open at that line when Ctrl+clicked there.
+      ...(remote && this.owner.hasShellBeside && !grepUnsupported((this.owner.terminal as { device?: { kind?: string } } | undefined)?.device?.kind)
+        ? [{ label: "하위 폴더에서 내용 찾기 (grep)…", icon: "FileSearch", disabled: !target?.isDir && !this.path, action: () => void this.grepIn(target?.isDir ? target.path : this.path) }]
+        : []),
       { label: "폴더 크기 계산", icon: "HardDrive", disabled: !target?.isDir && !this.path, action: () => this.folderSize(target?.isDir ? target : { name: this.path.split(/[\\/]/).filter(Boolean).pop() || this.path, path: this.path, isDir: true, isLink: false, size: 0, modified: null, perm: null }) },
       this.compareItem(sel),
       // An image checked against its vendor's published value before it goes up.
@@ -967,12 +1020,15 @@ class Pane {
     /** Why the walk ended early at a failed listing (walkStopsOnFailure). */
     let cut = "";
     let entries = 0;
+    /** Kernel views passed over (walkSkips): not counted, said with the total. */
+    const skipped = new Set<string>();
     const counts = () => [tr(`파일 ${files}개`), tr(`폴더 ${dirs}개`), formatBytes(bytes)].join(" · ");
     let shownAt = 0;
     const show = (done: boolean) => {
       const extra = [
         ...(failed ? [tr(`목록을 읽지 못한 폴더 ${failed}개`)] : []),
         ...(entries >= LIMIT ? [tr(`항목 ${LIMIT}개에서 멈췄습니다 (실제는 더 큼)`)] : []),
+        ...(skipped.size ? [tr(`가상 파일 시스템은 건너뛰었습니다: ${userText([...skipped].join(", "))}`)] : []),
       ];
       stateEl.innerHTML = done
         ? `<b>${esc(tr(`합계 ${formatBytes(bytes)}`))}</b> <span class="muted">${esc([counts(), ...extra].join(" · "))}</span>`
@@ -992,6 +1048,10 @@ class Pane {
         for (const e of await list(target.path)) {
           entries++;
           if (e.isLink) continue;
+          if (e.isDir && this.walkSkips(e.path)) {
+            skipped.add(e.path);
+            continue;
+          }
           if (e.isDir) {
             dirs++;
             buckets.set(e.name, buckets.get(e.name) ?? { bytes: 0, files: 0, path: e.path });
@@ -1029,6 +1089,10 @@ class Pane {
         for (const e of got) {
           entries++;
           if (e.isLink) continue;
+          if (e.isDir && this.walkSkips(e.path)) {
+            skipped.add(e.path);
+            continue;
+          }
           if (e.isDir) {
             dirs++;
             queue.push({ path: e.path, bucket });
@@ -1060,24 +1124,125 @@ class Pane {
     return this.side !== "local" && (this.owner.isFtp || this.owner.state !== "connected");
   }
 
+  /** Whether a folder walk (size, find) passes over this folder met on the
+   * way: a Unix server's kernel views (/proc, /sys, /dev), whose "files" are
+   * not on any disk (/proc/kcore reads as about 128 TB) and whose many
+   * entries would use up the walk. Only when met inside a walk started above
+   * them: one started there lists them. */
+  private walkSkips(path: string): boolean {
+    // A walk started at "//" lists "//proc": the same folder.
+    return this.side !== "local" && PSEUDO_FS.has(path.replace(/\/{2,}/g, "/"));
+  }
+
+  /** Whether a file of this pane can be followed with "tail -f" in the
+   * terminal beside: a server's, with its SSH shell there, not a Windows
+   * one's (no tail there; as the backup copy). */
+  private canFollow(): boolean {
+    // The shells the terminal puts a command for (its notAShellLine), or one not recognised yet.
+    const kind = (this.owner.terminal as { device?: { kind?: string } } | undefined)?.device?.kind;
+    return this.side === "remote" && this.owner.hasShellBeside && (!kind || ["linux", "aix", "hpux", "solaris"].includes(kind));
+  }
+
+  /** "tail -f" of the file put on the terminal's input line; Enter is the
+   * user's. Plain "tail -f" (every Unix's tail has it), "--" before the
+   * path as the terminal's own offer writes it. False when it could not go
+   * there (said why). */
+  private followInTerminal(path: string): boolean {
+    return this.owner.offerInTerminal("tail -f -- {}", path, false, "터미널에 tail -f 명령을 넣었습니다. Enter를 누르면 파일 끝부분을 계속 보여 주고, Ctrl+C로 멈춥니다");
+  }
+
+  /** "cp -p file file.bak-YYYYMMDD_HHMMSS" on the SSH terminal's input line
+   * beside: the copy goes next to the file, keeping its mode and times;
+   * Enter (and sudo, where the folder is not the user's) is the user's. The
+   * copy's name is the file's own with a safe suffix, so it quotes as safely
+   * as the path offerCheck checks. */
+  private backupCopy(path: string) {
+    this.owner.offerInTerminal(`cp -p {} ${shellQuote(`${path}.bak-${timestamp()}`)}`, path, false, "터미널에 백업 명령을 넣었습니다. Enter를 누르면 같은 폴더에 사본을 만듭니다 (권한이 없으면 앞에 sudo를 붙이세요)");
+  }
+
+  /** Text inside the files under a server folder (askGrep), on the SSH
+   * terminal's input line beside (Enter is the user's). */
+  private async grepIn(folder: string) {
+    const command = await askGrep();
+    if (command) this.owner.offerInTerminal(command, folder, false, GREP_PUT);
+  }
+
   /** Files and folders under `folder` whose names hold the words asked for
-   * (as the pane's filter reads them: every word, any case), folder by
-   * folder as "폴더 크기" goes: links are not followed, a folder that cannot
-   * be read is counted, and it ends at Stop, on closing, past LIMIT entries
-   * looked at or MAX found. A result opens its folder with the name in the
-   * filter (the editor for a text file is one double-click away there). */
+   * (as the pane's filter reads them: every word, any case), walked by
+   * walkFind. A result opens its folder with the name in the filter (the
+   * editor for a text file is one double-click away there). */
   private async findByName(folder: string) {
     const res = await promptDialog({ title: "이름으로 찾기", label: "찾을 이름 (일부만 써도 되고, 여러 낱말이면 모두 포함)", icon: "Search", confirm: "찾기 시작" });
     const terms = searchTerms(res?.value ?? "");
     if (!terms.length) return;
-    const LIMIT = 200_000;
-    const MAX = 500;
-    let stopped = false;
-    const m = modal({
+    await this.walkFind(folder, {
       title: "이름으로 찾기",
       icon: "Search",
+      asked: res!.value.trim(),
+      match: (e) => matchesTerms(e.name.toLowerCase(), terms),
+      mark: (name) => markTerms(name, terms),
+    });
+  }
+
+  /** The files changed lately under a folder, the newest first: what was
+   * touched before a service broke (a configuration, a log that grew). By
+   * the server's own times (its clock may differ from this PC's). */
+  private async findRecent(folder: string) {
+    const periods = [
+      // What just changed, a service having gone wrong a moment ago.
+      { value: "600", label: "지난 10분" },
+      { value: "3600", label: "지난 1시간" },
+      { value: "86400", label: "지난 24시간" },
+      { value: "604800", label: "지난 7일" },
+    ];
+    const picked = await choiceDialog({ title: "최근 바뀐 파일 찾기", icon: "History", message: esc("하위 폴더까지 살펴 이 기간에 바뀐 파일을 최근 것부터 보여 줍니다."), choices: periods, width: 620 });
+    if (!picked) return;
+    const since = Date.now() / 1000 - Number(picked);
+    await this.walkFind(folder, {
+      title: "최근 바뀐 파일 찾기",
+      icon: "History",
+      asked: tr(periods.find((p) => p.value === picked)!.label),
+      match: (e) => !e.isDir && e.modified !== null && e.modified >= since,
+      mark: esc,
+      top: "newest",
+    });
+  }
+
+  /** The largest files under a folder, the largest first: what fills a disk
+   * (a log never rotated, a core dump, a forgotten backup). */
+  private async findLargest(folder: string) {
+    await this.walkFind(folder, {
+      title: "큰 파일 찾기",
+      icon: "HardDrive",
+      asked: tr("크기순"),
+      // Links left out: the file they point to is listed where it lies (over
+      // SFTP a link carries its target's size, so it would be there twice).
+      match: (e) => !e.isDir && !e.isLink,
+      mark: esc,
+      top: "largest",
+    });
+  }
+
+  /** Walks a folder's subfolders (breadth first, links not followed) for
+   * the entries `match` lets through, shown as they are found; a row goes to
+   * its folder with the entry filtered. `top`: the whole tree is walked and
+   * only the MAX first by it kept: the latest ("newest", with their times)
+   * or the largest. */
+  private async walkFind(
+    folder: string,
+    opts: { title: string; icon: string; asked: string; match: (e: FileEntry) => boolean; mark: (name: string) => string; top?: "newest" | "largest" },
+  ) {
+    const LIMIT = 200_000;
+    const MAX = 500;
+    const top = opts.top;
+    const newest = top === "newest";
+    const rank = (e: FileEntry) => (top === "largest" ? e.size : (e.modified ?? 0));
+    let stopped = false;
+    const m = modal({
+      title: opts.title,
+      icon: opts.icon,
       width: 640,
-      body: `<p class="muted small mono" data-i18n-skip>${esc(folder)} · ${esc(res!.value.trim())}</p>
+      body: `<p class="muted small mono" data-i18n-skip>${esc(folder)} · ${esc(opts.asked)}</p>
         <p data-fs-state><span class="spinner sm"></span> <span>찾는 중...</span></p>
         <div class="fs-list" data-fs-list></div>`,
       footer: `<button class="btn" data-stop>${icon("Square", 14)}중지</button><button class="btn btn-primary" data-close>닫기</button>`,
@@ -1093,6 +1258,46 @@ class Pane {
       const row = (e.target as HTMLElement).closest<HTMLElement>("[data-dir]");
       if (!row) return;
       e.preventDefault();
+      goTo(row);
+    });
+    // A row's menu: its full path copied (a large file to remove or compress
+    // in the terminal), or its folder opened as a click does.
+    listEl.addEventListener("contextmenu", (e) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>("[data-dir]");
+      if (!row) return;
+      e.preventDefault();
+      const path = row.dataset.path!;
+      // A file on a server with its SSH terminal beside (a log found changing,
+      // or growing): "tail -f" put on that terminal's input line, the window
+      // closed; Enter is the user's. Plain "tail -f": every Unix's tail has it.
+      const follow = this.canFollow() && row.hasAttribute("data-file");
+      contextMenu(e.clientX, e.clientY, [
+        { label: "경로 복사", icon: "Copy", hint: row.dataset.name, userHint: true, action: () => void writeClipboard(path) },
+        { label: "이 폴더로 이동", icon: "FolderOpen", action: () => goTo(row) },
+        ...(follow
+          ? [
+              {
+                label: "터미널에서 끝부분 계속 보기",
+                icon: "SquareTerminal",
+                hint: "tail -f",
+                // The results kept when it could not go to the terminal (a busy
+                // prompt, a "!" in the name). Once there, the window closed and
+                // the keyboard left with the terminal (closing gives it back to
+                // the file list), so Enter runs it.
+                action: () => {
+                  if (!this.followInTerminal(path)) return;
+                  m.close();
+                  // Again on the next frame: the tab switch may settle focus after this.
+                  const term = this.owner.terminal as { focus?(): void } | undefined;
+                  term?.focus?.();
+                  requestAnimationFrame(() => term?.focus?.());
+                },
+              },
+            ]
+          : []),
+      ]);
+    });
+    const goTo = (row: HTMLElement) => {
       m.close();
       // Once there (a new folder's listing clears the filter first), and
       // only if it is there: not on the folder shown when it could not be read.
@@ -1113,9 +1318,13 @@ class Pane {
         }
         this.render();
       });
-    });
+    };
     const list = (path: string) => (this.side === "local" ? api.localList(path) : api.remoteList(this.owner.remoteId, path));
     const found: { entry: FileEntry; dir: string }[] = [];
+    /** All that matched (with `top`: more than the MAX kept). */
+    let matched = 0;
+    /** Kernel views passed over (walkSkips), said with the result. */
+    const skipped = new Set<string>();
     let entries = 0;
     let failed = 0;
     /** Why the walk ended early at a failed listing (walkStopsOnFailure). */
@@ -1124,10 +1333,15 @@ class Pane {
     const show = (done: boolean) => {
       const extra = [
         ...(failed ? [tr(`목록을 읽지 못한 폴더 ${failed}개`)] : []),
-        ...(found.length >= MAX ? [tr(`찾은 항목 ${MAX}개에서 멈췄습니다`)] : []),
+        ...(!top && found.length >= MAX ? [tr(`찾은 항목 ${MAX}개에서 멈췄습니다`)] : []),
+        ...(newest && matched > MAX ? [tr(`가장 최근 ${MAX}개만 보여 줍니다`)] : []),
+        ...(top === "largest" && matched > MAX ? [tr(`가장 큰 ${MAX}개만 보여 줍니다`)] : []),
+        // What the files listed take in all: what removing or compressing them frees.
+        ...(top === "largest" && found.length ? [tr(`보이는 파일 합계 ${formatBytes(found.reduce((n, f) => n + f.entry.size, 0))}`)] : []),
         ...(entries >= LIMIT ? [tr(`항목 ${LIMIT}개까지 살펴보고 멈췄습니다`)] : []),
+        ...(skipped.size ? [tr(`가상 파일 시스템은 건너뛰었습니다: ${userText([...skipped].join(", "))}`)] : []),
       ];
-      const count = tr(`찾은 항목 ${found.length}개`);
+      const count = tr(`찾은 항목 ${matched}개`);
       stateEl.innerHTML = done
         ? `<b>${esc(count)}</b>${extra.length ? ` <span class="muted">${esc(extra.join(" · "))}</span>` : ""}`
         : `<span class="spinner sm"></span> <span>${esc(count)}</span>`;
@@ -1135,7 +1349,9 @@ class Pane {
         ? `<table class="nettools-table"><tbody>${found
             .map(
               ({ entry, dir }) =>
-                `<tr class="fs-row" data-dir="${esc(dir)}" data-name="${esc(entry.name)}" title="${esc(tr("이 폴더로 이동"))}"><td class="fs-name" data-i18n-skip>${icon(entry.isDir ? "Folder" : "FileText", 13)}<span>${markTerms(entry.name, terms)}</span></td><td class="muted small mono" data-i18n-skip>${esc(dir)}</td><td>${entry.isDir ? "" : formatBytes(entry.size)}</td></tr>`,
+                `<tr class="fs-row" data-dir="${esc(dir)}" data-name="${esc(entry.name)}" data-path="${esc(entry.path)}"${entry.isDir ? "" : " data-file"} title="${esc(tr("이 폴더로 이동"))}"><td class="fs-name" data-i18n-skip>${icon(entry.isDir ? "Folder" : "FileText", 13)}<span>${opts.mark(entry.name)}</span></td><td class="muted small mono" data-i18n-skip>${esc(dir)}</td>${
+                  newest ? `<td class="muted small mono fs-when" data-i18n-skip>${formatDate(entry.modified)}</td>` : ""
+                }<td>${entry.isDir ? "" : formatBytes(entry.size)}</td></tr>`,
             )
             .join("")}</tbody></table>`
         : done
@@ -1143,7 +1359,12 @@ class Pane {
           : "";
     };
     const queue = [folder];
-    while (queue.length && !stopped && entries < LIMIT && found.length < MAX) {
+    // The first MAX by `top` of all matched: sorted and cut now and then, not per entry.
+    const keepTop = () => {
+      found.sort((a, b) => rank(b.entry) - rank(a.entry) || a.entry.path.localeCompare(b.entry.path));
+      if (found.length > MAX) found.length = MAX;
+    };
+    while (queue.length && !stopped && entries < LIMIT && (top || found.length < MAX)) {
       const dir = queue.shift()!;
       let got: FileEntry[];
       try {
@@ -1165,16 +1386,25 @@ class Pane {
       }
       for (const e of got) {
         entries++;
-        if (matchesTerms(e.name.toLowerCase(), terms) && found.length < MAX) found.push({ entry: e, dir });
-        if (e.isDir && !e.isLink) queue.push(e.path);
+        if (opts.match(e) && (top || found.length < MAX)) {
+          matched++;
+          found.push({ entry: e, dir });
+          if (top && found.length >= MAX * 2) keepTop();
+        }
+        if (e.isDir && !e.isLink) {
+          if (this.walkSkips(e.path)) skipped.add(e.path);
+          else queue.push(e.path);
+        }
       }
       if (Date.now() - shownAt > 200) {
         shownAt = Date.now();
+        if (top) keepTop();
         show(false);
       }
     }
     if (!m.root.isConnected) return;
     stopBtn.hidden = true;
+    if (top) keepTop();
     show(true);
     if (stopped) stateEl.insertAdjacentHTML("beforeend", ` <span class="muted">· ${esc(tr("중지했습니다"))}</span>`);
     if (cut) stateEl.insertAdjacentHTML("beforeend", ` <span class="danger-text">· ${esc(tr(`목록을 읽지 못해 멈췄습니다: ${userText(cut)}`))}</span>`);
@@ -1495,11 +1725,12 @@ export class FilesView implements View, EditorHost {
 
   /** A command about the file at `path` put on the SSH terminal's input line
    * ("{}" in it is the quoted path), and `said` told once it is there. */
-  offerInTerminal(command: string, path: string, sudo: boolean, said: string) {
+  offerInTerminal(command: string, path: string, sudo: boolean, said: string): boolean {
     const term = this.terminal as (View & { offerCheck?(command: string, path: string, sudo: boolean): boolean }) | undefined;
-    if (!term?.offerCheck) return void toast("옆에 SSH 터미널이 없어 명령을 넣을 수 없습니다", "warn", 5000);
-    if (!term.offerCheck(command, path, sudo)) return;
+    if (!term?.offerCheck) return void toast("옆에 SSH 터미널이 없어 명령을 넣을 수 없습니다", "warn", 5000), false;
+    if (!term.offerCheck(command, path, sudo)) return false;
     toast(said, "info", 8000);
+    return true;
   }
 
   /** The SFTP login is root's (a command on its server needs no sudo). */
@@ -1519,7 +1750,7 @@ export class FilesView implements View, EditorHost {
    * sudoers, checked and rolled back as installFor says; for a
    * system unit file, "&& sudo systemctl daemon-reload" after it. */
   async sudoSave(path: string, text: string, bom: boolean) {
-    const term = this.terminal as (View & { sudoCopy?(from: string, to: string, steps?: { install?: (copy: string, file: string) => string; then?: string }): boolean }) | undefined;
+    const term = this.terminal as (View & { sudoCopy?(from: string, to: string, steps?: { install?: (copy: string, file: string) => string; then?: string; status?: string }): boolean }) | undefined;
     if (!term?.sudoCopy) return;
     if (this.state !== "connected") return void toast("서버에 연결된 다음 열 수 있습니다", "warn");
     const name = (path.split("/").pop() || "file").replace(/[^\w.-]/g, "_");
@@ -1537,7 +1768,9 @@ export class FilesView implements View, EditorHost {
       return void toast(`사본을 만들지 못했습니다: ${errorText(err)}`, "error", 8000);
     }
     const reload = unitReloadFor(path, this.userHome);
-    const steps = { install: installFor(path, text) ?? undefined, then: reload?.system ? reload.command : undefined };
+    // After a system unit's reload, its status (as the editor's "daemon-reload 넣기").
+    const unit = reload?.system ? statusUnitOf(path) : null;
+    const steps = { install: installFor(path, text) ?? undefined, then: reload?.system ? reload.command : undefined, status: unit?.name };
     if (!term.sudoCopy(copy, path, steps)) return void api.remoteOp(this.remoteId, "delete", copy).catch(() => {});
     // Not run (or refused by sudo), the copy stays: said, as it holds the text.
     if (steps.install)
@@ -1631,10 +1864,18 @@ export class FilesView implements View, EditorHost {
     this.remotePane = new Pane("remote", this);
     // Rows hold words kept from the page translation (a link's badge): drawn
     // again once a new language is in place.
+    // A quick tab's name as this app made it ("web · Files"), followed into
+    // the new language; a name the user gave stays as it is.
+    let named = session.id.startsWith("quick-") ? { server: fileTabServer(session.name), as: session.name } : null;
     this.unsubscribeLang = onLanguageApplied(() => {
       if (this.disposed) return;
       this.localPane.render();
       this.remotePane.render();
+      if (named?.server != null && this.session.name === named.as) {
+        this.session.name = fileTabName(named.server);
+        named = { server: named.server, as: this.session.name };
+        this.ws.changed();
+      }
     });
     const panes = this.el.querySelector(".panes")!;
     panes.append(this.localPane.el, this.remotePane.el);
@@ -1694,23 +1935,25 @@ export class FilesView implements View, EditorHost {
   }
 
   /** A path asked for before the connection was up; the latest one only. */
-  private pendingPath: { path: string; line?: number } | null = null;
+  private pendingPath: { path: string; line?: number; download?: boolean } | null = null;
 
   /** A server path named elsewhere (a path clicked in the terminal beside):
-   * a folder opened in the server pane, a file in the editor. Kept until
-   * this tab is connected when it is still connecting. */
-  openPath(path: string, line?: number) {
+   * a folder opened in the server pane, a file in the editor; with
+   * `download`, sent to the folder open on the PC side instead (the same
+   * transfer as dragging it there: asks before overwriting). Kept until this
+   * tab is connected when it is still connecting. */
+  openPath(path: string, line?: number, download = false) {
     if (this.state === "connecting") {
-      this.pendingPath = { path, line };
+      this.pendingPath = { path, line, download };
       return;
     }
     // Down or failed: said now, not opened whenever it is reconnected later.
     if (this.state !== "connected") return void toast("서버에 연결된 다음 열 수 있습니다", "warn");
-    void this.showPath(path, line);
+    void this.showPath(path, line, download);
   }
 
   /** `line`: a file's line to show (grep's "path:12:"). */
-  private async showPath(path: string, line?: number) {
+  private async showPath(path: string, line?: number, download = false) {
     let entry: FileEntry | null | undefined;
     try {
       // Over SFTP the path itself (its folder may be one that can be passed
@@ -1726,6 +1969,15 @@ export class FilesView implements View, EditorHost {
     }
     if (this.disposed) return;
     if (!entry) return void toast(`서버에 없는 경로입니다: ${userText(path)}`, "warn", 5000);
+    if (download) {
+      this.ws.focusView(this);
+      // Where it went said once this request queued it (send may skip it, or
+      // the overwrite question be cancelled; it tells those itself).
+      const queued = { count: 0, dir: "" };
+      await this.send("remote", [entry], queued);
+      if (queued.count) toast(`내 PC의 ${userText(queued.dir)} 폴더로 받습니다`, "info", 4000);
+      return;
+    }
     if (entry.isDir) {
       await this.remotePane.load(path);
       return void this.ws.focusView(this);
@@ -2051,7 +2303,7 @@ export class FilesView implements View, EditorHost {
       // A path asked for while this tab was still connecting (a terminal's).
       const waiting = this.pendingPath;
       this.pendingPath = null;
-      if (waiting && !this.disposed && rid === this.remoteId) void this.showPath(waiting.path, waiting.line);
+      if (waiting && !this.disposed && rid === this.remoteId) void this.showPath(waiting.path, waiting.line, waiting.download);
     } catch (err) {
       if (this.disposed || rid !== this.remoteId) return;
       await this.handleConnectError(errorText(err), extra);
@@ -2311,7 +2563,8 @@ export class FilesView implements View, EditorHost {
     return same;
   }
 
-  async send(from: Side, entries: FileEntry[]) {
+  /** `queued`: told how many transfers this call queued, and to which folder. */
+  async send(from: Side, entries: FileEntry[], queued?: { count: number; dir: string }) {
     if (this.state !== "connected") return toast("서버에 연결된 다음 전송할 수 있습니다", "warn");
     const to = from === "local" ? "remote" : "local";
     const dest = this.pane(to);
@@ -2429,6 +2682,10 @@ export class FilesView implements View, EditorHost {
         el: h("div", { class: "job" }),
       };
       jobs.set(job.id, { job, view: this });
+      if (queued) {
+        queued.count++;
+        queued.dir = destDir;
+      }
       this.queue.push(job);
       this.active++;
       this.jobsEl.prepend(job.el);

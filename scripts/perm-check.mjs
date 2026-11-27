@@ -6,7 +6,7 @@
 //
 // Needs Node.js 23.6 or later (it imports the TypeScript directly).
 
-import { findPerms, lacksExecute, modeOf, octal, SCRIPT_NAME, withExecute } from "../src/remotePerm.ts";
+import { findPerms, lacksExecute, modeOf, octal, permString, SCRIPT_NAME, withExecute } from "../src/remotePerm.ts";
 
 let failed = 0;
 const check = (what, got, want) => {
@@ -79,6 +79,28 @@ for (const [name, want] of [
   ["install.sh", true], ["RUN.SH", true], ["a.bash", true], ["b.ksh", true], ["c.zsh", true], ["d.csh", true], ["e.pl", true], ["f.py", true], ["g.awk", true],
   ["sh", false], ["notes.shx", false], ["config.yml", false], ["a.sh.bak", false], ["x.pyc", false], ["Makefile", false],
 ]) check(`script ${name}`, SCRIPT_NAME.test(name), want);
+
+// A mode written as "ls -l" does: s/S for setuid and setgid, t/T for sticky.
+for (const [mode, want] of [
+  [0o755, "rwxr-xr-x"],
+  [0o644, "rw-r--r--"],
+  [0o600, "rw-------"],
+  [0o4755, "rwsr-xr-x"],
+  [0o4644, "rwSr--r--"],
+  [0o2755, "rwxr-sr-x"],
+  [0o2745, "rwxr-Sr-x"],
+  [0o1777, "rwxrwxrwt"],
+  [0o1776, "rwxrwxrwT"],
+  [0o7777, "rwsrwsrwt"],
+  [0, "---------"],
+]) check(`permString ${mode.toString(8)}`, permString(mode), want);
+// The inverse of modeOf for every mode.
+for (let mode = 0; mode <= 0o7777; mode++) {
+  if (modeOf(`-${permString(mode)}`) !== mode) {
+    check(`permString round trip ${mode.toString(8)}`, modeOf(`-${permString(mode)}`), mode);
+    break;
+  }
+}
 
 console.log(failed ? `${failed} problem(s)` : "permissions read and changed as expected");
 process.exit(failed ? 1 : 0);

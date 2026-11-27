@@ -120,6 +120,14 @@ try {
 struct Running {
     stop: watch::Sender<bool>,
     task: tauri::async_runtime::JoinHandle<()>,
+    /// The share's token: its events carry it, and a stop names it.
+    share: String,
+}
+
+/// The running share, if it is the one named: a dialog that let its share go
+/// on in the background must not stop a newer dialog's share later.
+fn take_if_current(slot: &mut Option<Running>, share: &str) -> Option<Running> {
+    if slot.as_ref().is_some_and(|r| r.share == share) { slot.take() } else { None }
 }
 
 #[derive(Default)]
@@ -136,6 +144,8 @@ pub struct KitInfo {
     pub admin_line: String,
     /// Whether the address was found from the route to the target.
     pub routed: bool,
+    /// This share's token, carried by its "ssh-kit" events and named by ssh_kit_stop.
+    pub share: String,
 }
 
 /// The first IPv4 address of `target` (port 22). Resolved by tokio, off the
@@ -190,16 +200,16 @@ pub async fn ssh_kit_start(app: AppHandle, state: State<'_, SshKitState>, target
     let url = format!("http://{ip}:{port}/{token}");
     let cache = app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("openssh-kit");
     let (stop, stopped) = watch::channel(false);
-    let share = Arc::new(Share { app: Some(app.clone()), token, base: url.clone(), cache, fetching: tokio::sync::Mutex::new(()) });
+    let share = Arc::new(Share { app: Some(app.clone()), token: token.clone(), base: url.clone(), cache, fetching: tokio::sync::Mutex::new(()) });
     let task = tauri::async_runtime::spawn(serve(listener, share, stopped));
     // A start running in parallel may have registered its share meanwhile:
     // this one replaces it, and it must not keep serving unseen.
-    let replaced = state.0.lock().unwrap().replace(Running { stop, task });
+    let replaced = state.0.lock().unwrap().replace(Running { stop, task, share: token.clone() });
     if let Some(replaced) = replaced {
         let _ = replaced.stop.send(true);
     }
     let (run_line, admin_line) = lines_for(&url);
-    Ok(KitInfo { url, run_line, admin_line, routed: found.is_some() })
+    Ok(KitInfo { url, run_line, admin_line, routed: found.is_some(), share: token })
 }
 
 /// The netsh commands that let `remote` (an IPv4 address) reach the share's
@@ -247,8 +257,8 @@ fn allow_script(commands: &str) -> String {
 }
 
 #[tauri::command]
-pub fn ssh_kit_stop(state: State<'_, SshKitState>) {
-    if let Some(running) = state.0.lock().unwrap().take() {
+pub fn ssh_kit_stop(state: State<'_, SshKitState>, share: String) {
+    if let Some(running) = take_if_current(&mut state.0.lock().unwrap(), &share) {
         let _ = running.stop.send(true);
     }
 }
@@ -265,7 +275,7 @@ struct Share {
 impl Share {
     fn emit(&self, kind: &str, text: &str) {
         if let Some(app) = &self.app {
-            let _ = app.emit("ssh-kit", json!({ "kind": kind, "text": text }));
+            let _ = app.emit("ssh-kit", json!({ "kind": kind, "text": text, "share": self.token }));
         }
     }
 }
@@ -471,6 +481,18 @@ mod tests {
         let s = allow_script(&allow_commands("12.0.0.9", 47622).unwrap());
         assert!(s.starts_with("$ErrorActionPreference = 'Stop'; try {"), "{s}");
         assert!(s.contains("catch { exit 1 }; if (-not $p) { exit 1 }; exit $p.ExitCode"), "{s}");
+    }
+
+    /// An earlier dialog's late stop (its 31-minute cleanup) leaves a newer share serving.
+    #[tokio::test]
+    async fn a_stop_names_its_own_share() {
+        let (stop, _stopped) = watch::channel(false);
+        let mut slot = Some(Running { stop, task: tauri::async_runtime::spawn(async {}), share: "new".into() });
+        assert!(take_if_current(&mut slot, "old").is_none());
+        assert!(slot.is_some(), "the newer share keeps serving");
+        assert!(take_if_current(&mut slot, "new").is_some_and(|r| r.share == "new"));
+        assert!(slot.is_none());
+        assert!(take_if_current(&mut slot, "new").is_none());
     }
 
     /// Stopping a share frees its port for the next one as soon as its task

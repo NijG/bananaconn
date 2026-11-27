@@ -6,7 +6,7 @@
 //
 // Needs Node.js 23.6 or later (it imports the TypeScript directly).
 
-import { splitTable } from "../src/tableCopy.ts";
+import { codeBlock, splitTable } from "../src/tableCopy.ts";
 
 /** [name, the selected lines, the rows expected]. */
 const cases = [
@@ -117,6 +117,20 @@ for (const [name, lines, want] of cases) {
   if (JSON.stringify(got) !== JSON.stringify(want)) {
     failed++;
     console.error(`FAIL ${name}\n  want ${JSON.stringify(want)}\n  got  ${JSON.stringify(got)}`);
+  }
+}
+// Copy as a Markdown code block: line ends trimmed, outer blank lines dropped,
+// CRLF as LF, a fence longer than any backtick run inside.
+for (const [name, text, want] of [
+  ["plain", "Gi1/0/1  up  \r\nGi1/0/2  down\r\n", "```\nGi1/0/1  up\nGi1/0/2  down\n```"],
+  ["outer blank lines", "\n\n  x\n\n y \n\n", "```\n  x\n\n y\n```"],
+  ["backticks inside", "a ``` b\n````", "`````\na ``` b\n````\n`````"],
+  ["one backtick", "echo `date`", "```\necho `date`\n```"],
+]) {
+  const got = codeBlock(text);
+  if (got !== want) {
+    failed++;
+    console.error(`FAIL codeBlock ${name}\n  want ${JSON.stringify(want)}\n  got  ${JSON.stringify(got)}`);
   }
 }
 if (failed) process.exit(1);

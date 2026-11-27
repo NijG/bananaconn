@@ -73,11 +73,21 @@ export function openConnectHistory(one?: Session, connect?: (s: Session) => void
         <label class="check" title="연결하지 못했거나 오류로 끊긴 기록만"><input type="checkbox" data-trouble />문제만</label><span class="muted small" data-count></span></div>`
     : "";
   const head = one ? `<b data-i18n-skip>${esc(one.name || one.host)}</b> · 최근 ${rows.length}번` : `세션 ${sessions}개 · 기록 ${rows.length}개`;
+  /** The rows' connected time added up (one still open: until now; never
+   * connected, or of an end not known: none), for a day's work log. Its
+   * own element, so the screen's translation reads it as the table's
+   * durations ("3시간 5분"). Connections at the same time count each. */
+  const totalOf = (list: typeof rows) => {
+    const ms = list.reduce((sum, { r }) => (r.how === "failed" || r.how === "unknown" ? sum : sum + Math.max(0, (r.end ?? Date.now()) - r.at)), 0);
+    // None at all ("문제만": never connected) is "0분", not "under a minute".
+    return ms > 0 && ms < 60000 ? "1분 미만" : elapsedText(ms);
+  };
+  const totalHtml = (list: typeof rows) => `<span>연결 시간 합계</span> <b data-total>${esc(totalOf(list))}</b>`;
   const m = modal({
     title: one ? "연결 기록" : "전체 연결 기록",
     icon: "History",
     width: one ? 520 : 640,
-    body: `<p class="muted small">${head}${failed ? ` · 연결하지 못함 ${failed}번` : ""}</p>${tools}
+    body: `<p class="muted small">${head}${failed ? ` · 연결하지 못함 ${failed}번` : ""} · <span data-total-box>${totalHtml(rows)}</span></p>${tools}
       <div class="history-wrap"><table class="reach-table history-table"><thead><tr><th>연결 시각</th>${named ? "<th>이름</th>" : ""}<th>연결 시간</th><th>결과</th><th>방식</th></tr></thead><tbody>${body}</tbody></table></div>
       <p class="muted small">이 PC에만 세션마다 최근 20번까지 남습니다. 로그인 정보는 남기지 않습니다.</p>`,
     footer: `${one ? `<button class="btn" data-clear>기록 지우기</button>` : ""}<button class="btn" data-copy>${icon("Table", 14)}표로 복사</button><button class="btn btn-primary" data-close>닫기</button>`,
@@ -127,6 +137,8 @@ export function openConnectHistory(one?: Session, connect?: (s: Session) => void
       tbody.innerHTML = shown.length ? shown.map(rowHtml).join("") : `<tr><td colspan="${cols}" class="muted">결과 없음</td></tr>`;
       count.textContent = shown.length === rows.length ? "" : `${shown.length}개 표시`;
       copy.disabled = !shown.length;
+      // The total of what is shown ("오늘만": today's connected time).
+      m.root.querySelector<HTMLElement>("[data-total-box]")!.innerHTML = totalHtml(shown);
     };
     find.addEventListener("input", filter);
     today.addEventListener("change", filter);

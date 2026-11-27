@@ -275,9 +275,39 @@ function readSnippets(): Snippet[] {
   return out;
 }
 
+/** Keys whose save failed and was said: said once, not on every change. */
+const unsaved = new Set<string>();
+
+/** Save `value` under `key` in localStorage: the one way the app keeps its
+ * own settings and lists there. Storage full (or unavailable): the user is
+ * told once per key, rather than the action that made the change (a server
+ * start, a setting) failing with the exception; false then, so a caller does
+ * not report as saved what is not. `kept`: the change still holds in memory
+ * for this run (settings, snippets, folders); else it is gone at once (a
+ * list read back from storage, such as the tunnels), and said so. */
+export function saveLocal(key: string, value: string, kept = true): boolean {
+  try {
+    localStorage.setItem(key, value);
+    unsaved.delete(key);
+    return true;
+  } catch (err) {
+    if (!unsaved.has(key)) {
+      unsaved.add(key);
+      toast(
+        kept
+          ? `저장 공간이 부족해 설정을 저장하지 못했습니다. 앱을 다시 시작하면 이 변경이 사라집니다 (${errorText(err)})`
+          : `저장 공간이 부족해 저장하지 못했습니다 (${errorText(err)})`,
+        "error",
+        8000,
+      );
+    }
+    return false;
+  }
+}
+
 export function saveSnippets(list: Snippet[]) {
   state.snippets = list;
-  localStorage.setItem("bx.snippets", JSON.stringify(list));
+  saveLocal("bx.snippets", JSON.stringify(list));
   notify("snippets");
 }
 
@@ -465,7 +495,15 @@ export async function pinSessions(ids: Iterable<string>, pinned: boolean) {
   await persistSessions();
 }
 
-/** After a credential is deleted, sessions that used it fall back to asking. */
+/** Whether a session refers to a credential: its login's, or its proxy's. */
+export function usesCredential(s: Session, credentialId: string): boolean {
+  return s.credentialId === credentialId || s.options.proxyCredentialId === credentialId;
+}
+
+/** After a credential is deleted, everything that named it lets go of it:
+ * sessions (their login and their proxy's) fall back to asking, an AI
+ * provider's key to none (it says a key is needed), the update share's
+ * account to none. Left pointing at it, they failed with "deleted". */
 export async function detachCredential(credentialId: string) {
   let changed = false;
   for (const s of state.sessions) {
@@ -473,9 +511,16 @@ export async function detachCredential(credentialId: string) {
       s.credentialId = null;
       changed = true;
     }
+    if (s.options.proxyCredentialId === credentialId) {
+      delete s.options.proxyCredentialId;
+      changed = true;
+    }
   }
   // The update share's NAS account may be the same credential.
   if (state.settings.updateCredentialId === credentialId) updateSettings({ updateCredentialId: null });
+  const providers = state.settings.aiProviders ?? [];
+  if (providers.some((p) => p.credentialId === credentialId))
+    updateSettings({ aiProviders: providers.map((p) => (p.credentialId === credentialId ? { ...p, credentialId: null } : p)) });
   if (changed) await persistSessions();
 }
 
@@ -530,7 +575,7 @@ export function allFolders(): string[] {
 }
 
 function saveFolders() {
-  localStorage.setItem("bx.folders", JSON.stringify([...state.extraFolders]));
+  saveLocal("bx.folders", JSON.stringify([...state.extraFolders]));
   notify("folders");
 }
 
@@ -558,21 +603,56 @@ export function addFolder(path: string) {
   saveFolders();
 }
 
-export async function renameFolder(from: string, to: string, rollback = folderSnapshot()) {
+/** Told how folder paths changed (each old path to its new one; "" for a
+ * deleted folder itself) whenever a rename, move or delete rewrites them,
+ * so state kept per folder elsewhere (the sidebar's collapsed folders)
+ * follows. */
+const folderRemapListeners = new Set<(remap: (path: string) => string, removed: string | null) => void>();
+export function onFoldersRemapped(fn: (remap: (path: string) => string, removed: string | null) => void): () => void {
+  folderRemapListeners.add(fn);
+  return () => void folderRemapListeners.delete(fn);
+}
+function foldersRemapped(remap: (path: string) => string, removed: string | null) {
+  for (const fn of folderRemapListeners) fn(remap, removed);
+}
+
+/** Rename folder `from` (its sessions and subfolders go with it). Refused,
+ * with the reason, when a folder of the new name exists already: renaming
+ * onto it would merge the two with no way to tell them apart afterwards. */
+export async function renameFolder(from: string, to: string, rollback = folderSnapshot()): Promise<string | null> {
   const clean = normalizeFolder(to);
-  if (!clean || clean === from) return;
+  if (!clean || clean === from) return null;
+  if (allFolders().includes(clean)) return `같은 이름의 폴더가 이미 있습니다: ${clean}`;
   const remap = (f: string) => (f === from ? clean : f.startsWith(from + "/") ? clean + f.slice(from.length) : f);
   state.sessions.forEach((s) => (s.folder = remap(s.folder)));
   state.extraFolders = new Set([...state.extraFolders].map(remap));
   if (state.settings.folderOrder.length) updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.map(remap))] });
   saveFolders();
+  foldersRemapped(remap, null);
   await persistSessions(rollback);
+  return null;
+}
+
+/** Where a folder goes when folder `path` is deleted: `path` itself becomes
+ * its parent, and what is under it moves up one level with it. */
+function deletedRemap(path: string): (f: string) => string {
+  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  return (f: string) => (f === path ? parent : f.startsWith(path + "/") ? parent + f.slice(path.length) : f);
+}
+
+/** The folders under `path` that deleting it would merge into a folder of
+ * the same name already beside it ("Site/Old/Switches" into "Site/Switches"),
+ * as the names they would share. */
+export function foldersMergedByDelete(path: string): string[] {
+  const remap = deletedRemap(path);
+  const all = allFolders();
+  const outside = new Set(all.filter((f) => f !== path && !f.startsWith(path + "/")));
+  return all.filter((f) => f.startsWith(path + "/")).map((f) => remap(f).replace(/^\//, "")).filter((f) => outside.has(f));
 }
 
 /** Delete a folder; its sessions move to the parent folder. */
 export async function deleteFolder(path: string) {
-  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-  const remap = (f: string) => (f === path ? parent : f.startsWith(path + "/") ? parent + f.slice(path.length) : f);
+  const remap = deletedRemap(path);
   const rollback = folderSnapshot();
   state.sessions.forEach((s) => (s.folder = remap(s.folder).replace(/^\//, "")));
   // Subfolders move up with the sessions, so empty ones are not lost.
@@ -583,6 +663,7 @@ export async function deleteFolder(path: string) {
     updateSettings({ folderOrder: [...new Set(state.settings.folderOrder.filter((f) => f !== path).map((f) => remap(f).replace(/^\//, "")).filter(Boolean))] });
   }
   saveFolders();
+  foldersRemapped((f) => remap(f).replace(/^\//, ""), path);
   await persistSessions(rollback);
 }
 
@@ -647,10 +728,11 @@ export async function placeFolder(path: string, anchor: string, where: "before" 
   const name = path.split("/").pop()!;
   const target = parent ? `${parent}/${name}` : name;
   if (target !== path) {
-    if (allFolders().includes(target)) return `같은 이름의 폴더가 이미 있습니다: ${target}`;
     // The save in renameFolder uses the caller's snapshot (taken before the
-    // sort mode was switched) so a failure restores that too.
-    await renameFolder(path, target, rollback);
+    // sort mode was switched) so a failure restores that too. It refuses a
+    // name taken already.
+    const refused = await renameFolder(path, target, rollback);
+    if (refused) return refused;
   }
   if (where !== "into") {
     const order = fullFolderOrder().filter((f) => f !== target);
@@ -684,7 +766,7 @@ export async function sortFolder(path: string, by: "name" | "address") {
 
 export function updateSettings(patch: Partial<Settings>) {
   state.settings = { ...state.settings, ...patch };
-  localStorage.setItem("bx.settings", JSON.stringify(state.settings));
+  saveLocal("bx.settings", JSON.stringify(state.settings));
   notify("settings");
 }
 

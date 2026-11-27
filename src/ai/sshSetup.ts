@@ -67,7 +67,11 @@ export function openSshSetup(desktop: Session, openSession: (s: Session) => void
     unlisten?.();
     unlisten = null;
   };
-  const releaseShare = () => void api.sshKitStop().catch(() => {});
+  // This dialog's share (its token), once sshKitStart has answered: only its
+  // events are this dialog's, and only it is stopped from here. Another
+  // dialog's share replaces it in the app, and must go on serving.
+  let share = "";
+  const releaseShare = () => void (share && api.sshKitStop(share).catch(() => {}));
   const m = modal({
     title: "SSH로 AI 명령 실행 준비",
     icon: "Bot",
@@ -208,6 +212,7 @@ export function openSshSetup(desktop: Session, openSession: (s: Session) => void
   // listener is kept after the window closes so the background flow can finish;
   // then it reports through toasts instead of the (gone) progress list.
   void on<SshKitEvent>("ssh-kit", (e) => {
+    if (!share || e.share !== share) return;
     if (closed) {
       if (e.kind === "error" || e.kind === "failed") toast(`${tr("원격 PC에서 설정하지 못했습니다")}: ${e.text}`, "error", 6000);
       else if (e.kind === "done") void checkAndGo();
@@ -222,7 +227,8 @@ export function openSshSetup(desktop: Session, openSession: (s: Session) => void
   api
     .sshKitStart(desktop.host.trim())
     .then((kit) => {
-      if (closed) return void api.sshKitStop().catch(() => {});
+      if (closed) return void api.sshKitStop(kit.share).catch(() => {});
+      share = kit.share;
       started = true;
       lines["copy-run"] = kit.runLine;
       lines["copy-admin"] = kit.adminLine;

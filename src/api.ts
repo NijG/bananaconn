@@ -264,11 +264,15 @@ export interface SshKit {
   adminLine: string;
   /** Whether this PC found its address toward the remote PC. */
   routed: boolean;
+  /** This share's token: its events carry it, and sshKitStop names it. */
+  share: string;
 }
 /** A step of the OpenSSH setup: here (log, error) or on the remote PC (remote, done, failed). */
 export interface SshKitEvent {
   kind: "log" | "error" | "remote" | "done" | "failed";
   text: string;
+  /** The share that sent it (SshKit.share). */
+  share: string;
 }
 
 export interface SyslogStatus {
@@ -309,7 +313,10 @@ export const api = {
   /** Roaming AppData (where other tools keep their session files). */
   roamingDir: async () => (isTauri ? (await import("@tauri-apps/api/path")).dataDir() : "C:\\Users\\me\\AppData\\Roaming"),
   /** Every *.ext file under a folder, with its path relative to it (session importers). */
-  importScan: (root: string, ext: string) => call<{ rel: string; text: string }[]>("import_scan", { root, ext }),
+  /** Session files under a folder, and those left out (too large, unreadable,
+   * or past the file count or folder depth it stops at). */
+  importScan: (root: string, ext: string) =>
+    call<{ files: { rel: string; text: string }[]; tooLarge: string[]; unreadable: string[]; truncated: boolean }>("import_scan", { root, ext }),
   /** PuTTY / KiTTY / WinSCP sessions as .reg text ("" when the tool was never used). */
   registryExport: (key: string) => call<string>("registry_export", { key }),
   /** The key files an import names, resolved (SecureCRT's ${VDS_CONFIG_PATH}
@@ -381,7 +388,7 @@ export const api = {
   monitorCommands: (id: string) => call<string[]>("monitor_commands", { id }),
   monitorTypes: (id: string, folder: string) => call<string[]>("monitor_types", { id, folder }),
   sshKitStart: (target: string) => call<SshKit>("ssh_kit_start", { target }),
-  sshKitStop: () => call<void>("ssh_kit_stop"),
+  sshKitStop: (share: string) => call<void>("ssh_kit_stop", { share }),
   sshKitAllow: (remote: string, port: number) => call<void>("ssh_kit_allow", { remote, port }),
   // AI (ai.rs): the answer streams back as "ai-stream" events, then "ai-done".
   aiChat: (id: string, provider: AiProviderWire, system: string, messages: { role: string; content: string; attachments?: { mime: string; data: string; name: string }[] }[]) => call<void>("ai_chat", { id, provider, system, messages }),
@@ -456,16 +463,33 @@ export const api = {
   /** Fails with "CANCELLED" after netPingCancel(id). */
   netPing: (id: string, host: string, count: number) => call<string>("net_ping", { id, host, count }),
   netPingCancel: (id: string) => call<void>("net_ping_cancel", { id }),
+  /** The certificate host:port offers over TLS (read only), and whether this PC trusts it for that name. */
+  netTls: (host: string, port: number) =>
+    call<{
+      cert: { subject: string; issuer: string; names: string[]; notBefore: number; notAfter: number; fingerprint: string; selfSigned: boolean };
+      untrusted: string | null;
+      chain: number;
+      version: string;
+      cipher: string;
+      ms: number;
+    }>("net_tls", { host, port }),
+  /** A name's A, AAAA, MX, TXT, CNAME, NS, SOA or SRV records (Windows' resolver), as nslookup -type shows them. */
+  netDnsRecords: (host: string, kind: string) =>
+    call<{ records: { kind: string; name: string; ttl: number; data: string }[]; ms: number }>("net_dns_records", { host, kind }),
+  /** The first line a service sends on its own (SSH, FTP, SMTP, POP3, IMAP greetings), nothing sent. */
+  netBanner: (host: string, port: number) => call<string>("net_banner", { host, port }),
   netPorts: (host: string, ports: number[]) =>
     call<{ port: number; open: boolean; ms: number | null; detail: string }[]>("net_ports", { host, ports }),
-  netDns: (host: string) => call<{ addresses: string[]; ms: number }>("net_dns", { host }),
+  /** A name's addresses; for an address, its name (PTR) when it has one (`reverse`). */
+  netDns: (host: string) => call<{ addresses: string[]; name: string | null; reverse: boolean; ms: number }>("net_dns", { host }),
   /** Ping every host of network/prefix (a /22 at most): those that answered
    * (ms), and on this PC's own segment those that answered ARP only (ms null),
    * with the MAC (12 hex digits) of the hosts on that segment.
    * Progress arrives as "sweep-progress" { id, done, total }; fails with
    * "CANCELLED" after netSweepCancel(id). */
-  netSweep: (id: string, network: string, prefix: number, timeoutMs: number) =>
-    call<{ ip: string; ms: number | null; mac: string | null }[]>("net_sweep", { id, network, prefix, timeoutMs }),
+  /** With `to`: every address from `network` to `to` (a range, 1024 at most) instead of the subnet's hosts. */
+  netSweep: (id: string, network: string, prefix: number, timeoutMs: number, to?: string) =>
+    call<{ ip: string; ms: number | null; mac: string | null }[]>("net_sweep", { id, network, prefix, timeoutMs, to: to ?? null }),
   netSweepCancel: (id: string) => call<void>("net_sweep_cancel", { id }),
   /** The DNS (or hosts file) names of IPv4 addresses, in their order: null for
    * one without a name or not found within 4 seconds. */

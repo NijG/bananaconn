@@ -49,6 +49,46 @@ let lastTermId: string | null = null;
   return true;
 };
 
+/** Layout problems on the screen now (or under `root`), for checking a UI
+ * change in the preview: `__bxLayoutAudit()`. Each finding is [kind, where,
+ * text, measure]:
+ * - "squeezed": text in a box narrower than ~2.5 characters, wrapping a
+ *   character a line (a help table's first column was 35px wide);
+ * - "wrapped": a caption broken over lines inside a toolbar button or chip;
+ * - "spills": content wider than a box that neither scrolls nor clips;
+ * - "offscreen": past the window's right edge.
+ * Terminals, editors, canvases and invisible elements are skipped. Preview only. */
+(globalThis as { __bxLayoutAudit?: (root?: Element) => string[][] }).__bxLayoutAudit = (root = document.body) => {
+  const out: string[][] = [];
+  const where = (el: Element) => {
+    const parts: string[] = [];
+    for (let e: Element | null = el; e && e !== document.body && parts.length < 4; e = e.parentElement) {
+      const cls = typeof e.className === "string" && e.className.trim() ? `.${e.className.trim().split(/\s+/).slice(0, 2).join(".")}` : "";
+      parts.unshift(e.tagName.toLowerCase() + cls);
+    }
+    return parts.join(">");
+  };
+  for (const el of root.querySelectorAll<HTMLElement>("*")) {
+    if (el.closest(".xterm, .cm-editor, canvas, svg")) continue;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === "hidden" || cs.opacity === "0") continue;
+    const own = [...el.childNodes].filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent).join("").trim();
+    const fs = parseFloat(cs.fontSize);
+    const lh = parseFloat(cs.lineHeight) || fs * 1.4;
+    const tag = el.tagName.toLowerCase();
+    const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    if (own.length >= 2 && inner > 0 && inner < fs * 2.5 && r.height > lh * 1.8 && !/^[\d.\s]+$/.test(own)) out.push(["squeezed", where(el), own.slice(0, 30), `${Math.round(inner)}px`]);
+    if (["button", "span", "a", "label"].includes(tag) && own.length >= 2 && r.height > lh * 1.8 && cs.whiteSpace === "normal" && el.closest(".view-bar, .tool, .chip"))
+      out.push(["wrapped", where(el), own.slice(0, 30), `${Math.round(r.height)}px`]);
+    if (cs.overflowX === "visible" && el.scrollWidth > el.clientWidth + 2 && el.clientWidth > 0 && !["span", "b", "code", "kbd", "a", "i", "label", "button"].includes(tag))
+      out.push(["spills", where(el), (el.textContent ?? "").trim().slice(0, 30), `${el.scrollWidth}>${el.clientWidth}`]);
+    if (r.right > innerWidth + 1 && r.left < innerWidth && cs.position !== "fixed") out.push(["offscreen", where(el), (el.textContent ?? "").trim().slice(0, 30), `${Math.round(r.right)}`]);
+  }
+  return out;
+};
+
 // The preview's pretend shell edits its line the way a real one does:
 // Backspace (DEL or ^H) erases a character, Ctrl-U the line, Enter starts a
 // new prompt; cursor and function keys are ignored.
@@ -309,6 +349,9 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
       if (a.op === "delete") mockMade.delete(String(a.path));
       return;
     case "remote_list":
+      // A Unix root: the kernel views a folder walk passes over (/proc/kcore reads as ~128 TB).
+      if (a.path === "/") return fake("/", [["dev", true, 0], ["home", true, 0], ["proc", true, 0], ["sys", true, 0], ["var", true, 0]]);
+      if (a.path === "/proc") return fake("/proc", [["kcore", false, 140_737_477_881_856], ["1", true, 0]]);
       return fake(a.path, [
         ["logs", true, 0],
         ["releases", true, 0],
@@ -387,7 +430,11 @@ export async function mockInvoke(cmd: string, a: Record<string, any>): Promise<u
     case "vault_list":
       return creds;
     case "vault_save": {
-      const c = { ...a.cred, hasSecret: a.secret ? true : a.cred.hasSecret };
+      // As vault.rs decides: "" clears, a value sets, none keeps it unless
+      // the kind changed (a key passphrase is no password).
+      const prev = creds.find((x: { id: string }) => x.id === a.cred.id) as { kind: string; hasSecret: boolean } | undefined;
+      const hasSecret = a.secret === "" ? false : a.secret ? true : prev && prev.kind !== a.cred.kind ? false : (prev?.hasSecret ?? false);
+      const c = { ...a.cred, hasSecret };
       creds = creds.filter((x) => x.id !== c.id).concat(c);
       return c;
     }
@@ -436,13 +483,21 @@ ${a.host}의 응답: 바이트=32 시간<1ms TTL=128
 ${a.host}에 대한 Ping 통계:
     패킷: 보냄 = ${a.count}, 받음 = ${a.count}, 손실 = 0 (0% 손실)`;
     case "net_ports":
-      return a.ports.map((p: number) => ({ port: p, open: p === 22 || p === 80, ms: p === 22 || p === 80 ? 3 : null, detail: p === 22 || p === 80 ? "열림" : "닫힘 (연결 거부)" }));
+      // 22, 80 and the TLS ports 443 and 8443 answer (8443: an expired self-signed certificate, net_tls).
+      return a.ports.map((p: number) => { const open = [22, 80, 443, 8443].includes(p); return { port: p, open, ms: open ? 3 : null, detail: open ? "열림" : "닫힘 (연결 거부)" }; });
     case "net_sweep": {
       // The host addresses of the range, as nettools.rs sweep_targets has them.
       const num = String(a.network).split(".").reduce((n: number, o: string) => n * 256 + Number(o), 0);
       const size = 2 ** (32 - a.prefix);
       const net = Math.floor(num / size) * size;
-      const hosts = a.prefix >= 31 ? Array.from({ length: size }, (_, i) => net + i) : Array.from({ length: size - 2 }, (_, i) => net + 1 + i);
+      // With `to`, every address of the range, its ends too (range_targets).
+      const end = a.to ? String(a.to).split(".").reduce((n: number, o: string) => n * 256 + Number(o), 0) : null;
+      const hosts =
+        end !== null
+          ? Array.from({ length: Math.abs(end - num) + 1 }, (_, i) => Math.min(num, end) + i)
+          : a.prefix >= 31
+            ? Array.from({ length: size }, (_, i) => net + i)
+            : Array.from({ length: size - 2 }, (_, i) => net + 1 + i);
       const total = hosts.length;
       const dotted = (n: number) => [24, 16, 8, 0].map((k) => Math.floor(n / 2 ** k) % 256).join(".");
       // A Stop that came before the start counts (as in nettools.rs).
@@ -494,8 +549,34 @@ ${a.host}에 대한 Ping 통계:
       await new Promise((r) => setTimeout(r, 600));
       // The trace's 10.10.x.x hop has no name (its saved session's name shows instead).
       return a.ips.map((ip: string, i: number) => (i % 3 === 2 || ip.startsWith("10.10.") ? null : `host-${ip.split(".").pop()}.lan`));
+    case "net_dns_records": {
+      const samples: Record<string, { kind: string; name: string; ttl: number; data: string }[]> = {
+        MX: [{ kind: "MX", name: a.host, ttl: 300, data: `10 mail.${a.host}` }, { kind: "MX", name: a.host, ttl: 300, data: `20 mail2.${a.host}` }],
+        TXT: [{ kind: "TXT", name: a.host, ttl: 3600, data: "v=spf1 include:_spf.example.net ~all" }],
+        SOA: [{ kind: "SOA", name: a.host, ttl: 3600, data: `ns1.${a.host} hostmaster.${a.host} 2024010101 7200 3600 1209600 300` }],
+        A: [{ kind: "A", name: a.host, ttl: 120, data: "93.184.216.34" }],
+        AAAA: [{ kind: "AAAA", name: a.host, ttl: 120, data: "2606:2800:220:1:248:1893:25c8:1946" }],
+      };
+      if (a.host.startsWith("nx")) throw `${a.host} 이름이 DNS에 없습니다`;
+      // One kind failing alone (a resolver timing out on a large TXT answer).
+      if (a.host.startsWith("notxt") && a.kind === "TXT") throw `${a.host} 조회에 실패했습니다 (오류 1460)`;
+      return { records: samples[a.kind] ?? [], ms: 14 };
+    }
+    case "net_banner":
+      await new Promise((r) => setTimeout(r, 200));
+      if (a.port === 22) return "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5";
+      throw `${a.host}:${a.port} 이(가) 먼저 보내는 내용이 없습니다 (클라이언트가 먼저 말하는 서비스일 수 있음)`;
+    case "net_tls":
+      // 8443: an expired self-signed one; any other port: a trusted one.
+      await new Promise((r) => setTimeout(r, 300));
+      return a.port === 8443
+        ? { cert: { subject: "CN=device.local", issuer: "CN=device.local", names: ["device.local"], notBefore: 1640995200, notAfter: 1672531200, fingerprint: "ab:cd", selfSigned: true }, untrusted: "만료된 인증서입니다", chain: 1, version: "TLSv1_2", cipher: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", ms: 21 }
+        : { cert: { subject: "CN=www.example.com", issuer: "C=US, O=DigiCert Inc, CN=DigiCert Global G3 TLS ECC SHA384 2020 CA1", names: ["www.example.com", "example.com"], notBefore: 1736985600, notAfter: Math.floor(Date.now() / 1000) + 40 * 86400, fingerprint: "12:34", selfSigned: false }, untrusted: null, chain: 2, version: "TLSv1_3", cipher: "TLS13_AES_256_GCM_SHA384", ms: 35 };
     case "net_dns":
-      return { addresses: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"], ms: 12 };
+      // An address: its name, except 10.10.x.x (none), as net_names answers.
+      if (/^[\d.]+$|:/.test(a.host.trim()))
+        return { addresses: [a.host.trim()], name: a.host.startsWith("10.10.") ? null : `host-${a.host.trim().split(/[.:]/).pop()}.lan`, reverse: true, ms: 8 };
+      return { addresses: ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"], name: null, reverse: false, ms: 12 };
     case "file_server_status":
       return [...fileServersMock.values()];
     case "file_server_stop":
@@ -570,7 +651,8 @@ ${a.host}에 대한 Ping 통계:
         ? 'Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\Default%20Settings]\r\n"HostName"=""\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\core%20sw01]\r\n"HostName"="10.9.0.1"\r\n"PortNumber"=dword:00000016\r\n"Protocol"="ssh"\r\n"UserName"="netops"\r\n\r\n[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\console]\r\n"Protocol"="serial"\r\n"SerialLine"="COM4"\r\n"SerialSpeed"=dword:00002580\r\n'
         : "";
     case "import_scan":
-      return a.ext === "ini" ? CRT_SAMPLE : a.ext === "xsh" ? XSH_SAMPLE : [];
+      // A too-large file too, so the review's "skipped" list shows it.
+      return { files: a.ext === "ini" ? CRT_SAMPLE : a.ext === "xsh" ? XSH_SAMPLE : [], tooLarge: a.ext === "xsh" ? ["Archive/huge.xsh"] : [], unreadable: [], truncated: false };
     case "vault_protect_key":
       ((window as any).__protected ??= []).push(a.keyPath);
       return;
@@ -596,9 +678,11 @@ ${a.host}에 대한 Ping 통계:
     case "monitor_commands":
       return ["journalctl", "jq", "systemctl", "ss", "tail"];
     case "ssh_kit_start": {
-      const url = "http://192.168.0.10:51234/ab12cd34ef56";
+      // A new token each time, as the app makes one per share.
+      const share = Math.random().toString(16).slice(2, 14).padEnd(12, "0");
+      const url = `http://192.168.0.10:51234/${share}`;
       const admin = `iex ((New-Object Net.WebClient).DownloadString('${url}/s'))`;
-      return { url, adminLine: admin, runLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command ${admin.replace(/'/g, "''")}'"`, routed: true };
+      return { url, adminLine: admin, runLine: `powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command ${admin.replace(/'/g, "''")}'"`, routed: true, share };
     }
     case "ssh_kit_stop":
     case "ssh_kit_allow":

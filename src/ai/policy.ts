@@ -16,11 +16,17 @@ export interface Verdict {
   reason: string;
 }
 
+/** Denied unless the program's first argument (after any flag options, "-x"
+ * or "--opt[=v]") is one of `list`: a read subcommand anywhere else in the
+ * line is no read ("docker stop web ps", "systemctl stop nginx status",
+ * "apt install x show" all name one, and change things). */
+const firstSub = (list: string) => new RegExp(String.raw`^(?!(?:\s+-[\w-]+(?:=\S+)?)*\s+(?:${list})(?:\s|$))`);
+
 /** Programs that only read, with the arguments that would make them write
  * or never end (checked against the whole command part). */
 const UNIX: Record<string, RegExp | null> = {
   ls: null, ll: null, cat: null, head: null, zcat: null, grep: null, egrep: null, fgrep: null, zgrep: null,
-  awk: /\bsystem\s*\(|\|\s*getline|print\s*>/, sort: /\s-o(\b|\S)|--output\b/, uniq: null, wc: null, cut: null, tr: null, column: null,
+  awk: /\bsystem\s*\(|(?<!\|)\|(?!\|)|print\s*>/, sort: /\s-o(\b|\S)|--output\b/, uniq: null, wc: null, cut: null, tr: null, column: null,
   stat: null, file: null, du: null, df: null, free: null, uptime: null, w: null, who: null, last: null, lastb: null,
   id: null, whoami: null, groups: null, uname: null, ps: null, pgrep: null, pidof: null, vmstat: null, iostat: null,
   mpstat: null, sar: /\s-o(\b|\S)|--output\b/, pidstat: null, lsblk: null, blkid: null, lsof: /\s[+-]r\d*/, ss: /\s-K\b/, netstat: /\s-[a-zA-Z]*c\b|--continuous\b/, lscpu: null,
@@ -40,32 +46,32 @@ const UNIX: Record<string, RegExp | null> = {
   // sed "w"/"W" write a file and "e" runs a shell command, as a standalone
   // command or as a flag on s///e / s///w (which execute or write per line).
   sed: /\s-i|--in-place|\s-f\b|--file\b|(?<![A-Za-z])[wW]\s+\S|(?:^|[\s;'"{])e(?:\s|$|['"}])|[sy]([/|,#:~@!%]).*?\1.*?\1[a-z0-9]*[ew]/,
-  find: /\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/, tail: /\s(-[a-zA-Z]*[fF]|--follow)\b/,
+  find: /\s-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b/, tail: /\s(-[a-zA-Z]*[fF]|--follow)\b/,
   journalctl: /\s(-f|--follow|--vacuum\S*|--rotate|--flush|--sync|--setup-keys|--relinquish-var)\b/, dmesg: /\s-[a-zA-Z]*[cCDEn]|--(clear|read-clear)\b/,
   top: /^(?!.*\s-[a-zA-Z]*b)|^(?!.*\s-[a-zA-Z]*n\s*\d)/, ping: /^(?!.*\s-[a-zA-Z]*c\s*\d)/, ping6: /^(?!.*\s-[a-zA-Z]*c\s*\d)/,
   date: /\s(?!\+)\S/, hostname: /\s(?!-[fiIsdA]\b)\S/, mount: /\s(?!-l\b)\S/, ifconfig: /\s(up|down|add|del|inet|netmask|broadcast|mtu|hw|promisc|arp|-arp)\b|\d+\.\d+\.\d+\.\d+/,
   ip: /\s(add|del|delete|change|replace|set|flush|append|prepend|save|restore|exec|monitor)\b/, route: /\s(add|del|delete|flush|change)\b/, arp: /\s-[ds]\b/,
   sysctl: /\s-w\b|=|\s-p\b|--load|--system/, ethtool: /\s(-[sKAGCEPLW]\b|--change|--set-\S+|--flash|--reset|--offload|--pause|--coalesce|--set-ring|--set-channels)/,
   smartctl: /\s(-t|--test|-X|--abort|-s|--smart|-o|--offline-auto|-S|--saveauto)\b/,
-  chronyc: /^(?!.*\s(tracking|sources|sourcestats|activity|ntpdata|serverstats|clients)\b)/,
-  timedatectl: /^(?!(.*\s)?(status|show|list-timezones|timesync-status|show-timesync)\b|\s*timedatectl\s*$)/,
+  chronyc: firstSub("tracking|sources|sourcestats|activity|ntpdata|serverstats|clients"),
+  timedatectl: /^(?!\s*$|\s+(status|show|list-timezones|timesync-status|show-timesync)(\s|$))/,
   hostnamectl: /\s(set-\S+|hostname\s+\S+)/,
-  systemctl: /^(?!.*\s(status|show|is-active|is-enabled|is-failed|is-system-running|list-units|list-unit-files|list-timers|list-sockets|list-dependencies|list-jobs|cat|--failed|get-default)\b)/,
+  systemctl: firstSub("status|show|is-active|is-enabled|is-failed|is-system-running|list-units|list-unit-files|list-timers|list-sockets|list-dependencies|list-jobs|cat|--failed|get-default"),
   firewall_cmd: /^(?!.*\s--(list-\S+|state|get-\S+|query-\S+|info-\S+)\b)|\s--(add|remove|change|set|new|delete|reload|complete-reload|runtime-to-permanent|panic)/,
   iptables: /\s-[ADIRNXFPZE]\b|--(append|delete|insert|replace|new|flush|zero|policy|rename|delete-chain)/,
   ip6tables: /\s-[ADIRNXFPZE]\b|--(append|delete|insert|replace|new|flush|zero|policy|rename|delete-chain)/,
-  nft: /^(?!.*\slist\b)/, crontab: /^(?!.*\s-l\b)|\s-[er]\b/, multipath: /^(?!.*\s-l)|\s-[fFrw]\b/,
-  docker: /^(?!.*\s(ps|images|logs|inspect|stats|info|version|top|port|history|network\s+ls|network\s+inspect|volume\s+ls|volume\s+inspect|system\s+df|compose\s+ps)\b)|\s(-f|--follow)\b|\sstats\b(?!.*--no-stream)/,
-  podman: /^(?!.*\s(ps|images|logs|inspect|stats|info|version|top|port|history)\b)|\s(-f|--follow)\b|\sstats\b(?!.*--no-stream)/,
-  kubectl: /^(?!.*\s(get|describe|logs|top|version|cluster-info|api-resources|api-versions|explain|events)\b)|\s(-f|--follow|-w|--watch)\b/,
+  nft: firstSub("list"), crontab: /^(?!(\s+(-l|-u\s+\S+))+\s*$)|^(?!.*\s-l\b)/, multipath: /^(?!.*\s-l)|\s-[fFrw]\b/,
+  docker: new RegExp(firstSub(String.raw`ps|images|logs|inspect|stats|info|version|top|port|history|network\s+(?:ls|inspect)|volume\s+(?:ls|inspect)|system\s+df|compose\s+ps`).source + String.raw`|\s(-f|--follow)\b|\sstats\b(?!.*--no-stream)`),
+  podman: new RegExp(firstSub("ps|images|logs|inspect|stats|info|version|top|port|history").source + String.raw`|\s(-f|--follow)\b|\sstats\b(?!.*--no-stream)`),
+  kubectl: new RegExp(firstSub("get|describe|logs|top|version|cluster-info|api-resources|api-versions|explain|events").source + String.raw`|\s(-f|--follow|-w|--watch)\b`),
   // "%(…)" in a macro or query format runs a shell command.
   rpm: /^(?!.*\s-q)|\s-(e|i|U|F|-erase|-install|-upgrade|-freshen|-rebuilddb|-import|-setperms|-setugids)\b|%\(/,
-  dpkg: /^(?!.*\s(-l|-s|-L|-S|-p|--list|--status|--listfiles|--search|--print-avail|--get-selections)\b)/,
-  apt: /^(?!.*\s(list|show|policy|search|depends|rdepends)\b)/, "apt-cache": null,
-  yum: /^(?!.*\s(list|info|repolist|search|provides|deplist|check-update)\b)/, dnf: /^(?!.*\s(list|info|repolist|search|provides|repoquery|check-update)\b)/,
-  zypper: /^(?!.*\s(se|search|info|if|lr|repos|lu|list-updates|pa|packages)\b)/,
-  ipmitool: /^(?!.*\s(sdr|sel\s+list|sel\s+elist|sel\s+info|sensor|fru|lan\s+print|chassis\s+status|mc\s+info|power\s+status)\b)/,
-  bootlist: /^(?!.*\s-o\b)/, zpool: /^(?!.*\s(status|list|iostat|get|history)\b)/, zfs: /^(?!.*\s(list|get)\b)/, pkg: /^(?!.*\s(list|info|search|contents)\b)/,
+  dpkg: firstSub("-l|-s|-L|-S|-p|--list|--status|--listfiles|--search|--print-avail|--get-selections"),
+  apt: firstSub("list|show|policy|search|depends|rdepends"), "apt-cache": null,
+  yum: firstSub("list|info|repolist|search|provides|deplist|check-update"), dnf: firstSub("list|info|repolist|search|provides|repoquery|check-update"),
+  zypper: firstSub("se|search|info|if|lr|repos|lu|list-updates|pa|packages"),
+  ipmitool: firstSub(String.raw`sdr|sel\s+(?:list|elist|info)|sensor|fru|lan\s+print|chassis\s+status|mc\s+info|power\s+status`),
+  bootlist: /^(?!\s+(-m\s+\S+\s+-o|-o\s+-m\s+\S+)\s*$)/, zpool: firstSub("status|list|iostat|get|history"), zfs: firstSub("list|get"), pkg: firstSub("list|info|search|contents"),
 };
 
 /** First words of read-only device CLI commands (Cisco, Aruba, FortiGate, Juniper, Huawei …). */
@@ -283,6 +289,10 @@ export function judge(command: string, network: boolean, windows = false): Verdi
   const cmd = command.trim();
   if (!cmd) return { action: "block", reason: "빈 명령" };
   if (/[\r\n]/.test(cmd)) return { action: "approve", reason: "여러 줄 명령" };
+  // A control character is a key to the shell, not text: Ctrl+U erases what
+  // was judged ("ls \x15curl x|sh" ran the curl), Ctrl+O runs the line with
+  // no Enter, and the approval card cannot show them. Never sent.
+  if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(cmd)) return { action: "block", reason: "제어 문자가 든 명령" };
   // A real read-only command is short; cap the length before the allowlist
   // regexes run, both as a safety net against a pathological line and to keep
   // any one pattern from backtracking over thousands of characters.

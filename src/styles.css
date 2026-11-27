@@ -908,11 +908,9 @@ kbd.word {
   flex-direction: column;
   container-type: inline-size;
 }
-/* Narrow views (split slots): toolbar buttons become icon-only. */
+/* Narrow views (split slots): a tighter toolbar (its captions follow what
+ * fits: fitToolbar in ui.ts). */
 @container (max-width: 680px) {
-  .view-actions .tool > span {
-    display: none;
-  }
   .view-bar {
     gap: 6px;
   }
@@ -991,11 +989,6 @@ kbd.word {
   /* Still too narrow: scroll the buttons rather than cut them off. */
   overflow-x: auto;
   scrollbar-width: none;
-}
-@container (max-width: 820px) {
-  .view-actions .tool > span {
-    display: none;
-  }
 }
 /* Buttons keep their size and captions stay on one line; when they do not
  * all fit, fitToolbar (ui.ts) turns the bar icon-only. */
@@ -1181,6 +1174,33 @@ kbd.word {
 .clip-del {
   flex: 0 0 auto;
   align-self: center;
+}
+/* Picked with Ctrl+click to copy together: its place in the order before it. */
+.clip-row.picked .clip-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--term-bg));
+}
+.clip-row.picked .clip-text {
+  flex: 1;
+  min-width: 0;
+}
+.clip-order {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+.clip-hint {
+  margin: 0 0 6px;
 }
 
 /* ---- files ----------------------------------------------------------------- */
@@ -1846,7 +1866,9 @@ kbd.word {
   overflow: hidden;
   background: var(--term-bg);
 }
-.vnc-screen > div {
+/* noVNC's own screen box (its inline background overridden); not the
+ * transfer-status box this view adds beside it, which keeps its own. */
+.vnc-screen > div:not(.rdp-keylog) {
   background: var(--term-bg) !important;
 }
 
@@ -2185,6 +2207,11 @@ kbd.word {
   gap: 8px;
   padding: 12px 18px;
   border-top: 1px solid var(--line);
+}
+/* A choice dialog's buttons (several, longer in other languages): onto a
+   second line rather than past the dialog's edge. */
+.modal-foot:has(> [data-choice]) {
+  flex-wrap: wrap;
 }
 .modal-text {
   margin: 0;
@@ -3783,8 +3810,19 @@ mark.term-hit {
   color: var(--ok);
   background: color-mix(in srgb, var(--ok) 14%, transparent);
 }
+/* A TXT record's text or a DKIM key wraps inside the table; the kind and
+   the TTL beside it stay whole ("AAAA" not broken in two). A name may wrap:
+   one can be 253 characters long. */
+.nettools-table td.dns-data {
+  overflow-wrap: anywhere;
+}
+.nettools-table.dns-table :is(th, td):is(:nth-child(1), :nth-child(3)) {
+  white-space: nowrap;
+}
 /* Left out of "Copy result" (read while this class is on, then taken off). */
-.copying .sweep-new-tag {
+.copying .sweep-new-tag,
+.copying .tls-cert-btn,
+.copying .dns-ptr {
   display: none;
 }
 .nettools-cont {
@@ -3850,6 +3888,10 @@ mark.term-hit {
 .fs-list .fs-name .ico {
   color: var(--accent);
 }
+/* The recently changed files' time: the date and the time on one line. */
+.fs-list .fs-when {
+  white-space: nowrap;
+}
 .fs-list .fs-bar {
   width: 30%;
 }
@@ -3906,10 +3948,39 @@ mark.term-hit {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
 }
+/* Long values with no space (an ip6.arpa name) wrap inside the table. */
+.nettools-table.subnet-table td.mono {
+  overflow-wrap: anywhere;
+}
 .nettools-table.subnet-table th {
   width: 12em;
   font-weight: normal;
   color: var(--muted);
+}
+/* The network split into longer prefixes, under the calculator's result. */
+.subnet-split {
+  margin-top: 12px;
+}
+.subnet-split > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.subnet-parts th {
+  font-weight: normal;
+  color: var(--muted);
+}
+/* A subnet stays on one line ("…::/64" is not split at the slash); a range
+   beside it wraps at the space around its dash instead. */
+.subnet-parts td:first-child {
+  white-space: nowrap;
+}
+/* The subnet that holds the address typed. */
+.subnet-parts tr.mine td {
+  color: var(--accent);
 }
 .nettools-list {
   margin: 0;
@@ -3943,6 +4014,11 @@ mark.term-hit {
 }
 .tunnel-row.on {
   border-color: color-mix(in srgb, var(--ok) 50%, var(--line));
+}
+/* The tunnel the form below is changing. */
+.tunnel-row.editing {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-2));
 }
 .tunnel-main {
   display: flex;

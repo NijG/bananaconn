@@ -42,6 +42,8 @@ export class VncView implements View {
   private ai: ViewAi;
   /** The last attempt failed authentication. */
   private authFailed = false;
+  /** The user cancelled the user name or password question of this attempt. */
+  private authCancelled = false;
   /** A refusal the server explained (not a wrong password). */
   private securityReason = "";
   /** Prompt for the password even if a credential is stored. */
@@ -231,6 +233,7 @@ export class VncView implements View {
   private async connect() {
     this.setState("connecting");
     this.authFailed = false;
+    this.authCancelled = false;
     this.securityReason = "";
     this.overlay.hidden = false;
     this.overlay.innerHTML = `<div class="overlay-card"><div class="spinner"></div><h3 data-i18n-skip>${esc(endpoint(this.session))}</h3><p>VNC 서버에 연결하는 중...</p></div>`;
@@ -257,6 +260,15 @@ export class VncView implements View {
       rfb.background = "#0d1017";
       this.applyQuality(rfb);
       this.countRects(rfb);
+      // noVNC lets go of held keys only when the whole window loses focus;
+      // clicking another tab or a toolbar button left Ctrl or Shift down on
+      // the remote PC. Released as the screen loses focus too (as RDP does).
+      const keyboard = (rfb as unknown as { _keyboard?: { _target?: EventTarget; _allKeysUp?: () => void } })._keyboard;
+      keyboard?._target?.addEventListener("blur", () => live() && keyboard._allKeysUp?.());
+      // The browser may hand the screen canvas back blank after a GPU reset
+      // (display change, driver update, long sleep); noVNC draws only what
+      // changes, so the rest stayed blank. Drawn again whole (redrawAll).
+      (keyboard?._target as HTMLCanvasElement | undefined)?.addEventListener("contextrestored", () => live() && this.redrawAll(rfb));
       rfb.addEventListener("connect", () => {
         if (!live()) return;
         this.overlay.hidden = true;
@@ -266,7 +278,11 @@ export class VncView implements View {
         this.ended.add(rfb);
         if (!live()) return;
         const clean = (e as CustomEvent<{ clean: boolean }>).detail?.clean;
-        if (this.state === "connecting" && this.authFailed)
+        // The user cancelled the sign-in: not a failure to reach the server.
+        if (this.state === "connecting" && this.authCancelled) {
+          this.setState("closed");
+          this.showClosed("로그인 정보 입력을 취소했습니다.");
+        } else if (this.state === "connecting" && this.authFailed)
           this.fail("VNC 비밀번호가 올바르지 않습니다. 다시 시도하면 비밀번호를 새로 묻습니다.");
         else if (this.state === "connecting") {
           // The relay knows why the server could not be reached (refused,
@@ -308,11 +324,37 @@ export class VncView implements View {
         this.desktopName = (e as CustomEvent<{ name: string }>).detail.name;
         this.ws.changed();
       });
-      rfb.addEventListener("clipboard", (e: Event) => writeClipboard((e as CustomEvent<{ text: string }>).detail.text));
+      rfb.addEventListener("clipboard", (e: Event) => live() && void writeClipboard((e as CustomEvent<{ text: string }>).detail.text));
       this.rfb = rfb;
     } catch (err) {
       if (this.disposed || proxyId !== this.proxyId) return;
       this.fail(errorText(err));
+    }
+  }
+
+  /** The whole remote screen drawn again: from noVNC's own copy of it (its
+   * display's back buffer, all marked changed and flipped onto the canvas),
+   * and asked of the server whole as well (a non-incremental
+   * FramebufferUpdateRequest, RFC 6143 §7.5.3), in case that copy was lost
+   * with the canvas. noVNC 1.7 internals, each checked before use. */
+  private redrawAll(rfb: RFB) {
+    const r = rfb as unknown as {
+      _display?: { width: number; height: number; _damage?: (x: number, y: number, w: number, h: number) => void; flip?: () => void };
+      _sock?: unknown;
+      _fbWidth?: number;
+      _fbHeight?: number;
+      _rfbConnectionState?: string;
+    };
+    try {
+      const d = r._display;
+      if (d?._damage && d.flip) {
+        d._damage(0, 0, d.width, d.height);
+        d.flip();
+      }
+      const request = (RFB as unknown as { messages?: { fbUpdateRequest?: (sock: unknown, incremental: boolean, x: number, y: number, w: number, h: number) => void } }).messages?.fbUpdateRequest;
+      if (request && r._sock && r._rfbConnectionState === "connected" && r._fbWidth && r._fbHeight) request(r._sock, false, 0, 0, r._fbWidth, r._fbHeight);
+    } catch {
+      // A noVNC without these: the screen fills in as it changes.
     }
   }
 
@@ -332,6 +374,7 @@ export class VncView implements View {
         const res = await promptDialog({ title: "VNC 사용자 이름", label: `${userText(this.session.host)} 의 사용자 이름`, icon: "User", confirm: "다음" });
         if (rfb !== this.rfb) return;
         if (!res) {
+          this.authCancelled = true;
           this.end(rfb);
           return;
         }
@@ -356,6 +399,7 @@ export class VncView implements View {
       });
       if (rfb !== this.rfb) return;
       if (!res) {
+        this.authCancelled = true;
         this.end(rfb);
         return;
       }
@@ -451,8 +495,10 @@ export class VncView implements View {
     if (this.statsBox) {
       clearInterval(this.statsTimer);
       this.statsBox = null;
-      this.el.querySelector('[data-act="stats"]')?.classList.remove("on");
+      setPressed(this.el.querySelector('[data-act="stats"]'), false);
     }
+    // A new connection's counts start from nothing.
+    this.rects.clear();
     this.screen.innerHTML = "";
     api.vncProxyStop(this.proxyId).catch(() => {});
   }

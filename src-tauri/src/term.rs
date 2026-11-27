@@ -431,6 +431,35 @@ pub struct SerialSettings {
     /// else: overlapped I/O (comport.rs).
     #[serde(default)]
     pub io: String,
+    /// What Enter sends: "crlf", "lf", or else CR alone (the terminal's own).
+    #[serde(default)]
+    pub enter: String,
+}
+
+/// Enter as the device wants it: each CR going out becomes CR LF ("crlf") or
+/// LF ("lf"); "cr" (any other value) leaves the bytes as they are. An LF right
+/// after a CR in the same chunk (text that already had CR LF) is the same
+/// Enter, not another one. Not across chunks: the terminal sends Enter as CR
+/// alone, so an LF in a later chunk is a key of its own (Ctrl+J).
+fn map_enter(chunk: &[u8], enter: &str) -> Vec<u8> {
+    if enter != "crlf" && enter != "lf" {
+        return chunk.to_vec();
+    }
+    let mut out = Vec::with_capacity(chunk.len() + chunk.len() / 8);
+    let mut after_cr = false;
+    for &b in chunk {
+        match b {
+            b'\r' => {
+                out.extend_from_slice(if enter == "crlf" { b"\r\n" } else { b"\n" });
+                after_cr = true;
+                continue;
+            }
+            b'\n' if after_cr => {}
+            _ => out.push(b),
+        }
+        after_cr = false;
+    }
+    out
 }
 
 fn eight() -> u8 {
@@ -535,7 +564,7 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
     if !valid_com_name(&name) {
         return Err(format!("COM 포트 이름이 올바르지 않습니다: {port_name} (예: COM3)"));
     }
-    let s = settings.clone().unwrap_or(SerialSettings { baud: 9600, data_bits: 8, parity: String::new(), stop_bits: 1, flow: String::new(), io: String::new() });
+    let s = settings.clone().unwrap_or(SerialSettings { baud: 9600, data_bits: 8, parity: String::new(), stop_bits: 1, flow: String::new(), io: String::new(), enter: String::new() });
     if !(50..=4_000_000).contains(&s.baud) {
         return Err(format!("통신 속도가 올바르지 않습니다: {}", s.baud));
     }
@@ -583,7 +612,7 @@ fn open_serial(port_name: &str, settings: &Option<SerialSettings>, out: Arc<OutP
     let mut reader = port.try_clone().map_err(|e| format!("{name} 포트를 열 수 없습니다: {e}"))?;
     let control = port.try_clone().map_err(|e| format!("{name} 포트를 열 수 없습니다: {e}"))?;
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (input, writer) = spawn_serial_writer(port, closed.clone());
+    let (input, writer) = spawn_serial_writer(port, closed.clone(), s.enter.clone());
     let session = Arc::new(
         Session::new(
             Backend::Serial { control: Mutex::new(Some(SerialControl::Sync(control))), closed: closed.clone(), threads: Mutex::new(vec![writer]) },
@@ -641,11 +670,11 @@ fn open_serial_async(name: &str, s: &SerialSettings, char_time: Duration, out: A
 
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
     let writer = {
-        let (port, closed) = (port.clone(), closed.clone());
+        let (port, closed, enter) = (port.clone(), closed.clone(), s.enter.clone());
         std::thread::spawn(move || {
             while !closed.load(Ordering::Relaxed) {
                 let chunk = match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(c) => c,
+                    Ok(c) => map_enter(&c, &enter),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
@@ -709,13 +738,14 @@ fn open_serial_async(name: &str, s: &SerialSettings, char_time: Duration, out: A
 fn spawn_serial_writer(
     mut port: Box<dyn serialport::SerialPort>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    enter: String,
 ) -> (SyncSender<Vec<u8>>, std::thread::JoinHandle<()>) {
     use std::sync::atomic::Ordering;
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE);
     let handle = std::thread::spawn(move || {
         while !closed.load(Ordering::Relaxed) {
             let chunk = match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(c) => c,
+                Ok(c) => map_enter(&c, &enter),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
@@ -1614,7 +1644,31 @@ mod ssh_arg_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::AnsiStripper;
+    use super::{map_enter, AnsiStripper};
+
+    /// Enter for a serial device that wants CR LF or LF: each CR changes, a
+    /// CR LF already there in one chunk stays one Enter, a later LF on its
+    /// own (Ctrl+J typed after an Enter) goes as it is, other bytes and the
+    /// default ("cr", unknown) are left as they are.
+    #[test]
+    fn serial_enter_is_sent_as_the_device_wants_it() {
+        let run = |chunks: &[&[u8]], enter: &str| chunks.iter().flat_map(|c| map_enter(c, enter)).collect::<Vec<u8>>();
+        assert_eq!(run(&[b"show ver\r"], "crlf"), b"show ver\r\n");
+        assert_eq!(run(&[b"show ver\r"], "lf"), b"show ver\n");
+        assert_eq!(run(&[b"a\rb\r"], "crlf"), b"a\r\nb\r\n");
+        // Already CR LF in one chunk: still one Enter each.
+        assert_eq!(run(&[b"a\r\nb\r\n"], "crlf"), b"a\r\nb\r\n");
+        // Enter, then Ctrl+J typed later (its own chunk): the LF is kept.
+        assert_eq!(run(&[b"a\r", b"\n"], "crlf"), b"a\r\n\n");
+        assert_eq!(run(&[b"a\r", b"\n"], "lf"), b"a\n\n");
+        // A lone LF (not after a CR) and every other byte go as they are.
+        assert_eq!(run(&[b"x\ny\x03\x1b[A"], "crlf"), b"x\ny\x03\x1b[A");
+        // Two Enters in a row are two.
+        assert_eq!(run(&[b"\r\r"], "lf"), b"\n\n");
+        for default in ["", "cr", "other"] {
+            assert_eq!(run(&[b"a\r", b"\nb\r"], default), b"a\r\nb\r");
+        }
+    }
 
     /// `ssh -G` key lines read: IdentityFile entries in order with "~/" put
     /// as the home folder, a % token or "none" left out, no repeats; and

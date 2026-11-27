@@ -91,10 +91,36 @@ export function syntaxCheckFor(name: string, path: string, firstLine: string): {
   // (its default), as one alone may name an ACL or key defined in another.
   if (path === "/etc/named.conf") return { command: "named-checkconf {}", sudo: true, system: true };
   if (/^\/etc\/bind\/named\.conf[^/]*$/.test(path)) return { command: "named-checkconf", sudo: true, whole: "BIND", system: true };
+  // rsyslog: rsyslogd(8) "-N level" checks the configuration and exits
+  // without running ("-N1"); "-f" names the file. A piece in rsyslog.d is
+  // checked through the main file, which includes it. No reload offered.
+  if (path === "/etc/rsyslog.conf") return { command: "rsyslogd -N1 -f {}", sudo: true, system: true };
+  if (/^\/etc\/rsyslog\.d\/[^/]+\.conf$/.test(path)) return { command: "rsyslogd -N1", sudo: true, whole: "rsyslog", system: true };
   // Samba: testparm(1) loads the named smb.conf and reports what it cannot
   // parse (exit 1 on an error); "-s" leaves out its "press enter" prompt
   // before the dump. No reload: the unit is smbd on Debian, smb on RHEL.
   if (path === "/etc/samba/smb.conf") return { command: "testparm -s {}", sudo: false, system: true };
+  // Squid: squid(8) "-k parse" parses the configuration named by "-f" and
+  // exits, the running proxy left alone.
+  if (path === "/etc/squid/squid.conf") return { command: "squid -k parse -f {}", sudo: true, system: true };
+  // dnsmasq(8): "--test" reads and syntax-checks the configuration and exits
+  // (0 when it is good) without starting; "-C" names the file. Its conf-dir
+  // pieces are not checked alone: whether the main file reads them depends
+  // on the distribution's service script.
+  if (path === "/etc/dnsmasq.conf") return { command: "dnsmasq --test -C {}", sudo: true, system: true };
+  // Unbound: unbound-checkconf(8) checks the named file, or the default one
+  // (which includes the .d pieces on the distributions that ship them).
+  if (path === "/etc/unbound/unbound.conf") return { command: "unbound-checkconf {}", sudo: true, system: true };
+  if (/^\/etc\/unbound\/unbound\.conf\.d\/[^/]+\.conf$/.test(path)) return { command: "unbound-checkconf", sudo: true, whole: "Unbound", system: true };
+  // ISC DHCP server: dhcpd(8) "-t" tests the file "-cf" names and exits;
+  // dhcpd6.conf is the DHCPv6 server's ("-6").
+  if (path === "/etc/dhcp/dhcpd.conf") return { command: "dhcpd -t -cf {}", sudo: true, system: true };
+  if (path === "/etc/dhcp/dhcpd6.conf") return { command: "dhcpd -6 -t -cf {}", sudo: true, system: true };
+  // Prometheus: promtool "check config" validates a server configuration
+  // (and the rule files it names).
+  if (path === "/etc/prometheus/prometheus.yml") return { command: "promtool check config {}", sudo: false, system: true };
+  // No Caddy: "caddy validate" provisions the configuration's modules, which
+  // may write a local CA into the running user's data directory.
   return null;
 }
 
@@ -149,6 +175,21 @@ export function unitFileOf(path: string): { name: string; user: boolean } | null
   if (UNIT_FILE_NAME.test(path)) return { name, user: false };
   if (USER_UNIT_FILE_NAME.test(path)) return { name, user: true };
   return null;
+}
+/** The unit a path belongs to: a unit file's own, or the unit whose drop-in
+ * folder holds it ("app.service.d/override.conf" is app.service's,
+ * systemd.unit(5)); not a whole type's drop-ins ("service.d/x.conf"). */
+export function unitOfPath(path: string): { name: string; user: boolean } | null {
+  const own = unitFileOf(path);
+  if (own) return own;
+  const m = new RegExp(String.raw`^(.*)/([^/]+\.(?:${TYPES}))\.d/[^/]+\.conf$`).exec(path);
+  return m ? unitFileOf(`${m[1]}/${m[2]}`) : null;
+}
+/** The unit whose state "systemctl status" can show for a path (unitOfPath),
+ * not a template ("getty@.service"), which has no state of its own. */
+export function statusUnitOf(path: string): { name: string; user: boolean } | null {
+  const unit = unitOfPath(path);
+  return unit && !/@\.[^.]+$/.test(unit.name) ? unit : null;
 }
 const UNIT_FILE = String.raw`(?:[^/]+\.(?:${TYPES})|(?:[^/]+\.(?:${TYPES}|scope)|${TYPES}|scope)\.d/[^/]+\.conf)`;
 const SYSTEM_UNIT = new RegExp(String.raw`^/(?:etc|run|lib|usr/lib|usr/local/lib)/systemd/system/${UNIT_FILE}$`);

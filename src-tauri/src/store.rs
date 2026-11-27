@@ -154,8 +154,14 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
         return String::from_utf8_lossy(rest).into_owned();
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16_lossy(&utf16_units(rest, true));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return String::from_utf16_lossy(&utf16_units(rest, false));
+    }
+    // Before UTF-8, which takes UTF-16's NUL bytes as valid text.
+    if let Some(text) = utf16_without_bom(bytes) {
+        return text;
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_string();
@@ -169,6 +175,33 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
         }
     use windows_sys::Win32::Globalization::CP_ACP;
     decode_code_page(CP_ACP, bytes, false).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn utf16_units(bytes: &[u8], little: bool) -> Vec<u16> {
+    bytes.chunks_exact(2).map(|c| if little { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect()
+}
+
+/// UTF-16 written without a byte-order mark (.NET's Encoding.Unicode bytes,
+/// some exporters). Text in UTF-8 or a code page holds no NUL byte, while
+/// UTF-16 has one in every ASCII character (the brackets, "=", line ends of
+/// an INI or XML file): at odd offsets little-endian, at even ones big-endian.
+/// Taken only when a quarter or more of the characters show it on one side
+/// and next to none on the other, and the whole decodes as valid UTF-16.
+fn utf16_without_bom(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let chars = bytes.len() / 2;
+    let even = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+    let odd = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+    let little = if odd * 4 >= chars && even * 10 <= odd {
+        true
+    } else if even * 4 >= chars && odd * 10 <= even {
+        false
+    } else {
+        return None;
+    };
+    String::from_utf16(&utf16_units(bytes, little)).ok()
 }
 
 /// Decode bytes in a Windows code page. `strict` fails on any invalid sequence.
@@ -193,7 +226,7 @@ pub(crate) fn decode_code_page(code_page: u32, bytes: &[u8], strict: bool) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_text, read_limited, reset_unreadable, save_in_order};
+    use super::{decode_text, read_limited, reset_unreadable, save_in_order, utf16_without_bom};
 
     /// Starting empty keeps the unreadable file aside (once per content) and
     /// never touches a file that reads fine.
@@ -249,6 +282,28 @@ mod tests {
         assert_eq!(decode_text(&[0xFF, 0xFE, 0x5C, 0xD5, 0x00, 0xAE]), "한글");
         // "한글 세션" in CP949, whatever this PC's ANSI code page is.
         assert_eq!(decode_text(&[0xC7, 0xD1, 0xB1, 0xDB, 0x20, 0xBC, 0xBC, 0xBC, 0xC7]), "한글 세션");
+    }
+
+    /// UTF-16 with no byte-order mark, either byte order, and big-endian with
+    /// one; text that only looks alike stays as it was read before.
+    #[test]
+    fn decodes_utf16_without_a_bom() {
+        let ini = "[Bookmarks]\r\n한글 세션=#109#0%10.0.0.1%22\r\n";
+        let le: Vec<u8> = ini.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let be: Vec<u8> = ini.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert_eq!(decode_text(&le), ini);
+        assert_eq!(decode_text(&be), ini);
+        assert_eq!(decode_text(&[[0xFE, 0xFF].as_slice(), &be].concat()), ini);
+        // All Hangul, no ASCII: no NUL anywhere, so it is not taken as UTF-16
+        // (UTF-8 bytes of the same text decode as before).
+        assert_eq!(decode_text("한글".as_bytes()), "한글");
+        // NULs on both sides (binary-ish data), an odd length, an unpaired
+        // surrogate: none is read as UTF-16.
+        assert!(utf16_without_bom(&[0, 0, 0, 0, b'a', 0, 0, b'b']).is_none());
+        assert!(utf16_without_bom(&[b'a', 0, b'b', 0, b'c']).is_none());
+        // A lone low surrogate (U+DC01) between ASCII letters.
+        assert!(utf16_without_bom(&[b'a', 0, 0x01, 0xDC, b'b', 0]).is_none());
+        assert_eq!(utf16_without_bom(&[b'a', 0, b'b', 0]).as_deref(), Some("ab"));
     }
 }
 

@@ -7,6 +7,7 @@ import { isPublicAddress, logRenderer, type LogEntry } from "./ftpServer";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
 import { userText } from "./i18n";
+import { saveLocal } from "./store";
 
 const LOG_MAX = 300;
 let logSeq = 0;
@@ -90,17 +91,23 @@ function deviceCommands(s: FileServerStatus): string {
   if (s.kind !== "tftp" || s.port !== 69) return "";
   const ip = s.addresses.map((a) => /^tftp:\/\/(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(a)?.[1]).find((a) => a && a !== "127.0.0.1");
   if (!ip) return "";
-  const rows: [string, string, string][] = [
-    [`copy running-config tftp://${ip}/router-confg`, "장비 설정을 이 PC로 백업", s.readOnly ? "읽기 전용이라 받을 수 없음 · 읽기/쓰기로 다시 시작" : ""],
-    [`copy tftp://${ip}/FILE flash:`, "이 PC의 파일을 장비로 (FILE을 파일 이름으로)", ""],
+  const noUpload = s.readOnly ? "읽기 전용이라 받을 수 없음 · 읽기/쓰기로 다시 시작" : "";
+  // [command, what it does, why it cannot work now, the system it is for].
+  // Huawei VRP and H3C Comware take the same user-view command,
+  // "tftp server { get | put } file".
+  const rows: [string, string, string, string][] = [
+    [`copy running-config tftp://${ip}/router-confg`, "장비 설정을 이 PC로 백업", noUpload, "Cisco IOS"],
+    [`copy tftp://${ip}/FILE flash:`, "이 PC의 파일을 장비로 (FILE을 파일 이름으로)", "", "Cisco IOS"],
+    [`tftp ${ip} put FILE`, "장비의 파일을 이 PC로 (FILE을 파일 이름으로)", noUpload, "Huawei · H3C"],
+    [`tftp ${ip} get FILE`, "이 PC의 파일을 장비로 (FILE을 파일 이름으로)", "", "Huawei · H3C"],
   ];
   // Folded until wanted: the running server's window stays its height. Each
-  // command on one line, what it does in its tooltip; a reason it cannot
-  // work (a read-only server) beside it.
-  return `<details class="tftp-cmds"><summary class="muted small" title="장비에서 쓸 명령 (Cisco IOS, 눌러서 복사)">${icon("SquareTerminal", 13)}<span>장비용 명령</span></summary>${rows
+  // command on one line with the system it is for, what it does in its
+  // tooltip; a reason it cannot work (a read-only server) beside it.
+  return `<details class="tftp-cmds"><summary class="muted small" title="장비에서 쓸 명령 (눌러서 복사)">${icon("SquareTerminal", 13)}<span>장비용 명령</span></summary>${rows
     .map(
-      ([cmd, what, note]) =>
-        `<button type="button" class="ftpd-addr" data-cmd="${esc(cmd)}" title="${esc(what)}">${icon("Copy", 13)}<code data-i18n-skip>${esc(cmd)}</code>${
+      ([cmd, what, note, system]) =>
+        `<button type="button" class="ftpd-addr" data-cmd="${esc(cmd)}" title="${esc(what)}">${icon("Copy", 13)}<code data-i18n-skip>${esc(cmd)}</code><span class="muted small" data-i18n-skip>${esc(system)}</span>${
           note ? `<span class="danger-text small">${esc(note)}</span>` : ""
         }</button>`,
     )
@@ -280,7 +287,8 @@ export function openFileServer(kind: FileServerKind) {
         if (kind === "http" && cfg.lan && !cfg.username)
           toast("인증 없이 다른 PC에 공개합니다. 폴더의 모든 파일을 누구나 내려받을 수 있습니다.", "warn", 6000);
         const { password: _pw, ...prefs } = cfg;
-        localStorage.setItem(`bx.${kind}Server`, JSON.stringify(prefs));
+        // Not saved (storage full): said once; the server starts all the same.
+        saveLocal(`bx.${kind}Server`, JSON.stringify(prefs));
         status[kind] = await api.fileServerStart(cfg);
         toast(`${info.title}를 시작했습니다 (${status[kind]!.addresses[0]})`, "success");
       }

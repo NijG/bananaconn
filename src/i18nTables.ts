@@ -51,6 +51,7 @@ const ENGLISH_SINGULAR: Record<string, string> = {
   times: "time", devices: "device", addresses: "address", messages: "message", names: "name", hops: "hop",
   terminals: "terminal", commands: "command", alerts: "alert", words: "word", records: "record", transfers: "transfer",
   IPs: "IP", models: "model", scripts: "script", minutes: "minute", seconds: "second", hours: "hour", days: "day",
+  blocks: "block", networks: "network",
 };
 // A count stands alone: not "11", "2.1" or the end of a word ("v1", "Q1").
 const ONE_PLURAL = new RegExp(`(?<![\\w.,])(1 (?:[A-Za-z-]+ )?)(${Object.keys(ENGLISH_SINGULAR).join("|")})\\b`, "g");

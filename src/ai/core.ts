@@ -108,6 +108,11 @@ export class Masker {
   /** Host names to hide (the session's host, the device's name …). */
   private names: string[];
 
+  /** Whether it hides hosts, IPs and e-mail addresses (not only secrets). */
+  get masksHosts(): boolean {
+    return this.hosts;
+  }
+
   constructor(hosts: boolean, names: string[] = []) {
     this.hosts = hosts;
     this.names = names;

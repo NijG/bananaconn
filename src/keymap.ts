@@ -51,6 +51,7 @@ export const ACTIONS: ActionDef[] = [
   g("app.tunnels", "SSH 터널 관리자"),
   g("app.netTools", "네트워크 도구"),
   g("app.subnet", "서브넷 계산", [], { note: "IP와 접두사로 네트워크·호스트 범위 계산" }),
+  g("app.watchClipboard", "클립보드의 주소들을 연속 ping으로 지켜보기", [], { note: "메일·표에서 복사한 장비 주소 목록" }),
   g("app.compare", "출력 비교", [], { note: "두 내용을 줄 단위로 비교" }),
   g("app.connectHistory", "전체 연결 기록", [], { note: "모든 세션의 연결·끊김·실패를 최신순으로" }),
   g("app.lock", "앱 잠그기", [], { note: "마스터 비밀번호를 설정했을 때" }),

@@ -5,7 +5,7 @@
 //
 // Needs Node.js 23.6 or later (it imports the TypeScript directly).
 
-import { installFor, interpreterOf, languageOfInterpreter, syntaxCheckFor, unitFileOf, unitReloadFor } from "../src/shebang.ts";
+import { installFor, interpreterOf, languageOfInterpreter, statusUnitOf, syntaxCheckFor, unitFileOf, unitOfPath, unitReloadFor } from "../src/shebang.ts";
 
 let failed = 0;
 const check = (what, got, want) => {
@@ -83,6 +83,10 @@ for (const [name, path, first, want] of [
   ["web.cfg", "/etc/haproxy/web.cfg", "backend web", "sudo haproxy -c -V -f {}"],
   ["db.local", "/etc/bind/db.local", "$TTL", null],
   ["smb.conf", "/etc/samba/smb.conf", "[global]", "testparm -s {}"],
+  ["rsyslog.conf", "/etc/rsyslog.conf", "module(load=\"imuxsock\")", "sudo rsyslogd -N1 -f {}"],
+  ["10-remote.conf", "/etc/rsyslog.d/10-remote.conf", "*.* @@10.0.0.1", "sudo rsyslogd -N1"],
+  ["rsyslog.conf", "/home/u/rsyslog.conf", "", null],
+  ["x.conf", "/etc/rsyslog.d/sub/x.conf", "", null],
   ["smb.conf", "/home/u/smb.conf", "[global]", null],
   ["lmhosts", "/etc/samba/lmhosts", "", null],
   ["app.service", "/etc/systemd/system/app.service", "[Unit]", "systemd-analyze verify {}"],
@@ -108,6 +112,20 @@ for (const [name, path, first, want] of [
   ["config.yml", "/srv/config.yml", "a: 1", null],
   ["notes.txt", "/srv/notes.txt", "", null],
   ["awk.sh", "/srv/awk.sh", "#!/usr/bin/awk -f", null],
+  // Each daemon's own configuration test.
+  ["squid.conf", "/etc/squid/squid.conf", "http_port 3128", "sudo squid -k parse -f {}"],
+  ["dnsmasq.conf", "/etc/dnsmasq.conf", "", "sudo dnsmasq --test -C {}"],
+  ["local.conf", "/etc/dnsmasq.d/local.conf", "", null],
+  ["unbound.conf", "/etc/unbound/unbound.conf", "server:", "sudo unbound-checkconf {}"],
+  ["remote.conf", "/etc/unbound/unbound.conf.d/remote.conf", "", "sudo unbound-checkconf"],
+  ["dhcpd.conf", "/etc/dhcp/dhcpd.conf", "", "sudo dhcpd -t -cf {}"],
+  ["dhcpd6.conf", "/etc/dhcp/dhcpd6.conf", "", "sudo dhcpd -6 -t -cf {}"],
+  ["dhclient.conf", "/etc/dhcp/dhclient.conf", "", null],
+  ["prometheus.yml", "/etc/prometheus/prometheus.yml", "global:", "promtool check config {}"],
+  ["rules.yml", "/etc/prometheus/rules.yml", "", null],
+  ["Caddyfile", "/etc/caddy/Caddyfile", ":80 {", null], // validate provisions modules: not offered
+  ["Caddyfile", "/home/u/site/Caddyfile", "", null],
+  ["squid.conf", "/home/u/squid.conf", "", null],
 ]) {
   const c = syntaxCheckFor(name, path, first);
   check(`check ${path}`, c ? `${c.sudo ? "sudo " : ""}${c.command}` : null, want);
@@ -124,7 +142,9 @@ for (const [path, want] of [
   ["/etc/ssh/sshd_config", undefined],
   ["/etc/named.conf", undefined],
   ["/etc/samba/smb.conf", undefined],
+  ["/etc/rsyslog.conf", undefined],
   ["/etc/sudoers", undefined],
+  ["/etc/squid/squid.conf", undefined],
 ]) check(`reload of ${path}`, syntaxCheckFor(path.split("/").pop(), path, "")?.reload, want);
 
 // A unit file saved: the reload systemd needs (system or user manager).
@@ -172,6 +192,28 @@ for (const [path, want] of [
   const u = unitFileOf(path);
   check(`unit ${path}`, u ? `${u.user ? "user " : ""}${u.name}` : null, want);
 }
+
+// The unit a drop-in belongs to (its folder's name), for "systemctl status".
+for (const [path, want] of [
+  ["/etc/systemd/system/app.service.d/override.conf", "app.service"],
+  ["/usr/lib/systemd/system/sshd.service.d/10-x.conf", "sshd.service"],
+  ["/home/u/.config/systemd/user/sync.service.d/env.conf", "user sync.service"],
+  ["/etc/systemd/system/app.service", "app.service"],
+  // A whole type's drop-ins, a non-.conf file, a copy elsewhere.
+  ["/etc/systemd/system/service.d/10-limits.conf", null],
+  ["/etc/systemd/system/app.service.d/notes.txt", null],
+  ["/srv/app.service.d/override.conf", null],
+]) {
+  const u = unitOfPath(path);
+  check(`unit of ${path}`, u ? `${u.user ? "user " : ""}${u.name}` : null, want);
+}
+// Templates have no state of their own: no "systemctl status" for them or their drop-ins.
+for (const [path, want] of [
+  ["/lib/systemd/system/getty@.service", null],
+  ["/etc/systemd/system/getty@.service.d/x.conf", null],
+  ["/etc/systemd/system/getty@tty1.service.d/x.conf", "getty@tty1.service"],
+  ["/etc/systemd/system/app.service", "app.service"],
+]) check(`status unit of ${path}`, statusUnitOf(path)?.name ?? null, want);
 
 // A sudo save of the sudoers policy: one root shell that checks the copy,
 // puts it in with a backup, checks the whole policy and puts the backup back

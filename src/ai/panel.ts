@@ -63,6 +63,8 @@ interface SavedConversation {
   at: number;
   /** Token totals, kept so a reopened conversation still shows its usage. */
   usage?: { input: number; output: number };
+  /** Some turns went to a service on this PC, unmasked. */
+  raw?: boolean;
 }
 
 const storageKey = (key: string) => SAVED_PREFIX + key;
@@ -419,6 +421,8 @@ export class AiPanel {
   private skip = { skip: false };
   private asking: Asking | null = null;
   private providerId: string | null = null;
+  /** This conversation has turns sent unmasked to a service on this PC. */
+  private raw = false;
   private system: "chat" | "explain" | "config" | "log" = "chat";
   /** Tokens this conversation has used (summed over its requests). */
   private usage = { input: 0, output: 0 };
@@ -674,6 +678,7 @@ export class AiPanel {
     this.interrupting = false;
     this.turns = [];
     this.masker = null;
+    this.raw = false;
     this.skip = { skip: false };
     this.system = "chat";
     this.queued = null;
@@ -713,6 +718,7 @@ export class AiPanel {
     this.queued = null;
     this.turns = [];
     this.masker = null;
+    this.raw = false;
     this.skip = { skip: false };
     this.system = "chat";
     this.usage = { input: 0, output: 0 };
@@ -859,7 +865,7 @@ export class AiPanel {
         ...(fixed.output ? { output: { ...fixed.output, command: maskSecrets(fixed.output.command), text: maskSecrets(fixed.output.text) } } : {}),
       };
     });
-    storeConversation(key, turns.length ? { turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now(), usage: this.usage } : null);
+    storeConversation(key, turns.length ? { turns, masker: this.masker?.save() ?? null, system: this.system, providerId: this.providerId, at: Date.now(), usage: this.usage, raw: this.raw } : null);
   }
 
   /** The conversation this connection had before (panel closed, app restarted). */
@@ -872,6 +878,11 @@ export class AiPanel {
     this.system = saved.system ?? "chat";
     if (saved.usage) this.usage = { input: saved.usage.input || 0, output: saved.usage.output || 0 };
     if (saved.providerId && providers().some((p) => p.id === saved.providerId)) this.providerId = saved.providerId;
+    // Saved before the flag existed: judge by the service it was saved with. Most
+    // saved none (the default was used) or one since deleted: then it may have
+    // gone to this PC, so it does not go on to an outside service unasked.
+    const was = saved.providerId ? providers().find((p) => p.id === saved.providerId) : undefined;
+    this.raw = saved.raw ?? (was ? isLocal(was) : true);
   }
 
   private click(e: MouseEvent) {
@@ -1021,14 +1032,45 @@ export class AiPanel {
     return !!t && t.role === "user" && !t.output && !t.nudge && !this.turns[i - 1]?.run;
   }
 
+  /** Keep the turns before `i`. With none left, the conversation starts over:
+   * its masker (made for the service it went to) and the local mark go too. */
+  private trimTo(i: number) {
+    this.turns = this.turns.slice(0, i);
+    if (this.turns.length) return;
+    this.masker = null;
+    this.raw = false;
+  }
+
+  /** Earlier turns went to this PC unmasked and `p` is an outside service:
+   * they must not go along. The service can change without the dropdown
+   * (Settings' default, a deleted service). */
+  private needsFresh(p: AiProvider): boolean {
+    return this.raw && this.turns.length > 0 && !isLocal(p);
+  }
+
+  /** Ask to start over for `p`; on yes the conversation is cleared (the next
+   * message's review mode kept). False: cancelled, or things changed meanwhile. */
+  private async startFresh(p: AiProvider): Promise<boolean> {
+    const fresh = await confirmDialog({ title: "AI 서비스 바꾸기", message: "이 PC의 AI와 나눈 대화는 외부 서비스로 이어 보내지 않습니다. 지금 대화를 정리하고 새 대화로 보낼까요?", confirm: "새 대화로 보내기" });
+    if (!fresh || this.provider?.id !== p.id || this.asking || this.busy || !this.needsFresh(p)) return false;
+    const system = this.system;
+    this.newConversation();
+    this.system = system;
+    return true;
+  }
+
   /** Regenerate the last answer: drop it and re-ask the last question. */
-  private regenerate() {
+  private async regenerate() {
     if (this.busy) return;
     let i = this.turns.length - 1;
     while (i >= 0 && !this.isQuestion(i)) i--;
     if (i < 0) return;
     const userTurn = this.turns[i];
-    this.turns = this.turns.slice(0, i);
+    const p = this.provider;
+    // Ask before anything is dropped, so "cancel" leaves the conversation whole.
+    if (p && this.needsFresh(p)) {
+      if (!(await this.startFresh(p))) return;
+    } else this.trimTo(i);
     this.pending = (userTurn.media ?? []).filter((a) => a.data);
     this.drawPending();
     // internal: the stored text already holds any attached selection — don't
@@ -1041,7 +1083,7 @@ export class AiPanel {
   private editTurn(i: number) {
     if (this.busy || !this.isQuestion(i)) return;
     const t = this.turns[i];
-    this.turns = this.turns.slice(0, i);
+    this.trimTo(i);
     this.input.value = t.shown;
     this.pending = (t.media ?? []).filter((a) => a.data);
     this.drawPending();
@@ -1201,6 +1243,16 @@ export class AiPanel {
       if (typed === undefined) this.queueFromCompose();
       return;
     }
+    // Start over with this message, or leave everything as is.
+    if (this.needsFresh(p) && ((typed ?? this.input.value).trim() || this.pending.length) && !(await this.startFresh(p))) return;
+    // A masker made while hosts were not hidden (for this PC's service, or with
+    // the setting off) hides them from here on: earlier turns hold no host
+    // placeholders, so nothing it knew is lost.
+    if (this.masker && !isLocal(p) && state.settings.aiMaskHosts && !this.masker.masksHosts) {
+      const secrets = this.masker.secrets;
+      this.masker = new Masker(true, this.host.hostNames());
+      this.masker.secrets = secrets;
+    }
     let text = (typed ?? this.input.value).trim();
     const attached = this.pending;
     if (!text && !attached.length) return;
@@ -1235,6 +1287,7 @@ export class AiPanel {
       this.pending = [];
       this.drawPending();
       this.turns.push({ role: "user", shown: text, sent, media });
+      if (isLocal(p)) this.raw = true;
       const target = this.host.target();
       const system = agent ? prompts.agent(target, MAX_STEPS) : this.system === "explain" ? prompts.explain(target) : this.system === "chat" ? prompts.chat(target) : prompts.analyse(target, this.system);
       let nudged = false;

@@ -7,7 +7,7 @@ import { api, on, openExternal, type ProxyLogEvent, type TunnelInfo } from "./ap
 import { proxyOf } from "./proxy";
 import { icon } from "./icons";
 import { endpoint, parseTarget, unusableHost, type Session } from "./model";
-import { state } from "./store";
+import { saveLocal, state } from "./store";
 import { confirmDialog, confirmDiscard, errorText, esc, formValues, modal, promptDialog, toast } from "./ui";
 import { userText } from "./i18n";
 import { forgetHostKey } from "./hostKeys";
@@ -215,8 +215,10 @@ function loadSaved(): SavedTunnel[] {
   }
 }
 
-function storeSaved(list: SavedTunnel[]) {
-  localStorage.setItem(KEY, JSON.stringify(list));
+/** False when storage is full: the tunnels are read back from storage each
+ * time, so a list not saved is not there at all. */
+function storeSaved(list: SavedTunnel[]): boolean {
+  return saveLocal(KEY, JSON.stringify(list), false);
 }
 
 /** Saved tunnels, for the session backup. */
@@ -224,11 +226,13 @@ export function savedTunnels(): SavedTunnel[] {
   return loadSaved();
 }
 
-/** Add tunnels from a backup that are not here yet (by id). */
-export function addSavedTunnels(list: SavedTunnel[]) {
+/** Add tunnels from a backup that are not here yet (by id): how many were
+ * added (0 when they could not be saved). */
+export function addSavedTunnels(list: SavedTunnel[]): number {
   const have = loadSaved();
   const ids = new Set(have.map((t) => t.id));
-  storeSaved([...have, ...list.filter((t) => !ids.has(t.id))]);
+  const added = list.filter((t) => !ids.has(t.id));
+  return storeSaved([...have, ...added]) ? added.length : 0;
 }
 
 let eventsWired = false;
@@ -258,7 +262,7 @@ export function openTunnelManager() {
         <p class="muted small">내 PC의 포트로 들어온 연결을 SSH 서버를 거쳐 다른 주소로 보냅니다(ssh -L). 예: 로컬 15432 → db.internal:5432</p>
         <div class="tunnel-list"></div>
         <form class="form tunnel-new" autocomplete="off">
-          <h4>새 터널</h4>
+          <h4 data-form-title>새 터널</h4>
           <div class="tunnel-grid">
             <label class="field"><span>이름</span><input name="name" placeholder="사내 DB" spellcheck="false"/></label>
             <label class="field"><span>SSH 서버</span><select name="gateway"></select></label>
@@ -266,17 +270,19 @@ export function openTunnelManager() {
             <label class="field"><span>대상 호스트 (SSH 서버에서 본 주소)</span><input name="targetHost" placeholder="db.internal" spellcheck="false"/></label>
             <label class="field"><span>대상 포트</span><input name="targetPort" type="number" min="1" max="65535" placeholder="5432"/></label>
           </div>
-          <div class="row"><button type="submit" class="btn btn-primary">${icon("Plus", 14)}추가</button></div>
+          <div class="row"><button type="button" class="btn" data-cancel-edit hidden>취소</button><button type="submit" class="btn btn-primary" data-submit>${icon("Plus", 14)}추가</button></div>
         </form>
       </div>`,
     footer: `<button class="btn" data-close>닫기</button>`,
     onClose: () => clearInterval(timer),
-    // A new tunnel typed in but not added yet.
-    beforeDismiss: () => formValues(form) === formEmpty || confirmDiscard(),
+    // A new tunnel typed in but not added yet, or a change to one not saved.
+    beforeDismiss: () => untouched() || confirmDiscard(),
   });
   const listEl = m.root.querySelector<HTMLElement>(".tunnel-list")!;
   const form = m.root.querySelector<HTMLFormElement>(".tunnel-new")!;
-  const sshSessions = () => state.sessions.filter((s) => s.protocol === "ssh");
+  // Only sessions a tunnel can log in to directly: one through a jump host or
+  // another gateway was offered too, and then failed at every start.
+  const sshSessions = () => state.sessions.filter(canBeGateway);
   form.querySelector<HTMLSelectElement>("[name=gateway]")!.innerHTML = sshSessions().length
     ? sshSessions()
         .map((s) => `<option value="${esc(s.id)}" data-i18n-skip>${esc(s.name)} · ${esc(endpoint(s))}</option>`)
@@ -284,6 +290,37 @@ export function openTunnelManager() {
     : `<option value="">저장된 SSH 세션이 없습니다</option>`;
   /** The new-tunnel form as it starts (and as "추가" leaves it). */
   const formEmpty = formValues(form);
+  /** The saved tunnel the form is changing (its id kept, so a running one is
+   * still known by it), and the form as it was filled: closing asks only
+   * when something was changed. Null: the form adds a new one. */
+  let editing: { id: string; base: string } | null = null;
+  /** The form as a clone filled it: nothing typed yet, so nothing to lose. */
+  let cloned: string | null = null;
+  /** Nothing typed since the form was emptied, filled for a change or cloned. */
+  const untouched = () => formValues(form) === (editing?.base ?? cloned ?? formEmpty);
+  const formTitle = form.querySelector<HTMLElement>("[data-form-title]")!;
+  const submitBtn = form.querySelector<HTMLButtonElement>("[data-submit]")!;
+  const cancelBtn = form.querySelector<HTMLButtonElement>("[data-cancel-edit]")!;
+  const field = (n: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name=${n}]`)!;
+  const setEditing = (t: SavedTunnel | null) => {
+    form.reset();
+    cloned = null;
+    if (t) {
+      field("name").value = t.name;
+      // A deleted SSH session is no choice in the list: the field asks for one.
+      field("gateway").value = sshSessions().some((s) => s.id === t.gatewayId) ? t.gatewayId : "";
+      field("localPort").value = String(t.localPort);
+      field("targetHost").value = t.targetHost;
+      field("targetPort").value = String(t.targetPort);
+    }
+    editing = t ? { id: t.id, base: formValues(form) } : null;
+    formTitle.textContent = t ? "터널 수정" : "새 터널";
+    submitBtn.innerHTML = t ? `${icon("Check", 14)}저장` : `${icon("Plus", 14)}추가`;
+    cancelBtn.hidden = !t;
+    render();
+    if (t) field("localPort").focus();
+  };
+  cancelBtn.addEventListener("click", () => setEditing(null));
 
   const refresh = async () => {
     running = await api.tunnelList().catch(() => []);
@@ -305,7 +342,7 @@ export function openTunnelManager() {
     const rows = list.map((t) => {
       const r = running.find((x) => x.id === t.id);
       const gw = state.sessions.find((s) => s.id === t.gatewayId);
-      const html = `<div class="tunnel-row${r ? " on" : ""}" data-id="${esc(t.id)}">
+      const html = `<div class="tunnel-row${r ? " on" : ""}${editing?.id === t.id ? " editing" : ""}" data-id="${esc(t.id)}">
           <span class="sb-dot ${r ? "connected" : "idle"}"></span>
           <div class="tunnel-main"><b data-i18n-skip>${esc(t.name || `${t.targetHost}:${t.targetPort}`)}</b>
             <span class="mono small"><button type="button" class="tunnel-local" data-copy-local title="주소 복사"><span data-i18n-skip>127.0.0.1:${esc(String(t.localPort))}</span></button><span data-i18n-skip> → ${esc(t.targetHost)}:${esc(String(t.targetPort))}</span></span>
@@ -314,12 +351,14 @@ export function openTunnelManager() {
               // whose value the translator would translate too ("삭제" → "Delete").
               gw ? `<span title="SSH 서버">${icon("Server", 12)}</span> <span data-i18n-skip>${esc(gw.name)}</span>` : "SSH 세션이 삭제됨"
             }<span class="tunnel-stats"></span></span></div>
-          <button class="btn btn-sm ${r ? "btn-danger" : "btn-primary"}" data-toggle ${busy.has(t.id) || !gw ? "disabled" : ""}>
+          <button class="btn btn-sm ${r ? "btn-danger" : "btn-primary"}" data-toggle ${busy.has(t.id) || (!gw && !r) ? "disabled" : ""}>
             ${r ? `${icon("Square", 13)}중지` : `${icon("Play", 13)}시작`}</button>
           ${
             // A running tunnel to a web port (a device's management page): opened in the browser.
             r && WEB_PORTS[t.targetPort] ? `<button class="tool" data-open-web title="브라우저에서 열기">${icon("Globe", 14)}</button>` : ""
           }
+          <button class="tool" data-clone title="복제 (다른 내 PC 포트로)">${icon("Copy", 14)}</button>
+          <button class="tool" data-edit title="수정" ${r || busy.has(t.id) ? "disabled" : ""}>${icon("Pencil", 14)}</button>
           <button class="tool" data-del title="삭제" ${r || busy.has(t.id) ? "disabled" : ""}>${icon("Trash2", 14)}</button>
         </div>`;
       return { id: t.id, html, stats: r ? ` · 연결 ${r.active}개 / 누적 ${r.total}` : "" };
@@ -358,6 +397,27 @@ export function openTunnelManager() {
       void writeClipboard(`127.0.0.1:${t.localPort}`);
       return void toast("주소를 복사했습니다", "success", 1600);
     }
+    // The same SSH server and target into the form as a new tunnel, its local
+    // port left to choose (one port takes one tunnel).
+    if ((e.target as HTMLElement).closest("[data-clone]")) {
+      if (!untouched() && !(await confirmDiscard("입력 중인 내용이 있습니다. 버리고 이 터널을 복제할까요?", "버리고 복제"))) return;
+      setEditing(null);
+      // Its SSH session deleted: none chosen (as a change does), not the
+      // list's first one in its place.
+      field("gateway").value = sshSessions().some((s) => s.id === t.gatewayId) ? t.gatewayId : "";
+      field("targetHost").value = t.targetHost;
+      field("targetPort").value = String(t.targetPort);
+      cloned = formValues(form);
+      return void field("localPort").focus();
+    }
+    // Its values into the form below, to change and save in place.
+    if ((e.target as HTMLElement).closest("[data-edit]")) {
+      if (busy.has(t.id) || running.some((r) => r.id === t.id)) return;
+      // The one already being changed: what is typed stays.
+      if (editing?.id === t.id) return void field("localPort").focus();
+      if (!untouched() && !(await confirmDiscard("입력 중인 내용이 있습니다. 버리고 이 터널을 수정할까요?", "버리고 수정"))) return;
+      return setEditing(t);
+    }
     if ((e.target as HTMLElement).closest("[data-del]")) {
       if (busy.has(t.id) || running.some((r) => r.id === t.id)) return;
       const ok = await confirmDialog({
@@ -368,8 +428,11 @@ export function openTunnelManager() {
       });
       // While the dialog was open the tunnel may have been deleted or opened.
       if (!ok || !list.some((x) => x.id === t.id) || busy.has(t.id) || running.some((r) => r.id === t.id)) return;
-      list = list.filter((x) => x.id !== t.id);
-      storeSaved(list);
+      const next = list.filter((x) => x.id !== t.id);
+      if (!storeSaved(next)) return;
+      list = next;
+      // The one being changed is gone: the form adds a new one again.
+      if (editing?.id === t.id) return setEditing(null);
       return render();
     }
     if (!(e.target as HTMLElement).closest("[data-toggle]") || busy.has(t.id)) return;
@@ -409,21 +472,37 @@ export function openTunnelManager() {
       targetPort ||= parsed.port ? String(parsed.port) : "";
     }
     const t: SavedTunnel = {
-      id: crypto.randomUUID(),
+      // A change keeps the tunnel's id (its place in the list, and a start's record).
+      id: editing?.id ?? crypto.randomUUID(),
       name: val("name"),
       gatewayId: val("gateway"),
       localPort: Number(val("localPort")),
       targetHost,
       targetPort: Number(targetPort),
     };
-    if (!t.gatewayId) return toast("먼저 SSH 세션을 저장하세요", "warn");
+    // None chosen (a change or a clone of a tunnel whose session is gone) while there are some.
+    if (!t.gatewayId) return toast(sshSessions().length ? "SSH 서버를 고르세요" : "먼저 SSH 세션을 저장하세요", "warn");
     if (!validPort(t.localPort) || !validPort(t.targetPort)) return toast("포트는 1부터 65535 사이의 정수여야 합니다", "warn");
     if (!t.targetHost) return toast("대상 호스트를 입력하세요", "warn");
     if (unusableHost(t.targetHost)) return toast("호스트 이름이 올바르지 않습니다", "warn");
-    if (list.some((x) => x.localPort === t.localPort)) return toast(`내 PC 포트 ${t.localPort}을(를) 쓰는 터널이 이미 있습니다`, "warn");
+    if (list.some((x) => x.id !== t.id && x.localPort === t.localPort)) return toast(`내 PC 포트 ${t.localPort}을(를) 쓰는 터널이 이미 있습니다`, "warn");
+    if (editing) {
+      // Started (or deleted) since the form was filled: a running tunnel keeps
+      // what it was opened with, so it is not changed under it.
+      if (running.some((r) => r.id === t.id) || busy.has(t.id)) return toast("실행 중인 터널은 중지한 뒤 수정하세요", "warn");
+      const at = list.findIndex((x) => x.id === t.id);
+      if (at < 0) return setEditing(null);
+      const next = list.map((x, i) => (i === at ? t : x));
+      // Not saved (storage full, said by storeSaved): the list stays as stored, the form as typed.
+      if (!storeSaved(next)) return;
+      list = next;
+      toast("터널을 수정했습니다", "success", 2000);
+      return setEditing(null);
+    }
+    if (!storeSaved([...list, t])) return;
     list.push(t);
-    storeSaved(list);
     form.reset();
+    cloned = null;
     render();
   });
 

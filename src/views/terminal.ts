@@ -17,6 +17,11 @@ import {
   bandwidthAbove,
   findInterfaces,
   findIps,
+  hostAddresses,
+  findIpv6s,
+  sameHost,
+  ipv6Kind,
+  parseIpv6,
   interfaceDescription,
   interfaceNeighbor,
   interfaceStateChange,
@@ -38,14 +43,14 @@ import {
 } from "../ipLinks";
 import { matchLines, type LineMatch, type OutputLine } from "../lineFilter";
 import { clockText, LineTimes } from "../lineTimes";
-import { splitTable, type CellLine } from "../tableCopy";
+import { splitTable, type CellLine, codeBlock } from "../tableCopy";
 import { notesButton } from "../sessionNotes";
 import { savedSessionItems } from "../nettools";
 import { openSyslog, SEVERITY, syslogSender } from "../syslog";
 import { icon } from "../icons";
 import { DRAG_FROM_THIS_APP, endpoint, keepaliveOf, PROTOCOLS, REMOTE_PATHS_DRAG, serialSettings, type Protocol, type Session } from "../model";
 import { fileSessionFor, fileTransferBlockedReason } from "../transfer";
-import { addMacro, askSnippetValues, asksValues, snippetMenu } from "../snippets";
+import { addMacro, askSnippetValues, asksValues, saveSelectionAsSnippet, snippetMenu } from "../snippets";
 import { findCommandRisk, findRisks, findTypedRisk, UNREADABLE_MACRO, type RiskHit } from "../riskRules";
 import { patchSession, state, subscribe, takeSavedSession, updateSettings, type Snippet, type TriggerRule } from "../store";
 import { termTheme } from "../themes";
@@ -65,7 +70,16 @@ import { afterExit, asksAtEnd, asksLogin, loginFailure, loginThrough, plainLines
 import { tr, userText } from "../i18n";
 import { findPerms, octal } from "../remotePerm";
 import { findPaths } from "../serverPaths";
-import { syntaxCheckFor, unitFileOf } from "../shebang";
+import { statusUnitOf, syntaxCheckFor } from "../shebang";
+import { QUOTE_UNSAFE, QUOTE_UNSAFE_TEXT, shellQuote } from "../shellQuote";
+import { archiveCommands } from "../archiveCommands";
+import { decodedLabel, decodeSelection } from "../decodeText";
+import { numberForms, printedSpan, timeForms } from "../numberForms";
+import { oidName } from "../oidNames";
+import { priText } from "../syslogPri";
+import { localEcho } from "../localEcho";
+import { askGrep, GREP_PUT } from "../grepPrompt";
+import { grepUnsupported } from "../grepCommand";
 import { actionFor, appTakesInTerminal, keyHint, SNIPPET_PREFIX, withKey } from "../keymap";
 
 /** Editing keys in recorded macros, as private-use marks U+E100.. in this
@@ -109,17 +123,16 @@ const USER_ANSWERED_ANGLE = new RegExp(`^[^>]{0,80}?\\b${USER_WORD}\\s*>\\s*\\S`
  * before it (not a host named "R1-PASS" or "FW-PIN"). The same words as the
  * login check's (sshLogin), so a question is never a finished login there. */
 const SECRET_ANGLE = new RegExp(String.raw`(?:^|\s)${SECRET_WORD}\s*[>＞]$`, "i");
-/** A path the '…' quoting (with '\'' for a quote) does not keep whole in
- * every shell: fish reads \' inside quotes as a quote, tcsh expands ! there. */
-const QUOTE_UNSAFE = (path: string) => /[\\!]/.test(path);
+/** What empties the input line before a command is put there: Ctrl+E (end
+ * of line in readline and in device CLIs) then Ctrl+U (erase to the start).
+ * Ctrl+U alone left whatever stood after a cursor moved back, which then ran
+ * as part of the command; where Ctrl+E means nothing, Ctrl+U does as before. */
+const LINE_CLEAR = "\x05\x15";
 /** A clicked path that names a text log: a log's file suffix (rotated ones
  * too: "app.log.1"), or a syslog file's name under /var/log or /var/adm. Not
  * anything under /var/log: wtmp, btmp, lastlog and the journal are binary
  * (their bytes would set the terminal's modes), and folders cannot be followed. */
 const LOG_PATH = /\.(?:log|out|err)(?:\.\d+)?$|^\/var\/(?:log|adm)\/(?:[^/]+\/)*(?:messages|syslog|secure|maillog|cron|dmesg|warn)(?:\.\d+)?$/i;
-const QUOTE_UNSAFE_TEXT = "이름에 \\ 또는 !가 있어 셸에 따라 다르게 읽히므로 보내지 않습니다";
-/** Single-quoted, so no character of the path means anything to the shell. */
-const shellQuote = (path: string) => `'${path.replace(/'/g, `'\\''`)}'`;
 
 /** ssh.exe asking about a host key: "... continue connecting (yes/no/[fingerprint])?",
  * its "Please type 'yes', 'no' or the fingerprint:", an answer echoed after it. */
@@ -809,12 +822,13 @@ export class TerminalView implements View {
     this.term.registerLinkProvider({
       provideLinks: (y, callback) => {
         const line = this.term.buffer.active.getLine(y - 1);
-        // A cheap test first: an address, a MAC, an interface name ("Gi1/0/1", "Po1")
+        // A cheap test first: an address (an IPv6 one may have no "hh:hh": "fe80::1"),
+        // a MAC, an interface name ("Gi1/0/1", "Po1")
         // or a log message name ("%SYS-5-CONFIG_I", often on a line with nothing else).
         const lineText = line?.translateToString(true) ?? "";
         // Server paths: on SSH to a Linux or Unix host (a switch's CLI has none to open).
         const paths = this.session.protocol === "ssh" && !this.device?.network;
-        if (!line || !((paths && /(?:^|[^\p{L}\p{N}_.~/:@$\\-])\/[\p{L}\p{N}_.+@~-]/u.test(lineText)) ||/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average|[-dlcbps][-r][-w][-xsS][-r][-w][-xsS][-r][-w][-xtT]/.test(lineText) || mayHoldInterface(lineText) || MAY_HOLD_MNEMONIC.test(lineText)))
+        if (!line || !((paths && /(?:^|[^\p{L}\p{N}_.~/:@$\\-])\/[\p{L}\p{N}_.+@~-]/u.test(lineText)) ||/\d\.\d+\.\d+\.\d|[0-9A-Fa-f]{2}[:.-][0-9A-Fa-f]{2}|[0-9A-Fa-f]::|::[0-9A-Fa-f]|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){7}|\d{4}\s?[kKmMgG]?(?:bits?\/sec|bit\/s|bps)|uptime is \d|load average|[-dlcbps][-r][-w][-xsS][-r][-w][-xsS][-r][-w][-xtT]/.test(lineText) || mayHoldInterface(lineText) || MAY_HOLD_MNEMONIC.test(lineText)))
           return callback(undefined);
         // The text with the screen cell of each character: a wide character
         // (Hangul) takes two cells, so string positions are not columns.
@@ -843,8 +857,12 @@ export class TerminalView implements View {
             open(e);
           },
         });
+        // IPv6 addresses too; an IPv4 one inside an IPv6 address
+        // ("::ffff:10.0.0.1") is that address's, not a link of its own.
+        const v6 = findIpv6s(text);
+        const addresses = [...v6, ...findIps(text).filter((m) => !v6.some((o) => m.index >= o.index && m.index < o.index + o.length))];
         const links = [
-          ...findIps(text).map((m) => link(m.index, m.length, (e) => this.addressMenu(m.ip, m.port, m.prefix, e.clientX, e.clientY))),
+          ...addresses.map((m) => link(m.index, m.length, (e) => this.addressMenu(m.ip, m.port, m.prefix, e.clientX, e.clientY))),
           ...findMacs(text).map((m) => link(m.index, m.length, (e) => this.macMenu(m.hex, e.clientX, e.clientY))),
           ...findInterfaces(text).map((m) => link(m.index, m.length, (e) => this.interfaceMenu(m.type, m.number, e.clientX, e.clientY))),
           ...findMasks(text).map((m) => link(m.index, m.length, (e) => this.maskMenu(m.prefix, e.clientX, e.clientY))),
@@ -988,12 +1006,59 @@ export class TerminalView implements View {
       const came = row === null ? null : this.lineTime(row);
       const when = came === null ? "" : clockText(came);
       const span = this.selectionSpan();
+      // Between the first and the last time printed in the selected lines
+      // (a log shown with cat or `show logging`: lines that came at once).
+      // Under a minute to the millisecond the log gives ("2.500s").
+      // The selection read once for the readings below (a large one is costly to rebuild).
+      const selected = this.term.hasSelection() ? this.term.getSelection() : "";
+      const watchIps = selected ? hostAddresses(selected) : [];
+      const printed = selected ? printedSpan(selected) : null;
+      const printedText = printed && `${printed.first.trim()} → ${printed.last.trim()} · ${printed.ms < 60_000 ? `${printed.ms % 1000 ? (printed.ms / 1000).toFixed(3) : printed.ms / 1000}s` : durationText(printed.ms)}`;
+      // A selected number in its other forms (a Unix time's date, hex ↔
+      // decimal, a netmask, a byte count's size): a click copies one.
+      const forms = selected ? numberForms(selected) : [];
+      // A selected time with its offset ("2024-11-24T07:13:20Z", a log's)
+      // in this PC's time, UTC and Unix time: lining two logs up.
+      const times = forms.length || !selected ? [] : timeForms(selected);
+      // A selected SNMP OID by its MIB name ("IF-MIB::ifHCInOctets.10001").
+      const oid = forms.length || times.length || !selected ? null : oidName(selected);
+      // A raw syslog message's "<189>": its facility and severity ("local7.notice").
+      const pri = forms.length || times.length || oid || !selected ? null : priText(selected);
+      const shownForms = forms.length ? forms : times.length ? times : oid ? [{ kind: "MIB 이름", text: oid, time: false }] : pri ? [{ kind: "Syslog 시설.심각도", text: pri, time: false }] : [];
+      // A selected Base64 value or JWT, decoded: a click copies it (not kept
+      // in the clipboard history: such values are often secrets).
+      const decoded = selected ? decodeSelection(selected) : null;
       contextMenu(e.clientX, e.clientY, [
         { label: "복사", icon: "Copy", hint: keyHint("term.copy"), disabled: !this.term.hasSelection(), action: run(() => writeClipboard(this.term.getSelection())) },
         { label: "붙여넣기", icon: "ClipboardPaste", hint: keyHint("term.paste"), action: run(() => this.paste()) },
         { label: "전체 선택", hint: keyHint("term.selectAll"), action: run(() => this.term.selectAll()) },
         { label: "선택 영역 비교", icon: "Columns2", hint: keyHint("term.compare"), disabled: !this.term.hasSelection(), action: () => this.compareSelection() },
         { label: "표로 복사 (엑셀용)", icon: "Table", hint: keyHint("term.copyTable"), disabled: !this.term.hasSelection(), action: run(() => this.copyTable()) },
+        // For a ticket, a wiki or a chat: the selection in a Markdown code block.
+        {
+          label: "코드 블록으로 복사 (Markdown)",
+          icon: "Braces",
+          disabled: !this.term.hasSelection(),
+          action: run(() => {
+            void writeClipboard(codeBlock(this.term.getSelection()));
+            toast("복사했습니다", "success", 1500);
+          }),
+        },
+        // A command that worked, kept to send again from the snippet menu.
+        { label: "선택한 내용을 스니펫으로 저장…", icon: "ClipboardType", disabled: !selected.trim(), action: () => void saveSelectionAsSnippet(selected) },
+        // The hosts a selected listing names ("show arp", "show cdp neighbors",
+        // a hosts file), each once, pinged together: which still answer in an
+        // outage. Multicast and above (224.0.0.0 on) are no host to ping.
+        ...(watchIps.length >= 2
+          ? [
+              {
+                label: `선택한 주소 ${watchIps.length}개를 연속 ping으로 지켜보기`,
+                icon: "Activity",
+                hint: watchIps.length > 32 ? "처음 32개" : undefined,
+                action: () => void import("../nettools").then((m) => m.openMultiWatch(watchIps.map((ip) => ({ name: ip, host: ip })))),
+              },
+            ]
+          : []),
         { label: "명령 출력 복사", icon: "ClipboardList", hint: keyHint("term.copyOutput"), action: run(() => this.copyCommandOutput()) },
         { label: "명령 출력을 파일로 저장…", icon: "Save", hint: keyHint("term.saveOutput"), action: () => void this.saveCommandOutput() },
         { label: "이전 실행과 비교", icon: "History", hint: keyHint("term.compareRuns"), action: () => this.compareRuns() },
@@ -1002,7 +1067,7 @@ export class TerminalView implements View {
         { label: "화면 지우기", icon: "Eraser", hint: keyHint("term.clear"), action: run(() => this.clearScreen()) },
         this.repeatMenuItem(),
         this.timerMenuItem(),
-        ...(when || span ? ["-" as const] : []),
+        ...(when || span || printedText ? ["-" as const] : []),
         ...(when
           ? [
               {
@@ -1028,6 +1093,51 @@ export class TerminalView implements View {
                   toast("시각을 복사했습니다", "success", 1500);
                 }),
               },
+            ]
+          : []),
+        ...(printedText
+          ? [
+              {
+                label: "선택한 로그 시각 사이 시간",
+                icon: "Timer",
+                hint: printedText,
+                userHint: true,
+                action: run(() => {
+                  void writeClipboard(printedText);
+                  toast("시각을 복사했습니다", "success", 1500);
+                }),
+              },
+            ]
+          : []),
+        ...(shownForms.length
+          ? [
+              "-" as const,
+              { label: forms.length ? "선택한 숫자 풀이" : times.length ? "선택한 시각 풀이" : oid ? "선택한 OID 풀이" : "선택한 Syslog 우선순위 풀이", icon: "Info", heading: true },
+              ...shownForms.map((f) => ({
+                label: f.text,
+                userLabel: true,
+                icon: f.time ? "Clock" : "Copy",
+                hint: f.kind,
+                action: run(() => {
+                  void writeClipboard(f.text);
+                  toast("복사했습니다", "success", 1500);
+                }),
+              })),
+            ]
+          : []),
+        ...(decoded
+          ? [
+              "-" as const,
+              { label: decoded.heading, icon: "Info", heading: true },
+              ...decoded.forms.map((f) => ({
+                label: decodedLabel(f.text),
+                userLabel: true,
+                icon: f.time ? "Clock" : "Copy",
+                hint: f.kind,
+                action: run(() => {
+                  void writeClipboard(f.text, { secret: true }).then((ok) => toast(ok ? "복사했습니다" : "클립보드에 복사하지 못했습니다", ok ? "success" : "error", 1500));
+                }),
+              })),
             ]
           : []),
       ]);
@@ -1192,7 +1302,7 @@ export class TerminalView implements View {
    * run; the user presses Enter and types the sudo password. cp onto the
    * file keeps its owner and mode; the copy goes once it is in. False when
    * it could not be put there (said why). Only this tab, not broadcast. */
-  sudoCopy(from: string, to: string, steps: { install?: (copy: string, file: string) => string; then?: string } = {}): boolean {
+  sudoCopy(from: string, to: string, steps: { install?: (copy: string, file: string) => string; then?: string; status?: string } = {}): boolean {
     for (const p of [from, to]) {
       if (/[\x00-\x1f\x7f-\x9f]/.test(p)) return void toast("이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000), false;
       if (QUOTE_UNSAFE(p)) return void toast(QUOTE_UNSAFE_TEXT, "warn", 6000), false;
@@ -1210,7 +1320,10 @@ export class TerminalView implements View {
     // unit file). A failure stops the line there and the copy stays.
     const put = steps.install ? steps.install(src, dst) : `sudo test -f ${dst} && sudo cp -- ${src} ${dst} && rm -f -- ${src}`;
     const then = steps.then ? ` && sudo ${steps.then}` : "";
-    this.putOnInputLine(`${put}${then}`);
+    // Then a unit's status (read only, no sudo): "bad-setting" and why, if the
+    // file just put in has a mistake.
+    const status = steps.status && !QUOTE_UNSAFE(steps.status) && !/[\x00-\x1f\x7f-\x9f]/.test(steps.status) ? ` && systemctl status --no-pager -- ${shellQuote(steps.status)}` : "";
+    this.putOnInputLine(`${put}${then}${status}`);
     this.ws.focusView(this);
     return true;
   }
@@ -1351,6 +1464,7 @@ export class TerminalView implements View {
         // or host-key question by then (a console that timed out, a sudo or
         // enable asking) must not get a command typed into it.
         if (!this.atCommandLine()) return toast("명령 줄에서만 보낼 수 있습니다", "warn");
+        if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(command)) return toast("이름에 제어 문자가 있어 보낼 수 없습니다", "warn", 6000);
         this.putOnInputLine(command);
       },
       focus: () => this.term.focus(),
@@ -1375,6 +1489,9 @@ export class TerminalView implements View {
 
   private async runForAi(command: string, reason: string, timeoutMs = 30_000): Promise<{ output: string; timedOut: boolean }> {
     if (this.state !== "connected") throw new Error("연결이 끊어져 실행하지 않았습니다");
+    // A control character would be a key, not text (Ctrl+U erasing what was
+    // approved, Ctrl+O running the line): never sent (policy.judge blocks it too).
+    if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(command)) throw new Error("제어 문자가 든 명령이라 실행하지 않았습니다");
     if (this.aiRunning) throw new Error("다른 명령이 실행 중입니다");
     this.interruptRepeat();
     if (this.term.buffer.active.type !== "normal") throw new Error("화면 전체를 쓰는 프로그램이 실행 중이라 실행하지 않았습니다");
@@ -1393,7 +1510,7 @@ export class TerminalView implements View {
       // Clear what the engineer left on the line: Ctrl+U, or Backspaces in
       // Windows PowerShell (PSReadLine does not bind Ctrl+U there).
       const typed = this.assist.typedText();
-      const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : "\x15";
+      const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : LINE_CLEAR;
       const data = clear + command.replace(/[\r\n]+/g, " ") + "\r";
       this.assist.note(data);
       this.sendInput(data);
@@ -2394,8 +2511,36 @@ export class TerminalView implements View {
   private typedOut(data: string) {
     this.assist.note(data);
     this.mirrorTyped({ keys: data }, /[\r\n\x03]/.test(data));
+    this.echoTyped(data);
     this.sendInput(data);
     this.recording?.push(data);
+  }
+
+  /** What this serial session's own line shows of the keys typed on it
+   * (localEcho), for Backspace to rub out only that, and the row it is on:
+   * once the device's output moves the cursor to another line, nothing
+   * echoed is on it. */
+  private echoLine = { text: "", row: -1 };
+
+  /** Local echo (a serial device that does not echo): only keys typed here,
+   * one Enter at a time (typedInput splits them), each judged by the line it
+   * goes to. Not a paste, a snippet, a macro or a sent file, whose later
+   * lines may answer a password question, be held back or come before the
+   * device's replies; not the terminal's automatic replies; not before the
+   * port is open; never the answer to a password question. */
+  private echoTyped(data: string) {
+    if (this.session.protocol !== "serial" || this.session.options.localEcho !== true) return;
+    if (this.opened !== this.runtimeId || this.inputKind() === "secret") {
+      // Nothing of this line is on screen to rub out.
+      if (/[\r\n]/.test(data)) this.echoLine.text = "";
+      return;
+    }
+    const row = this.lineRow();
+    if (row !== this.echoLine.row) this.echoLine = { text: "", row };
+    const shown = localEcho(data, this.echoLine);
+    if (shown) this.term.write(shown);
+    // Where the cursor will be once this is drawn: an Enter echoed moves it down.
+    if (/[\r\n]/.test(data)) this.echoLine.row = -1;
   }
 
   /** Enter goes out now (typed, held and confirmed, or a repeated command's):
@@ -2701,9 +2846,11 @@ export class TerminalView implements View {
     return [...out];
   }
 
-  /** Send a saved command; it follows broadcast like typed input does. */
-  async sendSnippet(s: Snippet) {
-    if (this.state !== "connected") return toast("연결된 다음 보낼 수 있습니다", "warn");
+  /** Send a saved command; it follows broadcast like typed input does. True
+   * once sent; nothing when not (its values cancelled, a risk refused, not
+   * connected). */
+  async sendSnippet(s: Snippet): Promise<true | void> {
+    if (this.state !== "connected") return void toast("연결된 다음 보낼 수 있습니다", "warn");
     // Its {{?name}} values first, if it has any: then sent only to the
     // connections it was asked on (see sendScope), and the line it joins.
     const scope = this.inputScope();
@@ -2712,8 +2859,8 @@ export class TerminalView implements View {
       const filled = await askSnippetValues(s, (name, text) => this.valuesFor(name, text));
       this.term.focus();
       if (filled === null) return;
-      if (!this.stillSame(scope)) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
-      if (!this.lineStill(scope)) return toast(LINE_CHANGED, "warn", 6000);
+      if (!this.stillSame(scope)) return void toast("연결이 바뀌어 보내지 않았습니다", "warn");
+      if (!this.lineStill(scope)) return void toast(LINE_CHANGED, "warn", 6000);
       text = filled;
     }
     this.interruptRepeat();
@@ -2726,8 +2873,8 @@ export class TerminalView implements View {
     if ((scope.kind === "user" || scope.kind === "secret" || scope.kind === "hostkey") && enters > 1) return void toast(MANY_LINES_AT_LOGIN, "warn", 6000);
     if (scope.kind === "prelogin" && enters > 1) {
       if (!(await this.confirmBeforeLogin(enters))) return;
-      if (!this.stillSame(scope)) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
-      if (!this.lineStill(scope)) return toast(LINE_CHANGED, "warn", 6000);
+      if (!this.stillSame(scope)) return void toast("연결이 바뀌어 보내지 않았습니다", "warn");
+      if (!this.lineStill(scope)) return void toast(LINE_CHANGED, "warn", 6000);
     }
     const hits = findRisks(data);
     // Its first line joins what is already on the command line, as a paste's does.
@@ -2740,7 +2887,7 @@ export class TerminalView implements View {
       if (!confirmedOthers) return void this.term.focus();
     }
     const peers = confirmedOthers ?? this.stillSame(scope);
-    if (!peers) return toast("연결이 바뀌어 보내지 않았습니다", "warn");
+    if (!peers) return void toast("연결이 바뀌어 보내지 않았습니다", "warn");
     if (!confirmedOthers) this.noteLeftOut(scope, peers);
     this.sendInput(data);
     const kind = scope.kind ?? undefined;
@@ -2759,6 +2906,8 @@ export class TerminalView implements View {
       const lines = text.split(/\r?\n/);
       for (const line of s.run ? lines : lines.slice(0, -1)) this.offerTimer(line);
     }
+    // Sent (every earlier return is a "not sent": cancelled, refused, not connected).
+    return true;
   }
 
   /** A command sent again every few seconds (term.repeat), as `watch` would
@@ -3964,58 +4113,102 @@ export class TerminalView implements View {
     // nginx, a unit file…), not by a "#!" line this menu cannot see: its
     // check run in this shell, the one that printed the path.
     const check = syntaxCheckFor(path.slice(path.lastIndexOf("/") + 1), path, "");
-    const unit = unitFileOf(path);
+    const unit = statusUnitOf(path);
+    const archive = archiveCommands(path, this.device?.kind);
     contextMenu(x, y, [
       // With grep's line number: the file opens at that line.
       { label: line ? `${path}:${line}` : path, userLabel: true, icon: "File", heading: true },
       // On this session's server: after an ssh or su inside the shell, the
       // path printed may be another machine's, so the server is named.
       { label: "파일 탭에서 열기", icon: "FolderLock", hint: this.session.host, userHint: true, action: () => this.openServerPath(path, line) },
+      // The same transfer as dragging it to the PC side of that file tab (its
+      // open folder; asks before overwriting).
+      { label: "내 PC로 받기", icon: "Download", hint: this.session.host, userHint: true, action: () => this.openServerPath(path, undefined, true) },
       { label: "경로 복사", icon: "Copy", action: () => void writeClipboard(path) },
       // Into the command being written, quoted, where the cursor is.
       { label: "명령 줄에 경로 넣기", icon: "SquareTerminal", action: () => this.typePaths([path]) },
       // A log named in the output, followed from here: put on the idle
       // input line, not run (Enter is the user's; Ctrl+C ends it). "-f" as
       // every Unix tail has it; "--" so no name is read as an option.
+      // Text under it (a folder's files, or the file itself), searched in this shell.
+      ...(grepUnsupported(this.device?.kind) ? [] : [{ label: "내용 찾기 (grep)…", icon: "FileSearch", action: () => void this.grepUnder(path) }]),
       ...(LOG_PATH.test(path) ? [{ label: "tail -f로 따라 보기", icon: "ScrollText", action: () => void this.offerCheck("tail -f -- {}", path, false) }] : []),
+      // An archive (archiveCommands, as the file tab offers it): its listing,
+      // or its unpacking into its own folder, on this shell's input line.
+      ...(archive && !QUOTE_UNSAFE(path)
+        ? [
+            { label: "압축 파일 내용 보기", icon: "FileSearch", hint: archive.tool, action: () => void this.offerCheck(archive.list, path, false) },
+            {
+              label: "같은 폴더에 압축 풀기",
+              icon: "FolderOpen",
+              hint: archive.tool,
+              action: () => {
+                if (this.offerCheck(archive.extract, path, false))
+                  toast(
+                    archive.tool === "tar"
+                      ? "터미널에 압축 풀기 명령을 넣었습니다. Enter를 누르면 같은 폴더에 풉니다 (이미 있는 파일은 바꾸지 않습니다)"
+                      : "터미널에 압축 풀기 명령을 넣었습니다. Enter를 누르면 같은 폴더에 풉니다 (이미 있는 파일은 바꿀지 묻습니다)",
+                    "info",
+                    8000,
+                  );
+              },
+            },
+          ]
+        : []),
       // sudo left out at a root shell's "#" prompt (one may have no sudo).
-      ...(check?.system
+      // Not offered when the path would be refused (see offerCheck).
+      ...(check?.system && !(check.command.includes("{}") && QUOTE_UNSAFE(path))
         ? [{ label: "문법 검사 넣기", icon: "ShieldCheck", hint: check.command.replace("{}", path.slice(path.lastIndexOf("/") + 1)), userHint: true, action: () => void this.offerCheck(check.command, path, check.sudo && !/#$/.test(this.idlePrompt()?.trimEnd() ?? "")) }]
         : []),
-      // A unit file: its unit's state and latest log lines, read only
-      // (systemctl(1) "status"; "--" as "-.mount" is a unit's name; no pager
-      // so it stays in the output). Not a template ("x@.service"), which has
-      // no state of its own; a user unit asks the shell's own user manager.
-      ...(unit && !/@\.[^.]+$/.test(unit.name)
+      // A unit file (or a unit's drop-in): its unit's state and latest log
+      // lines, read only (systemctl(1) "status"; "--" as "-.mount" is a
+      // unit's name; no pager so it stays in the output); statusUnitOf leaves
+      // templates out. A user unit asks the shell's own user manager. Not a
+      // name no quoting keeps whole ("\x2d" in a mount's), which would be refused.
+      ...(unit && !QUOTE_UNSAFE(unit.name)
         ? [{ label: "systemctl status로 상태 보기", icon: "Activity", hint: unit.name, userHint: true, action: () => void this.offerCheck(`systemctl ${unit.user ? "--user " : ""}status --no-pager -- {}`, unit.name, false) }]
         : []),
     ]);
   }
 
-  /** The file tab beside this terminal (its SFTP browser) opens `path`; one
-   * is opened first when there is none, and takes the path once connected. */
-  private openServerPath(path: string, line?: number) {
-    type Files = View & { terminal?: unknown; openPath?(p: string, line?: number): void };
+  /** Text under a clicked server path (askGrep), put on this shell's input line. */
+  private async grepUnder(path: string) {
+    const command = await askGrep();
+    if (command && this.offerCheck(command, path, false)) toast(GREP_PUT, "info", 8000);
+  }
+
+  /** The file tab beside this terminal (its SFTP browser) opens `path` (or,
+   * with `download`, sends it to its PC-side folder); one is opened first
+   * when there is none, and takes the path once connected. */
+  private openServerPath(path: string, line?: number, download = false) {
+    type Files = View & { terminal?: unknown; openPath?(p: string, line?: number, download?: boolean): void };
     const beside = () => this.ws.tabs.map((t) => t.view as Files).find((v) => v.terminal === this && typeof v.openPath === "function");
     const files = beside();
-    if (files) return files.openPath!(path, line);
+    if (files) {
+      // A request still waiting for that tab to appear is older than this one.
+      this.filesComing = null;
+      return files.openPath!(path, line, download);
+    }
     // A file tab already on its way (a second click before it appeared):
     // it takes this path instead, and no second tab (or login) is made.
     if (this.filesComing) {
-      this.filesComing = Object.assign(this.filesComing, { path, line });
+      this.filesComing = Object.assign(this.filesComing, { path, line, download });
       return;
     }
     const blocked = fileTransferBlockedReason(this.session);
     if (blocked) return void toast(blocked, "error", 7000);
-    const coming = (this.filesComing = { path, line });
+    const coming = (this.filesComing = { path, line, download });
     this.openFiles(this.session, this);
     // The file tab is made once its code has loaded: given the path then.
     let tries = 0;
     const handOver = () => {
       const f = !this.disposed && beside();
       if (f || this.disposed || ++tries >= 50) {
-        if (this.filesComing === coming) this.filesComing = null;
-        if (f) f.openPath!(coming.path, coming.line);
+        // Handed over only if no later click reached the tab first (it
+        // cleared this request), so the last click is the one done.
+        const mine = this.filesComing === coming;
+        if (mine) this.filesComing = null;
+        if (f && mine) f.openPath!(coming.path, coming.line, coming.download);
         return;
       }
       window.setTimeout(handOver, 100);
@@ -4024,7 +4217,7 @@ export class TerminalView implements View {
   }
 
   /** A file tab opened for a clicked path, not yet made, and the path it takes. */
-  private filesComing: { path: string; line?: number } | null = null;
+  private filesComing: { path: string; line?: number; download?: boolean } | null = null;
 
   /** An "ls -l" permission string clicked: what it allows whom, and its
    * number for chmod ("-rwsr-xr-x" is 4755). */
@@ -4060,7 +4253,7 @@ export class TerminalView implements View {
    * Enter is never pressed: the user reads it and runs it. */
   private putOnInputLine(command: string) {
     const typed = this.assist.typedText();
-    const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : "\x15";
+    const clear = !typed ? "" : this.windowsShell() ? "\x7f".repeat(typed.length) : LINE_CLEAR;
     const data = clear + command.replace(/[\r\n]+/g, " ");
     this.interruptRepeat();
     this.assist.note(data);
@@ -4567,7 +4760,8 @@ export class TerminalView implements View {
    * the editor first; only a saved session's own "Connect" item connects, once
    * per click (as in the network tools and the Syslog window). */
   private addressMenu(ip: string, port: number | null, prefix: number | null, x: number, y: number) {
-    const address = port ? `${ip}:${port}` : ip;
+    // An IPv6 address with a port is written in brackets ("[::1]:631", RFC 3986).
+    const address = port ? (ip.includes(":") ? `[${ip}]:${port}` : `${ip}:${port}`) : ip;
     // A port names the protocol when it is a well-known one ("10.0.0.5:3389");
     // another (":443" in netstat output) is not taken for a terminal's port.
     const byPort: Record<number, Protocol> = { 22: "ssh", 23: "telnet", 21: "ftp", 990: "ftps", 69: "tftp", 3389: "rdp", 5900: "vnc" };
@@ -4576,15 +4770,15 @@ export class TerminalView implements View {
     const sender = syslogSender(ip);
     // That device's tab, already open (a neighbour in an ARP table): gone to.
     // Otherwise its saved sessions, to connect; none for this tab's own device.
-    const key = ip.toLowerCase();
-    const theirs = this.ws.liveTab((t) => t.view !== this && t.session.host.trim().toLowerCase() === key);
-    const own = this.session.host.trim().toLowerCase() === key;
+    const theirs = this.ws.liveTab((t) => t.view !== this && sameHost(t.session.host, ip));
+    const own = sameHost(this.session.host, ip);
     // Its MAC, as an ARP table in a tab gives it: each opens that MAC's menu
     // (which switch port: "모든 터미널 탭에서 찾기" there).
     const macs = this.macsOfIp(ip);
     contextMenu(x, y, [
       // What kind of address it is (private, CGNAT, loopback…), as the subnet calculator says.
-      ...(ip.includes(":") ? [] : [{ label: addressKind(ip), icon: "Info", heading: true }, "-" as const]),
+      { label: ip.includes(":") ? ipv6Kind(parseIpv6(ip) ?? 0n) : addressKind(ip), icon: "Info", heading: true },
+      "-" as const,
       ...(theirs
         ? [{ label: "이 장비의 탭으로 이동", icon: "SquareTerminal", action: () => this.ws.activate(theirs.id) }]
         : own
@@ -4593,11 +4787,12 @@ export class TerminalView implements View {
       { label: "이 주소로 새 세션 만들기…", icon: "Plus", hint: address, action: () => this.ws.newSessionHandler?.({ protocol, host: ip, ...(known ? { port } : {}) }) },
       { label: "네트워크 도구", icon: "Activity", hint: "ping · 포트 · DNS", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip)) },
       // Watching it come back after a restart, at once.
-      { label: "연속 ping으로 지켜보기", icon: "Activity", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "ping", null, true, true)) },
+      // IPv4 only, as the continuous ping's echo is.
+      ...(ip.includes(":") ? [] : [{ label: "연속 ping으로 지켜보기", icon: "Activity", action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "ping", null, true, true)) }]),
       // IPv4 only, as the trace is.
       ...(ip.includes(":") ? [] : [{ label: "경로 추적", icon: "Waypoints", hint: ip, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "trace", null, true)) }]),
       // With the prefix written next to it ("/24", a netmask) when there is one.
-      { label: "서브넷 계산", icon: "Network", hint: prefix !== null ? `${ip}/${prefix}` : undefined, action: () => void import("../nettools").then((m) => m.openNetworkTools(ip, "subnet", prefix)) },
+      { label: "서브넷 계산", icon: "Network", hint: prefix !== null ? `${ip}/${prefix}` : undefined, action: () => void import("../nettools").then((m) => (ip.includes(":") ? m.openNetworkTools(prefix !== null ? `${ip}/${prefix}` : ip, "subnet") : m.openNetworkTools(ip, "subnet", prefix))) },
       // The other devices on its subnet (an interface's address in "show ip
       // interface"): the IP scan filled in, started by its Run button. Only a
       // prefix the scan takes (/22 at most); none written is the scan's /24.
@@ -5264,7 +5459,12 @@ export class TerminalView implements View {
     this.findBar.hidden = !show;
     if (show) {
       const input = this.findBar.querySelector("input")!;
-      if (this.term.hasSelection()) input.value = this.term.getSelection();
+      // A selection over several lines: its first line with text (a one-line
+      // box drops the line breaks, running the lines together into a text
+      // found nowhere), the cells' blanks at its end left out.
+      // Blanks alone: the query kept (as with no selection).
+      const line = this.term.hasSelection() ? this.term.getSelection().split(/\r\n?|\n/).find((l) => l.trim()) : undefined;
+      if (line) input.value = line.replace(/[ \t]+$/, "");
       input.focus();
       input.select();
       // Highlight matches at once when opening on a selection or a kept query,

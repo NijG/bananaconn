@@ -122,3 +122,17 @@ const ruleLine = (r: CellLine) => {
   const text = r.join("");
   return /^[\s\-=+_]+$/.test(text) && /[-=_]{3}/.test(text);
 };
+
+/** Text as a Markdown fenced code block (CommonMark 4.5), to paste device
+ * output into a ticket, a wiki or a chat that keeps its columns: line
+ * endings as "\n", spaces at line ends and blank lines at either end
+ * dropped, and a fence of backticks longer than any run inside (a line of
+ * three backticks in the output would otherwise end the block early). */
+export function codeBlock(text: string): string {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n").map((l) => l.replace(/[ \t]+$/, ""));
+  while (lines.length && !lines[0]) lines.shift();
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}\n${lines.join("\n")}\n${fence}`;
+}

@@ -75,6 +75,9 @@ export function serialSettings(o: Record<string, unknown>) {
     parity: o.parity === "odd" || o.parity === "even" ? o.parity : "none",
     stopBits: o.stopBits === 2 || o.stopBits === "2" ? 2 : 1,
     flow: o.flow === "hardware" || o.flow === "software" ? o.flow : "none",
+    // What Enter sends (term.rs map_enter): CR, the terminal's own, unless the
+    // device wants CR+LF or LF (some UPS, PLC and modem consoles).
+    enter: o.enter === "crlf" || o.enter === "lf" ? o.enter : "cr",
   };
 }
 

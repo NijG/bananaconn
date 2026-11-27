@@ -39,6 +39,29 @@ export const SECRET_RULES: RegExp[] = [
   /(:\/\/[^\s/:@]*:)([^\s/@]+)(?=@)/g,
   // Authorization: Bearer x
   /(\bBearer\s+)([A-Za-z0-9._~+/=-]{8,})/g,
+  // Authorization / Proxy-Authorization: Basic|Token|Negotiate|NTLM x (Basic is user:password in base64)
+  /(\bAuthorization[ \t]*:[ \t]*(?:Basic|Token|Negotiate|NTLM)[ \t]+)([A-Za-z0-9._~+/=-]{4,})/gi,
+  // Cookie: / Set-Cookie: headers carry session tokens: the rest of the header
+  // (up to a quote that ends the curl -H argument, or the line's end).
+  /(\b(?:Set-)?Cookie[ \t]*:[ \t]*)([^\s"'][^\r\n"']*)/gi,
+  // The same as JSON ("Cookie": "sid=…", browser developer tools, HAR).
+  /("(?:Set-)?Cookie"[ \t]*:[ \t]*)("[^"\n]*")/gi,
+  // curl --cookie / -b "name=value" (not a cookie file: a value with no "="),
+  // on a curl line only (grep -b and du -b are other things).
+  /(\bcurl\b[^\n]{0,300}?\s(?:--cookie|-b)(?:=|[ \t]+))("[^"\n]*=[^"\n]*"|'[^'\n]*=[^'\n]*'|[^\s"']*=\S*)/g,
+  // Digest authentication's response and an AWS request signature (each
+  // replays the request it signs).
+  /(\bAuthorization[ \t]*:[ \t]*Digest\b[^\n]{0,600}?\bresponse[ \t]*=[ \t]*"?)([0-9a-f]{32,})/gi,
+  /(\bSignature=)([0-9a-f]{64})\b/g,
+  // Environment-style names ending in _KEY (OPENAI_KEY=, SIGNING_KEY="…"), not
+  // database or table words (PRIMARY_KEY, SORT_KEY); the first rule covers
+  // *_API_KEY, *_SECRET*, *_PASS*, *_TOKEN*.
+  /(\b(?!(?:PRIMARY|FOREIGN|UNIQUE|SORT|PARTITION|SHARD|HASH|RANGE|ROW)_KEY\b)[A-Z][A-Z0-9]*_KEY[ \t]*=[ \t]*)("[^"\n]*"|'[^'\n]*'|[^\s,;]+)/g,
+  // A shadow-file entry's hash (sudo cat /etc/shadow): "user:$6$salt$hash:…",
+  // also locked ("!$6$…"); "*" and "!" alone hold no hash.
+  /^([a-z_][\w.-]*\$?:!?)(\$[\w./+=-]{1,40}\$[^:\s]+)(?=:)/gim,
+  // PuTTY key file (.ppk): the lines after "Private-Lines: N" are the private key.
+  /(Private-Lines:[ \t]*\d+[ \t]*\r?\n)((?:[A-Za-z0-9+/=]+\r?\n){0,400}[A-Za-z0-9+/=]+(?=[ \t]*(?:\r?\n|$)))/g,
   // Cisco / Aruba / Huawei / Juniper / FortiGate configuration secrets
   /^(\s*(?:enable\s+)?(?:secret|password)\s+(?:\d+\s+)?)(\S+)/gim,
   /(\busername\s+\S+[^\n]{0,300}?\s(?:secret|password)\s+(?:\d+\s+)?)(\S+)/gi,
@@ -81,7 +104,16 @@ export const SECRET_RULES: RegExp[] = [
 
 /** Whole-token secrets: keys with a recognisable shape, private key blocks. */
 export const SECRET_TOKENS = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  // PEM and OpenSSH keys; PGP's "PRIVATE KEY BLOCK" too.
+  /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g,
+  // Only one marker in view (head -n, tail, a cut-off output): a start runs to
+  // the end of the text, an end takes the key lines just before it.
+  /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*/g,
+  // (Tried only at the first key line of a run, so a long run is read once.)
+  // The line next to the END is usually short (the rest of the key, "q3eD9Kx==").
+  /(?<!^[A-Za-z0-9+/=]{16,}[ \t]*\r?\n)(?:^[A-Za-z0-9+/=]{16,}[ \t]*\r?\n){0,1000}^[A-Za-z0-9+/=]+[ \t]*\r?\n[ \t]*-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/gm,
+  // JSON Web Tokens: header.payload.signature, header and payload being base64url JSON ("eyJ" = '{"').
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
   /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})\b/g,
 ];
 

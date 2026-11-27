@@ -75,8 +75,11 @@ pub async fn vnc_proxy_start(state: State<'_, VncState>, id: String, host: Strin
             let counter = counter.clone();
             let errors = errors.clone();
             let relay = tauri::async_runtime::spawn(async move {
-                if let Err(e) = bridge(stream, path, target, counter).await {
-                    *errors.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                // A failure to reach the server is recorded inside bridge,
+                // before its WebSocket closes (the page asks once it sees the
+                // close); any other failure here, after.
+                if let Err(e) = bridge(stream, path, target, counter, errors.clone()).await {
+                    errors.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(e);
                 }
             });
             let mut list = tracked.lock().unwrap_or_else(|p| p.into_inner());
@@ -98,7 +101,7 @@ pub fn vnc_proxy_stats(state: State<VncState>, id: String) -> u64 {
     state
         .proxies
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get(&id)
         .map(|p| p.received.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(0)
@@ -128,12 +131,13 @@ pub async fn test_start(port: u16) -> String {
         while let Ok((stream, _)) = listener.accept().await {
             let path = path.clone();
             tokio::spawn(async move {
-                let _ = bridge(stream, path, ("127.0.0.1".to_string(), port), Arc::default()).await;
+                let _ = bridge(stream, path, ("127.0.0.1".to_string(), port), Arc::default(), Arc::default()).await;
             });
         }
     });
     format!("ws://127.0.0.1:{local_port}/{token}")
 }
+
 
 #[allow(clippy::result_large_err)] // tungstenite fixes the handshake error type
 async fn bridge(
@@ -141,6 +145,7 @@ async fn bridge(
     expected_path: String,
     target: (String, u16),
     received: Arc<std::sync::atomic::AtomicU64>,
+    last_error: Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
     let check = move |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
         // Token path, and only the app's own page may connect.
@@ -163,9 +168,21 @@ async fn bridge(
         .map_err(|e| e.to_string())?;
     // Bounded: Windows would otherwise wait about 21 s for a silent host.
     let tcp = match tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect((target.0.as_str(), target.1))).await {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => return Err(format!("{}:{} 에 연결할 수 없습니다: {e}", target.0, target.1)),
-        Err(_) => return Err(format!("{}:{} 이(가) 15초 동안 응답하지 않습니다", target.0, target.1)),
+        Ok(Ok(tcp)) => {
+            // Reached: an earlier attempt's reason no longer applies.
+            *last_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            tcp
+        }
+        failed => {
+            let why = match failed {
+                Ok(Err(e)) => format!("{}:{} 에 연결할 수 없습니다: {e}", target.0, target.1),
+                _ => format!("{}:{} 이(가) 15초 동안 응답하지 않습니다", target.0, target.1),
+            };
+            // Recorded while the WebSocket is still open: the page reads it
+            // once it sees the close, which comes when `ws` drops below.
+            *last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(why.clone());
+            return Err(why);
+        }
     };
     let _ = tcp.set_nodelay(true);
 
@@ -205,4 +222,35 @@ async fn bridge(
         _ = to_client => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    /// A VNC server that cannot be reached: why is recorded before the page
+    /// sees its WebSocket close (it asks for the reason then), not after.
+    #[tokio::test]
+    async fn an_unreachable_server_is_recorded_before_the_close() {
+        // A port nothing listens on any more.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = random_token();
+        let path = format!("/{token}");
+        let errors: Arc<Mutex<Option<String>>> = Arc::default();
+        let recorded = errors.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = bridge(stream, path, ("127.0.0.1".to_string(), closed), Arc::default(), recorded).await;
+        });
+        let mut req = format!("ws://127.0.0.1:{port}/{token}").into_client_request().unwrap();
+        req.headers_mut().insert("Origin", "http://tauri.localhost".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        // Until the relay ends the connection, as the page waits for it.
+        while let Some(Ok(_)) = ws.next().await {}
+        let why = errors.lock().unwrap().clone();
+        assert!(why.as_deref().is_some_and(|w| w.contains(&closed.to_string())), "{why:?}");
+    }
 }

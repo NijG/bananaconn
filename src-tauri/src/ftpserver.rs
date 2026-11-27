@@ -209,6 +209,16 @@ impl SharedFolder {
         self.live()?;
         if self.read_only { self.deny() } else { Ok(()) }
     }
+
+    /// A file name with ":" names an NTFS alternate data stream ("cfg.txt:x"),
+    /// data no listing shows: refused. No Windows file name holds ":" itself.
+    fn plain_name(&self, path: &Path) -> StorageResult<()> {
+        if stream_name(path) { self.deny() } else { Ok(()) }
+    }
+}
+
+fn stream_name(path: &Path) -> bool {
+    path.as_os_str().to_string_lossy().contains(':')
 }
 
 /// A transfer stream that fails as soon as the server is stopped.
@@ -254,6 +264,7 @@ impl StorageBackend<DefaultUser> for SharedFolder {
 
     async fn get<P: AsRef<Path> + Send + Debug>(&self, user: &DefaultUser, path: P, start_pos: u64) -> StorageResult<Box<dyn AsyncRead + Send + Sync + Unpin>> {
         self.live()?;
+        self.plain_name(path.as_ref())?;
         let inner = self.fs.get(user, path, start_pos).await?;
         Ok(Box::new(StopRead { inner, stopped: self.stopped.clone() }))
     }
@@ -266,27 +277,33 @@ impl StorageBackend<DefaultUser> for SharedFolder {
         start_pos: u64,
     ) -> StorageResult<u64> {
         self.writable()?;
+        self.plain_name(path.as_ref())?;
         let input = StopRead { inner: input, stopped: self.stopped.clone() };
         self.fs.put(user, input, path, start_pos).await
     }
 
     async fn del<P: AsRef<Path> + Send + Debug>(&self, user: &DefaultUser, path: P) -> StorageResult<()> {
         self.writable()?;
+        self.plain_name(path.as_ref())?;
         self.fs.del(user, path).await
     }
 
     async fn mkd<P: AsRef<Path> + Send + Debug>(&self, user: &DefaultUser, path: P) -> StorageResult<()> {
         self.writable()?;
+        self.plain_name(path.as_ref())?;
         self.fs.mkd(user, path).await
     }
 
     async fn rename<P: AsRef<Path> + Send + Debug>(&self, user: &DefaultUser, from: P, to: P) -> StorageResult<()> {
         self.writable()?;
+        self.plain_name(from.as_ref())?;
+        self.plain_name(to.as_ref())?;
         self.fs.rename(user, from, to).await
     }
 
     async fn rmd<P: AsRef<Path> + Send + Debug>(&self, user: &DefaultUser, path: P) -> StorageResult<()> {
         self.writable()?;
+        self.plain_name(path.as_ref())?;
         self.fs.rmd(user, path).await
     }
 
@@ -322,7 +339,10 @@ impl Authenticator for Login {
         if self.anonymous && anonymous_name {
             return Ok(Principal { username: "anonymous".into() });
         }
-        if !self.username.is_empty() && same(username, &self.username) && same(creds.password.as_deref().unwrap_or(""), &self.password) {
+        // The named login needs the password start requires (4 characters)
+        // even when anonymous access is on: start does not check it then, and
+        // an empty one would let the name in with no password at all.
+        if !self.username.is_empty() && self.password.len() >= 4 && same(username, &self.username) && same(creds.password.as_deref().unwrap_or(""), &self.password) {
             return Ok(Principal { username: username.into() });
         }
         Err(AuthenticationError::BadPassword)
@@ -413,6 +433,11 @@ pub async fn ftp_server_start(app: AppHandle, state: State<'_, FtpServerState>, 
     }
     if !config.anonymous && (config.username.trim().is_empty() || config.password.len() < 4) {
         return Err("사용자 이름과 4자 이상의 비밀번호를 정하거나, 익명 접속을 허용하세요".into());
+    }
+    // Beside anonymous access too: a named login with a shorter password is
+    // refused by the authenticator, so say so now rather than at the device.
+    if !config.username.trim().is_empty() && config.password.len() < 4 {
+        return Err("비밀번호는 4자 이상이어야 합니다 (익명 접속만 쓰려면 사용자 이름을 비우세요)".into());
     }
 
     // Probe the port ourselves: libunftp reports bind failures only as "io error".
@@ -581,7 +606,7 @@ pub async fn test_start(config: ServerConfig) -> (oneshot::Sender<()>, Arc<Atomi
 
 #[cfg(test)]
 mod tests {
-    use super::{same, scan_folder};
+    use super::{same, scan_folder, stream_name, Login};
     use unftp_core::storage::Metadata;
 
     #[test]
@@ -620,5 +645,28 @@ mod tests {
         assert!(!same("s3cret", "s3cret!"));
         assert!(!same("", "x"));
         assert!(same("", ""));
+    }
+
+    /// With anonymous access on, start does not ask for the named user's
+    /// password; a short or empty one must not let that name in.
+    #[tokio::test]
+    async fn a_named_login_needs_its_password_even_beside_anonymous() {
+        use unftp_core::auth::{Authenticator, Credentials};
+        let login = |password: &str| Login { username: "banana".into(), password: password.into(), anonymous: true };
+        assert!(login("").authenticate("banana", &Credentials::from("")).await.is_err());
+        assert!(login("abc").authenticate("banana", &Credentials::from("abc")).await.is_err());
+        assert!(login("abcd").authenticate("banana", &Credentials::from("abcd")).await.is_ok());
+        assert!(login("abcd").authenticate("banana", &Credentials::from("abce")).await.is_err());
+        assert!(login("").authenticate("anonymous", &Credentials::from("")).await.is_ok());
+    }
+
+    #[test]
+    fn stream_names_are_refused() {
+        for p in ["/cfg.txt:hidden", "cfg.txt::$DATA", "/sub/a:b/c.txt"] {
+            assert!(stream_name(std::path::Path::new(p)), "{p}");
+        }
+        for p in ["/cfg.txt", "/sub/펌웨어 v1.2.bin", "c3750-universalk9.152-4.E10.bin"] {
+            assert!(!stream_name(std::path::Path::new(p)), "{p}");
+        }
     }
 }

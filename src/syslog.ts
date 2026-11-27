@@ -18,13 +18,14 @@ const KEEP = 20000;
 const KEEP_CHARS = 8_000_000;
 /** Rows drawn at once: the newest of those the filter lets through. */
 const SHOW = 2000;
-/** RFC 5424 severity keywords, shown as devices print them. */
-/** RFC 5424 severity keywords 0-7, as devices print them (Cisco's log message numbers too). */
-export const SEVERITY = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"];
+/** RFC 5424 severity keywords 0-7, as devices print them (Cisco's log
+ * message numbers too): owned by syslogPri.ts, which names a PRI with them. */
+import { facilityName, SEVERITY } from "./syslogPri";
+export { SEVERITY };
 
-/** A message kept: numbered in arrival order, its text lower-cased once for the filter. */
-/** `name`: the message's own name ("%link-3-updown", lower case: the first in
- * its text), or null; another name quoted later in the text is not it. */
+/** A message kept: numbered in arrival order, its text lower-cased once for
+ * the filter. `name`: the message's own name ("%link-3-updown", lower case:
+ * the first in its text), or null; another name quoted later in the text is not it. */
 type Kept = SyslogMessage & { seq: number; lower: string; name: string | null };
 
 let status: SyslogStatus | null = null;
@@ -187,6 +188,15 @@ const asText = (m: SyslogMessage, withDate: boolean, sheet = false) =>
     .map((c) => (sheet ? sheetCell(c) : c))
     .join("\t");
 
+/** The filter box's words: those a message must hold (`want`), and those
+ * after "!" it must not (`not`): "!ipaccesslog" leaves a flood out. Not "-":
+ * "-3-" is a search for a message number. A lone "!" is a word to find. */
+function filterTerms(query: string): { want: string[]; not: string[] } {
+  const all = searchTerms(query);
+  const out = (t: string) => t.length > 1 && t.startsWith("!");
+  return { want: all.filter((t) => !out(t)), not: all.filter(out).map((t) => t.slice(1)) };
+}
+
 /** Saved sessions' names by their host (lower-case): a sender shown by its address is found by its name too. */
 function sessionNames(): Map<string, string> {
   const byHost = new Map<string, string[]>();
@@ -197,10 +207,10 @@ function sessionNames(): Map<string, string> {
   return new Map([...byHost].map(([host, names]) => [host, names.join(", ")]));
 }
 
-/** A row; the sender's session names as its tooltip (user data: never translated). */
-/** A message's row; the filter's words (`terms`) marked in its sender and text. */
+/** A message's row; the filter's words (`terms`) marked in its sender and
+ * text, the sender's session names as its tooltip (user data: never translated). */
 const rowHtml = (x: Kept, names: Map<string, string>, terms: string[]) =>
-  `<div class="syslog-row sev-${x.severity ?? "x"}${hasAlertWord(x.lower) ? " word-hit" : ""}" data-seq="${x.seq}"><time>${clockText(x.at)}</time><span class="from" data-i18n-skip${names.has(x.from) ? ` title="${esc(names.get(x.from)!)}"` : ""}>${markTerms(x.from, terms)}</span><span class="sev">${x.severity !== null ? SEVERITY[x.severity] : "-"}</span><span class="tx" data-i18n-skip>${markTerms(x.text, terms)}</span></div>`;
+  `<div class="syslog-row sev-${x.severity ?? "x"}${hasAlertWord(x.lower) ? " word-hit" : ""}" data-seq="${x.seq}"><time>${clockText(x.at)}</time><span class="from" data-i18n-skip${names.has(x.from) ? ` title="${esc(names.get(x.from)!)}"` : ""}>${markTerms(x.from, terms)}</span><span class="sev"${x.facility !== null && x.severity !== null ? ` title="${facilityName(x.facility)}.${SEVERITY[x.severity]}" data-i18n-skip` : ""}>${x.severity !== null ? SEVERITY[x.severity] : "-"}</span><span class="tx" data-i18n-skip>${markTerms(x.text, terms)}</span></div>`;
 
 /** Marks the open tabs connected to an address that sent an alert-worthy message (main's). */
 let markTabsOf: (ip: string) => void = () => {};
@@ -214,7 +224,6 @@ let openWindow: HTMLElement | null = null;
 /** The open window's sender filter. */
 let showSender: ((from: string | null) => void) | null = null;
 
-/** Whether messages from this address are kept (a terminal's address menu offers them). */
 /** The senders of the kept messages, the latest first, each once. */
 export function syslogSenderList(): string[] {
   const out = new Set<string>();
@@ -222,6 +231,7 @@ export function syslogSenderList(): string[] {
   return [...out];
 }
 
+/** Whether messages from this address are kept (a terminal's address menu offers them): the address as they came from it. */
 export function syslogSender(host: string): string | undefined {
   const key = host.trim().toLowerCase();
   return key ? messages.find((m) => m.from.toLowerCase() === key)?.from : undefined;
@@ -251,10 +261,10 @@ export function openSyslog(from?: string) {
             <button type="button" class="btn" data-pick-file>${icon("FolderOpen", 14)}찾아보기</button></div>
         </form>
         <div class="syslog-tools">
-          <label class="pane-filter syslog-filter" title="주소나 내용으로 거르기">${icon("Search", 13)}<input placeholder="필터" spellcheck="false"/></label>
+          <label class="pane-filter syslog-filter" title="주소나 내용으로 거르기 (!낱말: 그 낱말이 든 메시지 빼기)">${icon("Search", 13)}<input placeholder="필터" spellcheck="false"/></label>
           <button type="button" class="syslog-only" data-only hidden title="모든 장비의 메시지 보기">${icon("X", 12)}<span>보낸 곳</span><code data-i18n-skip></code></button>
           <button type="button" class="syslog-only" data-hidden-names hidden data-i18n-skip>${icon("X", 12)}<span></span></button>
-          <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기 · 링크가 자주 끊긴 포트도 함께 보기">${icon("Server", 13)}보낸 곳</button>
+          <button type="button" class="btn btn-sm" data-senders title="메시지를 보낸 장비를 많이 보낸 순서로 보고 하나만 거르기 · 링크가 자주 끊긴 포트와 많이 온 메시지 종류도 함께 보기">${icon("Server", 13)}보낸 곳</button>
           <select name="level" title="심각도">
             <option value="7">모든 심각도</option>
             <option value="4">warning 이상</option>
@@ -389,12 +399,20 @@ export function openSyslog(from?: string) {
   /** Message names hidden from the list ("%SEC-6-IPACCESSLOGP" that floods
    * it), lower case; for this window only, so nothing stays hidden unseen. */
   const hiddenNames = new Set<string>();
+  /** `find` as the filter's new words, the words left out ("!flood") as the
+   * user typed them kept after it: a pick from a menu does not bring a flood
+   * back. One the pick itself holds ("!gi0" and the port "Gi0/1") is let go:
+   * kept, it would leave out every line picked. */
+  const withExclusions = (find: string) => {
+    const picked = find.toLowerCase();
+    return [find, ...filterTerms(filterIn.value).not.filter((t) => !picked.includes(t)).map((t) => `!${t}`)].join(" ");
+  };
   /** The list shows some messages only (a word, a severity, one device, names hidden). */
   const filtered = () => filterIn.value.trim() !== "" || level.value !== "7" || onlyFrom !== null || hiddenNames.size > 0;
 
   /** Whether the sender, the filter and the severity let a message through. */
   const passes = () => {
-    const terms = searchTerms(filterIn.value);
+    const { want: terms, not } = filterTerms(filterIn.value);
     const max = Number(level.value);
     const from = onlyFrom;
     const names = sessionNames();
@@ -405,7 +423,8 @@ export function openSyslog(from?: string) {
       (from === null || x.from === from) &&
       !(x.name !== null && hiddenNames.has(x.name)) &&
       (max >= 7 || (x.severity !== null && x.severity <= max)) &&
-      terms.every((t) => x.from.includes(t) || x.lower.includes(t) || !!names.get(x.from)?.toLowerCase().includes(t));
+      terms.every((t) => x.from.includes(t) || x.lower.includes(t) || !!names.get(x.from)?.toLowerCase().includes(t)) &&
+      !not.some((t) => x.from.includes(t) || x.lower.includes(t) || !!names.get(x.from)?.toLowerCase().includes(t));
   };
   const showOnly = (from: string | null) => {
     onlyFrom = from;
@@ -445,7 +464,7 @@ export function openSyslog(from?: string) {
         action: () => {
           // That device alone, and that port's lines: "Gi1/0/1," so that
           // Gi1/0/10's are not let through.
-          filterIn.value = `${c.iface},`;
+          filterIn.value = withExclusions(`${c.iface},`);
           showOnly(c.from);
         },
       }));
@@ -455,11 +474,14 @@ export function openSyslog(from?: string) {
   // their ports whose link went down.
   m.root.querySelector<HTMLElement>("[data-senders]")!.addEventListener("click", (e) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const per = new Map<string, { n: number; bad: number }>();
+    // `last`: when its latest message came (kept in arrival order): a device
+    // that went quiet in an outage stands out by an old time.
+    const per = new Map<string, { n: number; bad: number; last: number }>();
     for (const x of messages) {
-      const c = per.get(x.from) ?? { n: 0, bad: 0 };
+      const c = per.get(x.from) ?? { n: 0, bad: 0, last: 0 };
       c.n++;
       if (x.severity !== null && x.severity <= 3) c.bad++;
+      c.last = x.at;
       per.set(x.from, c);
     }
     if (!per.size) return void toast("아직 받은 메시지가 없습니다.", "info");
@@ -469,13 +491,37 @@ export function openSyslog(from?: string) {
     // The busiest senders (IPv4, as the pings go), up: a storm of messages
     // in an outage, and whether those devices still answer.
     const watch = top.map(([ip]) => ip).filter(isIPv4);
+    // The kinds of message (their own names, "%SEC-6-IPACCESSLOGP") that came
+    // the most, of the device shown alone if one is and of the severity
+    // chosen (kept when one is picked): what a storm is made of.
+    // One picked: those alone (a hidden one shown again for it).
+    const kinds = new Map<string, number>();
+    const max = Number(level.value);
+    for (const x of messages)
+      if (x.name !== null && (onlyFrom === null || x.from === onlyFrom) && (max >= 7 || (x.severity !== null && x.severity <= max))) kinds.set(x.name, (kinds.get(x.name) ?? 0) + 1);
+    const kindItems = [...kinds]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 10)
+      .map(([name, n]) => ({
+        // The name as devices print it (upper case), never translated.
+        label: name.toUpperCase(),
+        userLabel: true,
+        icon: hiddenNames.has(name) ? "EyeOff" : "ListFilter",
+        hint: `${n}`,
+        userHint: true,
+        action: () => {
+          hiddenNames.delete(name);
+          filterIn.value = withExclusions(name.toUpperCase());
+          render();
+        },
+      }));
     contextMenu(r.left, r.bottom + 4, [
       ...(onlyFrom !== null ? [{ label: "모든 장비의 메시지 보기", icon: "ListFilter", action: () => showOnly(null) }, "-" as const] : []),
       ...top.map(([ip, c]) => ({
         label: names.has(ip) ? `${names.get(ip)} (${ip})` : ip,
         userLabel: true,
         icon: c.bad ? "TriangleAlert" : "Server",
-        hint: c.bad ? `${c.n} · err+ ${c.bad}` : `${c.n}`,
+        hint: `${c.bad ? `${c.n} · err+ ${c.bad}` : `${c.n}`} · ${clockText(c.last)}`,
         userHint: true,
         action: () => showOnly(ip),
       })),
@@ -491,6 +537,7 @@ export function openSyslog(from?: string) {
           ]
         : []),
       ...(ports.length ? ["-" as const, { label: "포트 상태 변화", icon: "Activity", heading: true }, ...ports] : []),
+      ...(kindItems.length ? ["-" as const, { label: "많이 온 메시지 종류", icon: "ListFilter", heading: true }, ...kindItems] : []),
     ]);
   });
 
@@ -643,7 +690,8 @@ export function openSyslog(from?: string) {
    * it follows new lines only when it was at its bottom. */
   function renderList() {
     const names = sessionNames();
-    const terms = searchTerms(filterIn.value);
+    // The words to find are marked; those left out ("!word") are in no row shown.
+    const terms = filterTerms(filterIn.value).want;
     const atBottom = follow;
     // A time clicked then shows the messages around it (below).
     list.classList.toggle("filtered", filtered());
@@ -817,7 +865,7 @@ export function openSyslog(from?: string) {
       names.flatMap((name) => {
         const known = alertWords.includes(name.toLowerCase());
         return [
-          { label: "이 메시지만 보기", icon: "ListFilter", hint: name, userHint: true, action: () => ((filterIn.value = name), render()) },
+          { label: "이 메시지만 보기", icon: "ListFilter", hint: name, userHint: true, action: () => ((filterIn.value = withExclusions(name)), render()) },
           // A flood of one kind (ACL logs, a flapping port) out of the way.
           { label: "이 메시지 숨기기", icon: "EyeOff", hint: name, userHint: true, action: () => hideName(name) },
           {

@@ -355,8 +355,26 @@ fn parse_request(buf: &[u8]) -> Option<Request> {
     Some(Request { op, file, mode, options })
 }
 
+/// The requests being served, by sender and the request's bytes: a device
+/// that did not get the first reply sends its RRQ/WRQ again, and a second
+/// transfer for it would end in a false error (no reply, or the device's
+/// "unknown transfer ID") after the first one has done the work.
+/// Each with a nudge: the same request again means the device has not had
+/// the transfer's first packet, which then goes again at once.
+type Serving = Arc<Mutex<HashMap<(SocketAddr, Vec<u8>), Arc<tokio::sync::Notify>>>>;
+
+/// Takes a request off `Serving` when its transfer ends, however it ends.
+struct Served(Serving, (SocketAddr, Vec<u8>));
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.1);
+    }
+}
+
 async fn tftp_serve(sock: UdpSocket, root: PathBuf, opts: TftpOptions, notify: Notify, ctl: Control) {
     let mut buf = vec![0u8; 1024];
+    let serving: Serving = Arc::default();
     loop {
         let Ok((n, peer)) = sock.recv_from(&mut buf).await else { continue };
         let Some(req) = parse_request(&buf[..n]) else { continue };
@@ -364,14 +382,28 @@ async fn tftp_serve(sock: UdpSocket, root: PathBuf, opts: TftpOptions, notify: N
             let _ = sock.send_to(&tftp_error(4, "Illegal TFTP operation"), peer).await;
             continue;
         }
+        // The same request again from the same port: its transfer is running;
+        // nudged, it sends what it is waiting on an answer to again now.
+        let key = (peer, buf[..n].to_vec());
+        let nudge = {
+            let mut serving = serving.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(running) = serving.get(&key) {
+                running.notify_one();
+                continue;
+            }
+            let nudge = Arc::new(tokio::sync::Notify::new());
+            serving.insert(key.clone(), nudge.clone());
+            nudge
+        };
+        let served = Served(serving.clone(), key);
         let Some(slot) = take_slot(&ctl.active, TFTP_MAX_TRANSFERS) else {
             let _ = sock.send_to(&tftp_error(0, "Server busy, try again later"), peer).await;
             continue;
         };
         let (root, notify, ctl) = (root.clone(), notify.clone(), ctl.clone());
         tauri::async_runtime::spawn(async move {
-            let _slot = slot;
-            if let Err((kind, msg)) = tftp_transfer(req, peer, &root, opts, &notify, &ctl).await {
+            let (_slot, _served) = (slot, served);
+            if let Err((kind, msg)) = tftp_transfer(req, peer, &root, opts, &notify, &ctl, &nudge).await {
                 notify.emit(kind, &peer.ip().to_string(), msg);
             }
         });
@@ -386,6 +418,7 @@ async fn tftp_transfer(
     opts: TftpOptions,
     notify: &Notify,
     ctl: &Control,
+    nudge: &tokio::sync::Notify,
 ) -> Result<(), (&'static str, String)> {
     let ip = if opts.lan { "0.0.0.0" } else { "127.0.0.1" };
     let sock = UdpSocket::bind((ip, 0)).await.map_err(|e| ("error", e.to_string()))?;
@@ -416,7 +449,7 @@ async fn tftp_transfer(
             _ => {}
         }
     }
-    let t = Transfer { sock: &sock, blksize, ctl };
+    let t = Transfer { sock: &sock, blksize, ctl, nudge };
 
     if req.op == WRQ {
         if opts.read_only {
@@ -467,11 +500,16 @@ struct Transfer<'a> {
     sock: &'a UdpSocket,
     blksize: usize,
     ctl: &'a Control,
+    /// The device sent its request again (tftp_serve).
+    nudge: &'a tokio::sync::Notify,
 }
 
 impl Transfer<'_> {
-    /// Send `packet` until a reply satisfying `accept` arrives (retransmitting on timeout).
-    async fn exchange(&self, packet: &[u8], accept: impl Fn(&[u8]) -> bool) -> Result<Vec<u8>, String> {
+    /// Send `packet` until a reply satisfying `accept` arrives (retransmitting
+    /// on timeout). A reply satisfying `lost` shows the peer did not get
+    /// `packet` (it repeats what came before): sent again at once. Only for
+    /// an ACK: DATA resent on a repeated ACK would double every later block.
+    async fn exchange(&self, packet: &[u8], accept: impl Fn(&[u8]) -> bool, lost: impl Fn(&[u8]) -> bool) -> Result<Vec<u8>, String> {
         let mut buf = vec![0u8; self.blksize + 4];
         for _ in 0..RETRIES {
             if self.ctl.stopped() {
@@ -481,7 +519,15 @@ impl Transfer<'_> {
             self.sock.send(packet).await.map_err(|e| e.to_string())?;
             let deadline = Instant::now() + TIMEOUT;
             while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                match tokio::time::timeout(left, self.sock.recv(&mut buf)).await {
+                let got = tokio::select! {
+                    got = tokio::time::timeout(left, self.sock.recv(&mut buf)) => got,
+                    // The device asked again: what it waits for goes now, once.
+                    _ = self.nudge.notified() => {
+                        self.sock.send(packet).await.map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                };
+                match got {
                     Ok(Ok(n)) => {
                         let reply = &buf[..n];
                         if reply.len() >= 2 && u16::from_be_bytes([reply[0], reply[1]]) == ERROR {
@@ -490,6 +536,9 @@ impl Transfer<'_> {
                         }
                         if accept(reply) {
                             return Ok(reply.to_vec());
+                        }
+                        if lost(reply) {
+                            self.sock.send(packet).await.map_err(|e| e.to_string())?;
                         }
                     }
                     Ok(Err(e)) => return Err(e.to_string()),
@@ -503,7 +552,7 @@ impl Transfer<'_> {
     /// Stream a file block by block (never the whole file in memory).
     async fn send(&self, file: &mut tokio::fs::File, oack: Vec<(String, String)>) -> Result<(), String> {
         if !oack.is_empty() {
-            self.exchange(&oack_packet(&oack), |p| is_ack(p, 0)).await?;
+            self.exchange(&oack_packet(&oack), |p| is_ack(p, 0), |_| false).await?;
         }
         let mut block: u16 = 1;
         let mut chunk = vec![0u8; self.blksize];
@@ -521,7 +570,7 @@ impl Transfer<'_> {
             p.extend_from_slice(&[0, DATA as u8]);
             p.extend_from_slice(&block.to_be_bytes());
             p.extend_from_slice(&chunk[..filled]);
-            self.exchange(&p, |r| is_ack(r, block)).await?;
+            self.exchange(&p, |r| is_ack(r, block), |_| false).await?;
             // A final block shorter than blksize (possibly empty) ends the transfer.
             if filled < self.blksize {
                 return Ok(());
@@ -562,9 +611,18 @@ impl Transfer<'_> {
         let mut out = tokio::fs::File::create(tmp).await.map_err(|e| format!("파일을 만들 수 없습니다: {e}"))?;
         let mut reply = if oack.is_empty() { vec![0, ACK as u8, 0, 0] } else { oack_packet(&oack) };
         let mut block: u16 = 1;
+        // The block received last: arriving again, our ACK of it was lost.
+        let mut last: Option<u16> = None;
         let mut size = 0u64;
         loop {
-            let packet = self.exchange(&reply, |p| is_data(p, block)).await?;
+            // Past block 65535 a device goes on with 0 or with 1 (the RFC says
+            // neither); a stale repeat then would be 65535, so a 1 where 0 is
+            // due is the next block.
+            let packet = self
+                .exchange(&reply, |p| is_data(p, block) || (block == 0 && is_data(p, 1)), |p| last.is_some_and(|b| is_data(p, b)))
+                .await?;
+            block = u16::from_be_bytes([packet[2], packet[3]]);
+            last = Some(block);
             let payload = &packet[4..];
             size += payload.len() as u64;
             if size > TFTP_MAX_UPLOAD {
@@ -901,6 +959,133 @@ mod tests {
         let mut rest = Vec::new();
         let closed = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut rest)).await;
         assert!(closed.is_ok(), "the connection was closed with the server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device uploading past block 65535 that goes on with 1 (not 0): the
+    /// server takes every block in order and acknowledges each by its number.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tftp_upload_rolling_over_to_one_is_received_whole() {
+        let dir = std::env::temp_dir().join(format!("bx-fs-roll1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let task = test_start(FileServerConfig {
+            kind: "tftp".into(),
+            root: dir.to_string_lossy().into_owned(),
+            port,
+            lan: false,
+            read_only: false,
+            keep_previous: false,
+            username: String::new(),
+            password: String::new(),
+        })
+        .await;
+        let data: Vec<u8> = (0..65536u32 * 8 + 5).map(|i| (i % 241) as u8).collect();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(b"\x00\x02roll.bin\x00octet\x00blksize\x008\x00", ("127.0.0.1", port)).await.unwrap();
+        async fn recv(sock: &UdpSocket, buf: &mut [u8]) -> (usize, std::net::SocketAddr) {
+            tokio::time::timeout(Duration::from_secs(5), sock.recv_from(buf)).await.expect("a reply").unwrap()
+        }
+        let mut buf = [0u8; 64];
+        let (n, xfer) = recv(&sock, &mut buf).await;
+        assert_eq!(&buf[..n], b"\x00\x06blksize\x008\x00", "OACK");
+        for (i, chunk) in data.chunks(8).enumerate() {
+            let i = i as u32 + 1;
+            let block = if i <= 65535 { i as u16 } else { (i - 65535) as u16 };
+            let packet = [&[0u8, DATA as u8][..], &block.to_be_bytes(), chunk].concat();
+            sock.send_to(&packet, xfer).await.unwrap();
+            let (n, _) = recv(&sock, &mut buf).await;
+            assert!(is_ack(&buf[..n], block), "block {i}: {:?}", &buf[..n]);
+        }
+        assert_eq!(std::fs::read(dir.join("roll.bin")).unwrap(), data);
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device sends its WRQ twice (the first reply was slow): one transfer
+    /// answers, not two, and repeats its OACK at once for the second. Once it
+    /// is done, the same request is served again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_tftp_request_starts_one_transfer() {
+        let dir = std::env::temp_dir().join(format!("bx-fs-dupreq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let task = test_start(FileServerConfig {
+            kind: "tftp".into(),
+            root: dir.to_string_lossy().into_owned(),
+            port,
+            lan: false,
+            read_only: false,
+            keep_previous: false,
+            username: String::new(),
+            password: String::new(),
+        })
+        .await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wrq = b"\x00\x02dup.cfg\x00octet\x00blksize\x00512\x00";
+        let mut buf = [0u8; 64];
+        for round in 0..2 {
+            sock.send_to(wrq, ("127.0.0.1", port)).await.unwrap();
+            sock.send_to(wrq, ("127.0.0.1", port)).await.unwrap();
+            // Every reply within a second: the OACK, and again at once for the
+            // repeat (well before the server's 3-second timeout), all from
+            // one transfer port.
+            let mut from = Vec::new();
+            while let Ok(Ok((n, addr))) = tokio::time::timeout(Duration::from_millis(1000), sock.recv_from(&mut buf)).await {
+                assert_eq!(&buf[..n], b"\x00\x06blksize\x00512\x00", "round {round}");
+                from.push(addr);
+            }
+            assert_eq!(from.len(), 2, "round {round}: replies from {from:?}");
+            assert_eq!(from[0], from[1], "round {round}: one transfer");
+            // One short block ends the upload.
+            sock.send_to(b"\x00\x03\x00\x01hostname r1\n", from[0]).await.unwrap();
+            let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await.unwrap().unwrap();
+            assert!(is_ack(&buf[..n], 1), "round {round}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(std::fs::read(dir.join("dup.cfg")).unwrap(), b"hostname r1\n");
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device uploading repeats a block (our ACK of it was lost): the ACK
+    /// goes again at once, not after the server's own 3-second timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_block_is_acknowledged_again_at_once() {
+        let dir = std::env::temp_dir().join(format!("bx-fs-reack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let task = test_start(FileServerConfig {
+            kind: "tftp".into(),
+            root: dir.to_string_lossy().into_owned(),
+            port,
+            lan: false,
+            read_only: false,
+            keep_previous: false,
+            username: String::new(),
+            password: String::new(),
+        })
+        .await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 64];
+        let quick = Duration::from_millis(800);
+        sock.send_to(b"\x00\x02re.cfg\x00octet\x00blksize\x008\x00", ("127.0.0.1", port)).await.unwrap();
+        let (_, xfer) = tokio::time::timeout(quick, sock.recv_from(&mut buf)).await.unwrap().unwrap();
+        let block1 = b"\x00\x03\x00\x01AAAAAAAA";
+        for _ in 0..2 {
+            // The second time is the repeat: answered as quickly as the first.
+            sock.send_to(block1, xfer).await.unwrap();
+            let (n, _) = tokio::time::timeout(quick, sock.recv_from(&mut buf)).await.expect("ACK 1 at once").unwrap();
+            assert!(is_ack(&buf[..n], 1));
+        }
+        sock.send_to(b"\x00\x03\x00\x02BB", xfer).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert!(is_ack(&buf[..n], 2));
+        assert_eq!(std::fs::read(dir.join("re.cfg")).unwrap(), b"AAAAAAAABB");
+        task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

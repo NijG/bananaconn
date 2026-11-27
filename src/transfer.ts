@@ -30,6 +30,13 @@ export function fileTabName(server: string): string {
   return `${server} · ${tr("파일")}`;
 }
 
+/** The server a name made by fileTabName in the language shown now is for,
+ * or null for any other name (one the user gave, or another language's). */
+export function fileTabServer(name: string): string | null {
+  const tail = ` · ${tr("파일")}`;
+  return name.endsWith(tail) && name.length > tail.length ? name.slice(0, -tail.length) : null;
+}
+
 /** A quick (unsaved) file-browser session reusing `source`'s host, account and
  * proxy. SSH credentials carry to SFTP; a telnet or VNC login is reused for FTP.
  * An SSH gateway is not reused here — the file backend connects directly, so

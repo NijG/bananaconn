@@ -32,40 +32,69 @@ pub struct ScannedFile {
     pub text: String,
 }
 
-fn walk(dir: &Path, rel: &str, ext: &str, depth: usize, out: &mut Vec<ScannedFile>) {
-    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+/// What a scan read, and what it left out, so the import can say so instead
+/// of the sessions silently missing.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanResult {
+    pub files: Vec<ScannedFile>,
+    /// Session files over MAX_FILE_BYTES (relative paths).
+    pub too_large: Vec<String>,
+    /// Session files or folders that could not be read (relative paths).
+    pub unreadable: Vec<String>,
+    /// Stopped at MAX_FILES files or MAX_DEPTH folders deep: there may be more.
+    pub truncated: bool,
+}
+
+fn walk(dir: &Path, rel: &str, ext: &str, depth: usize, out: &mut ScanResult) {
+    if depth > MAX_DEPTH {
+        out.truncated = true;
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    if out.files.len() >= MAX_FILES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        out.unreadable.push(if rel.is_empty() { ".".to_string() } else { format!("{rel}/") });
+        return;
+    };
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
+        if out.files.len() >= MAX_FILES {
+            out.truncated = true;
+            return;
+        }
         // Never follow links or junctions out of the chosen folder.
         let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         if meta.is_dir() {
             walk(&entry.path(), &child, ext, depth + 1, out);
-        } else if meta.is_file() && meta.len() <= MAX_FILE_BYTES && name.to_lowercase().ends_with(ext)
-            && let Ok(bytes) = fs::read(entry.path()) {
-                out.push(ScannedFile { rel: child, text: crate::store::decode_text(&bytes) });
+        } else if meta.is_file() && name.to_lowercase().ends_with(ext) {
+            if meta.len() > MAX_FILE_BYTES {
+                out.too_large.push(child);
+            } else {
+                match fs::read(entry.path()) {
+                    Ok(bytes) => out.files.push(ScannedFile { rel: child, text: crate::store::decode_text(&bytes) }),
+                    Err(_) => out.unreadable.push(child),
+                }
             }
-        if out.len() >= MAX_FILES {
-            return;
         }
     }
 }
 
-/// Every `*.ext` file under `root` (texts decoded like read_text_file).
+/// Every `*.ext` file under `root` (texts decoded like read_text_file), and
+/// what was left out.
 #[tauri::command]
-pub async fn import_scan(root: String, ext: String) -> Result<Vec<ScannedFile>, String> {
+pub async fn import_scan(root: String, ext: String) -> Result<ScanResult, String> {
     let ext = format!(".{}", ext.trim_start_matches('.').to_lowercase());
     tauri::async_runtime::spawn_blocking(move || {
         let root = Path::new(&root);
         if !root.is_dir() {
             return Err(format!("폴더를 찾을 수 없습니다: {}", root.display()));
         }
-        let mut out = Vec::new();
+        let mut out = ScanResult::default();
         walk(root, "", &ext, 0, &mut out);
         Ok(out)
     })
@@ -256,6 +285,24 @@ pub async fn registry_export(key: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session file too big to read is reported, not silently left out;
+    /// other files of the folder are read, files of another kind ignored.
+    #[test]
+    fn a_scan_reports_what_it_left_out() {
+        let dir = std::env::temp_dir().join(format!("bx-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Lab")).unwrap();
+        fs::write(dir.join("Lab").join("sw1.ini"), "S:\"Hostname\"=10.0.0.1\n").unwrap();
+        fs::write(dir.join("big.ini"), vec![b'x'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+        fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        let mut out = ScanResult::default();
+        walk(&dir, "", ".ini", 0, &mut out);
+        assert_eq!(out.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), ["Lab/sw1.ini"]);
+        assert_eq!(out.too_large, ["big.ini"]);
+        assert!(out.unreadable.is_empty() && !out.truncated);
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn key_paths_resolve_their_placeholders() {

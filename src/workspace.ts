@@ -6,6 +6,7 @@
 // onto a slot to place them there.
 
 import { icon } from "./icons";
+import { sameHost } from "./ipLinks";
 import { PROTOCOLS, type Protocol, type Session } from "./model";
 import { copyAddresses, writeClipboard } from "./clipboard";
 import { tr } from "./i18n";
@@ -819,9 +820,8 @@ export class Workspace {
    * always has its device in deviceAlerts). The latest note is the one told.
    * True when a tab of the device is the one in front. */
   markDevice(host: string, note: string): boolean {
-    const key = host.trim().toLowerCase();
     const active = this.slots[this.focused];
-    const mine = this.tabs.filter((t) => t.session.host.trim().toLowerCase() === key);
+    const mine = this.tabs.filter((t) => sameHost(t.session.host, host));
     if (mine.some((t) => t.id === active)) return true;
     let marked = false;
     for (const t of mine) {

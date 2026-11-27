@@ -3,8 +3,8 @@
 import { icon } from "./icons";
 import { saveSnippets, state, type Snippet } from "./store";
 import { groupForKind } from "./snippetLibrary";
-import { confirmDialog, confirmDiscard, contextMenu, enterSubmits, esc, formValues, listKeys, markTerms, matchesTerms, modal, searchTerms, toast, type MenuItem } from "./ui";
-import { tr } from "./i18n";
+import { confirmDialog, confirmDiscard, contextMenu, enterSubmits, esc, formValues, listKeys, markTerms, matchesTerms, modal, promptDialog, searchTerms, toast, type MenuItem } from "./ui";
+import { tr, userText } from "./i18n";
 import { fillSnippetVars, snippetVars } from "./snippetVars";
 
 /** Recorded keystrokes made readable: Enter ⏎, Tab ⇥, Esc ␛, other controls ^X. */
@@ -33,9 +33,9 @@ export function asksValues(s: Snippet): boolean {
 
 /** Ask for the values of `s`'s {{?name}}s and give its text with them filled
  * in; null when cancelled. Each value starts as the one typed last time, else
- * the default written in the snippet. One without a default must be given. */
-/** `suggest`: values to offer for a {{?name}} as it is typed (the caller's:
- * a terminal offers the interfaces or the addresses its output shows). */
+ * the default written in the snippet. One without a default must be given.
+ * `suggest`: values to offer for a {{?name}} as it is typed (the caller's: a
+ * terminal offers the interfaces or the addresses its output shows). */
 export function askSnippetValues(s: Snippet, suggest?: (name: string, text: string) => string[]): Promise<string | null> {
   const vars = snippetVars(s.text);
   const key = (name: string) => `${s.id}\n${name}`;
@@ -98,17 +98,54 @@ export function askSnippetValues(s: Snippet, suggest?: (name: string, text: stri
   });
 }
 
+/** Text selected in a terminal (a command that worked) kept as one of the
+ * user's own snippets, after its name is asked (its first line offered).
+ * Not run on sending (no Enter), so a prompt selected with it can be taken
+ * out first; changed in the manager, which the saved toast opens. */
+export async function saveSelectionAsSnippet(selected: string) {
+  // Its lines as "\n" (xterm joins a selection's lines with "\r\n" on
+  // Windows; sending turns them into Enter either way), then the blanks it
+  // carries at its lines' ends (a terminal's cells), and after it.
+  const text = selected.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").replace(/\s+$/, "");
+  if (!text.trim()) return;
+  const first = text.trim().split("\n")[0];
+  const res = await promptDialog({ title: "스니펫으로 저장", label: "스니펫 이름", value: first.length > 40 ? `${first.slice(0, 40)}…` : first, icon: "ClipboardType", confirm: "저장" });
+  const name = res?.value.trim();
+  if (!name) return;
+  saveSnippets([...state.snippets, { id: crypto.randomUUID(), name, text, run: false }]);
+  toast(`스니펫 "${userText(name)}"을(를) 저장했습니다`, "success", 5000, { label: "스니펫 관리", run: () => openSnippetManager() });
+}
+
 /** Save a recorded macro. */
 export function addMacro(name: string, keys: string) {
   saveSnippets([...state.snippets, { id: crypto.randomUUID(), name, text: keys, run: false, macro: true }]);
 }
 
+/** The snippets sent from the menu lately, the latest first (their ids: a
+ * library one's is fixed); a convenience of this PC, so not in the backup. */
+const RECENT = "bx.snippetRecent";
+function recentIds(): string[] {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(RECENT) ?? "[]");
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string").slice(0, 5) : [];
+  } catch {
+    return [];
+  }
+}
+function noteRecent(id: string) {
+  try {
+    localStorage.setItem(RECENT, JSON.stringify([id, ...recentIds().filter((x) => x !== id)].slice(0, 5)));
+  } catch {
+    // Only the menu's shortcut: nothing lost.
+  }
+}
+
 /** Show the snippet menu at a toolbar button; `send` delivers the text.
  * The user's own snippets come first, then the group for the operating system
  * recognised in this tab (`kind`, devmon.rs); every other group is one click
- * further, so the menu stays short with the whole library loaded. */
-/** `extra`: the terminal's own sending items, above the manager. */
-export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kind?: string, extra: MenuItem[] = []) {
+ * further, so the menu stays short with the whole library loaded.
+ * `extra`: the terminal's own sending items, above the manager. */
+export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => Promise<true | void> | void, kind?: string, extra: MenuItem[] = []) {
   const r = anchor.getBoundingClientRect();
   const entry = (s: Snippet): MenuItem => ({
     label: s.name,
@@ -118,12 +155,26 @@ export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kin
     hint: s.macro ? "매크로 재생" : s.text.split("\n")[0].slice(0, 28),
     // The command is the user's (or a device's) text: never translated.
     userHint: !s.macro,
-    action: () => send(s),
+    action: () => {
+      // Only what the recent list shows (a group's): one's own five would push
+      // those out. Once sent: not one whose values were cancelled, or refused.
+      void Promise.resolve(send(s)).then((sent) => {
+        if (sent && s.group) noteRecent(s.id);
+      });
+    },
   });
   const groups = [...new Set(state.snippets.flatMap((s) => (s.group ? [s.group] : [])))];
   const detected = groupForKind(kind);
   const show = (group: string | undefined) => {
-    const items: (MenuItem | "-")[] = state.snippets.filter((s) => !s.group).map(entry);
+    // The ones sent lately that this menu would not show at once (another
+    // group's, one level further): first, so a command used again and again
+    // is one click away whatever the tab.
+    const recent = recentIds()
+      .map((id) => state.snippets.find((s) => s.id === id))
+      .filter((s): s is Snippet => !!s && !!s.group && s.group !== group)
+      .slice(0, 3);
+    const items: (MenuItem | "-")[] = recent.length ? [{ label: "최근 사용", icon: "History", heading: true }, ...recent.map(entry), "-"] : [];
+    items.push(...state.snippets.filter((s) => !s.group).map(entry));
     if (group) {
       if (items.length) items.push("-");
       items.push({ label: group, icon: "Server", heading: true });
@@ -141,7 +192,13 @@ export function snippetMenu(anchor: HTMLElement, send: (s: Snippet) => void, kin
     items.push("-");
     items.push(...extra);
     items.push({ label: "스니펫 관리…", icon: "Pencil", action: () => openSnippetManager() });
-    contextMenu(r.left, r.bottom + 4, items);
+    // One line between parts: with none of one's own, the recent part and the
+    // next one would each bring theirs.
+    contextMenu(
+      r.left,
+      r.bottom + 4,
+      items.filter((it, i) => it !== "-" || (i > 0 && items[i - 1] !== "-")),
+    );
   };
   show(detected && groups.includes(detected) ? detected : undefined);
 }

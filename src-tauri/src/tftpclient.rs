@@ -259,7 +259,11 @@ fn get(
                 DATA => {
                     let block = u16::from_be_bytes([buf[2], buf[3]]);
                     let data = &buf[4..n];
-                    if block != expect {
+                    // Past block 65535 a server goes on with 0 or with 1 (the
+                    // RFC says neither); a stale repeat then would be 65535,
+                    // so a 1 where 0 is due is the next block.
+                    let rolled_to_one = expect == 0 && block == 1;
+                    if block != expect && !rolled_to_one {
                         // A repeat of the previous block: our ACK was lost; send it again.
                         n = exchange(sock, &ack(expect.wrapping_sub(1)), peer.unwrap(), &mut peer, cancel, &mut buf)?;
                         continue;
@@ -340,10 +344,21 @@ fn put(
         // block) must not keep pushing it back.
         n = exchange(sock, &packet, peer.unwrap(), &mut peer, cancel, &mut buf)?;
         let mut resend_at = Instant::now() + TIMEOUT;
+        // However the server answers (a stale ACK every second restarts
+        // nothing), a block not acknowledged within the whole retry budget
+        // ends the upload: a path that drops our large blocks but passes the
+        // server's small ACKs would otherwise never fail.
+        let give_up = Instant::now() + TIMEOUT * (RETRIES + 1);
         loop {
+            if Instant::now() >= give_up {
+                return Err("TFTP 서버가 응답하지 않습니다".into());
+            }
             match u16::from_be_bytes([buf[0], buf[1]]) {
                 ACK if u16::from_be_bytes([buf[2], buf[3]]) == block => break,
-                ACK => {
+                // A stale ACK, or the OACK again while block 1 is out (the
+                // server's timer ran out first after block 1 was lost): wait,
+                // and resend on our own timeout.
+                op if op == ACK || (op == OACK && block == 1) => {
                     n = match listen(sock, peer.unwrap(), resend_at, cancel, &mut buf)? {
                         Some(n) => n,
                         None => {
@@ -531,6 +546,120 @@ mod tests {
         assert!(!local.join("nope.bin").exists() && !local.join("nope.bin.bxpart").exists());
         server.abort();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Block 1 of an upload is lost after the OACK, and the server, its own
+    /// timer first, sends the OACK again: the client waits and resends block
+    /// 1 on its timeout instead of giving up on an "unknown reply".
+    #[test]
+    fn a_repeated_oack_while_block_one_is_out_is_waited_out() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let oack: Vec<u8> = [&[0u8, OACK as u8][..], b"blksize\x001024\x00"].concat();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (_, client) = server.recv_from(&mut buf).unwrap();
+            let xfer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            xfer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            xfer.send_to(&oack, client).unwrap();
+            let mut dropped = false;
+            while let Ok((n, from)) = xfer.recv_from(&mut buf) {
+                let block = u16::from_be_bytes([buf[2], buf[3]]);
+                if block == 1 && !dropped {
+                    dropped = true;
+                    xfer.send_to(&oack, from).unwrap();
+                    continue;
+                }
+                xfer.send_to(&ack(block), from).unwrap();
+                if n - 4 < 1024 {
+                    break;
+                }
+            }
+            dropped
+        });
+        let dir = std::env::temp_dir().join(format!("bx-tftp-oack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("image.bin");
+        std::fs::write(&file, vec![5u8; 1024 * 3 + 7]).unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let (sent, size) = put(&sock, addr, "image.bin", &file, 1024, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        assert_eq!((sent, size), (1024 * 3 + 7, 1024));
+        assert!(worker.join().unwrap(), "the server dropped block 1 once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that goes on with block 1 after 65535 (not 0): the download
+    /// still takes every block, in order.
+    #[test]
+    fn a_download_follows_a_rollover_to_one() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        // 65536 full 8-byte blocks and a short one: past 65535 by two.
+        let data: Vec<u8> = (0..65536u32 * 8 + 3).map(|i| (i % 253) as u8).collect();
+        let sent = data.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (_, client) = server.recv_from(&mut buf).unwrap();
+            let xfer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            xfer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let oack: Vec<u8> = [&[0u8, OACK as u8][..], b"blksize\x008\x00"].concat();
+            xfer.send_to(&oack, client).unwrap();
+            xfer.recv_from(&mut buf).unwrap(); // ACK 0
+            for (i, chunk) in sent.chunks(8).enumerate() {
+                let i = i as u32 + 1;
+                let block = if i <= 65535 { i as u16 } else { (i - 65535) as u16 };
+                let packet = [&[0u8, DATA as u8][..], &block.to_be_bytes(), chunk].concat();
+                xfer.send_to(&packet, client).unwrap();
+                let (n, _) = xfer.recv_from(&mut buf).unwrap();
+                assert_eq!(&buf[..n], &ack(block), "block {i}");
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("bx-tftp-roll1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("back.bin");
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let (got, size) = get(&sock, addr, "image.bin", &local, 8, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        worker.join().unwrap();
+        assert_eq!((got, size), (data.len() as u64, 8));
+        assert_eq!(std::fs::read(&local).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that never takes block 1 but answers everything with ACK 0,
+    /// again and again: the upload fails within its retry budget instead of
+    /// waiting forever.
+    #[test]
+    fn endless_stale_acks_end_the_upload() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (_, client) = server.recv_from(&mut buf).unwrap();
+            let xfer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            xfer.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+            while !stopped.load(Ordering::Relaxed) {
+                // Every DATA, and every quiet moment: ACK 0 once more.
+                let _ = xfer.recv_from(&mut buf);
+                xfer.send_to(&ack(0), client).unwrap();
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("bx-tftp-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("image.bin");
+        std::fs::write(&file, vec![1u8; 2000]).unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let t = Instant::now();
+        let r = put(&sock, addr, "image.bin", &file, 512, &AtomicBool::new(false), &mut |_, _| {});
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(r.is_err(), "{r:?}");
+        assert!(t.elapsed() < TIMEOUT * (RETRIES + 3), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

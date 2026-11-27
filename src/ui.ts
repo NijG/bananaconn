@@ -197,8 +197,13 @@ export function fitToolbar(view: HTMLElement): () => void {
   actions.addEventListener("wheel", wheel, { passive: false });
   const sized = new ResizeObserver(fit);
   sized.observe(bar);
-  const changed = new MutationObserver(fit);
-  changed.observe(actions, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden", "class", "style"] });
+  // The whole bar, not only the buttons: a chip or state beside them that
+  // grows ("받는 중 42%", "연결됨") takes their room without resizing the
+  // bar. The bar's own attributes are skipped: they are fit()'s class.
+  const changed = new MutationObserver((records) => {
+    if (records.some((r) => r.target !== bar || r.type !== "attributes")) fit();
+  });
+  changed.observe(bar, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden", "class", "style"] });
   return () => {
     sized.disconnect();
     changed.disconnect();
@@ -500,12 +505,15 @@ export function choiceDialog(opts: {
   message: string;
   icon?: string;
   choices: { value: string; label: string; kind?: "primary" | "danger" }[];
+  /** Wider than a modal's own, for several choices (their labels longer in other languages). */
+  width?: number;
 }): Promise<string | null> {
   return new Promise((resolve) => {
     let result: string | null = null;
     const m = modal({
       title: opts.title,
       icon: opts.icon ?? "Info",
+      ...(opts.width ? { width: opts.width } : {}),
       body: `<div class="modal-text">${opts.message}</div>`,
       footer: `<button class="btn" data-close>취소</button>${opts.choices
         .map((c) => `<button class="btn ${c.kind === "primary" ? "btn-primary" : c.kind === "danger" ? "btn-danger" : ""}" data-choice="${esc(c.value)}">${esc(c.label)}</button>`)

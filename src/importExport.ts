@@ -16,14 +16,16 @@ import {
   parseXshellFiles,
   locateSecureCrt,
   secureCrtGlobalKey,
+  sshAliasWord,
+  SSH_EXPORT_HEADER,
   type ParsedImport,
 } from "./importers";
 import type { MenuItem } from "./ui";
 import { icon } from "./icons";
-import { endpoint, isSensitiveOption, normalizeJumpHost, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
-import { addFolder, reloadCredentials, saveSnippets, state, upsertSessions, type Snippet } from "./store";
-import { addSavedTunnels, parseTunnel, savedTunnels } from "./tunnels";
-import { errorText, esc, modal, sheetCell, timestamp, toast } from "./ui";
+import { endpoint, isSensitiveOption, normalizeFolder, normalizeJumpHost, normalizeSession, PROTOCOLS, sensitiveOptionKeys, type Protocol, type Session } from "./model";
+import { addFolder, allFolders, reloadCredentials, saveSnippets, state, upsertSessions, type Snippet } from "./store";
+import { addSavedTunnels, parseTunnel, savedTunnels, type SavedTunnel } from "./tunnels";
+import { confirmDialog, errorText, esc, modal, sheetCell, timestamp, toast } from "./ui";
 
 // ---- review & save -----------------------------------------------------------------------
 
@@ -31,7 +33,9 @@ import { errorText, esc, modal, sheetCell, timestamp, toast } from "./ui";
  * case), port, user and name. One already here, or an earlier repeat in the
  * same file, is not added again. A key, so a large import is matched in one
  * pass instead of every pair compared. */
-const targetKey = (s: Session) => JSON.stringify([s.protocol, s.host.toLowerCase(), s.port, s.username, s.name]);
+// The name trimmed: imports trim it (importers.add), a restored backup keeps
+// it as stored, and " web" and "web" are the same session to the user.
+const targetKey = (s: Session) => JSON.stringify([s.protocol, s.host.toLowerCase(), s.port, s.username, s.name.trim()]);
 
 /** Why a key file a source names cannot be used, for the review. */
 const KEY_PROBLEMS: Partial<Record<ImportKeyKind, string>> = {
@@ -206,12 +210,18 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
                <button class="btn btn-primary" data-ok ${fresh.length || extras || repairs ? "" : "disabled"}>${icon("Check", 14)}${fresh.length ? `${fresh.length}개 가져오기` : extras ? "백업 복원" : "키 파일 연결"}</button>`,
       onClose: () => resolve({ saved, keep, confirmed }),
     });
-    m.root.querySelector("[data-ok]")!.addEventListener("click", async () => {
+    const ok = m.root.querySelector<HTMLButtonElement>("[data-ok]")!;
+    let running = false;
+    ok.addEventListener("click", async () => {
+      // Once: a second click while saving made a second credential per key
+      // file and saved carried keys twice ("id_rsa-1").
+      if (running) return;
+      running = true;
+      ok.disabled = true;
       try {
         keep = m.root.querySelector<HTMLInputElement>("[name=keepSensitive]")?.checked ?? false;
         if (!keep)
           for (const s of fresh) for (const k of Object.keys(s.options)) if (isSensitiveOption(k)) delete s.options[k];
-        confirmed = true;
         // Key files the export carries go to the .ssh folder first (once per
         // file); one that cannot be saved leaves its sessions unlinked.
         const stored = new Map<string, string | null>();
@@ -230,6 +240,9 @@ async function reviewImport(title: string, parsed: ParsedImport, tunnels = 0, ex
           saved = fresh.length;
           toast(`${saved}개 세션을 가져왔습니다`, "success");
         }
+        // Only once the sessions are saved: a backup's extras (tunnels through
+        // these sessions) are not restored after that save failed.
+        confirmed = true;
         const repaired = [...new Set(keyLinks.filter((k) => !freshIds.has(k.session.id) && k.session.credentialId).map((k) => k.session))];
         if (repaired.length) {
           await upsertSessions(repaired);
@@ -325,8 +338,19 @@ export const importSecureCrtFolder = () =>
     const { configDir, scanDir, subFolders } = await locateSecureCrt(dir, exists);
     const ssh2 = ssh2Of.get(`${configDir}\\SSH2.ini`) ?? "";
     const root = ["SecureCRT", ...subFolders].join("/");
-    return { ...parseSecureCrtFiles(await api.importScan(scanDir, "ini"), root, secureCrtGlobalKey(ssh2)), configDir };
+    const scan = await api.importScan(scanDir, "ini");
+    return { ...withLeftOut(parseSecureCrtFiles(scan.files, root, secureCrtGlobalKey(ssh2)), scan), configDir };
   });
+
+/** A folder scan's session files that were not read, said in the review's
+ * skipped list (not silently missing): too large, unreadable, or past the
+ * scan's limits. */
+function withLeftOut(parsed: ParsedImport, scan: Awaited<ReturnType<typeof api.importScan>>): ParsedImport {
+  for (const rel of scan.tooLarge) parsed.skipped.push({ name: rel, reason: "2MB가 넘어 읽지 않았습니다" });
+  for (const rel of scan.unreadable) parsed.skipped.push({ name: rel, reason: "읽을 수 없습니다" });
+  if (scan.truncated) parsed.skipped.push({ name: "…", reason: "파일이 너무 많거나 폴더가 너무 깊어 일부만 읽었습니다 (최대 5000개, 12단계)" });
+  return parsed;
+}
 
 export const importSecureCrtXml = () =>
   runImport("SecureCRT 세션 가져오기", "SecureCRT XML", async () => {
@@ -360,7 +384,9 @@ export const importWinScp = () =>
 export const importXshell = () =>
   runImport("Xshell 세션 가져오기", "Xshell 세션 폴더", async () => {
     const dir = await pickFolder("Xshell 세션 폴더 선택 (문서\\NetSarang Computer\\<버전>\\Xshell\\Sessions)");
-    return dir ? parseXshellFiles(await api.importScan(dir, "xsh")) : null;
+    if (!dir) return null;
+    const scan = await api.importScan(dir, "xsh");
+    return withLeftOut(parseXshellFiles(scan.files), scan);
   });
 
 export const importRdcMan = () =>
@@ -372,7 +398,9 @@ export const importRdcMan = () =>
 export const importRdpFiles = () =>
   runImport("원격 데스크톱 파일 가져오기", "선택한 폴더", async () => {
     const dir = await pickFolder(".rdp 파일이 있는 폴더 선택 (하위 폴더 포함)");
-    return dir ? parseRdpFiles(await api.importScan(dir, "rdp")) : null;
+    if (!dir) return null;
+    const scan = await api.importScan(dir, "rdp");
+    return withLeftOut(parseRdpFiles(scan.files), scan);
   });
 
 export const importCsv = () =>
@@ -417,7 +445,17 @@ export async function importFromBackup() {
     }
     const list = Array.isArray(data) ? data : Array.isArray((data as { sessions?: unknown }).sessions) ? (data as { sessions: unknown[] }).sessions : null;
     if (!list) return toast("세션 목록을 찾지 못했습니다", "error");
-    const parsed = list.map((raw) => normalizeSession(raw)).filter((s): s is Session => s !== null);
+    // Entries that are not sessions (an unknown kind, a hand-edited line) are
+    // listed in the review instead of being dropped unseen.
+    const skipped: ParsedImport["skipped"] = [];
+    const parsed = list.flatMap((raw): Session[] => {
+      const s = normalizeSession(raw);
+      if (s) return [s];
+      const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+      const name = typeof r?.name === "string" && r.name.trim() ? r.name : typeof r?.host === "string" && r.host.trim() ? r.host : "(이름 없음)";
+      skipped.push({ name, reason: r ? "알 수 없는 종류" : "세션 정보가 올바르지 않습니다" });
+      return [];
+    });
     // New ids for imported sessions. One already here keeps its id, and a
     // repeat within the backup gets the first one's (the review adds only that
     // one), so SSH gateway and tunnel references in the backup still point at
@@ -448,14 +486,20 @@ export async function importFromBackup() {
       const credentialId = s.credentialId && state.credentials.some((c) => c.id === s.credentialId) ? s.credentialId : null;
       return { ...s, id: newIds[i], credentialId, options };
     });
-    const tunnels = Array.isArray((data as { tunnels?: unknown }).tunnels) ? (data as { tunnels: unknown[] }).tunnels.length : 0;
-    const d = data as { folders?: unknown; snippets?: unknown };
-    const extras =
-      tunnels +
-      (Array.isArray(d.folders) ? d.folders.filter((f) => typeof f === "string" && !state.extraFolders.has(f)).length : 0) +
-      (Array.isArray(d.snippets) ? missingSnippets(d.snippets).length : 0);
-    const { keep, confirmed } = await reviewImport("세션 백업 가져오기", { sessions, skipped: [] }, tunnels, extras);
-    if (confirmed) restoreExtras(data, ids, keep);
+    // What else would be restored, counted as the restore will find it.
+    const plan = extrasPlan(data, ids, sessions);
+    const extras = plan.folders.length + plan.snippets.length + plan.tunnels.length;
+    const { keep, confirmed } = await reviewImport("세션 백업 가져오기", { sessions, skipped }, plan.tunnels.length, extras);
+    if (!confirmed) return;
+    // Again, after the save: the review may have stood open while things changed.
+    const now = extrasPlan(data, ids, sessions);
+    const tunnels = keep ? now.tunnels : [];
+    for (const f of now.folders) addFolder(f);
+    if (now.snippets.length) saveSnippets([...state.snippets, ...now.snippets]);
+    // Only the tunnels that were saved count (storage full: none, said by saveLocal).
+    const restored = tunnels.length ? addSavedTunnels(tunnels) : 0;
+    if (now.folders.length || now.snippets.length || restored)
+      toast(`백업에서 폴더 ${now.folders.length}개, 스니펫 ${now.snippets.length}개, 터널 ${restored}개를 복원했습니다`, "success");
   } catch (err) {
     toast(errorText(err), "error");
   }
@@ -481,24 +525,38 @@ function missingSnippets(raw: unknown[]): Snippet[] {
   });
 }
 
-/** Folders, snippets and tunnels of a backup that are missing here. */
-function restoreExtras(data: unknown, ids: Map<string, string>, withTunnels: boolean) {
+/** Folders, snippets and tunnels of a backup that are missing here: what the
+ * review counts and the restore adds, from one reading. A folder its sessions
+ * bring along is no folder of its own; a tunnel whose gateway session is
+ * neither in the backup nor here, or one already saved (by id), is none to add. */
+function extrasPlan(data: unknown, ids: Map<string, string>, sessions: Session[]): { folders: string[]; snippets: Snippet[]; tunnels: SavedTunnel[] } {
   const d = (data ?? {}) as { folders?: unknown; snippets?: unknown; tunnels?: unknown };
-  if (Array.isArray(d.folders)) for (const f of d.folders) if (typeof f === "string") addFolder(f);
-  if (Array.isArray(d.snippets)) {
-    const add = missingSnippets(d.snippets);
-    if (add.length) saveSnippets([...state.snippets, ...add]);
+  const have = new Set(allFolders());
+  // Only the backup's sessions that are not here: those are saved with their
+  // folders. One already here (perhaps moved to another folder since) is
+  // skipped by the review and brings no folder.
+  const here = new Set(state.sessions.map(targetKey));
+  for (const s of sessions) {
+    if (here.has(targetKey(s))) continue;
+    const parts = s.folder.split("/").filter(Boolean);
+    for (let i = 1; i <= parts.length; i++) have.add(parts.slice(0, i).join("/"));
   }
-  if (withTunnels && Array.isArray(d.tunnels)) {
-    // A tunnel goes through a gateway session: point it at that session here.
-    const tunnels = d.tunnels
-      .flatMap((raw) => parseTunnel(raw) ?? [])
-      .flatMap((t) => {
-        const gatewayId = ids.get(t.gatewayId) ?? (state.sessions.some((s) => s.id === t.gatewayId) ? t.gatewayId : null);
-        return gatewayId ? [{ ...t, gatewayId }] : [];
-      });
-    if (tunnels.length) addSavedTunnels(tunnels);
+  const folders: string[] = [];
+  for (const raw of Array.isArray(d.folders) ? d.folders : []) {
+    const f = typeof raw === "string" ? normalizeFolder(raw) : "";
+    if (f && !have.has(f)) (have.add(f), folders.push(f));
   }
+  const saved = new Set(savedTunnels().map((t) => t.id));
+  const tunnels = (Array.isArray(d.tunnels) ? d.tunnels : [])
+    .flatMap((raw) => parseTunnel(raw) ?? [])
+    .flatMap((t) => {
+      // A tunnel goes through a gateway session: point it at that session here.
+      const gatewayId = ids.get(t.gatewayId) ?? (state.sessions.some((s) => s.id === t.gatewayId) ? t.gatewayId : null);
+      if (!gatewayId || saved.has(t.id)) return [];
+      saved.add(t.id);
+      return [{ ...t, gatewayId }];
+    });
+  return { folders, snippets: Array.isArray(d.snippets) ? missingSnippets(d.snippets) : [], tunnels };
 }
 
 export async function exportBackup() {
@@ -537,10 +595,12 @@ export function sshConfigText(sessions: Session[]): string {
   // Control characters (a line break in an imported host or user name) would
   // start a line of their own in the file: blanks instead, before anything else.
   const plain = (v: string) => v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
-  const word = (v: string) => plain(v).replace(/\s+/g, "-").replace(/[*?!,%"'#=]/g, "");
+  // The import reads a session's name back by this same word (exportedLabel).
+  const word = sshAliasWord;
   const arg = (v: string) => {
     const p = plain(v);
-    return /[\s"]/.test(p) ? `"${p.replace(/"/g, "")}"` : p;
+    // A leading "=" would be read as the keyword's separator ("User =x").
+    return /[\s"]|^=/.test(p) ? `"${p.replace(/"/g, "")}"` : p;
   };
   const blocks = sessions
     .filter((s) => sshConfigKeeps(s) && plain(s.host))
@@ -564,7 +624,7 @@ export function sshConfigText(sessions: Session[]): string {
         ...(jump ? [`    ProxyJump ${jump}`] : []),
       ].join("\n");
     });
-  return blocks.length ? `# Exported from BananaConn ${new Date().toISOString()}\n\n${blocks.join("\n\n")}\n` : "";
+  return blocks.length ? `${SSH_EXPORT_HEADER}${new Date().toISOString()}\n\n${blocks.join("\n\n")}\n` : "";
 }
 
 /** SSH sessions the export writes. Not one through an SSH gateway (another
@@ -580,10 +640,32 @@ export async function exportSshConfig() {
   const viaGateway = state.sessions.filter((s) => s.protocol === "ssh" && !sshConfigKeeps(s)).length;
   const left = viaGateway ? ` · SSH 게이트웨이를 거치는 세션 ${viaGateway}개는 뺐습니다` : "";
   if (!text) return toast(`내보낼 SSH 세션이 없습니다${left}`, "warn", 6000);
-  // No extension: ssh reads a file named "config".
-  const path = await pickSavePath("config");
+  // A name of its own, not "config": picking the real ~/.ssh/config by
+  // default would replace it (its Include, Match and IdentityFile lines,
+  // none of which this writes). ssh reads this one through "Include".
+  const path = await pickSavePath("bananaconn_ssh_config");
   if (!path) return;
+  // The user's own ssh config chosen after all: asked, and kept as a backup.
+  let backup: string | null = null;
+  if (/[\\/]\.ssh[\\/]config$/i.test(path)) {
+    const d = new Date();
+    const two = (n: number) => String(n).padStart(2, "0");
+    backup = `${path}.bak-${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+    const ok = await confirmDialog({
+      title: "SSH 설정 파일 바꾸기",
+      message: `<b data-i18n-skip>${esc(path)}</b>은(는) ssh가 읽는 설정 파일입니다. 이 내용으로 바꾸면 지금 있는 설정은 <b data-i18n-skip>${esc(backup)}</b>에 백업해 둡니다.`,
+      confirm: "백업하고 바꾸기",
+      danger: true,
+    });
+    if (!ok) return;
+  }
   try {
+    if (backup) {
+      // Not there yet: nothing to keep. Any other failure stops the export.
+      // (Windows: 2 is no such file, 3 no such folder.)
+      const old = await api.readTextFile(path).catch((err) => (/\(os error [23]\)/.test(errorText(err)) ? null : Promise.reject(err)));
+      if (old !== null) await api.saveTextFile(backup, old);
+    }
     await api.saveTextFile(path, text);
     toast(`SSH 세션 ${(text.match(/^Host /gm) ?? []).length}개를 OpenSSH 설정 파일로 내보냈습니다${left}`, "success", left ? 7000 : 3800);
   } catch (err) {

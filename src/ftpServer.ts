@@ -7,6 +7,7 @@ import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { errorText, esc, modal, toast } from "./ui";
 import { userText } from "./i18n";
+import { saveLocal } from "./store";
 
 export interface LogEntry {
   /** Increasing per log: tells a dialog which rows it has not drawn yet. */
@@ -336,7 +337,8 @@ export function openFtpServer() {
         if (!cfg.root) throw new Error("공유할 폴더를 고르세요");
         if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) throw new Error("포트는 1~65535 사이여야 합니다");
         const { password: _pw, ...prefs } = cfg;
-        localStorage.setItem(PREFS, JSON.stringify(prefs));
+        // Not saved (storage full): said once; the server starts all the same.
+        saveLocal(PREFS, JSON.stringify(prefs));
         status = await api.ftpServerStart(cfg);
         livePassword = cfg.password;
         toast(`FTP 서버를 시작했습니다 (${status.addresses[0]})`, "success");

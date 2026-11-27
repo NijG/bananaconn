@@ -14,12 +14,12 @@ import { openCommandPalette } from "./palette";
 import { fileSessionFor, fileTabName } from "./transfer";
 import { GatewayLink, openTunnelManager } from "./tunnels";
 import { icon } from "./icons";
-import { parseSubnetInput } from "./ipLinks";
+import { parseSubnetInput, sameHost } from "./ipLinks";
 import { endpoint, formatTarget, hasScheme, newSession, parseTarget, PROTOCOLS, schemeProtocol, type Protocol, type Session } from "./model";
 import { editSession } from "./sessionEditor";
 import { openSettings } from "./settings";
 import { Sidebar } from "./sidebar";
-import { loadAll, savesSettled, state, subscribe, touchSession } from "./store";
+import { loadAll, saveLocal, savesSettled, state, subscribe, touchSession } from "./store";
 import { isLanguage, LANGUAGES, setLanguage, userText, type Language } from "./i18n";
 import { confirmDialog, contextMenu, elapsedText, errorText, esc, installCapsLockHint, type MenuItem, setPressed, toast } from "./ui";
 import { openVault } from "./vault";
@@ -89,31 +89,68 @@ function openFiles(s: Session, beside?: View) {
   });
 }
 
-/** Gateway tunnels of RDP sessions opened in mstsc, reused per session. */
-const externalLinks = new Map<string, { key: string; link: GatewayLink }>();
+/** Gateway tunnels of RDP sessions opened in mstsc, reused per session.
+ * `idleSince`: when its tunnel last had no connection (see below). */
+const externalLinks = new Map<string, { key: string; link: GatewayLink; idleSince?: number }>();
+
+/** What an mstsc session's reused tunnel depends on: its target, its
+ * gateway (and that gateway's own route), and its proxy (a proxied,
+ * gateway-less session's forward goes through it). */
+function externalKey(s: Session): string {
+  const gw = state.sessions.find((x) => x.id === s.options.gateway);
+  const route = (o: Session["options"] | undefined) => [
+    o?.proxyType ?? null, o?.proxyHost ?? null, o?.proxyPort ?? null, o?.proxyLocal ?? null, o?.proxyDns ?? null,
+    o?.proxyCredentialId ?? null, o?.proxyExclude ?? null, o?.proxyTelnetCommand ?? null, o?.proxyLocalCommand ?? null,
+  ];
+  return JSON.stringify([s.host, s.port, s.options.gateway ?? null, gw?.host, gw?.port, gw?.username, gw?.credentialId, route(s.options), route(gw?.options)]);
+}
+
+function dropExternal(id: string) {
+  externalLinks.get(id)?.link.close();
+  externalLinks.delete(id);
+}
+
+// A session deleted or changed since its tunnel was made: the tunnel (a
+// logged-in gateway connection) is closed now, not left until the app exits.
+subscribe("sessions", () => {
+  for (const [id, entry] of externalLinks) {
+    const s = state.sessions.find((x) => x.id === id);
+    if (!s || externalKey(s) !== entry.key) dropExternal(id);
+  }
+});
+// mstsc runs on its own and says nothing when it closes: a gateway tunnel
+// with no connection for 10 minutes is closed (mstsc holds its connection
+// while it is open, and reconnects within seconds when it drops).
+window.setInterval(async () => {
+  if (!externalLinks.size) return;
+  const open = await api.tunnelList().catch(() => null);
+  if (!open) return;
+  const now = Date.now();
+  for (const [id, entry] of externalLinks) {
+    const t = open.find((x) => x.id === entry.link.id);
+    // Not a gateway tunnel (a proxy forward), or not open (yet): left alone.
+    if (!t) continue;
+    if (t.active > 0) entry.idleSince = undefined;
+    else if ((entry.idleSince ??= now) <= now - 10 * 60_000) dropExternal(id);
+  }
+}, 60_000);
 
 async function launchRdp(s: Session) {
   const o = s.options;
   const [w, h] = String(o.resolution ?? "").split("x").map(Number);
   try {
     // mstsc connects to the gateway tunnel's local end; one tunnel per session
-    // stays open while the app runs (mstsc reconnects on its own).
-    // Rebuilt whenever the target or the gateway changed since it was made.
-    const gw = state.sessions.find((x) => x.id === s.options.gateway);
-    const o2 = s.options;
-    // Include the proxy settings: a proxied (no-gateway) session's forward also
-    // depends on them, so editing the proxy must rebuild the reused tunnel.
-    const key = JSON.stringify([
-      s.host, s.port, s.options.gateway ?? null, gw?.host, gw?.port, gw?.username, gw?.credentialId,
-      o2.proxyType ?? null, o2.proxyHost ?? null, o2.proxyPort ?? null, o2.proxyLocal ?? null, o2.proxyDns ?? null,
-      o2.proxyCredentialId ?? null, o2.proxyExclude ?? null, o2.proxyTelnetCommand ?? null, o2.proxyLocalCommand ?? null,
-    ]);
+    // is reused while it is in use (mstsc reconnects on its own), and rebuilt
+    // whenever the target or the gateway changed since it was made.
+    const key = externalKey(s);
     let entry = externalLinks.get(s.id);
     if (entry?.key !== key) {
       entry?.link.close();
       entry = { key, link: new GatewayLink(s, 3389) };
       externalLinks.set(s.id, entry);
     }
+    // Opened again now: its idle time starts over (mstsc is still connecting).
+    entry.idleSince = undefined;
     const tunnelPort = await entry.link.port();
     if (tunnelPort === null) return;
     await api.rdpLaunch({
@@ -142,8 +179,7 @@ async function launchRdp(s: Session) {
  * status bar; a continuous ping is one the user chose to watch). */
 function markDevice(host: string, note: string, knownOnly = false) {
   if (ws.markDevice(host, note)) return;
-  const key = host.trim().toLowerCase();
-  const known = state.sessions.some((s) => s.host.trim().toLowerCase() === key) || ws.tabs.some((t) => t.session.host.trim().toLowerCase() === key);
+  const known = state.sessions.some((s) => sameHost(s.host, host)) || ws.tabs.some((t) => sameHost(t.session.host, host));
   if (!knownOnly || known) markDeviceAlert(host, note);
 }
 
@@ -192,8 +228,7 @@ installCapsLockHint();
 // An address's open tab (the most live of them), to go to from the address
 // menus of the Syslog window and the network tools.
 setDeviceTabFinder((ip) => {
-  const key = ip.trim().toLowerCase();
-  const tab = ws.liveTab((t) => t.session.host.trim().toLowerCase() === key);
+  const tab = ws.liveTab((t) => sameHost(t.session.host, ip));
   return tab ? { state: tab.view.state, go: () => ws.activate(tab.id) } : null;
 });
 // A tab's device that sent Syslog messages: they open from the tab's menu too.
@@ -246,7 +281,7 @@ if (localStorage.getItem("bx.sidebarHidden") === "1") app.classList.add("sidebar
 
 function toggleSidebar() {
   app.classList.toggle("sidebar-hidden");
-  localStorage.setItem("bx.sidebarHidden", app.classList.contains("sidebar-hidden") ? "1" : "0");
+  saveLocal("bx.sidebarHidden", app.classList.contains("sidebar-hidden") ? "1" : "0");
 }
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 
@@ -262,7 +297,7 @@ $("#resizer").addEventListener("pointerdown", (e) => {
     app.classList.remove("resizing");
     resizer.removeEventListener("pointermove", move);
     resizer.removeEventListener("pointerup", up);
-    localStorage.setItem("bx.sidebarWidth", app.style.getPropertyValue("--sidebar-w").replace("px", ""));
+    saveLocal("bx.sidebarWidth", app.style.getPropertyValue("--sidebar-w").replace("px", ""));
   };
   resizer.addEventListener("pointermove", move);
   resizer.addEventListener("pointerup", up);
@@ -325,7 +360,8 @@ function rememberQuick(proto: string, typed: string) {
   const target = withoutPassword(typed);
   const all = quickHistory();
   all[proto] = [target, ...(all[proto] ?? []).filter((t) => t !== target)].slice(0, 12);
-  localStorage.setItem("bx.quickHistory", JSON.stringify(all));
+  // Read back from storage each time: not saved, it is not there.
+  saveLocal("bx.quickHistory", JSON.stringify(all), false);
   renderQuickHistory();
 }
 renderQuickHistory();
@@ -334,7 +370,7 @@ const quickPlaceholder = () =>
 quickPlaceholder();
 quickProto.addEventListener("change", () => {
   quickPlaceholder();
-  localStorage.setItem("bx.quickProto", quickProto.value);
+  saveLocal("bx.quickProto", quickProto.value);
   renderQuickHistory();
 });
 /** Quick serial: "COM3" or "COM3:115200" (the number after the colon is the speed). */
@@ -515,8 +551,8 @@ function alertsMenu(btn: HTMLElement) {
   const r = btn.getBoundingClientRect();
   const items: MenuItem[] = deviceAlertList().slice(0, 20).map(([host, note]) => {
     // The most live of its tabs (a connected one before a closed one), named as the tab bar names it.
-    const tab = ws.liveTab((t) => t.session.host.trim().toLowerCase() === host);
-    const saved = state.sessions.find((s) => s.host.trim().toLowerCase() === host);
+    const tab = ws.liveTab((t) => sameHost(t.session.host, host));
+    const saved = state.sessions.find((s) => sameHost(s.host, host));
     const name = tab ? ws.nameOf(tab.view) : saved?.name;
     const sender = syslogSender(host);
     return {
@@ -534,13 +570,8 @@ onDeviceAlerts(renderStatus);
 // A mark put away anywhere (tree, home, "clear all") goes from the tabs too.
 onDeviceAlerts(() => ws.syncDeviceMarks());
 subscribe("sessions", () => {
-  // Close the kept mstsc tunnel of any session that was deleted, so it does not
-  // linger open for the rest of the app's life.
-  for (const [id, entry] of externalLinks)
-    if (!state.sessions.some((x) => x.id === id)) {
-      entry.link.close();
-      externalLinks.delete(id);
-    }
+  // (A deleted session's kept mstsc tunnel is closed by the subscription by
+  // externalLinks, with the other changes that make it stale.)
   if (!ws.activeTab) renderStatus();
   // A tab opened from a session shows its name: one renamed (the tree's menu) shows at once.
   if (ws.tabs.length) ws.changed();
@@ -671,6 +702,14 @@ const GLOBAL_ACTIONS: Record<string, () => void | boolean> = {
   "app.tunnels": () => openTunnelManager(),
   "app.netTools": () => openNetworkTools(),
   "app.subnet": () => openNetworkTools("", "subnet"),
+  // A list of devices copied from a mail, a sheet or a ticket: its hosts
+  // (as a terminal selection's: each once, no multicast, network or broadcast).
+  "app.watchClipboard": () =>
+    void Promise.all([import("./clipboard").then((c) => c.readClipboard()), import("./ipLinks"), import("./nettools")]).then(([text, { hostAddresses }, { openMultiWatch }]) => {
+      const ips = hostAddresses(text);
+      if (!ips.length) return void toast("클립보드에 IPv4 주소가 없습니다", "info", 3000);
+      openMultiWatch(ips.map((ip) => ({ name: ip, host: ip })));
+    }, (err) => void toast(errorText(err), "error")),
   "app.compare": () => void import("./diffView").then((m) => m.openDiffFromMenu()),
   "app.connectHistory": () => void import("./connectHistoryView").then((m) => m.openConnectHistory(undefined, open)),
   "app.lock": () => (appLock.enabled ? void lockNow() : false),

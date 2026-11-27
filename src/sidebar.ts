@@ -22,7 +22,9 @@ import {
   addFolder,
   allFolders,
   deleteFolder,
+  foldersMergedByDelete,
   moveSessions,
+  onFoldersRemapped,
   pinSessions,
   placeFolder,
   placeSessions,
@@ -84,6 +86,17 @@ const saveCollapsed = () => {
     // Storage full or blocked: the collapsed state just isn't remembered.
   }
 };
+// Collapsed folders follow a rename or move (still collapsed under the new
+// name); a deleted folder's is forgotten, so a new one of that name opens.
+onFoldersRemapped((remap, removed) => {
+  const next = new Set<string>();
+  for (const f of collapsed) if (f !== removed) next.add(remap(f));
+  next.delete("");
+  if (next.size === collapsed.size && [...next].every((f) => collapsed.has(f))) return;
+  collapsed.clear();
+  for (const f of next) collapsed.add(f);
+  saveCollapsed();
+});
 
 /** Where a dragged row would land: before/after a row, into a folder, or (no
  * row) at the top level. */
@@ -194,8 +207,16 @@ export class Sidebar {
       if (!first) return void (e.key === "Enter" && this.query && this.newFromSearch());
       if (e.key === "Enter" && this.query && this.order.length === 1) {
         const s = this.session(first);
-        if (s) this.actions.connect(s);
-        return;
+        // An address typed ("10.0.0.5", "root@web", "host:2222") connects
+        // only to a session that is that address: the search matches any
+        // part, and "10.0.0.5" alone matching 10.0.0.50 would log in to the
+        // wrong device. That one is selected instead (Enter again connects).
+        const q = this.query.trim().toLowerCase();
+        const exact = !!s && [s.name, s.host, s.username && `${s.username}@${s.host}`, s.port && `${s.host}:${s.port}`].some((v) => !!v && String(v).toLowerCase() === q);
+        if (s && (exact || !/[.:@]/.test(q))) {
+          this.actions.connect(s);
+          return;
+        }
       }
       this.select([first], first);
       this.reveal(first);
@@ -630,7 +651,7 @@ export class Sidebar {
             label: "이 폴더의 세션 연결 확인",
             icon: "Activity",
             disabled: !inside.length,
-            action: () => void checkReachableMany(inside, (s) => this.actions.connect(s)),
+            action: () => void checkReachableMany(inside, (s) => this.connectCurrent(s)),
           },
           // A floor's or a site's switches after maintenance, as the multi-selection offers it.
           // Counted as the window takes them (no serial ports, each address once).
@@ -796,7 +817,7 @@ export class Sidebar {
     contextMenu(x, y, [
       { label: `${list.length}개 세션 연결`, icon: "Play", hint: keyHint("tree.connect"), action: () => void this.connectAll(list) },
       "-",
-      { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.actions.connect(s)) },
+      { label: `${list.length}개 세션 연결 확인`, icon: "Activity", action: () => void checkReachableMany(list, (s) => this.connectCurrent(s)) },
       // After a maintenance window: which of them are back, as it happens.
       { label: `${list.length}개 장비를 연속 ping으로 지켜보기`, icon: "Radar", action: () => openMultiWatch(list, undefined, true) },
       { label: "한꺼번에 수정…", icon: "Pencil", hint: keyHint("tree.edit"), action: () => this.bulkEdit(list) },
@@ -894,7 +915,13 @@ export class Sidebar {
     const undo = folderSnapshot();
     const switched = at.where !== "into" && adoptManualOrder();
     const err = await placeFolder(path, anchor, at.where, switched ? undo : undefined);
-    if (err) return void toast(err, "warn");
+    if (err) {
+      // Refused (a folder of that name there already): the sort switched to
+      // the manual order for this move goes back as it was, unasked.
+      if (switched) undo();
+      this.render();
+      return void toast(err, "warn");
+    }
     if (at.where === "into" && anchor) {
       collapsed.delete(anchor);
       saveCollapsed();
@@ -1159,19 +1186,34 @@ export class Sidebar {
     addFolder(parent ? `${parent}/${name}` : name);
   }
 
+  /** A session connected from a result listed a while ago (the reachability
+   * check takes seconds): as it is saved now, not as it was when the list was
+   * made, so an edit meanwhile (another host, port or account) is the one
+   * used; gone since, it is not connected. */
+  private connectCurrent(s: Session) {
+    const now = this.session(s.id);
+    if (!now) return void toast("세션을 찾을 수 없습니다", "warn");
+    this.actions.connect(now);
+  }
+
   private async renameFolder(path: string) {
     const res = await promptDialog({ title: "폴더 이름 바꾸기", label: "새 이름", value: path.split("/").pop(), confirm: "바꾸기" });
     const name = res?.value.trim().replace(/\//g, "-");
     if (!name) return;
     const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/") + 1) : "";
-    await renameFolder(path, parent + name);
+    const refused = await renameFolder(path, parent + name);
+    if (refused) toast(refused, "warn", 5000);
   }
 
   private async deleteFolder(path: string) {
     const inside = state.sessions.filter((s) => s.folder === path || s.folder.startsWith(path + "/")).length;
+    // Subfolders whose name is taken where they move: said, as they merge.
+    const merged = foldersMergedByDelete(path);
     const ok = await confirmDialog({
       title: "폴더 삭제",
-      message: `<b data-i18n-skip>${esc(path)}</b> 폴더를 삭제합니다.${inside ? `<br>안에 있는 세션 ${inside}개는 상위 폴더로 옮겨지며 삭제되지 않습니다.` : ""}`,
+      message:
+        `<b data-i18n-skip>${esc(path)}</b> 폴더를 삭제합니다.${inside ? `<br>안에 있는 세션 ${inside}개는 상위 폴더로 옮겨지며 삭제되지 않습니다.` : ""}` +
+        (merged.length ? `<br>같은 이름의 폴더와 합쳐지는 하위 폴더: <b data-i18n-skip>${esc(merged.join(", "))}</b>` : ""),
       confirm: "삭제",
       danger: true,
     });

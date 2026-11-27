@@ -51,7 +51,8 @@ import type { Session } from "../model";
 import { jsonProblem } from "../jsonCheck";
 import { cronProblem } from "../cronCheck";
 import { indentOf } from "../indentStyle";
-import { interpreterOf, languageOfInterpreter, syntaxCheckFor, unitReloadFor } from "../shebang";
+import { interpreterOf, languageOfInterpreter, statusUnitOf, syntaxCheckFor, unitReloadFor } from "../shebang";
+import { QUOTE_UNSAFE } from "../shellQuote";
 import { choiceDialog, contextMenu, errorText, esc, h, toast, setPressed } from "../ui";
 import { lacksExecute, modeOf, SCRIPT_NAME, withExecute } from "../remotePerm";
 import type { StatusInfo, View, ViewState, Workspace } from "../workspace";
@@ -938,10 +939,23 @@ export class EditorView implements View {
       // A unit file: systemd goes on with the old one until it reloads, and
       // the reload is one click from the terminal beside (Enter is the user's).
       const reload = unitReloadFor(this.path, this.owner.home);
+      // Then the unit's status (read only), which says "bad-setting" and why
+      // once the reloaded file has a mistake: its own unit or the one whose
+      // drop-in this is; none for a template or a whole type's drop-ins.
+      // A name no quoting keeps whole in every shell ("media-usb\x2ddrive.mount")
+      // leaves the status out, so the reload is still offered.
+      const unit = statusUnitOf(this.path);
+      const status = unit && !QUOTE_UNSAFE(unit.name) ? ` && systemctl ${reload?.system ? "" : "--user "}status --no-pager -- {}` : "";
       if (reload && this.owner.hasShellBeside)
         toast(`${userText(this.name)} 을(를) 저장했습니다. systemd에 반영하려면 daemon-reload가 필요합니다`, "success", 10_000, {
           label: "daemon-reload 넣기",
-          run: () => this.owner.offerInTerminal(reload.command, this.path, reload.system && !this.owner.asRoot, "터미널에 daemon-reload 명령을 넣었습니다. Enter를 눌러 실행하세요"),
+          run: () =>
+            this.owner.offerInTerminal(
+              reload.command + status,
+              status ? unit!.name : this.path,
+              reload.system && !this.owner.asRoot,
+              status ? "터미널에 daemon-reload 뒤 유닛 상태를 보는 명령을 넣었습니다. Enter를 눌러 실행하세요" : "터미널에 daemon-reload 명령을 넣었습니다. Enter를 눌러 실행하세요",
+            ),
         });
       // A configuration a system service or the boot reads (sshd_config,
       // sudoers, nginx, fstab): its check one click away before the service

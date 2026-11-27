@@ -19,6 +19,10 @@ mod lock;
 mod monitor;
 mod devmon;
 mod nettools;
+mod tlscheck;
+mod dnsrecords;
+mod banner;
+mod servertext;
 mod paste;
 mod ai;
 mod sshkit;
@@ -163,6 +167,9 @@ pub fn run() {
             nettools::net_ping_cancel,
             nettools::net_ports,
             nettools::net_dns,
+            tlscheck::net_tls,
+            dnsrecords::net_dns_records,
+            banner::net_banner,
             nettools::net_sweep,
             nettools::net_sweep_cancel,
             nettools::net_names,

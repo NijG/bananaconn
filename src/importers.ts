@@ -853,6 +853,37 @@ function sshHostMatches(host: string, patterns: string[]): boolean {
   return matched;
 }
 
+/** The first line of an OpenSSH config this app exports (sshConfigText). */
+export const SSH_EXPORT_HEADER = "# Exported from BananaConn ";
+
+/** A session name made one Host word, as the export writes it: blanks to "-",
+ * ssh's pattern characters and quotes left out. */
+export function sshAliasWord(v: string): string {
+  return v.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().replace(/\s+/g, "-").replace(/[*?!,%"'#=]/g, "");
+}
+
+/** An exported block's "# folder/name" label read back: the split whose name
+ * part makes the block's Host word (the word itself, or numbered "-2", "-3"
+ * when two names came out the same). A name or folder may hold "/", so each
+ * split is tried, the longest name first; none fits: undefined (a label edited
+ * by hand, kept as the file has it). */
+export function exportedLabel(label: string | undefined, alias: string, host = ""): { name: string; folder: string } | undefined {
+  if (!label) return undefined;
+  const a = alias.toLowerCase();
+  const word = (w: string) => !!w && (a === w || (a.startsWith(`${w}-`) && /^\d+$/.test(a.slice(w.length + 1))));
+  // A name that makes no word at all ("*") was written under its host's word.
+  const fits = (name: string) => {
+    const w = sshAliasWord(name).toLowerCase();
+    return w ? word(w) : word(sshAliasWord(host).toLowerCase());
+  };
+  for (let i = -1; i < label.length; i = label.indexOf("/", i + 1)) {
+    const name = label.slice(i + 1);
+    if (fits(name)) return { name, folder: i < 0 ? "" : label.slice(0, i) };
+    if (label.indexOf("/", i + 1) < 0) break;
+  }
+  return undefined;
+}
+
 /** OpenSSH client config (~/.ssh/config), read the way ssh reads it: every
  * Host block whose patterns match a host applies, in file order, and the first
  * value found for a keyword wins, so "Host *" defaults fill in only what is
@@ -866,13 +897,24 @@ function sshHostMatches(host: string, patterns: string[]): boolean {
  * imported. */
 export function parseSshConfig(text: string): ParsedImport {
   const out = empty();
-  type Block = { patterns: string[]; fields: Record<string, string>; forwards: string[] };
+  type Block = { patterns: string[]; fields: Record<string, string>; forwards: string[]; label?: string };
   const blocks: Block[] = [{ patterns: ["*"], fields: {}, forwards: [] }];
+  // A file this app exported (sshConfigText): each Host line has "# folder/name"
+  // right above it, so the sessions come back with their own names and folders
+  // and a re-import finds them instead of adding copies.
+  const ours = text.replace(/^\uFEFF/, "").startsWith(SSH_EXPORT_HEADER);
+  let comment: string | undefined;
   // The block settings go into; null inside a Match block.
   let cur: Block | null = blocks[0];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("#")) {
+      comment = line.replace(/^#\s?/, "");
+      continue;
+    }
+    const above = comment;
+    comment = undefined;
+    if (!line) continue;
     // "Keyword value" or "Keyword=value"; a value may be quoted.
     const m = /^(\S+?)[\s=]+(.*)$/.exec(line);
     if (!m) continue;
@@ -880,7 +922,7 @@ export function parseSshConfig(text: string): ParsedImport {
     let value = m[2].trim();
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
     if (key === "host") {
-      cur = { patterns: value.split(/\s+/).filter(Boolean), fields: {}, forwards: [] };
+      cur = { patterns: value.split(/\s+/).filter(Boolean), fields: {}, forwards: [], label: ours ? above : undefined };
       blocks.push(cur);
     } else if (key === "match") cur = null;
     else if (cur && key in SSH_FORWARDS) {
@@ -900,6 +942,10 @@ export function parseSshConfig(text: string): ParsedImport {
         names.push(p);
       }
 
+  // The block that names each one, for its exported label.
+  const labelOf = new Map<string, string>();
+  for (const b of blocks.slice(1)) if (b.label && b.patterns.length === 1 && !labelOf.has(b.patterns[0].toLowerCase())) labelOf.set(b.patterns[0].toLowerCase(), b.label);
+
   for (const name of names) {
     const f: Record<string, string> = {};
     const forwards: string[] = [];
@@ -913,13 +959,14 @@ export function parseSshConfig(text: string): ParsedImport {
     const proxy = f.proxyjump && !/^none$/i.test(f.proxyjump) ? normalizeJumpHost(f.proxyjump) : "";
     // IdentityFile "none" disables key auth; "~" is expanded on import (importExport).
     const keyFile = f.identityfile && !/^none$/i.test(f.identityfile) ? f.identityfile : "";
+    const own = exportedLabel(labelOf.get(name.toLowerCase()), name, host);
     add(out, "OpenSSH", {
       protocol: "ssh",
-      name,
+      name: own?.name ?? name,
       host,
       port: f.port,
       username: f.user,
-      folder: "OpenSSH",
+      folder: own ? own.folder : "OpenSSH",
       options: { ...(proxy ? { jumpHost: proxy } : {}), ...sshConfigOptions(f, forwards) },
       keyPath: keyFile || undefined,
     });
@@ -929,6 +976,8 @@ export function parseSshConfig(text: string): ParsedImport {
 
 const CSV_PROTOCOLS: Record<string, Protocol> = {
   ssh: "ssh", ssh2: "ssh", ssh1: "ssh", telnet: "telnet", rdp: "rdp", vnc: "vnc", sftp: "sftp", ftp: "ftp", ftps: "ftps", serial: "serial",
+  // exportCsv writes every protocol, TFTP too: its own export must come back.
+  tftp: "tftp",
 };
 
 /** CSV with a header row; columns are found by name (mRemoteNG's CSV export works too). */

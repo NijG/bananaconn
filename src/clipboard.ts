@@ -17,8 +17,25 @@ import { toast } from "./ui";
 const HIST_KEY = "bx.clipHistory";
 const HIST_MAX = 30;
 const HIST_ITEM_MAX = 100_000;
+/** All entries together, in characters: 30 copies of 100,000 would take
+ * some 3 MB of localStorage, which the AI conversations (ai/panel.ts, 3 MB)
+ * share with the settings, snippets and folders; past the quota those could
+ * no longer be saved. The oldest entries go first. */
+const HIST_TOTAL = 1_000_000;
 
 const secretIn = (text: string) => text.split(/\r?\n/).some(holdsSecret);
+
+/** The newest entries that fit HIST_TOTAL (the newest always stays). */
+function fit(list: string[]): string[] {
+  let total = 0;
+  const kept: string[] = [];
+  for (const t of list) {
+    total += t.length;
+    if (kept.length && total > HIST_TOTAL) break;
+    kept.push(t);
+  }
+  return kept;
+}
 
 function loadHistory(): string[] {
   try {
@@ -29,9 +46,10 @@ function loadHistory(): string[] {
   }
 }
 let history: string[] = loadHistory();
-// Entries kept by an earlier version that hold a secret leave the store too.
-if (history.some(secretIn)) {
-  history = history.filter((t) => !secretIn(t));
+// Entries kept by an earlier version that hold a secret leave the store too,
+// and so do those past the total it keeps now.
+if (history.some(secretIn) || fit(history).length < history.length) {
+  history = fit(history.filter((t) => !secretIn(t)));
   try {
     localStorage.setItem(HIST_KEY, JSON.stringify(history));
   } catch {
@@ -41,7 +59,7 @@ if (history.some(secretIn)) {
 
 function record(text: string) {
   if (!text || text.length > HIST_ITEM_MAX || secretIn(text)) return;
-  history = [text, ...history.filter((t) => t !== text)].slice(0, HIST_MAX);
+  history = fit([text, ...history.filter((t) => t !== text)].slice(0, HIST_MAX));
   try {
     localStorage.setItem(HIST_KEY, JSON.stringify(history));
   } catch {
@@ -93,6 +111,15 @@ export async function writeClipboard(text: string, opts?: { secret?: boolean }):
     // Clipboard unavailable: most callers ignore it; a secret's caller says so.
     return false;
   }
+}
+
+/** A secret put on the clipboard (writeClipboard with `secret`) taken off it
+ * again after `ms`, if it is still what the clipboard holds: something copied
+ * since is left alone. Nothing is said: the caller said when it copied. */
+export function clearSecretLater(text: string, ms = 60_000) {
+  window.setTimeout(async () => {
+    if (text && (await readClipboard()) === text) await writeClipboard("", { secret: true });
+  }, ms);
 }
 
 export async function readClipboard(): Promise<string> {

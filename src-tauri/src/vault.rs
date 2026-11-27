@@ -144,16 +144,21 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
         let mut creds = read_all(&app)?;
         let previous = creds.iter().find(|c| c.id == cred.id).map(|c| c.has_secret);
         let kind_changed = creds.iter().any(|c| c.id == cred.id && c.kind != cred.kind);
-        // The keyring changes before the list is written; if that write fails,
-        // the two would disagree. Keep the old secret so the keyring can be put
-        // back. (`touched` is set whenever the keyring entry is mutated below.)
-        let touched = secret.is_some() || kind_changed;
-        // read_secret includes the legacy store, so a not-yet-migrated secret
-        // can still be restored if the list write later fails.
-        let old_secret = if touched && previous == Some(true) { read_secret(&cred.id).ok().flatten() } else { None };
+        // A new secret goes into the keyring before the list is written; if
+        // that write fails it is undone, so the old secret is read first. One
+        // that cannot be read stops the save: it could not be put back, and
+        // overwriting it then would lose it. (read_secret includes the legacy
+        // store, so a not-yet-migrated secret is kept too.)
+        let replacing = matches!(secret.as_deref(), Some(v) if !v.is_empty());
+        let old_secret = if replacing && previous == Some(true) { read_secret(&cred.id)? } else { None };
+        // A secret removed ("" or a change of kind: a key passphrase is no
+        // password) leaves the keyring only once the list says so: a failure
+        // in between then leaves at worst an unused entry, never a list that
+        // claims a secret the keyring no longer has.
+        let mut remove_after = false;
         match secret.as_deref() {
             Some("") => {
-                delete_secret(&cred.id)?;
+                remove_after = previous == Some(true);
                 cred.has_secret = false;
             }
             Some(value) => {
@@ -165,7 +170,7 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
             // A secret means something else per kind (key passphrase vs password):
             // switching kind without a new one must not reuse the old value.
             None if kind_changed => {
-                delete_secret(&cred.id)?;
+                remove_after = previous == Some(true);
                 cred.has_secret = false;
             }
             None => cred.has_secret = previous.unwrap_or(false),
@@ -176,8 +181,8 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
             creds.push(cred.clone());
         }
         if let Err(e) = write_all(&app, &creds) {
-            // The list write failed: undo the keyring change so the two agree.
-            if touched {
+            // The list write failed: undo the new secret so the two agree.
+            if replacing {
                 match &old_secret {
                     // Restore the secret that was there before this save.
                     Some(old) => {
@@ -193,6 +198,11 @@ pub async fn vault_save(app: AppHandle, cred: Credential, secret: Option<String>
             }
             return Err(e);
         }
+        if remove_after {
+            // The list no longer refers to it; an entry that will not go is
+            // left unused (never read: the list says there is none).
+            let _ = delete_secret(&cred.id);
+        }
         Ok(cred)
     })
     .await
@@ -205,9 +215,12 @@ pub async fn vault_delete(app: AppHandle, id: String) -> Result<(), String> {
         let _list = LIST.lock().unwrap_or_else(|p| p.into_inner());
         let mut creds = read_all(&app)?;
         creds.retain(|c| c.id != id);
-        // Remove the secret first; if that fails keep the entry so it can be retried.
-        delete_secret(&id)?;
-        write_all(&app, &creds)
+        // The list first: if its write fails nothing changed (the credential
+        // and its secret are both still there). Then the secret; one that will
+        // not go is left unused, as no credential refers to it any more.
+        write_all(&app, &creds)?;
+        let _ = delete_secret(&id);
+        Ok(())
     })
     .await
 }

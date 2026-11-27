@@ -3,9 +3,9 @@
 // never displays stored ones.
 
 import { api, pickOpenFile, type Credential, type ImportKeyKind } from "./api";
-import { writeClipboard } from "./clipboard";
+import { clearSecretLater, writeClipboard } from "./clipboard";
 import { icon } from "./icons";
-import { detachCredential, reloadCredentials, state } from "./store";
+import { detachCredential, reloadCredentials, state, usesCredential } from "./store";
 import { confirmDialog, confirmDiscard, errorText, esc, formValues, h, listKeys, markTerms, matchesTerms, modal, searchTerms, toast } from "./ui";
 import { userText } from "./i18nTables";
 
@@ -193,6 +193,11 @@ export function openVault(): Promise<void> {
       }
       const isNew = !!draft;
       const isKey = c.kind === "key";
+      // The saved copy, and whether a secret is stored for what the form now
+      // shows: switched to the other kind, the stored one goes when this is
+      // saved (a key passphrase is no password), so it is not said to be kept.
+      const saved = state.credentials.find((x) => x.id === c.id);
+      const stored = !isNew && !!saved?.hasSecret && saved.kind === c.kind;
       detailEl.innerHTML = `<form class="form" autocomplete="off">
           <div class="seg" role="tablist">
             <button type="button" data-kind="password" class="${!isKey ? "on" : ""}">${icon("Lock", 14)}비밀번호</button>
@@ -207,13 +212,13 @@ export function openVault(): Promise<void> {
                    <button type="button" class="btn" data-browse>${icon("FolderOpen", 14)}찾기</button>
                    <button type="button" class="btn" data-gen>${icon("Sparkles", 14)}새로 만들기</button></div>
                    <small class="key-issue" hidden></small></label>
-                 <label class="field"><span>키 암호 ${c.hasSecret ? '<em class="ok">저장됨</em>' : ""}</span>
-                   <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "암호가 없으면 비워 두세요"}" /></label>
+                 <label class="field"><span>키 암호 ${stored ? '<em class="ok">저장됨</em>' : ""}</span>
+                   <input name="secret" type="password" placeholder="${stored ? "바꾸려면 새로 입력" : "암호가 없으면 비워 두세요"}" /></label>
                  <div class="pubkey" hidden><span>공개 키 (서버의 ~/.ssh/authorized_keys 에 추가)</span>
                    <div class="inline"><code></code><button type="button" class="btn" data-copy>${icon("Copy", 14)}복사</button></div></div>`
-              : `<label class="field"><span>비밀번호 ${c.hasSecret ? '<em class="ok">저장됨</em>' : ""}</span>
+              : `<label class="field"><span>비밀번호 ${stored ? '<em class="ok">저장됨</em>' : ""}</span>
                    <div class="inline">
-                     <input name="secret" type="password" placeholder="${c.hasSecret ? "바꾸려면 새로 입력" : "비밀번호"}" />
+                     <input name="secret" type="password" placeholder="${stored ? "바꾸려면 새로 입력" : "비밀번호"}" />
                      <button type="button" class="icon-btn" data-reveal title="비밀번호 보기/숨기기">${icon("Eye", 14)}</button>
                      <select name="pwlen" title="비밀번호 길이">${[12, 16, 20, 24, 32].map((n) => `<option value="${n}"${n === 20 ? " selected" : ""}>${n}</option>`).join("")}</select>
                      <button type="button" class="btn" data-genpass title="강력한 비밀번호를 만들어 넣고 복사합니다">${icon("Sparkles", 14)}생성</button>
@@ -222,7 +227,7 @@ export function openVault(): Promise<void> {
           ${usedBy(c)}
           <div class="row end">
             ${!isNew ? `<button type="button" class="btn btn-danger-ghost" data-del>${icon("Trash2", 14)}삭제</button>` : ""}
-            ${!isNew && c.hasSecret ? `<button type="button" class="btn" data-clear>저장된 비밀 값 지우기</button>` : ""}
+            ${stored ? `<button type="button" class="btn" data-clear>저장된 비밀 값 지우기</button>` : ""}
             <button type="submit" class="btn btn-primary">${icon("Check", 14)}${isNew ? "추가" : "저장"}</button>
           </div>
         </form>`;
@@ -245,23 +250,23 @@ export function openVault(): Promise<void> {
       );
       if (isKey) {
         showPublicKey(c.keyPath);
-        showKeyIssue(c.keyPath, c.hasSecret);
+        showKeyIssue(c.keyPath, stored);
         // A path typed or pasted by hand is checked once the field is left.
-        field("keyPath")!.addEventListener("change", () => showKeyIssue(field("keyPath")!.value.trim(), c.hasSecret, true));
+        field("keyPath")!.addEventListener("change", () => showKeyIssue(field("keyPath")!.value.trim(), stored, true));
       }
       form.querySelector("[data-browse]")?.addEventListener("click", async () => {
         const path = await pickOpenFile("개인 키 파일 선택", c.keyPath ?? undefined);
         if (path) {
           field("keyPath")!.value = path;
           showPublicKey(path);
-          showKeyIssue(path, c.hasSecret, true);
+          showKeyIssue(path, stored, true);
         }
       });
       form.querySelector("[data-gen]")?.addEventListener("click", () => generateKey(current(), (path, pass) => {
         field("keyPath")!.value = path;
         if (pass) field("secret")!.value = pass;
         showPublicKey(path);
-        showKeyIssue(path, c.hasSecret, true);
+        showKeyIssue(path, stored, true);
       }));
       form.querySelector("[data-copy]")?.addEventListener("click", () => {
         writeClipboard(detailEl.querySelector(".pubkey code")!.textContent ?? "");
@@ -284,14 +289,16 @@ export function openVault(): Promise<void> {
         const reveal = form.querySelector("[data-reveal]");
         if (reveal) reveal.innerHTML = icon("EyeOff", 14);
         // Kept out of the clipboard history (the app's and Windows').
-        void writeClipboard(pw, { secret: true }).then((copied) =>
-          copied
-            ? toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다", "success", 3000)
-            : toast("강력한 비밀번호를 만들었지만 클립보드에 복사하지 못했습니다", "warn", 5000),
-        );
+        // Off the clipboard again after a minute: kept out of the history, it
+        // otherwise stayed there until something else was copied.
+        void writeClipboard(pw, { secret: true }).then((copied) => {
+          if (!copied) return toast("강력한 비밀번호를 만들었지만 클립보드에 복사하지 못했습니다", "warn", 5000);
+          clearSecretLater(pw);
+          toast("강력한 비밀번호를 만들어 클립보드에 복사했습니다 (1분 뒤 클립보드에서 지웁니다)", "success", 4000);
+        });
       });
       form.querySelector("[data-del]")?.addEventListener("click", async () => {
-        const used = state.sessions.filter((s) => s.credentialId === c.id).length;
+        const used = state.sessions.filter((s) => usesCredential(s, c.id)).length;
         const ok = await confirmDialog({
           title: "자격 증명 삭제",
           message: `<b data-i18n-skip>${esc(c.name)}</b>을(를) 삭제합니다.${used ? `<br>이 자격 증명을 쓰는 세션 ${used}개는 접속할 때 직접 입력하게 됩니다.` : ""}${
@@ -315,13 +322,22 @@ export function openVault(): Promise<void> {
         renderDetail();
       });
       form.querySelector("[data-clear]")?.addEventListener("click", async () => {
+        // Only the secret goes: the saved copy is sent, not the form, so a
+        // name or key path being edited is neither saved with it nor lost
+        // (it stays in the form, now without a stored secret).
+        if (!saved) return;
+        // What the form holds now (current() keeps its kind as shown).
+        const keep = current();
         try {
-          await api.vaultSave(current(), "");
+          await api.vaultSave(saved, "");
           await reloadCredentials();
         } catch (err) {
           return toast(errorText(err), "error");
         }
-        shownFor = "";
+        edited = { ...keep, hasSecret: false };
+        // The form's baseline stays the one it opened with: the edits kept
+        // here are still unsaved (closing or moving on asks first). The item
+        // is the same, so renderDetail does not take a new one.
         renderDetail();
         toast("저장된 비밀 값을 지웠습니다");
       });

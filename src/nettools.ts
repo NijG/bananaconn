@@ -4,7 +4,8 @@ import { api, on } from "./api";
 import { writeClipboard } from "./clipboard";
 import { icon } from "./icons";
 import { tr, userText } from "./i18n";
-import { addressKind, macFormats, parseSubnetInput, subnetInfo } from "./ipLinks";
+import { addressKind, expandIpv6, formatIpv6, ipv6Kind, ipv6Subnet, macFormats, reverseName4, sameHost, trimSeparators, reverseName6, reverseZone4, reverseZone6, splitIpv6, parseIpv6Input, parseNetworkList, parseRangeInput, parseSubnetInput, rangeAddresses, rangeToCidrs, splitSubnet, summarizeNetworks, subnetInfo, type SubnetPart } from "./ipLinks";
+import { parsePorts, WELL_KNOWN_PORTS } from "./wellKnownPorts";
 import { parseTarget, PROTOCOLS, type Session } from "./model";
 import { STATE_TEXT, type ViewState } from "./workspace";
 import { state } from "./store";
@@ -43,9 +44,8 @@ export function setSessionOpener(f: (s: Session) => void) {
 export function savedSessionItems(ip: string, close: () => void): MenuItem[] {
   const open = openSaved;
   if (!open) return [];
-  const key = ip.trim().toLowerCase();
   return state.sessions
-    .filter((s) => s.host.trim().toLowerCase() === key)
+    .filter((s) => sameHost(s.host, ip))
     .slice(0, 5)
     .map((s) => ({ label: "연결", icon: "Play", hint: s.name, userHint: true, action: () => (close(), open(s)) }));
 }
@@ -244,24 +244,11 @@ export async function checkReachable(s: Pick<Session, "protocol" | "host" | "por
   }
 }
 
-/** "22, 80, 8000-8010" → ports; null if any part is invalid. */
-export function parsePorts(text: string): number[] | null {
-  const out = new Set<number>();
-  for (const part of text.split(/[\s,]+/).filter(Boolean)) {
-    const m = part.match(/^(\d{1,5})(?:-(\d{1,5}))?$/);
-    if (!m) return null;
-    const a = Number(m[1]);
-    const b = m[2] ? Number(m[2]) : a;
-    if (a < 1 || b > 65535 || a > b || b - a > 64) return null;
-    for (let p = a; p <= b; p++) out.add(p);
-  }
-  // The limit is for the whole list ("1-60, 100-160" is 121 ports).
-  return out.size && out.size <= 64 ? [...out] : null;
-}
-
 /** The subnet calculator's result for an address and prefix length. */
 function subnetTable(ip: string, prefix: number): string {
   const s = subnetInfo(ip, prefix);
+  // Where its PTR record lives, and the network's reverse zone (on an octet).
+  const zone4 = reverseZone4(s.network, prefix);
   const row = (label: string, value: string, mono = true) => `<tr><th>${label}</th><td${mono ? ` class="mono" data-i18n-skip` : ""}>${esc(value)}</td></tr>`;
   return `<table class="nettools-table subnet-table"><tbody>
       ${row("주소", `${ip}/${prefix}`)}
@@ -272,21 +259,144 @@ function subnetTable(ip: string, prefix: number): string {
       ${row("호스트 수", s.hosts.toLocaleString())}
       ${row("서브넷 마스크", s.mask)}
       ${row("와일드카드 마스크", s.wildcard)}
-    </tbody></table>${prefix === 31 ? `<p class="muted small">/31은 점대점 링크라 두 주소를 모두 씁니다 (RFC 3021).</p>` : ""}`;
+      ${row("PTR 이름", reverseName4(ip))}
+      ${zone4 ? row("역방향 영역", zone4) : ""}
+    </tbody></table>${prefix === 31 ? `<p class="muted small">/31은 점대점 링크라 두 주소를 모두 씁니다 (RFC 3021).</p>` : ""}${prefix < 32 ? splitControl(prefix) : ""}`;
 }
 
-/** IANA service names of well-known TCP ports (the port check is TCP), as the
- * registry writes them, with the common name after a slash where the registry
- * name says little ("ms-wbt-server" is RDP). */
-const WELL_KNOWN_PORTS: Record<number, string> = {
-  20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "domain/DNS", 80: "http", 88: "kerberos",
-  110: "pop3", 111: "sunrpc", 119: "nntp", 123: "ntp", 135: "epmap/RPC", 139: "netbios-ssn", 143: "imap", 179: "bgp",
-  389: "ldap", 443: "https", 445: "microsoft-ds/SMB", 465: "submissions", 514: "shell/rsh", 515: "printer/LPD",
-  587: "submission", 636: "ldaps", 830: "netconf-ssh", 873: "rsync", 990: "ftps", 993: "imaps", 995: "pop3s",
-  1433: "ms-sql-s", 1521: "ncube-lm/Oracle", 1723: "pptp", 1883: "mqtt", 2049: "nfs", 3306: "mysql", 3389: "ms-wbt-server/RDP",
-  5432: "postgresql", 5900: "rfb/VNC", 5985: "wsman/WinRM", 5986: "wsmans/WinRM", 6379: "redis", 8080: "http-alt",
-  8443: "pcsync-https", 9100: "pdl-datastream/JetDirect", 27017: "mongodb",
-};
+/** Under the calculator's result: the network split into longer prefixes
+ * (8 bits more at most, 256 subnets). Not part of what Copy takes. */
+function splitControl(prefix: number, bits = 32): string {
+  const options = Array.from({ length: Math.min(8, bits - prefix) }, (_, i) => prefix + 1 + i)
+    .map((q) => `<option value="${q}">/${q} × ${2 ** (q - prefix)}</option>`)
+    .join("");
+  return `<div class="subnet-split"><label data-no-copy><span>더 작은 서브넷으로 나누기</span>
+      <select data-split data-i18n-skip><option value="">—</option>${options}</select></label><div data-split-out></div></div>`;
+}
+
+/** The subnet calculator's result for an IPv6 address and prefix length. */
+function ipv6Table(n: bigint, prefix: number, assumed: boolean): string {
+  const s = ipv6Subnet(n, prefix);
+  const row = (label: string, value: string, mono = true) => `<tr><th>${label}</th><td${mono ? ` class="mono" data-i18n-skip` : ""}>${esc(value)}</td></tr>`;
+  const bits = 128 - prefix;
+  const zone6 = reverseZone6(n, prefix);
+  return `<table class="nettools-table subnet-table"><tbody>
+      ${row("주소", `${formatIpv6(n)}/${prefix}`)}
+      ${row("전체 표기", expandIpv6(n))}
+      ${row("종류", ipv6Kind(n), false)}
+      ${row("네트워크", `${formatIpv6(s.network)}/${prefix}`)}
+      ${row("주소 범위", s.size === 1n ? formatIpv6(s.network) : `${formatIpv6(s.network)} – ${formatIpv6(s.last)}`)}
+      ${row("주소 수", bits > 20 ? `2^${bits} (${s.size.toLocaleString()})` : s.size.toLocaleString())}
+      ${row("PTR 이름", reverseName6(n))}
+      ${zone6 ? row("역방향 영역", zone6) : ""}
+    </tbody></table>${assumed ? `<p class="muted small">접두사 없이 입력하면 /64로 계산합니다 (다른 길이는 /48처럼 주소 뒤에 적으세요).</p>` : ""}${prefix < 128 ? splitControl(prefix, 128) : ""}`;
+}
+
+/** The IPv6 subnets of a split (all the same size), the one holding the address typed marked. */
+function splitTable6(parts: { network: bigint; last: bigint; mine: boolean }[], into: number): string {
+  const rows = parts
+    .map(
+      (s) => `<tr${s.mine ? ' class="mine"' : ""}><td class="mono" data-i18n-skip>${esc(`${formatIpv6(s.network)}/${into}`)}</td>
+        <td class="mono" data-i18n-skip>${esc(s.network === s.last ? formatIpv6(s.network) : `${formatIpv6(s.network)} – ${formatIpv6(s.last)}`)}</td></tr>`,
+    )
+    .join("");
+  return `<table class="nettools-table subnet-parts"><thead><tr><th>서브넷</th><th>주소 범위</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/** CIDR blocks as a table: each block, its first and last address, its size. */
+function blockTable(blocks: { network: string; prefix: number; size: number }[]): string {
+  const last = (b: { network: string; size: number }) => {
+    const n = b.network.split(".").reduce((a, o) => a * 256 + Number(o), 0) + b.size - 1;
+    return [24, 16, 8, 0].map((s) => Math.floor(n / 2 ** s) % 256).join(".");
+  };
+  const rows = blocks
+    .map(
+      (b) => `<tr><td class="mono" data-i18n-skip>${esc(`${b.network}/${b.prefix}`)}</td><td class="mono" data-i18n-skip>${esc(b.network)}</td>
+        <td class="mono" data-i18n-skip>${esc(last(b))}</td><td class="mono" data-i18n-skip>${b.size.toLocaleString()}</td></tr>`,
+    )
+    .join("");
+  return `<table class="nettools-table subnet-parts"><thead><tr><th>CIDR</th><th>시작</th><th>끝</th><th>주소 수</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/** An address range as the fewest CIDR blocks that cover it exactly. */
+function rangeTable(from: string, to: string): string {
+  const blocks = rangeToCidrs(from, to);
+  const total = blocks.reduce((n, b) => n + b.size, 0);
+  return `<p class="muted small"><span class="mono" data-i18n-skip>${esc(from)} – ${esc(to)}</span> · ${blocks.length === 1 ? "하나의 서브넷입니다" : `주소 ${total.toLocaleString()}개를 CIDR ${blocks.length}개로 덮습니다`}</p>
+    ${blockTable(blocks)}`;
+}
+
+/** Several networks summarized: merged exactly (nothing added), and the one
+ * network that covers them all, with the addresses it adds. */
+function summaryTable(nets: { ip: string; prefix: number }[]): string {
+  const s = summarizeNetworks(nets);
+  const covering = `${s.covering.network}/${s.covering.prefix}`;
+  return `<p class="muted small">${`네트워크 ${nets.length}개를 정확히 합치면 ${s.exact.length}개입니다`}</p>
+    ${blockTable(s.exact)}
+    <table class="nettools-table subnet-table"><tbody><tr><th>모두 덮는 네트워크</th><td class="mono" data-i18n-skip>${esc(covering)}</td></tr>
+      <tr><th>그중 입력에 없는 주소</th><td class="mono" data-i18n-skip>${s.extra.toLocaleString()}</td></tr></tbody></table>${
+        // Entries already inside another (a route or an ACL line that does nothing more).
+        s.covered.length
+          ? `<p class="muted small">${esc(`다른 항목 안에 이미 들어 있는 항목 ${s.covered.length}개`)}</p>
+            <table class="nettools-table"><thead><tr><th>항목</th><th>들어 있는 곳</th></tr></thead><tbody>${s.covered
+              .map((c) => `<tr><td class="mono" data-i18n-skip>${esc(c.net)}</td><td class="mono" data-i18n-skip>${esc(c.by)}</td></tr>`)
+              .join("")}</tbody></table>`
+          : ""
+      }`;
+}
+
+/** The subnets of a split, the one holding the address typed marked. */
+function splitTable(parts: SubnetPart[], into: number): string {
+  const rows = parts
+    .map(
+      (s) => `<tr${s.mine ? ' class="mine"' : ""}><td class="mono" data-i18n-skip>${esc(`${s.network}/${into}`)}</td>
+        <td class="mono" data-i18n-skip>${esc(s.first === s.last ? s.first : `${s.first} – ${s.last}`)}</td>
+        ${into < 31 ? `<td class="mono" data-i18n-skip>${esc(s.broadcast)}</td>` : ""}<td class="mono" data-i18n-skip>${s.hosts.toLocaleString()}</td></tr>`,
+    )
+    .join("");
+  return `<table class="nettools-table subnet-parts"><thead><tr><th>서브넷</th><th>사용 가능한 범위</th>${into < 31 ? "<th>브로드캐스트</th>" : ""}<th>호스트 수</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/** The IPv4 address the IPv4-only tools use for `target`: itself, or a
+ * name's first IPv4 address; none for an IPv6 address (looking that up
+ * would only wait for its reverse name to fail the same way). */
+async function ipv4Of(target: string): Promise<string | undefined> {
+  if (isIPv4(target)) return target;
+  if (target.includes(":")) return undefined;
+  return (await api.netDns(target)).addresses.find(isIPv4);
+}
+
+/** Well-known ports whose service does not start with a TLS handshake (plain
+ * text, or TLS only after a STARTTLS-like step: SMTP, IMAP, LDAP, PostgreSQL;
+ * SSH, RDP and VNC have their own): no certificate button on them. Any other
+ * open port may be TLS (443, 8443, a vendor's 9443) and gets one. */
+const NOT_TLS = new Set([21, 22, 23, 25, 53, 80, 110, 111, 119, 135, 139, 143, 179, 389, 445, 514, 515, 587, 830, 873, 1433, 1521, 1723, 1883, 2049, 3306, 3389, 5432, 5900, 5985, 6379, 8080, 9100, 27017]);
+
+/** Well-known ports whose service sends its greeting before the client says
+ * anything: SSH (RFC 4253 4.2), FTP, SMTP and submission, POP3, IMAP. */
+const SPEAKS_FIRST = new Set([21, 22, 25, 110, 143, 587]);
+
+/** A certificate as the port check shows it: what it names, who issued it,
+ * how long it is valid (days left, or since it expired) and whether this PC
+ * trusts it for the name connected to. */
+function certificateTable(endpoint: string, t: Awaited<ReturnType<typeof api.netTls>>): string {
+  const row = (label: string, value: string, mono = true) => `<tr><th>${label}</th><td${mono ? ` class="mono" data-i18n-skip` : ""}>${value}</td></tr>`;
+  const day = (s: number) => new Date(s * 1000).toISOString().slice(0, 10);
+  const left = Math.floor((t.cert.notAfter * 1000 - Date.now()) / 86_400_000);
+  const due = left < 0 ? `<span class="danger-text">${esc(`${-left}일 지남`)}</span>` : left <= 30 ? `<span class="warn-text">${esc(`${left}일 남음`)}</span>` : esc(`${left}일 남음`);
+  return `<p class="muted small"><span class="mono" data-i18n-skip>${esc(endpoint)}</span> · ${esc(`${t.ms} ms`)}</p>
+    <table class="nettools-table subnet-table"><tbody>
+      ${row("신뢰", t.untrusted ? `<span class="danger-text">${icon("X", 13)} ${esc(t.untrusted)}</span>` : `${icon("Check", 13)} ${esc("이 PC가 신뢰하는 인증서입니다")}`, false)}
+      ${/* Said apart: an expired self-signed one is reported as expired only. */ t.cert.selfSigned ? row("발급", esc("자체 서명 인증서 (발급자가 자기 자신)"), false) : ""}
+      ${row("주체", esc(t.cert.subject))}
+      ${row("이름 (SAN)", esc(t.cert.names.join(", ") || "-"))}
+      ${row("발급자", esc(t.cert.issuer))}
+      ${row("유효 기간", `<span class="mono" data-i18n-skip>${day(t.cert.notBefore)} ~ ${day(t.cert.notAfter)}</span> (${due})`, false)}
+      ${row("TLS", esc(`${t.version} · ${t.cipher}`))}
+      ${row("인증서 수", String(t.chain))}
+      ${row("SHA-256 지문", esc(t.cert.fingerprint))}
+    </tbody></table>`;
+}
 
 /** The TCP ports whose kind of session the app opens (TFTP is UDP: not found by the port check). */
 const PORT_PROTOCOL: Record<number, Session["protocol"]> = { 21: "ftp", 22: "ssh", 23: "telnet", 990: "ftps", 3389: "rdp", 5900: "vnc" };
@@ -313,7 +423,8 @@ function sortableTable(table: HTMLTableElement) {
       const up = th.getAttribute("aria-sort") !== "ascending";
       heads.forEach((h) => h.removeAttribute("aria-sort"));
       th.setAttribute("aria-sort", up ? "ascending" : "descending");
-      const text = (row: HTMLTableRowElement) => (row.cells[col]?.textContent ?? "").trim();
+      // A cell's own text: a button beside it (the certificate check) is not sorted by.
+      const text = (row: HTMLTableRowElement) => [...(row.cells[col]?.childNodes ?? [])].filter((n) => !(n instanceof Element && n.matches(".tls-cert-btn"))).map((n) => n.textContent).join("").trim();
       const all = [...body.rows];
       const kind = all.some((r) => r.cells[col]?.querySelector("[data-ip]:not([data-port])"))
         ? "ip"
@@ -463,6 +574,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
             <input name="host" placeholder="호스트 또는 IP (예: 192.168.0.1)" spellcheck="false" value="${esc(initialHost)}" list="${hostListId}"/>
             <datalist id="${hostListId}" data-i18n-skip>${savedHostOptions()}</datalist>
             <input name="extra" class="nettools-extra" spellcheck="false"/>
+            <select name="dnsType" class="nettools-extra" title="레코드 종류" hidden><option value="">A · AAAA</option><option>MX</option><option>TXT</option><option>CNAME</option><option>NS</option><option>SOA</option><option>SRV</option><option value="ALL">모두</option></select>
             <label class="check nettools-cont" title="중지할 때까지 1초마다 보내고, 끊기거나 다시 응답하면 알립니다"><input type="checkbox" name="cont"/>계속 보내기</label>
             <button type="submit" class="btn btn-primary" data-run>${icon("Play", 14)}실행</button>
           </div>
@@ -483,6 +595,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   const form = m.root.querySelector<HTMLFormElement>(".nettools-form")!;
   const host = form.querySelector<HTMLInputElement>("[name=host]")!;
   const extra = form.querySelector<HTMLInputElement>("[name=extra]")!;
+  // The DNS tool's record type: addresses (A, AAAA; a name of an address) or one kind of record.
+  const dnsType = form.querySelector<HTMLSelectElement>("[name=dnsType]")!;
   const cont = form.querySelector<HTMLInputElement>("[name=cont]")!;
   const contBox = form.querySelector<HTMLElement>(".nettools-cont")!;
   // A count means nothing to a ping that goes on until stopped.
@@ -521,8 +635,14 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     const textOf = (el: HTMLElement): string =>
       el instanceof HTMLTableElement
         ? [...el.rows].map((row) => [...row.cells].map((c) => sheetCell(c.innerText.replace(/[\t\r\n]+/g, " ").trim())).join("\t")).join("\n")
-        : el.querySelector("table")
-          ? [...el.children].map((c) => textOf(c as HTMLElement)).filter(Boolean).join("\n")
+        : // A part to leave out ([data-no-copy]) is looked for whether or not a
+          // table is there yet (the split's control before a split is chosen).
+          el.querySelector("table, [data-no-copy]")
+          ? [...el.children]
+              .filter((c) => !c.hasAttribute("data-no-copy"))
+              .map((c) => textOf(c as HTMLElement))
+              .filter(Boolean)
+              .join("\n")
           : el.innerText.trim();
     out.classList.add("copying");
     const text = textOf(out).trim();
@@ -540,7 +660,16 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   /** A prefix typed with the address ("/24", a mask) is the one used: shown
    * in the prefix box, which then takes no input of its own. */
   const mirrorPrefix = () => {
-    const parsed = parseSubnetInput(host.value);
+    // A range ("10.0.0.5 - 10.0.0.20") takes no prefix at all: the box,
+    // disabled, shows the prefix's own value (not another tool's, such as
+    // Ping's count, which a scan would then keep as its prefix).
+    // Several networks carry their own prefixes: the same.
+    if (parseRangeInput(trimSeparators(host.value)) || parseNetworkList(host.value)) {
+      extra.disabled = true;
+      if (extra.value !== ownPrefix) extra.value = ownPrefix;
+      return null;
+    }
+    const parsed = parseSubnetInput(trimSeparators(host.value));
     const carried = parsed?.prefix ?? null;
     extra.disabled = carried !== null;
     const shown = carried !== null ? String(carried) : ownPrefix;
@@ -550,25 +679,121 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
   /** The prefix box's own value (typed there, or read with the address in
    * terminal output): shown again once the address stops carrying one. */
   let ownPrefix = "24";
+  /** The network the calculator shows, and the split chosen under it. */
+  let subnetShown: { ip: string; prefix: number } | null = null;
+  let v6Shown: { n: bigint; prefix: number } | null = null;
+  let splitInto: number | null = null;
+  /** Which kind of network the split was chosen for: a /26 picked under an
+   * IPv4 /24 is not carried to an IPv6 network (where it would cut a /20
+   * into 64 pieces), nor the other way. */
+  let splitFamily: "v4" | "v6" = "v4";
   /** The calculator works as it is typed into; `strict` (Enter, Run) also
    * says what is wrong with an entry it cannot read. A prefix typed with the
    * address ("/24", a mask) is the one used, and shown in the prefix box. */
   const calculate = (strict: boolean) => {
+    v6Shown = null;
+    // The prefix box's range is IPv4's, but for an IPv6 address (below).
+    extra.max = "32";
+    extra.title = "접두사 길이 (0~32)";
+    // A range ("10.0.0.5 - 10.0.0.20"): the CIDR blocks that cover it, for an
+    // ACL or a firewall rule. The prefix box says nothing about a range.
+    const range = parseRangeInput(trimSeparators(host.value));
+    if (range) {
+      mirrorPrefix();
+      subnetShown = null;
+      out.innerHTML = rangeTable(range.from, range.to);
+      copyBtn.hidden = false;
+      return;
+    }
+    // IPv6 ("2001:db8::1/64"); without a prefix, a /64 (a LAN's), shown in
+    // the box, which takes no input of its own here (type "/n" instead).
+    const v6 = parseIpv6Input(trimSeparators(host.value));
+    if (v6) {
+      const prefix = v6.prefix ?? 64;
+      extra.max = "128";
+      extra.title = "접두사 길이 (0~128)";
+      extra.disabled = true;
+      extra.value = String(prefix);
+      subnetShown = null;
+      v6Shown = { n: v6.n, prefix };
+      out.innerHTML = ipv6Table(v6.n, prefix, v6.prefix === null);
+      copyBtn.hidden = false;
+      keepSplit();
+      return;
+    }
+    // Several networks ("10.0.0.0/24, 10.0.1.0/24"): summarized.
+    const list = parseNetworkList(host.value);
+    if (list) {
+      mirrorPrefix();
+      subnetShown = null;
+      out.innerHTML = summaryTable(list);
+      copyBtn.hidden = false;
+      return;
+    }
     const parsed = mirrorPrefix();
     const typed = /^\d{1,2}$/.test(extra.value.trim()) && Number(extra.value) <= 32 ? Number(extra.value) : null;
     const prefix = parsed?.prefix ?? typed;
     if (!parsed || prefix === null) {
       if (!strict) return placeholder();
-      out.innerHTML = `<p class="danger-text">IPv4 주소와 접두사 길이를 입력하세요 (예: 10.0.0.5/24, 10.0.0.5 255.255.255.0)</p>`;
+      // A colon is only ever in an IPv6 address: say what that one needs.
+      out.innerHTML = host.value.includes(":")
+        ? `<p class="danger-text">IPv6 주소와 0~128 사이의 접두사 길이를 입력하세요 (예: 2001:db8::1/64)</p>`
+        : `<p class="danger-text">IPv4 주소와 접두사 길이를 입력하세요 (예: 10.0.0.5/24, 10.0.0.5 255.255.255.0)</p>`;
       copyBtn.hidden = true;
       return;
     }
     out.innerHTML = subnetTable(parsed.ip, prefix);
     copyBtn.hidden = false;
+    // The split chosen before stays while the address or prefix changes, as
+    // long as it is still a longer prefix the control offers.
+    subnetShown = { ip: parsed.ip, prefix };
+    keepSplit();
   };
+  // Declarations (hoisted): calculate, defined above, calls them.
+  function keepSplit() {
+    const sel = out.querySelector<HTMLSelectElement>("[data-split]");
+    if (sel && splitInto !== null && splitFamily === (v6Shown ? "v6" : "v4") && [...sel.options].some((o) => o.value === String(splitInto))) {
+      sel.value = String(splitInto);
+      drawSplit();
+    }
+  }
+  function drawSplit() {
+    const box = out.querySelector<HTMLElement>("[data-split-out]");
+    if (!box) return;
+    if (v6Shown) {
+      const parts = splitInto !== null ? splitIpv6(v6Shown.n, v6Shown.prefix, splitInto) : null;
+      box.innerHTML = parts ? splitTable6(parts, splitInto!) : "";
+      return;
+    }
+    const parts = subnetShown && splitInto !== null ? splitSubnet(subnetShown.ip, subnetShown.prefix, splitInto) : null;
+    box.innerHTML = parts ? splitTable(parts, splitInto!) : "";
+  }
+  out.addEventListener("change", (e) => {
+    const sel = (e.target as HTMLElement).closest<HTMLSelectElement>("[data-split]");
+    if (!sel) return;
+    splitInto = sel.value ? Number(sel.value) : null;
+    splitFamily = v6Shown ? "v6" : "v4";
+    drawSplit();
+  });
   host.addEventListener("input", () => {
     if (tool === "subnet") calculate(false);
     else if (tool === "sweep") mirrorPrefix();
+  });
+  // A column of networks pasted from a route table or a spreadsheet: the
+  // one-line box would turn its line breaks into spaces, which separate only
+  // entries that each carry a prefix, so they become ", " (a list) instead.
+  // An address and its mask on two lines ("10.0.0.5⏎255.255.255.0") are one
+  // subnet: those keep the space. Inserted as typing is, so Ctrl+Z undoes it.
+  host.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (tool !== "subnet" || !/[\r\n]/.test(text)) return;
+    e.preventDefault();
+    const lines = text.split(/\r?\n|\r/).map((l) => l.trim()).filter(Boolean);
+    const joined = lines.length === 2 && parseSubnetInput(lines.join(" ")) ? lines.join(" ") : lines.join(", ");
+    if (!document.execCommand("insertText", false, joined)) {
+      host.setRangeText(joined, host.selectionStart ?? host.value.length, host.selectionEnd ?? host.value.length, "end");
+      host.dispatchEvent(new Event("input"));
+    }
   });
   extra.addEventListener("input", () => {
     if (tool !== "subnet" && tool !== "sweep") return;
@@ -582,15 +807,25 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     if (was === "sweep" && t !== "sweep" && swept !== null) kept = [...out.childNodes];
     m.root.querySelectorAll<HTMLElement>("[data-tool]").forEach((b) => b.classList.toggle("on", b.dataset.tool === t));
     extra.hidden = t === "dns";
+    dnsType.hidden = t !== "dns";
     extra.disabled = false;
     contBox.hidden = t !== "ping";
     if (t !== "sweep") freeBtn.hidden = watchBtn.hidden = true;
-    host.placeholder = t === "subnet" ? "IP 주소 (예: 10.0.0.5/24)" : t === "sweep" ? "네트워크 (예: 192.168.0.0/24)" : "호스트 또는 IP (예: 192.168.0.1)";
+    host.placeholder = t === "subnet" ? "IPv4·IPv6 주소, 범위 또는 여러 네트워크 (예: 10.0.0.5/24, 2001:db8::1/64, 10.0.0.5-10.0.0.20)" : t === "sweep" ? "네트워크 또는 범위 (예: 192.168.0.0/24, 192.168.0.50-192.168.0.80)" : "호스트 또는 IP (예: 192.168.0.1)";
     const withPrefix = (x: NetTool) => x === "subnet" || x === "sweep";
     if (withPrefix(was) && !withPrefix(t)) {
-      // "10.0.0.5/24" is not a host ping or the port check can take.
-      const p = parseSubnetInput(host.value);
-      if (p) host.value = p.ip;
+      // "10.0.0.5/24" is not a host ping or the port check can take, nor is
+      // a range: its first address stays.
+      // Read as the calculator reads it ("10.0.0.5/24," is that network).
+      const text = trimSeparators(host.value);
+      const r = parseRangeInput(text);
+      const list = r ? null : parseNetworkList(text);
+      const v6 = r || list ? null : parseIpv6Input(text);
+      const p = r || list || v6 ? null : parseSubnetInput(text);
+      if (r) host.value = r.from;
+      else if (list) host.value = list[0].ip;
+      else if (v6) host.value = text.split("/")[0].trim();
+      else if (p) host.value = p.ip;
       placeholder();
     }
     if (t === "subnet") {
@@ -608,7 +843,8 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
       if (was !== "sweep" && kept && swept !== null) {
         // The address and prefix the results are for, as they were typed.
         host.value = swept.host;
-        if (parseSubnetInput(swept.host)?.prefix == null) ownPrefix = swept.prefix;
+        // A range carries no prefix of its own to take back.
+        if (!parseRangeInput(trimSeparators(swept.host)) && parseSubnetInput(trimSeparators(swept.host))?.prefix == null) ownPrefix = swept.prefix;
         out.replaceChildren(...kept);
         copyBtn.hidden = !out.querySelector("table.nettools-table");
         freeBtn.hidden = !free.length;
@@ -632,7 +868,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     } else if (t === "ports") {
       extra.type = "text";
       extra.value = DEFAULT_PORTS;
-      extra.title = "포트 (쉼표, 범위 8000-8010)";
+      extra.title = "포트 또는 서비스 이름 (쉼표, 범위 8000-8010, 예: ssh, https, rdp)";
     }
     host.focus();
   };
@@ -648,14 +884,18 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     free = [];
     answered = [];
     const parsed = mirrorPrefix();
+    // A range ("192.168.0.50 - 192.168.0.80"): every address in it, its ends
+    // too (the backend's range_targets), 1024 at most.
+    const range = parseRangeInput(trimSeparators(host.value));
+    const inRange = range ? rangeAddresses(range.from, range.to) : null;
     const typed = /^\d{1,2}$/.test(extra.value.trim()) ? Number(extra.value) : NaN;
     const prefix = parsed?.prefix ?? typed;
-    if (!parsed || !(prefix >= 22 && prefix <= 32)) {
-      out.innerHTML = `<p class="danger-text">네트워크 주소와 접두사 길이를 입력하세요. 한 번에 /22(호스트 1022개)까지 검사할 수 있습니다 (예: 192.168.0.0/24)</p>`;
+    if (range ? !inRange : !parsed || !(prefix >= 22 && prefix <= 32)) {
+      out.innerHTML = `<p class="danger-text">네트워크 주소와 접두사 길이, 또는 주소 범위를 입력하세요. 한 번에 /22(호스트 1022개)나 주소 1024개까지 검사할 수 있습니다 (예: 192.168.0.0/24, 192.168.0.50-192.168.0.80)</p>`;
       copyBtn.hidden = freeBtn.hidden = watchBtn.hidden = true;
       return;
     }
-    const all = hostsOf(parsed.ip, prefix);
+    const all = inRange ?? hostsOf(parsed!.ip, prefix);
     const input = { host: host.value, prefix: extra.value };
     busy = true;
     copyBtn.hidden = freeBtn.hidden = watchBtn.hidden = true;
@@ -669,7 +909,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         const el = p.id === id ? out.querySelector("[data-sweep-progress]") : null;
         if (el) el.textContent = tr(`검사하는 중... ${p.done} / ${p.total}`);
       });
-      const hits = await api.netSweep(id, parsed.ip, prefix, 1000);
+      const hits = range ? await api.netSweep(id, range.from, 32, 1000, range.to) : await api.netSweep(id, parsed!.ip, prefix, 1000);
       // A host that answered ARP but not the ping is there all the same:
       // never among the free addresses.
       const present = new Set(hits.map((h) => h.ip));
@@ -760,7 +1000,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     ensureNotifyPermission();
     try {
       // The echo is IPv4: a name is looked up first, its first IPv4 address used.
-      const ip = isIPv4(target) ? target : (await api.netDns(target)).addresses.find(isIPv4);
+      const ip = await ipv4Of(target);
       if (!ip) throw new Error(`${userText(target)}의 IPv4 주소를 찾을 수 없습니다`);
       // Stopped while the name was looked up: nothing was sent.
       if (watchId !== id) return void (out.innerHTML = `<p class="muted">중지했습니다.</p>`);
@@ -903,7 +1143,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     traceId = id;
     try {
       // The echoes are IPv4: a name is looked up first, its first IPv4 address used.
-      const ip = isIPv4(target) ? target : (await api.netDns(target)).addresses.find(isIPv4);
+      const ip = await ipv4Of(target);
       if (!ip) throw new Error(`${userText(target)}의 IPv4 주소를 찾을 수 없습니다`);
       // Stopped while the name was looked up: nothing was sent.
       if (traceId !== id) return void (out.innerHTML = `<p class="muted">중지했습니다.</p>`);
@@ -990,9 +1230,43 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
     host.value = ip;
     form.requestSubmit();
   };
+  /** The TLS certificate of host:port, under the port table (one at a time). */
+  let tlsAsked = 0;
+  const showCertificate = async (target: string, port: number) => {
+    const box = out.querySelector<HTMLElement>("[data-tls-out]");
+    if (!box) return;
+    const asked = ++tlsAsked;
+    box.innerHTML = `<p class="muted"><span class="spinner sm"></span> ${esc(`${userText(`${target}:${port}`)} 인증서를 읽는 중...`)}</p>`;
+    try {
+      const t = await api.netTls(target, port);
+      if (asked !== tlsAsked || !box.isConnected) return;
+      box.innerHTML = certificateTable(`${target}:${port}`, t);
+    } catch (err) {
+      if (asked === tlsAsked && box.isConnected) box.innerHTML = `<p class="danger-text">${esc(errorText(err))}</p>`;
+    }
+  };
+  /** The first line the service on host:port sends, under the port table (where a certificate is shown too). */
+  const showBanner = async (target: string, port: number) => {
+    const box = out.querySelector<HTMLElement>("[data-tls-out]");
+    if (!box) return;
+    const asked = ++tlsAsked;
+    box.innerHTML = `<p class="muted"><span class="spinner sm"></span> ${esc(`${userText(`${target}:${port}`)} 배너를 읽는 중...`)}</p>`;
+    try {
+      const line = await api.netBanner(target, port);
+      if (asked !== tlsAsked || !box.isConnected) return;
+      // A table row, as the certificate's: "Copy result" passes a cell through
+      // sheetCell, so a server's line starting with "=" stays text in a spreadsheet.
+      box.innerHTML = `<p class="muted small"><span class="mono" data-i18n-skip>${esc(`${target}:${port}`)}</span></p>
+        <table class="nettools-table subnet-table"><tbody><tr><th>${esc("배너")}</th><td class="mono" data-i18n-skip>${esc(line)}</td></tr></tbody></table>`;
+    } catch (err) {
+      if (asked === tlsAsked && box.isConnected) box.innerHTML = `<p class="danger-text">${esc(errorText(err))}</p>`;
+    }
+  };
   out.addEventListener("click", (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>(".sweep-link");
     if (!b || busy) return;
+    if (b.dataset.tlsPort) return void showCertificate(b.dataset.tlsHost ?? "", Number(b.dataset.tlsPort));
+    if (b.dataset.bannerPort) return void showBanner(b.dataset.bannerHost ?? "", Number(b.dataset.bannerPort));
     // Under the address, by mouse or by keyboard (Enter on it).
     const r = b.getBoundingClientRect();
     // A MAC: copied in the notation the next tool or switch wants.
@@ -1053,7 +1327,7 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
         out.innerHTML = `<pre class="mono" data-i18n-skip>${esc(text)}</pre>`;
       } else if (tool === "ports") {
         const ports = parsePorts(extra.value);
-        if (!ports) throw new Error("포트 형식: 22, 80, 8000-8010 (1~65535, 한 번에 64개까지)");
+        if (!ports) throw new Error("포트 형식: 22, 80, 8000-8010 또는 ssh, https 같은 서비스 이름 (1~65535, 한 번에 64개까지)");
         const res = await api.netPorts(target, ports);
         const openCount = res.filter((r) => r.open).length;
         // The well-known service of a port, in a column of its own (the port
@@ -1068,16 +1342,79 @@ export function openNetworkTools(initialHost = "", initialTool: NetTool = "ping"
                 ? `<button type="button" class="sweep-link" data-ip="${esc(target)}" data-port="${r.port}" title="이 포트로 새 세션 만들기">${r.port}</button>`
                 : r.port
             }</td>
-              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.open ? "열려 있음" : r.detail)}</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td>${
+              <td>${r.open ? icon("Check", 13) : icon("X", 13)} ${esc(r.open ? "열려 있음" : r.detail)}${
+                // Its TLS certificate (expiry, names, trust), read on demand.
+                r.open && !NOT_TLS.has(r.port) ? ` <button type="button" class="sweep-link tls-cert-btn" data-tls-host="${esc(target)}" data-tls-port="${r.port}" title="이 포트의 TLS 인증서 확인">인증서</button>` : ""
+              }${
+                // A service that greets first (SSH, FTP, SMTP, POP3, IMAP): its first line.
+                r.open && SPEAKS_FIRST.has(r.port) ? ` <button type="button" class="sweep-link tls-cert-btn" data-banner-host="${esc(target)}" data-banner-port="${r.port}" title="서버가 먼저 보내는 첫 줄(종류·버전) 읽기">배너</button>` : ""
+              }</td><td class="muted">${r.ms != null ? `${r.ms} ms` : ""}</td>${
                 named ? `<td class="muted mono" data-i18n-skip>${WELL_KNOWN_PORTS[r.port] ?? ""}</td>` : ""
               }</tr>`,
           )
-          .join("")}</tbody></table>`;
+          .join("")}</tbody></table><div data-tls-out></div>`;
         // Many ports (a range): sorted by state or round trip with a click.
         const portTable = out.querySelector<HTMLTableElement>("table.nettools-table");
         if (portTable) sortableTable(portTable);
       } else {
+        // One kind of record (MX, TXT, SRV…): a table of what the name has.
+        if (dnsType.value) {
+          // An address has no MX or TXT of its own: its name is the A · AAAA lookup's (PTR).
+          if (isIPv4(target) || target.includes(":"))
+            return void (out.innerHTML = `<p class="muted">${esc("IP 주소의 이름은 종류를 A · AAAA로 두고 조회하세요 (PTR).")}</p>`);
+          // "모두": the kinds a name usually has, asked at once, in one table
+          // (SRV is under its own _service._proto names, so not among them).
+          const all = dnsType.value === "ALL";
+          const kinds = all ? ["A", "AAAA", "CNAME", "NS", "MX", "TXT", "SOA"] : [dnsType.value];
+          const started = performance.now();
+          const got = await Promise.allSettled(kinds.map((k) => api.netDnsRecords(target, k)));
+          // Every kind failed (a name not in DNS says so for each): said once, as for one kind.
+          const failed = got.flatMap((g, i) => (g.status === "rejected" ? [{ kind: kinds[i], why: errorText(g.reason) }] : []));
+          if (failed.length === kinds.length) throw (got[0] as PromiseRejectedResult).reason;
+          // A record once: an alias's CNAME comes with each kind asked of it.
+          const seen = new Set<string>();
+          const answered = got.flatMap((g) => (g.status === "fulfilled" ? [g.value] : []));
+          const records = answered
+            .flatMap((a) => a.records)
+            .filter((r) => {
+              const key = `${r.kind}\n${r.name.toLowerCase()}\n${r.data}`;
+              return !seen.has(key) && !!seen.add(key);
+            });
+          // One kind: the resolver's own time. Several side by side: how long
+          // all of them took (a kind that timed out, failed, counts too).
+          const ms = all ? Math.round(performance.now() - started) : answered[0].ms;
+          const failedHtml = failed.map((f) => `<p class="danger-text small"><span class="mono" data-i18n-skip>${f.kind}</span> ${esc(f.why)}</p>`).join("");
+          out.innerHTML = records.length
+            ? `<table class="nettools-table dns-table"><thead><tr><th>종류</th><th>이름</th><th>TTL</th><th>값</th></tr></thead><tbody>${records
+                .map((r) => `<tr><td class="mono" data-i18n-skip>${esc(r.kind)}</td><td class="mono" data-i18n-skip>${esc(r.name)}</td><td class="mono muted" data-i18n-skip>${r.ttl}</td><td class="mono dns-data" data-i18n-skip${all && (r.kind === "A" || r.kind === "AAAA") ? ` data-ptr="${esc(r.data)}"` : ""}>${esc(r.data)}</td></tr>`)
+                .join("")}</tbody></table>${failedHtml}<p class="muted small">${ms} ms</p>`
+            : `<p class="muted">${esc(all ? `${userText(target)}에 레코드가 없습니다.` : `${userText(target)}에 ${dnsType.value} 레코드가 없습니다.`)}</p>${failedHtml}`;
+          // "모두": each address's own name (its PTR) beside it, filled in as
+          // they come: a mail server's forward and reverse names agreeing
+          // (FCrDNS) is what receivers check. At most 8, side by side.
+          if (all) {
+            for (const cell of [...out.querySelectorAll<HTMLElement>("[data-ptr]")].slice(0, 8)) {
+              void api
+                .netDns(cell.dataset.ptr!)
+                .then((r) => (r.reverse ? r.name : null))
+                .catch(() => undefined)
+                .then((name) => {
+                  // Another lookup drew the box meanwhile: not this one's.
+                  if (!cell.isConnected || name === undefined) return;
+                  cell.insertAdjacentHTML("beforeend", ` <span class="muted dns-ptr">→ ${esc(name ?? tr("PTR 없음"))}</span>`);
+                });
+            }
+          }
+          return;
+        }
         const res = await api.netDns(target);
+        // An address: what it is called (its PTR record), or that it has no name.
+        if (res.reverse) {
+          out.innerHTML = res.name
+            ? `<p class="muted small">${esc(userText(target))}의 이름 (PTR)</p><ul class="nettools-list"><li class="mono" data-i18n-skip>${esc(res.name)}</li></ul><p class="muted small">${res.ms} ms</p>`
+            : `<p class="muted">${esc(userText(target))}에 등록된 이름(PTR)이 없습니다.</p>`;
+          return;
+        }
         out.innerHTML = res.addresses.length
           ? `<ul class="nettools-list">${res.addresses.map((a) => `<li class="mono">${esc(a)}</li>`).join("")}</ul><p class="muted small">${res.ms} ms</p>`
           : `<p class="muted">주소가 없습니다.</p>`;
@@ -1462,7 +1799,7 @@ export function openMultiWatch(sessions: { name: string; host: string; protocol?
   function start(r: Row) {
       void (async () => {
         try {
-          const ip = isIPv4(r.host) ? r.host : (await api.netDns(r.host)).addresses.find(isIPv4);
+          const ip = await ipv4Of(r.host);
           if (!ip) throw new Error(`${userText(r.host)}의 IPv4 주소를 찾을 수 없습니다`);
           // Closed, or taken out while its name was looked up: nothing started.
           if (closed || !rows.includes(r)) return;

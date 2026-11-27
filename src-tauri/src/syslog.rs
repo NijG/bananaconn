@@ -362,14 +362,18 @@ async fn batches(sock: UdpSocket, every: Duration, mut file: Option<FileOut>, mu
     }
 }
 
+/// Stop receiving. Returns once the loop has ended (a moment at most), so its
+/// socket is closed and a start right after binds the same port again.
 #[tauri::command]
-pub fn syslog_stop(state: State<SyslogState>) {
+pub async fn syslog_stop(state: State<'_, SyslogState>) -> Result<(), String> {
     // The loop's end lets the file's thread put the rest on disk and end.
     let running = state.running.lock().unwrap_or_else(|p| p.into_inner()).take();
-    if let Some(r) = running {
+    if let Some(mut r) = running {
         r.task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut r.task).await;
         state.retire(r);
     }
+    Ok(())
 }
 
 /// The app is closing (its runtime does not drop tasks on the way out):

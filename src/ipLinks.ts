@@ -41,6 +41,57 @@ export function findIps(text: string): IpMatch[] {
   return out;
 }
 
+/** A run of hex groups and colons (at least two), optionally ending in a
+ * dotted IPv4 tail, not inside a word, a longer run or a dotted number; a
+ * "/64" after it is its prefix. parseIpv6 decides whether it is an address. */
+const IPV6 = /(?<![\w:.])((?:[0-9A-Fa-f]{0,4}:){2,8}(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]{1,4})?)(?:\/(\d{1,3})(?!\d))?/g;
+
+/** The IPv6 addresses in a line of output ("show ipv6 interface brief",
+ * "ip -6 route", "show ipv6 neighbors"): what parseIpv6 reads as one, so a
+ * MAC ("00:50:56:ab:cd:ef"), a time ("10:20:30") or a C++ name ("std::map")
+ * is not, nor hex letters alone ("a::b"), nor an 8-byte ID written as eight
+ * two-digit groups (a Fibre Channel WWN "20:00:00:25:b5:00:00:0f", an EUI-64).
+ * A colon or a sentence's dot right after it ("Reply from ::1: time<1ms",
+ * "is 2001:db8::1.") is not part of it; a zone ("fe80::1%eth0") is left out
+ * of the link; "::" alone (an empty route field) is not linked. */
+export function findIpv6s(text: string): IpMatch[] {
+  if (!text.includes(":")) return [];
+  // Linux netstat's tcp6/udp6 lines write the port after the address with
+  // one more colon ("::1:631", "fe80::1:22"): there the last group is the port.
+  const netstat = /^\s*(?:tcp6|udp6)\s/.test(text);
+  const out: IpMatch[] = [];
+  for (const m of text.matchAll(IPV6)) {
+    let ip = m[1];
+    const end = m.index! + m[0].length;
+    // Part of a longer word or dotted number: not an address.
+    if (/^(?:\w|\.\d)/.test(text.slice(end))) continue;
+    // One trailing colon is the line's punctuation, not a group ("::" stays).
+    if (m[2] === undefined && ip.endsWith(":") && !ip.endsWith("::")) ip = ip.slice(0, -1);
+    const cut = ip.lastIndexOf(":");
+    if (netstat && m[2] === undefined && /^\d{1,5}$/.test(ip.slice(cut + 1))) {
+      const host = ip.slice(0, cut);
+      const n = Number(ip.slice(cut + 1));
+      // ":::22" is "::" (no digit: not linked) with port 22.
+      if (!/\d/.test(host) || parseIpv6(host) === null || n < 1 || n > 65535) continue;
+      out.push({ ip: host, port: n, index: m.index!, length: ip.length, prefix: null });
+      continue;
+    }
+    // Hex letters alone ("a::b", "add::cafe") are a program's names far more
+    // often than an address, which has a digit somewhere.
+    if (!/\d/.test(ip) || parseIpv6(ip) === null) continue;
+    if (/^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){7}$/.test(ip)) continue;
+    const prefix = m[2] !== undefined && Number(m[2]) <= 128 ? Number(m[2]) : null;
+    // netstat with an IPv4 tail ("::ffff:10.0.0.5:22"): the port follows the dotted part.
+    const after = netstat && prefix === null && ip === m[1] ? /^:(\d{1,5})(?![\w:.])/.exec(text.slice(end)) : null;
+    if (after && Number(after[1]) >= 1 && Number(after[1]) <= 65535) {
+      out.push({ ip, port: Number(after[1]), index: m.index!, length: ip.length + after[0].length, prefix: null });
+      continue;
+    }
+    out.push({ ip, port: null, index: m.index!, length: prefix !== null ? m[0].length : ip.length, prefix });
+  }
+  return out;
+}
+
 /** The prefix length written right after an address: "/24", a netmask
  * ("255.255.255.0", "netmask 255.255.255.0", AIX's "netmask 0xffffff00") or an
  * ACL/OSPF wildcard ("0.0.0.255"). Anything else (another address) is none.
@@ -264,6 +315,353 @@ export function subnetInfo(ip: string, prefix: number): SubnetInfo {
   };
 }
 
+/** One of the subnets a network splits into (splitSubnet). */
+export interface SubnetPart extends SubnetInfo {
+  /** The address the network was given with lies in this part. */
+  mine: boolean;
+}
+
+/** The network of `ip`/`prefix` split into the /`into` subnets it holds, in
+ * order: a /24 into four /26, or into /30 point-to-point links. At most 256
+ * parts (8 bits more); null for a split that is not longer, or longer than that. */
+export function splitSubnet(ip: string, prefix: number, into: number): SubnetPart[] | null {
+  if (!Number.isInteger(into) || into <= prefix || into > 32 || into - prefix > 8) return null;
+  const whole = subnetInfo(ip, prefix);
+  const start = whole.network.split(".").reduce((n, o) => n * 256 + Number(o), 0);
+  const at = ip.split(".").reduce((n, o) => n * 256 + Number(o), 0);
+  const size = 2 ** (32 - into);
+  const parts: SubnetPart[] = [];
+  for (let i = 0; i < 2 ** (into - prefix); i++) {
+    const n = start + i * size;
+    parts.push({ ...subnetInfo(dotted(n), into), mine: at >= n && at < n + size });
+  }
+  return parts;
+}
+
+/** An address range typed into the subnet calculator ("10.0.0.5 - 10.0.0.20",
+ * also with "–" or "~"): its two ends, the lower first; null for anything else. */
+export function parseRangeInput(text: string): { from: string; to: string } | null {
+  const m = new RegExp(`^(${OCTET}(?:\\.${OCTET}){3})\\s*[-–~]\\s*(${OCTET}(?:\\.${OCTET}){3})$`).exec(text.trim());
+  if (!m) return null;
+  const [a, b] = [m[1], m[2]];
+  return ipv4Number(a)! <= ipv4Number(b)! ? { from: a, to: b } : { from: b, to: a };
+}
+
+// ---- IPv6 (the subnet calculator) -------------------------------------------------
+
+const V6_MAX = (1n << 128n) - 1n;
+
+/** An IPv6 address as a 128-bit number, or null: hex groups with at most
+ * one "::", and an IPv4 dotted tail ("::ffff:10.0.0.1") in the last 32 bits.
+ * No zone ("%eth0") and no brackets. */
+export function parseIpv6(text: string): bigint | null {
+  let s = text.trim().toLowerCase();
+  if (!s.includes(":") || /[^0-9a-f:.]/.test(s)) return null;
+  // A dotted IPv4 tail becomes two hex groups.
+  const tail = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+  if (tail) {
+    const o = tail[2].split(".").map(Number);
+    if (o.some((x) => x > 255)) return null;
+    s = `${tail[1]}${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  } else if (s.includes(".")) return null;
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const groups = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  const missing = 8 - head.length - rest.length;
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null;
+  const all = [...head, ...Array(halves.length === 2 ? missing : 0).fill("0"), ...rest];
+  if (all.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return all.reduce((n, g) => (n << 16n) | BigInt(parseInt(g, 16)), 0n);
+}
+
+const v6Groups = (n: bigint) => Array.from({ length: 8 }, (_, i) => Number((n >> BigInt(112 - 16 * i)) & 0xffffn));
+
+/** All eight groups, four digits each: "2001:0db8:0000:…". */
+export function expandIpv6(n: bigint): string {
+  return v6Groups(n)
+    .map((g) => g.toString(16).padStart(4, "0"))
+    .join(":");
+}
+
+/** The canonical text form (RFC 5952): lower case, no leading zeros, the
+ * longest run of two or more zero groups (the first when tied) as "::", and
+ * an IPv4-mapped address (::ffff:0:0/96) with its IPv4 part dotted. */
+export function formatIpv6(n: bigint): string {
+  const g = v6Groups(n);
+  if (n >> 32n === 0xffffn) return `::ffff:${[24, 16, 8, 0].map((s) => Number((n >> BigInt(s)) & 0xffn)).join(".")}`;
+  let best = -1;
+  let bestLen = 1;
+  for (let i = 0; i < 8; ) {
+    if (g[i] !== 0) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && g[j] === 0) j++;
+    if (j - i > bestLen) [best, bestLen] = [i, j - i];
+    i = j;
+  }
+  const hex = g.map((x) => x.toString(16));
+  if (best < 0) return hex.join(":");
+  return `${hex.slice(0, best).join(":")}::${hex.slice(best + bestLen).join(":")}`;
+}
+
+/** What kind of IPv6 address it is: the blocks an engineer meets (RFC 4291,
+ * 4193, 3849); anything else in 2000::/3 is global unicast. */
+export function ipv6Kind(n: bigint): string {
+  const top = (bits: number) => n >> BigInt(128 - bits);
+  if (n === 0n) return "지정되지 않은 주소 (::)";
+  if (n === 1n) return "루프백 (::1)";
+  if (n >> 32n === 0xffffn) return "IPv4 매핑 주소";
+  if (top(8) === 0xffn) return "멀티캐스트";
+  if (top(10) === 0x3fan) return "링크 로컬 (fe80::/10)";
+  if (top(7) === 0x7en) return "고유 로컬 (ULA, fc00::/7)";
+  if (top(32) === 0x20010db8n) return "문서용 (2001:db8::/32)";
+  if (top(3) === 1n) return "글로벌 유니캐스트";
+  return "특수 용도 (예약)";
+}
+
+/** The IPv6 subnet of `n`/`prefix`: its first and last address and how many. */
+export function ipv6Subnet(n: bigint, prefix: number): { network: bigint; last: bigint; size: bigint } {
+  const host = (1n << BigInt(128 - prefix)) - 1n;
+  const network = n & (V6_MAX ^ host);
+  return { network, last: network | host, size: host + 1n };
+}
+
+/** The IPv6 network of `n`/`prefix` split into the /`into` subnets it holds,
+ * in order (a /48 site into its /56s, a /56 into its /64 LANs), as IPv4's
+ * splitSubnet: at most 256 parts (8 bits more); null for a split that is not
+ * longer, or longer than that. */
+export function splitIpv6(n: bigint, prefix: number, into: number): { network: bigint; last: bigint; mine: boolean }[] | null {
+  if (!Number.isInteger(into) || into <= prefix || into > 128 || into - prefix > 8) return null;
+  const { network } = ipv6Subnet(n, prefix);
+  const host = (1n << BigInt(128 - into)) - 1n;
+  const parts: { network: bigint; last: bigint; mine: boolean }[] = [];
+  for (let i = 0n; i < 1n << BigInt(into - prefix); i++) {
+    const start = network + i * (host + 1n);
+    parts.push({ network: start, last: start | host, mine: n >= start && n <= (start | host) });
+  }
+  return parts;
+}
+
+// ---- Reverse DNS names (RFC 1035 3.5 in-addr.arpa, RFC 3596 2.5 ip6.arpa) --------
+
+/** The name an IPv4 address's PTR record is kept under: its octets reversed
+ * under in-addr.arpa ("10.0.0.5" → "5.0.0.10.in-addr.arpa"). */
+export function reverseName4(ip: string): string {
+  return `${ip.split(".").reverse().join(".")}.in-addr.arpa`;
+}
+
+/** The reverse zone of an IPv4 network that ends on an octet (/8, /16, /24):
+ * its network's leading octets reversed ("10.1.2.0/24" → "2.1.10.in-addr.arpa");
+ * null for other prefixes, whose zone a delegation (RFC 2317) names instead. */
+export function reverseZone4(network: string, prefix: number): string | null {
+  if (prefix <= 0 || prefix >= 32 || prefix % 8) return null;
+  return `${network.split(".").slice(0, prefix / 8).reverse().join(".")}.in-addr.arpa`;
+}
+
+/** The 32 hex digits of an IPv6 address, lower case, most significant first. */
+const nibbles6 = (n: bigint) => n.toString(16).padStart(32, "0").split("");
+
+/** The name an IPv6 address's PTR record is kept under: its 32 nibbles
+ * reversed, dot-separated, under ip6.arpa. */
+export function reverseName6(n: bigint): string {
+  return `${nibbles6(n).reverse().join(".")}.ip6.arpa`;
+}
+
+/** The reverse zone of an IPv6 network on a nibble boundary (/32, /48, /56, /64 …):
+ * the network's leading prefix/4 nibbles reversed; null otherwise. */
+export function reverseZone6(n: bigint, prefix: number): string | null {
+  if (prefix <= 0 || prefix >= 128 || prefix % 4) return null;
+  return `${nibbles6(ipv6Subnet(n, prefix).network).slice(0, prefix / 4).reverse().join(".")}.ip6.arpa`;
+}
+
+/** Whether a session's host is the address `ip` (an address clicked in
+ * output, a scanned host): letter case and spaces aside, and an IPv6 address
+ * however it is written ("2001:0DB8::1", "[2001:db8:0:0::1]" and
+ * "2001:db8::1" are one address). A name matches only as written. */
+export function sameHost(host: string, ip: string): boolean {
+  return hostKey(host) === hostKey(ip);
+}
+
+/** A host as sameHost compares it, for keying a map by device (deviceAlerts):
+ * trimmed, lower case, brackets off, an IPv6 address in its RFC 5952 form. */
+export function hostKey(host: string): string {
+  const bare = host.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  const v6 = bare.includes(":") ? parseIpv6(bare) : null;
+  return v6 === null ? bare : formatIpv6(v6);
+}
+
+/** "2001:db8::1/64" (or a bare address, `prefix` null) typed into the subnet
+ * calculator; null for anything that is not IPv6. */
+export function parseIpv6Input(text: string): { n: bigint; prefix: number | null } | null {
+  const m = /^\s*([^/\s]+)\s*(?:\/\s*(\d{1,3}))?\s*$/.exec(text);
+  if (!m) return null;
+  const n = parseIpv6(m[1]);
+  if (n === null) return null;
+  if (m[2] === undefined) return { n, prefix: null };
+  const prefix = Number(m[2]);
+  return prefix <= 128 ? { n, prefix } : null;
+}
+
+/** Several networks typed into the subnet calculator, to summarize:
+ * "10.0.0.0/24, 10.0.1.0/24" (commas, semicolons or line breaks between them;
+ * a bare address counts as a /32), or two or more "a.b.c.d/n" with only
+ * spaces between. "10.0.0.5 255.255.255.0" (an address and its mask) is one
+ * subnet, not a list. Null when it is not such a list. */
+export function parseNetworkList(text: string): { ip: string; prefix: number }[] | null {
+  // A separator left at either end ("10.0.0.0/24, 10.0.1.0/24,") separates nothing.
+  const t = trimSeparators(text);
+  const separated = /[,;\n]/.test(t);
+  const entry = new RegExp(`^(${OCTET}(?:\\.${OCTET}){3})(?:/(\\d{1,2}))?$`);
+  /** "a.b.c.d/n" (`bare`: or a bare address, a /32). */
+  const one = (token: string, bare: boolean) => {
+    const m = entry.exec(token);
+    if (!m || (m[2] === undefined && !bare)) return null;
+    const prefix = m[2] === undefined ? 32 : Number(m[2]);
+    return prefix > 32 ? null : { ip: m[1], prefix };
+  };
+  const out: { ip: string; prefix: number }[] = [];
+  /** The last entry was a bare address (a mask may follow it). */
+  let lastBare = false;
+  for (const token of t.split(separated ? /\s*[,;\n]\s*/ : /\s+/).filter(Boolean)) {
+    const net = one(token, separated);
+    // A netmask alone ("255.255.255.0", from "10.0.0.5⏎255.255.255.0⏎…"
+    // pasted as a column) is the mask of the bare address before it, not a
+    // network of its own; after anything else the list is not read.
+    const mask = net && token.startsWith("255.") ? maskPrefix(token) : null;
+    if (mask !== null) {
+      if (!lastBare) return null;
+      out[out.length - 1].prefix = mask;
+      lastBare = false;
+      continue;
+    }
+    lastBare = !!net && !token.includes("/");
+    if (net) {
+      out.push(net);
+      continue;
+    }
+    if (!separated) return null;
+    // Between separators: an address and its mask or wildcard
+    // ("10.0.0.5 255.255.255.0"), or several "a.b.c.d/n" with only spaces
+    // between (a list that mixes commas and spaces).
+    const subnet = parseSubnetInput(token);
+    if (subnet?.prefix != null && /\s/.test(token)) {
+      out.push({ ip: subnet.ip, prefix: subnet.prefix });
+      continue;
+    }
+    const parts = token.split(/\s+/).map((p) => one(p, false));
+    if (parts.length < 2 || parts.some((p) => !p)) return null;
+    out.push(...(parts as { ip: string; prefix: number }[]));
+  }
+  return out.length >= 2 ? out : null;
+}
+
+/** Text with commas, semicolons and spaces at either end taken off: what
+ * the subnet calculator reads ("10.0.0.0/24," is that network). */
+export function trimSeparators(text: string): string {
+  return text.replace(/^[\s,;]+|[\s,;]+$/g, "");
+}
+
+/** What `nets` amount to: `exact`, the fewest CIDR blocks that cover the
+ * same addresses (overlaps and neighbours merged, nothing added: for a route
+ * table or an ACL); `covering`, the smallest one network that holds them all
+ * (a summary route), and `extra`, how many addresses it has that none of
+ * them does. `covered`: each one already inside another of them, as typed
+ * order goes ("10.0.5.0/24" in "10.0.0.0/16"; the same network twice, the
+ * later one), each as typed and the one holding it by its network: entries a route table or an ACL does
+ * not need. CIDR blocks are nested or apart, so inside is all there is. */
+export function summarizeNetworks(nets: { ip: string; prefix: number }[]): {
+  exact: { network: string; prefix: number; size: number }[];
+  covering: { network: string; prefix: number };
+  total: number;
+  extra: number;
+  covered: { net: string; by: string }[];
+} {
+  const blocks = nets.map(({ ip, prefix }) => {
+    const size = 2 ** (32 - prefix);
+    const first = Math.floor(ipv4Number(ip)! / size) * size;
+    // `typed`: the address as the user wrote it, so two entries of one network
+    // ("10.0.5.0/24", "10.0.5.9/24") are told apart (a mask written as its
+    // prefix: parseNetworkList reads it so); `name`: the network it is.
+    return { first, last: first + size - 1, size, typed: prefix === 32 ? ip : `${ip}/${prefix}`, name: prefix === 32 ? dotted(first) : `${dotted(first)}/${prefix}` };
+  });
+  // In address order, a larger block before a smaller one at the same start
+  // and the one typed first before its repeat: a block is inside another
+  // exactly when one met before it reaches as far (blocks are nested or
+  // apart). One pass, so a pasted table of thousands stays quick.
+  const order = blocks.map((_, i) => i).sort((a, b) => blocks[a].first - blocks[b].first || blocks[b].size - blocks[a].size || a - b);
+  const inside = new Map<number, number>();
+  let reach = -1;
+  for (const i of order) {
+    if (reach >= 0 && blocks[reach].last >= blocks[i].last) inside.set(i, reach);
+    else reach = i;
+  }
+  // As typed order goes.
+  const covered = blocks.flatMap((x, i) => (inside.has(i) ? [{ net: x.typed, by: blocks[inside.get(i)!].name }] : []));
+  // Each network as its first and last address, in order, merged where they
+  // overlap or meet.
+  const spans = nets
+    .map(({ ip, prefix }) => {
+      const size = 2 ** (32 - prefix);
+      const first = Math.floor(ipv4Number(ip)! / size) * size;
+      return [first, first + size - 1];
+    })
+    .sort((a, b) => a[0] - b[0]);
+  const merged: number[][] = [];
+  for (const [a, b] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1] + 1) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  const exact = merged.flatMap(([a, b]) => rangeToCidrs(dotted(a), dotted(b)));
+  const total = merged.reduce((n, [a, b]) => n + (b - a + 1), 0);
+  // The covering network: the longest prefix whose block holds both the
+  // lowest and the highest address.
+  const lo = merged[0][0];
+  const hi = merged[merged.length - 1][1];
+  let prefix = 32;
+  while (prefix > 0 && Math.floor(lo / 2 ** (32 - prefix)) !== Math.floor(hi / 2 ** (32 - prefix))) prefix--;
+  const size = 2 ** (32 - prefix);
+  return { exact, covering: { network: dotted(Math.floor(lo / size) * size), prefix }, total, extra: size - total, covered };
+}
+
+/** Every address from `from` to `to` (both included, any order), as an IP
+ * scan of a range pings them; null past `max` addresses. */
+export function rangeAddresses(from: string, to: string, max = 1024): string[] | null {
+  let lo = ipv4Number(from);
+  let hi = ipv4Number(to);
+  if (lo === null || hi === null) return null;
+  if (lo > hi) [lo, hi] = [hi, lo];
+  if (hi - lo + 1 > max) return null;
+  return Array.from({ length: hi - lo + 1 }, (_, i) => dotted(lo! + i));
+}
+
+/** The fewest CIDR blocks that cover `from` to `to` exactly (both included,
+ * any order): what an ACL or a firewall rule takes for a range. Each block
+ * is the largest one that starts at the next uncovered address, is aligned
+ * to its size, and ends inside the range. At most 62 blocks (a whole range
+ * of 2^32 addresses less its two ends); one for a range that is a subnet. */
+export function rangeToCidrs(from: string, to: string): { network: string; prefix: number; size: number }[] {
+  let lo = ipv4Number(from);
+  let hi = ipv4Number(to);
+  if (lo === null || hi === null) return [];
+  if (lo > hi) [lo, hi] = [hi, lo];
+  const out: { network: string; prefix: number; size: number }[] = [];
+  // Numbers past 2^31 stay exact as plain numbers (not 32-bit bit operations).
+  let at = lo;
+  while (at <= hi) {
+    let size = 1;
+    // Grow while the block stays aligned at `at` and inside the range.
+    while (size < 2 ** 32 && at % (size * 2) === 0 && at + size * 2 - 1 <= hi) size *= 2;
+    out.push({ network: dotted(at), prefix: 32 - Math.log2(size), size });
+    at += size;
+  }
+  return out;
+}
+
 const IPV4_START = new RegExp(`^(${OCTET}(?:\\.${OCTET}){3})(.*)$`);
 
 /** What is typed into the subnet calculator: "10.0.0.5", "10.0.0.5/24" or
@@ -277,6 +675,32 @@ export function parseSubnetInput(text: string): { ip: string; prefix: number | n
   if (!/^(?:\/\d{1,2}|\s+(?:(?:net)?mask\s+)?\S+)$/i.test(m[2])) return null;
   const prefix = prefixAfter(m[2], "");
   return prefix === null ? null : { ip: m[1], prefix };
+}
+
+/** The hosts a pasted listing names (a terminal selection of "show arp",
+ * "show cdp neighbors", a hosts file), each once, to ping together: read a
+ * line at a time (findIps reads one line), multicast and above (224.0.0.0
+ * on) left out, and with a prefix written by it ("10.1.1.0/24" in a route
+ * table, "10.0.0.255 255.255.255.0") its network and broadcast addresses
+ * too, which no host answers for; so is one named a broadcast where it is
+ * written (ifconfig's "broadcast 10.0.0.255", ip's "brd", "Bcast:"). */
+export function hostAddresses(text: string): string[] {
+  const out = new Set<string>();
+  for (const line of text.split(/\r\n?|\n/)) {
+    for (const m of findIps(line)) {
+      const n = ipv4Number(m.ip);
+      if (n === null || n >>> 28 >= 14) continue;
+      // The word on its own ("lab-bcast 10.2.0.7" names a host), Cisco's "ip broadcast-address" too.
+      if (/(?:^|[\s(:])(?:broadcast(?:-address)?|brd|bcast)[\s:]+$/i.test(line.slice(0, m.index))) continue;
+      if (m.prefix !== null && m.prefix <= 30) {
+        const size = 2 ** (32 - m.prefix);
+        const off = n % size;
+        if (off === 0 || off === size - 1) continue;
+      }
+      out.add(m.ip);
+    }
+  }
+  return [...out];
 }
 
 /** An IPv4 address as a number, or null when `text` is not exactly one. */
@@ -338,12 +762,26 @@ export function findMacs(text: string): MacMatch[] {
 export function macFormats(hex: string): { text: string; style: string }[] {
   const pairs = hex.match(/../g)!;
   const quads = hex.match(/..../g)!;
-  return [
+  const forms = [
     { text: pairs.join(":"), style: "Linux" },
     { text: pairs.join("-").toUpperCase(), style: "Windows" },
     { text: quads.join("."), style: "Cisco" },
     { text: quads.join("-"), style: "Huawei" },
   ];
+  const linkLocal = macLinkLocal(hex);
+  if (linkLocal) forms.push({ text: linkLocal, style: "EUI-64 링크 로컬 IPv6" });
+  return forms;
+}
+
+/** The IPv6 link-local address a host forms from its MAC (modified EUI-64,
+ * RFC 4291 appendix A: ff:fe in the middle, the universal/local bit flipped),
+ * as `show ipv6 interface` and `ip -6 addr` print it; null for a group address
+ * (the I/G bit), which never names an interface. */
+export function macLinkLocal(hex: string): string | null {
+  const first = parseInt(hex.slice(0, 2), 16);
+  if (!/^[0-9a-f]{12}$/i.test(hex) || first & 1) return null;
+  const iid = BigInt(`0x${(first ^ 2).toString(16).padStart(2, "0")}${hex.slice(2, 6)}fffe${hex.slice(6)}`);
+  return formatIpv6((0xfe80n << 112n) | iid);
 }
 
 /** What a MAC address is, when its value says so by standard: a protocol's

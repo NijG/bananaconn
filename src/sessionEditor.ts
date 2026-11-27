@@ -135,7 +135,9 @@ function optionsFields(p: Protocol, o: Record<string, unknown>): string {
           <label class="field"><span>패리티</span>${sel("parity", [["none", "없음"], ["even", "짝수 (Even)"], ["odd", "홀수 (Odd)"]], st.parity)}</label>
           <label class="field"><span>정지 비트</span>${sel("stopBits", [[1, "1"], [2, "2"]], st.stopBits)}</label>
           <label class="field span-2"><span>흐름 제어</span>${sel("flow", [["none", "없음 (대부분의 장비 콘솔)"], ["hardware", "하드웨어 (RTS/CTS)"], ["software", "소프트웨어 (XON/XOFF)"]], st.flow)}</label>
+          <label class="field span-2"><span>Enter 키가 보내는 것</span>${sel("enter", [["cr", "CR (대부분의 장비 콘솔)"], ["crlf", "CR+LF"], ["lf", "LF"]], st.enter)}</label>
         </div>
+        ${check("localEcho", "로컬 에코 (입력한 글자를 화면에도 표시 · 장비가 되돌려 보내지 않을 때)", !!o.localEcho)}
         ${keyModeField(o.keyMode ?? "network", o.backspace)}
         ${startup()}
         <p class="muted small">Cisco 등 장비 콘솔의 일반 설정은 9600 · 8 · 없음 · 1 · 흐름 제어 없음입니다. 툴바의 Break 버튼으로 Break 신호를 보낼 수 있습니다.</p>`;

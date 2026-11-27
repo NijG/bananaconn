@@ -3,11 +3,15 @@
 // one of their sessions is connected or one of their tabs is in front. Kept
 // in memory only: a new run starts with none.
 
-/** Lower-case host → what happened (an app phrase, translated where shown) and when it first did. */
+import { hostKey } from "./ipLinks";
+
+/** Host (hostKey) → what happened (an app phrase, translated where shown) and when it first did. */
 const alerts = new Map<string, { note: string; at: number }>();
 const listeners = new Set<() => void>();
 
-const keyOf = (host: string) => host.trim().toLowerCase();
+// Keyed as sessions are matched to an address (ipLinks.sameHost): an IPv6
+// address however written is one device.
+const keyOf = hostKey;
 
 /** The note with its time, as shown: "… · 14:05" (each " · " part is translated on its own). */
 const shown = (a: { note: string; at: number }) => `${a.note} · ${new Date(a.at).toTimeString().slice(0, 5)}`;
